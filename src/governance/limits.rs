@@ -6,10 +6,9 @@
 //! dies at 20% still pays for the prompt it already sent, and the over-reserve
 //! is released on settle.
 //!
-//! Locking discipline: window counters live behind a `std::sync::Mutex` that is
-//! never held across an `await`, so `settle()` can stay synchronous and be
-//! called straight from a stream `Drop`. Spend uses atomics for the same
-//! reason.
+//! Locking discipline: window counters and the spend ledger live behind
+//! `std::sync::Mutex`s that are never held across an `await`, so `settle()`
+//! can stay synchronous and be called straight from a stream `Drop`.
 
 use std::{
     collections::VecDeque,
@@ -17,7 +16,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use dashmap::DashMap;
@@ -83,63 +82,57 @@ impl Window {
     }
 }
 
-/// Day-bucketed spend in nano-USD. Integer only: money is not a float.
+/// Day-bucketed spend in nano-USD, guarded by one mutex so the bucket and the
+/// counter flip together. Integer only: money is not a float.
 #[derive(Debug, Default)]
 struct SpendLedger {
-    bucket: AtomicU64,
-    spent: AtomicU64,
+    inner: Mutex<(u64, u64)>,
 }
 
 impl SpendLedger {
-    /// Roll over at the UTC day boundary. Called on every read/write, so the
-    /// first request after midnight resets the counter without a timer.
-    fn current_bucket(&self, now: std::time::SystemTime) -> u64 {
+    /// Roll over at the UTC day boundary and run `f` on the pair. Called on
+    /// every read/write, so the first request after midnight resets the
+    /// counter without a timer. The pair must flip under one lock: two
+    /// separate atomics let a write sneak between the bucket's CAS and the
+    /// `spent` reset, and that write is silently lost — a reservation made one
+    /// microsecond after the boundary vanishes from the budget graph.
+    fn with_day<F, R>(&self, now: SystemTime, f: F) -> R
+    where
+        F: FnOnce(&mut (u64, u64)) -> R,
+    {
         let today = budget_bucket(now);
-        let stored = self.bucket.load(Ordering::Acquire);
-        if stored == today {
-            return today;
+        let mut pair = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pair.0 != today {
+            pair.0 = today;
+            pair.1 = 0;
         }
-        if self
-            .bucket
-            .compare_exchange(stored, today, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            self.spent.store(0, Ordering::Release);
-        }
-        self.bucket.load(Ordering::Acquire)
+        f(&mut pair)
     }
 
-    fn snapshot(&self, now: std::time::SystemTime) -> (u64, u64) {
-        let bucket = self.current_bucket(now);
-        (bucket, self.spent.load(Ordering::Acquire))
+    fn snapshot(&self, now: SystemTime) -> (u64, u64) {
+        self.with_day(now, |pair| *pair)
     }
 
-    fn reserve(&self, now: std::time::SystemTime, amount: u64) -> u64 {
-        self.current_bucket(now);
-        self.spent.fetch_add(amount, Ordering::AcqRel) + amount
+    fn reserve(&self, now: SystemTime, amount: u64) -> u64 {
+        self.with_day(now, |pair| {
+            pair.1 = pair.1.saturating_add(amount);
+            pair.1
+        })
     }
 
-    /// Correct a reservation once real usage is known. Clamps at zero so a
-    /// refund larger than the reservation cannot wrap the counter.
-    fn adjust(&self, now: std::time::SystemTime, delta: i128) {
-        self.current_bucket(now);
-        let mut current = self.spent.load(Ordering::Acquire);
-        loop {
-            let next = if delta < 0 {
-                current.saturating_sub(delta.unsigned_abs().min(u64::MAX as u128) as u64)
+    /// Correct a reservation once real usage or abandonment is known. Clamps
+    /// at zero so a refund larger than the reservation cannot wrap the counter.
+    fn adjust(&self, now: SystemTime, delta: i128) {
+        self.with_day(now, |pair| {
+            if delta < 0 {
+                pair.1 = pair.1.saturating_sub(delta.unsigned_abs().min(u64::MAX as u128) as u64);
             } else {
-                current.saturating_add(delta.min(u64::MAX as i128) as u64)
-            };
-            match self.spent.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return,
-                Err(observed) => current = observed,
+                pair.1 = pair.1.saturating_add(delta.min(u64::MAX as i128) as u64);
             }
-        }
+        });
     }
 }
 
@@ -212,10 +205,22 @@ impl Reservation {
         }
     }
 
-    /// Release without charging completion tokens — the stream failed before
-    /// producing any. The prompt estimate still stands.
+/// Release without charging completion tokens — the stream failed before
+    /// producing any. The prompt estimate still stands, because the upstream
+    /// already received and paid for it. Refunds the completion half *now*,
+    /// rather than counting on `Drop`: a client disconnecting mid-stream
+    /// reaches this from `Drop` for the stream state, and a `Drop` that merely
+    /// marks itself settled would leave the over-reserve on the ledger.
+    /// Idempotent — a later `settle` or `Drop` sees `settled` and does nothing.
     pub fn abandon(&mut self) {
+        if self.settled {
+            return;
+        }
         self.settled = true;
+        let refund = self.reserved_nano_usd as i128 - self.reserved_prompt_nano_usd as i128;
+        if refund > 0 {
+            self.state.spend.adjust(SystemTime::now(), -refund);
+        }
     }
 
     pub fn reserved_nano_usd(&self) -> u64 {
@@ -592,11 +597,11 @@ mod tests {
         assert_eq!(engine.snapshot("t", &l).spent_nano_usd, 60_000);
     }
 
-    #[tokio::test]
+#[tokio::test]
     async fn abandoned_stream_keeps_prompt_cost_and_refunds_the_rest() {
         let engine = LimitEngine::new(64, true);
         let l = limits(0, 0, 8, 10_000_000);
-        let r = engine
+        let mut r = engine
             .admit(
                 "t",
                 &l,
@@ -607,9 +612,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(engine.snapshot("t", &l).spent_nano_usd, 820);
-        drop(r);
-        // Only the prompt half is kept; the completion reservation is refunded.
+        r.abandon();
+        // The completion reservation is refunded immediately, not deferred to
+        // `Drop`; only the prompt half stands.
         assert_eq!(engine.snapshot("t", &l).spent_nano_usd, 20);
+        drop(r);
+        // Dropping an already-abandoned reservation refunds nothing twice.
+        assert_eq!(engine.snapshot("t", &l).spent_nano_usd, 20);
+    }
+
+    #[tokio::test]
+    async fn abandon_after_settle_is_a_no_op() {
+        let engine = LimitEngine::new(64, true);
+        let l = limits(0, 0, 8, 10_000_000);
+        let c = cost(2.0, 8.0);
+        let mut r = engine
+            .admit("t", &l, 10, 100, CostEstimate { prompt_nano_usd: 20, completion_nano_usd: 800 })
+            .await
+            .unwrap();
+        r.settle(
+            Usage { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, ..Default::default() },
+            &c,
+        );
+        let billed = engine.snapshot("t", &l).spent_nano_usd;
+        assert_eq!(billed, 60_000);
+        r.abandon();
+        // Real usage was already charged; abandoning afterwards must not refund
+        // the completion half a second time.
+        assert_eq!(engine.snapshot("t", &l).spent_nano_usd, billed);
+    }
+
+    #[test]
+    fn spend_rolls_over_at_the_utc_day_boundary() {
+        let ledger = SpendLedger::default();
+        let day1 = SystemTime::UNIX_EPOCH + Duration::from_secs(3 * 86_400);
+        let day2 = SystemTime::UNIX_EPOCH + Duration::from_secs(4 * 86_400);
+        assert_eq!(ledger.snapshot(day1), (3, 0));
+        ledger.reserve(day1, 820);
+        ledger.reserve(day1, 1_000_000);
+        assert_eq!(ledger.snapshot(day1), (3, 1_000_820));
+        // First touch on a new day resets the pair to that day's bucket.
+        assert_eq!(ledger.snapshot(day2), (4, 0));
+    }
+
+    /// Regression guard for the two-atomics reset, where a write landing
+    /// between the bucket's CAS and the `spent` reset was silently lost.
+    /// All reservations here are made *after* the day flip, so every one of
+    /// them must survive: the total can never fall short of the count.
+    #[test]
+    fn day_rollover_cannot_lose_concurrent_spend() {
+        let ledger = Arc::new(SpendLedger::default());
+        let day1 = SystemTime::UNIX_EPOCH + Duration::from_secs(3 * 86_400);
+        let day2 = SystemTime::UNIX_EPOCH + Duration::from_secs(4 * 86_400);
+        assert_eq!(ledger.snapshot(day1), (3, 0));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let ledger = Arc::clone(&ledger);
+                std::thread::spawn(move || {
+                    let _ = ledger.snapshot(day2);
+                    for _ in 0..10_000 {
+                        ledger.reserve(day2, 1);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("worker must not panic");
+        }
+        assert_eq!(ledger.snapshot(day2), (4, 40_000));
     }
 
     #[tokio::test]
