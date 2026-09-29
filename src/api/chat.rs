@@ -458,6 +458,9 @@ async fn normalized_response(
     let upstream = match admitted.provider.stream_chat(admitted.request.clone()).await {
         Ok(stream) => {
             state.metrics.stream_started(&provider, &model);
+            state
+                .inflight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             stream
         }
         Err(err) => {
@@ -472,6 +475,7 @@ async fn normalized_response(
         span: span.clone(),
         cost_model: admitted.resolved.config.cost.clone(),
         metrics: Arc::clone(&state.metrics),
+        inflight: Arc::clone(&state.inflight),
         model: admitted.resolved.registry_id.clone(),
         tenant: admitted.principal.tenant_id.to_string(),
         request_id: span.request_id.clone(),
@@ -549,6 +553,9 @@ struct NormalizedState {
     reservation: Reservation,
     cost_model: router::CostModel,
     metrics: crate::observability::SharedMetrics,
+    /// Decremented when the stream object is dropped, which lets shutdown
+    /// drain by counting live streams instead of sleeping a fixed amount.
+    inflight: std::sync::Arc<std::sync::atomic::AtomicU64>,
     model: String,
     tenant: String,
     request_id: String,
@@ -771,6 +778,8 @@ impl Drop for NormalizedState {
             self.reservation.abandon();
             self.emit_summary();
         }
+        self.inflight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -907,6 +916,9 @@ async fn passthrough_response(
     let stream = match admitted.provider.stream_chat_raw(admitted.request.clone()).await {
         Ok(stream) => {
             state.metrics.stream_started(&provider_name, &model_id);
+            state
+                .inflight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             stream
         }
         Err(err) => {
@@ -928,6 +940,7 @@ async fn passthrough_response(
             reservation: admitted.reservation,
             cost_model: admitted.resolved.config.cost.clone(),
             metrics: Arc::clone(&state.metrics),
+            inflight: Arc::clone(&state.inflight),
             model: admitted.resolved.registry_id.clone(),
             provider: admitted.resolved.provider().to_string(),
             tenant: admitted.principal.tenant_id.to_string(),
@@ -952,6 +965,9 @@ struct RawStream {
     reservation: Reservation,
     cost_model: router::CostModel,
     metrics: crate::observability::SharedMetrics,
+    /// Decremented when the stream object is dropped, the same shutdown-drain
+    /// counter the normalized path uses.
+    inflight: std::sync::Arc<std::sync::atomic::AtomicU64>,
     model: String,
     provider: String,
     tenant: String,
@@ -1006,6 +1022,8 @@ impl Drop for RawStream {
             self.reservation.abandon();
             self.emit();
         }
+        self.inflight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

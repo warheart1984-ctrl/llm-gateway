@@ -180,10 +180,12 @@ constraint a caller can override is not one.
 [server]
 port = 8080
 request_body_limit_bytes = 1048576
-# Per-chunk idle timeout, NOT a whole-response deadline: a 30s total limit on a
-# 4000-token completion is a bug, not a safety feature.
-stream_idle_timeout_ms = 120000
 keep_alive_interval_ms = 15000
+
+[upstream]
+# Per-chunk read timeout, NOT a whole-response deadline: a 30s total limit on
+# a 4000-token completion is a bug, not a safety feature.
+stream_read_timeout_ms = 120000
 
 [governance]
 require_model_allowlist = true

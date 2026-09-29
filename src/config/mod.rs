@@ -38,24 +38,17 @@ pub struct Settings {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub bind_addr: String,
     pub port: u16,
     /// Hard cap on request body size for the chat endpoints.
     pub request_body_limit_bytes: usize,
-    /// Applied to non-streaming handlers. Streaming requests are governed by
-    /// `stream_idle_timeout_ms` instead (a total deadline would fight SSE).
-    pub request_timeout_ms: u64,
-    /// If no upstream byte arrives for this long mid-stream, the stream is
-    /// aborted. Protects against half-open upstream connections.
-    pub stream_idle_timeout_ms: u64,
     /// SSE comment ping cadence. Keeps intermediaries from buffering.
     pub keep_alive_interval_ms: u64,
     /// Global ceiling across all tenants, independent of per-tenant limits.
     pub max_concurrent_streams_global: usize,
     pub shutdown_grace_ms: u64,
-    #[serde(default)]
-    pub cors: CorsConfig,
     /// Serve `GET /metrics`.
     pub metrics_enabled: bool,
 }
@@ -66,51 +59,16 @@ impl Default for ServerConfig {
             bind_addr: "0.0.0.0".to_string(),
             port: 8080,
             request_body_limit_bytes: 1 << 20,
-            request_timeout_ms: 30_000,
-            stream_idle_timeout_ms: 120_000,
             keep_alive_interval_ms: 15_000,
             max_concurrent_streams_global: 512,
             shutdown_grace_ms: 20_000,
-            cors: CorsConfig::default(),
             metrics_enabled: true,
         }
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct CorsConfig {
-    pub enabled: bool,
-    /// `*` is allowed and means "reflect any origin" without credentials.
-    pub allowed_origins: Vec<String>,
-    pub allowed_headers: Vec<String>,
-    pub exposed_headers: Vec<String>,
-    pub max_age_secs: u64,
-}
-
-impl Default for CorsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            allowed_origins: vec!["*".to_string()],
-            allowed_headers: vec![
-                "authorization".into(),
-                "content-type".into(),
-                "x-api-key".into(),
-                "x-request-id".into(),
-            ],
-            exposed_headers: vec![
-                "x-request-id".into(),
-                "x-provider".into(),
-                "x-model".into(),
-                "x-upstream-model".into(),
-                "x-gateway-version".into(),
-            ],
-            max_age_secs: 600,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RegistryConfig {
     pub models_path: PathBuf,
     pub tenants_path: PathBuf,
@@ -144,6 +102,7 @@ pub enum AuthMode {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     pub mode: AuthMode,
     pub api_key_header: String,
@@ -169,6 +128,7 @@ impl Default for AuthConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JwtConfig {
     pub issuer: String,
     pub audience: String,
@@ -293,6 +253,7 @@ impl LimitProfile {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpstreamConfig {
     pub connect_timeout_ms: u64,
     /// Per-chunk read timeout for streaming responses.
@@ -303,8 +264,6 @@ pub struct UpstreamConfig {
     pub user_agent: String,
     /// Send `stream_options.include_usage` so we can bill accurately.
     pub request_usage: bool,
-    /// Vendor telemetry opt-out header (`X-Privacy`).
-    pub disable_vendor_telemetry: bool,
 }
 
 impl Default for UpstreamConfig {
@@ -317,7 +276,6 @@ impl Default for UpstreamConfig {
             pool_idle_timeout_ms: 90_000,
             user_agent: concat!("llm-gateway/", env!("CARGO_PKG_VERSION")).to_string(),
             request_usage: true,
-            disable_vendor_telemetry: true,
         }
     }
 }
@@ -331,6 +289,7 @@ pub enum LogFormat {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {
     pub service_name: String,
     pub service_version: String,
@@ -426,10 +385,6 @@ impl Settings {
         Duration::from_millis(self.server.keep_alive_interval_ms)
     }
 
-    pub fn request_timeout(&self) -> Duration {
-        Duration::from_millis(self.server.request_timeout_ms)
-    }
-
     pub fn shutdown_grace(&self) -> Duration {
         Duration::from_millis(self.server.shutdown_grace_ms)
     }
@@ -472,4 +427,85 @@ pub fn redacted_settings(settings: &Settings) -> BTreeMap<&'static str, String> 
     out.insert("jwt_issuer", settings.auth.jwt.as_ref().map(|j| j.issuer.clone()).unwrap_or_else(|| "-".into()));
     out.insert("metrics_enabled", settings.server.metrics_enabled.to_string());
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// Walking `cargo test --lib` from the crate root, so the shipped file is
+    /// reachable the same way the binary reaches it when started from the repo
+    /// root. With every config struct `deny_unknown_fields`, this is the
+    /// regression guard for the dead-key removal: a stale key revived in
+    /// `default.toml` makes boot fail loudly instead of being silently ignored.
+    #[test]
+    fn the_shipped_default_config_loads() {
+        Settings::load_file(
+            Path::new("config/default.toml"),
+            Path::new("config"),
+        )
+        .unwrap_or_else(|e| panic!("shipped config/default.toml must parse: {e:?}"));
+    }
+
+    /// A config file that still carries the removed knobs is now a hard parse
+    /// error. Grabs each section's required fields so the failure can only
+    /// come from the stale key in `[server]`.
+    #[test]
+    fn removed_keys_are_rejected_not_ignored() {
+        let toml = r#"
+[server]
+bind_addr = "0.0.0.0"
+port = 8080
+request_body_limit_bytes = 1048576
+keep_alive_interval_ms = 15000
+max_concurrent_streams_global = 512
+shutdown_grace_ms = 20000
+metrics_enabled = true
+request_timeout_ms = 30000
+
+[registry]
+models_path = "models.yaml"
+tenants_path = "tenants.yaml"
+hot_reload = false
+reload_interval_ms = 5000
+
+[auth]
+mode = "api_key"
+api_key_header = "x-api-key"
+accept_bearer = true
+allow_anonymous = false
+
+[governance]
+require_model_allowlist = true
+on_max_tokens_exceeded = "clamp"
+cost_tracking_enabled = true
+
+[upstream]
+connect_timeout_ms = 5000
+stream_read_timeout_ms = 120000
+tcp_keepalive_secs = 75
+pool_max_idle_per_host = 64
+pool_idle_timeout_ms = 90000
+user_agent = "test/0.0.0"
+request_usage = true
+
+[telemetry]
+service_name = "test"
+service_version = "0.0.0"
+log_format = "json"
+log_filter = "info"
+"#;
+        let dir = std::env::temp_dir().join("llm-gateway-config-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stale.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = Settings::load_file(&path, &dir).unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("request_timeout_ms"),
+            "expected the stale key to be named in the error, got: {rendered}"
+        );
+    }
 }
