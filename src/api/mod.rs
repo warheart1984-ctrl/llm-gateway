@@ -127,7 +127,15 @@ mod tests {
     use tower::ServiceExt;
 
     fn build_state(metrics_enabled: bool) -> Arc<AppState> {
-        let dir = std::env::temp_dir().join(format!("llm-gateway-router-{}", std::process::id()));
+        // Each call gets its own directory: the helper used one
+        // `llm-gateway-router-{pid}` dir for every test, and parallel tests
+        // raced the trailing `remove_dir_all` against the next `fs::write`.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "llm-gateway-router-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let tenants_path = dir.join("tenants.yaml");
         std::fs::write(
