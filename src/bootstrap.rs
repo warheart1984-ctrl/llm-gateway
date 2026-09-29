@@ -95,7 +95,11 @@ pub async fn build(settings: Settings) -> Result<Arc<AppState>, BootError> {
     // warned about, because refusing to start would turn a missing secret into
     // a full outage.
     let pool = providers.names();
-    let validation = policy::validate(&tenants, &|p| pool.contains(&p.to_ascii_lowercase()));
+    let validation = policy::validate(
+        &tenants,
+        settings.governance.require_model_allowlist,
+        &|p| pool.contains(&p.to_ascii_lowercase()),
+    );
     for warning in &validation.warnings {
         tracing::warn!(%warning, "tenant registry warning");
     }

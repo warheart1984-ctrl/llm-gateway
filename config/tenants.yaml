@@ -58,8 +58,8 @@ tenants:
       tokens_per_minute: 4000000
       max_concurrent_streams: 128
       max_output_tokens: 32768
-    # 1000 USD/day.
-    daily_budget_nano_usd: 1000000000000
+      # 1000 USD/day.
+      daily_budget_nano_usd: 1000000000000
 
   - tenant_id: sandbox
     display_name: Sandbox (cheap models only)

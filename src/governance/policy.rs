@@ -377,11 +377,16 @@ fn check_model_access(
         });
     }
     if require_allowlist {
-        let allowed = tenant.allowed_models.is_empty()
-            || tenant
-                .allowed_models
-                .iter()
-                .any(|p| glob_match(p, qualified_model));
+        // Fail closed. An empty allowlist means "no models", not "every model":
+        // this is the strict mode, and the permissive reading turned a present-
+        // but-empty `allowed_models` list into full catalogue access. A tenant
+        // that genuinely wants everything writes `*`, which `glob_match`
+        // already handles. A *misnamed* key is already rejected outright by
+        // `deny_unknown_fields` on `Tenant`.
+        let allowed = tenant
+            .allowed_models
+            .iter()
+            .any(|p| glob_match(p, qualified_model));
         if !allowed {
             return Err(AuthorizeError::ModelNotAllowed {
                 tenant: tenant.tenant_id.clone(),
@@ -450,8 +455,13 @@ pub struct Validation {
 /// error: tenants are routinely provisioned before credentials land, and
 /// refusing to boot would turn a missing secret into an outage. A
 /// `default_model` that is not in the tenant's own allowlist *is* fatal, since
-/// nothing about that deployment can ever succeed.
-pub fn validate(tenants: &TenantRegistry, provider_available: &dyn Fn(&str) -> bool) -> Validation {
+/// nothing about that deployment can ever succeed. So is a tenant with no
+/// allowlist at all while `require_allowlist` is on, for the same reason.
+pub fn validate(
+    tenants: &TenantRegistry,
+    require_allowlist: bool,
+    provider_available: &dyn Fn(&str) -> bool,
+) -> Validation {
     let mut v = Validation::default();
     for id in tenants.tenant_ids() {
         let Some(tenant) = tenants.get(id) else { continue };
@@ -467,9 +477,23 @@ pub fn validate(tenants: &TenantRegistry, provider_available: &dyn Fn(&str) -> b
             }
         }
 
+        // Fail closed, so this is now a load-time error rather than a request
+        // that silently succeeds. Caught here because the request-time effect
+        // is a 403 on every model, which looks like a policy problem rather
+        // than a missing config key.
+        if require_allowlist && tenant.allowed_models.is_empty() {
+            v.errors.push(format!(
+                "tenant `{id}` has no `allowed_models` while `require_model_allowlist` is on, so every model request will be refused; list the models it may call, or use `[\"*\"]` if unrestricted access is intended"
+            ));
+        }
+
         if let Some(model) = &tenant.default_model {
             let qualified = qualify(&tenant.model_suffix, model);
-            if !tenant.allowed_models.is_empty()
+            // Only meaningful when an allowlist is in force for this tenant:
+            // either the deployment requires one, or this tenant supplied one.
+            // With `require_allowlist` off and no list, there is nothing to be
+            // outside of.
+            if (require_allowlist || !tenant.allowed_models.is_empty())
                 && !glob_any(&tenant.allowed_models, &qualified)
             {
                 v.errors.push(format!(
@@ -601,6 +625,104 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, AuthorizeError::ModelDenied { .. }));
     }
+
+    /// The strict mode is the one that must be strict. An empty allowlist used
+    /// to short-circuit to "allowed", which handed a tenant with a missing or
+    /// empty `allowed_models` the whole catalogue -- including the most
+    /// expensive model in the registry. Fail closed instead.
+    #[test]
+    fn an_empty_allowlist_allows_nothing_when_required() {
+        for model in [
+            "groq/gpt-oss-20b",
+            "openrouter/gpt-4.1-mini",
+            "openrouter/claude-sonnet-4",
+        ] {
+            let err = engine()
+                .authorize(&principal(), &registry(tenant(&[], &[])), model, 1, 10)
+                .unwrap_err();
+            assert!(
+                matches!(err, AuthorizeError::ModelNotAllowed { .. }),
+                "empty allowlist must refuse `{model}`, got {err:?}"
+            );
+        }
+    }
+
+    /// A tenant that genuinely wants every model still says so with `*`, which
+    /// is why the empty case above can be closed without breaking anyone.
+    #[test]
+    fn a_star_allowlist_still_allows_everything() {
+        for model in ["groq/gpt-oss-20b", "openrouter/claude-sonnet-4"] {
+            engine()
+                .authorize(&principal(), &registry(tenant(&["*"], &[])), model, 1, 10)
+                .unwrap_or_else(|e| panic!("`*` must allow `{model}`, got {e:?}"));
+        }
+    }
+
+    /// With the allowlist not required, an empty list is not an error: the
+    /// deployment has opted out of allowlist enforcement entirely.
+    #[test]
+    fn an_empty_allowlist_is_permissive_when_not_required() {
+        let engine = PolicyEngine::new(false, crate::config::DEFAULT_LIMITS);
+        engine
+            .authorize(&principal(), &registry(tenant(&[], &[])), "groq/anything", 1, 10)
+            .expect("allowlist enforcement is off, so the empty list must not gate");
+    }
+
+    /// The request-time gate fails closed, so the empty case is also a
+    /// load-time error: otherwise an operator sees a 403 on every model and has
+    /// no reason to suspect a missing config key.
+    #[test]
+    fn validation_reports_an_empty_allowlist_as_fatal() {
+        let reg = registry(tenant(&[], &[]));
+        let v = validate(&reg, true, &|_| true);
+        assert!(
+            v.errors.iter().any(|e| e.contains("no `allowed_models`")),
+            "expected a fatal error about the empty allowlist, got {:?}",
+            v.errors
+        );
+        // Not fatal when allowlist enforcement is off, since it then has no
+        // effect on the request path.
+        let v = validate(&reg, false, &|_| true);
+        assert!(
+            !v.errors.iter().any(|e| e.contains("no `allowed_models`")),
+            "must not be fatal when enforcement is off, got {:?}",
+            v.errors
+        );
+    }
+
+    /// The shipped roster must survive the stricter reading, and every tenant
+    /// in it must have a real allowlist or a deliberate `*`.
+    #[test]
+    fn the_shipped_tenant_roster_validates() {
+        // The loader hashes credential material from `key_env` vars at load
+        // time, like boot does. The CI/test environment has none of them set.
+        for var in [
+            "GATEWAY_KEY_ACME_MAIN",
+            "GATEWAY_KEY_ACME_CI",
+            "GATEWAY_KEY_JARVIS_MAIN",
+            "GATEWAY_KEY_SANDBOX",
+        ] {
+            // Rust 2024 edition: process env mutation is `unsafe`. This is a
+            // single-threaded unit test, so it is sound here.
+            unsafe { std::env::set_var(var, "test-material-not-a-real-key") };
+        }
+        let reg =
+            TenantRegistry::load("config/tenants.yaml").unwrap_or_else(|e| panic!("{e:?}"));
+        let v = validate(&reg, true, &|_| true);
+        assert!(
+            v.errors.is_empty(),
+            "config/tenants.yaml must not fail strict validation: {:?}",
+            v.errors
+        );
+        for id in reg.tenant_ids() {
+            let t = reg.get(id).expect("tenant exists");
+            assert!(
+                !t.allowed_models.is_empty(),
+                "shipped tenant `{id}` has no allowed_models, so under strict mode it can call nothing"
+            );
+        }
+    }
+
 
     #[test]
     fn missing_scope_is_rejected() {

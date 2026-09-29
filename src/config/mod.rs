@@ -205,6 +205,7 @@ pub enum OverflowMode {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GovernanceConfig {
     pub require_model_allowlist: bool,
     /// What to do when a request asks for more output tokens than allowed.
@@ -238,6 +239,7 @@ impl Default for GovernanceConfig {
 /// All fields optional so a tenant can override just the ceiling it cares
 /// about; `0` means "inherit the gateway default" (see [`LimitProfile::merged_with_defaults`]).
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LimitProfile {
     #[serde(default)]
     pub requests_per_minute: u32,
