@@ -7,8 +7,17 @@
 #   setx GATEWAY_KEY_ACME_MAIN gwk_live_...
 #   setx GATEWAY_KEY_JARVIS_MAIN gwk_live_...
 #
-# Reloading this file re-derives the key digests, so a rotation takes effect
-# without a restart: POST /v1/admin/registry/reload (admin scope required).
+# Reloading this file re-derives the key digests: POST
+# /v1/admin/registry/reload (admin scope), or let hot reload see the mtime
+# change. What a reload can rotate depends on where the key lives:
+#
+#   key_file: /run/secrets/...   re-read on every reload — rotate by replacing
+#                                the file, then touching this one or reloading.
+#   key_env:  NAME               a running process never sees a changed
+#                                environment, so rotation needs a restart.
+#
+# Rotate without a gap by adding the new credential alongside the old one,
+# moving clients over, then removing the old one.
 
 tenants:
   - tenant_id: acme

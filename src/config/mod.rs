@@ -51,6 +51,21 @@ pub struct ServerConfig {
     pub shutdown_grace_ms: u64,
     /// Serve `GET /metrics`.
     pub metrics_enabled: bool,
+    /// Separate listener for the operator surface. When set, `/metrics` and
+    /// `/v1/admin/*` are served only here, unauthenticated for `/metrics`, and
+    /// removed from the public port; bind it to an interface tenants cannot
+    /// reach. When unset, both stay on the public port and `/metrics`
+    /// requires the `admin` scope, because it names every tenant's spend.
+    #[serde(default)]
+    pub ops_port: Option<u16>,
+    /// Interface for `ops_port`. Loopback by default, so turning the ops
+    /// listener on never exposes it by accident.
+    #[serde(default = "default_ops_bind_addr")]
+    pub ops_bind_addr: String,
+}
+
+fn default_ops_bind_addr() -> String {
+    "127.0.0.1".to_string()
 }
 
 impl Default for ServerConfig {
@@ -63,6 +78,8 @@ impl Default for ServerConfig {
             max_concurrent_streams_global: 512,
             shutdown_grace_ms: 20_000,
             metrics_enabled: true,
+            ops_port: None,
+            ops_bind_addr: default_ops_bind_addr(),
         }
     }
 }
@@ -373,6 +390,17 @@ impl Settings {
             .map_err(|e| ConfigError::Parse(format!("invalid bind address {addr}: {e}")))
     }
 
+    /// The ops listener's address, when one is configured.
+    pub fn ops_socket_addr(&self) -> Result<Option<SocketAddr>, ConfigError> {
+        let Some(port) = self.server.ops_port else {
+            return Ok(None);
+        };
+        let addr = format!("{}:{}", self.server.ops_bind_addr, port);
+        addr.parse()
+            .map(Some)
+            .map_err(|e| ConfigError::Parse(format!("invalid ops bind address {addr}: {e}")))
+    }
+
     pub fn connect_timeout(&self) -> Duration {
         Duration::from_millis(self.upstream.connect_timeout_ms)
     }
@@ -398,12 +426,11 @@ pub fn config_dir() -> PathBuf {
     if let Ok(dir) = env::var(ENV_CONFIG_DIR) {
         return PathBuf::from(dir);
     }
-    if let Ok(file) = env::var(ENV_CONFIG_FILE) {
-        if let Some(parent) = Path::new(&file).parent() {
-            if !parent.as_os_str().is_empty() {
-                return parent.to_path_buf();
-            }
-        }
+    if let Ok(file) = env::var(ENV_CONFIG_FILE)
+        && let Some(parent) = Path::new(&file).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        return parent.to_path_buf();
     }
     PathBuf::from("config")
 }
@@ -426,6 +453,14 @@ pub fn redacted_settings(settings: &Settings) -> BTreeMap<&'static str, String> 
     out.insert("auth_mode", format!("{:?}", settings.auth.mode));
     out.insert("jwt_issuer", settings.auth.jwt.as_ref().map(|j| j.issuer.clone()).unwrap_or_else(|| "-".into()));
     out.insert("metrics_enabled", settings.server.metrics_enabled.to_string());
+    out.insert(
+        "ops_bind",
+        settings
+            .server
+            .ops_port
+            .map(|p| format!("{}:{p}", settings.server.ops_bind_addr))
+            .unwrap_or_else(|| "-".into()),
+    );
     out
 }
 

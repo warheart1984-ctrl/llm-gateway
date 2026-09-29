@@ -1,0 +1,52 @@
+# A self-contained demo: mock provider + gateway + scripted SSE client.
+#
+#   cd demo && docker compose up --build --abort-on-container-exit --exit-code-from client
+#
+# Afterwards, poke at it yourself (`docker compose up -d gateway mock`):
+#   curl -N -H "x-api-key: $(cat secrets/demo_key)" -d @- localhost:8080/v1/chat/stream <<< \
+#     '{"model":"mock/chat","messages":[{"role":"user","content":"hi"}],"stream":true}'
+#   curl localhost:9090/metrics
+
+name: llm-gateway-demo
+
+services:
+  mock:
+    build: { context: .., dockerfile: demo/Dockerfile }
+    image: llm-gateway-demo
+    entrypoint: ["/usr/local/bin/mock_upstream"]
+    environment:
+      MOCK_ADDR: 0.0.0.0:9000
+      MOCK_TOKEN_DELAY_MS: "40"
+
+  gateway:
+    # Same build as `mock` (served from cache), so compose never tries to
+    # pull the local-only image from a registry.
+    build: { context: .., dockerfile: demo/Dockerfile }
+    image: llm-gateway-demo
+    depends_on: [mock]
+    environment:
+      LLM_GATEWAY_CONFIG_DIR: /etc/llm-gateway
+    volumes:
+      - ./config:/etc/llm-gateway:ro
+    secrets: [demo_key, shoestring_key]
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health/ready"]
+      interval: 2s
+      retries: 30
+
+  client:
+    image: curlimages/curl:8.10.1
+    depends_on:
+      gateway: { condition: service_healthy }
+    entrypoint: ["/bin/sh", "/demo/client.sh"]
+    volumes:
+      - ./client.sh:/demo/client.sh:ro
+    secrets: [demo_key, shoestring_key]
+
+secrets:
+  # Demo-only placeholder keys, not credentials for anything.
+  demo_key: { file: ./secrets/demo_key }
+  shoestring_key: { file: ./secrets/shoestring_key }

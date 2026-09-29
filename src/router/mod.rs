@@ -49,28 +49,28 @@ pub fn merge_params(defaults: &Map<String, Value>, requested: Option<&Map<String
 /// Reject values a provider will certainly reject, before we spend a
 /// connection on them. Cheap, and keeps upstream 400s off our error budget.
 pub fn validate_params(params: &ResolvedParams) -> Result<(), ParamViolation> {
-    if let Some(t) = params.temperature {
-        if !(0.0..=2.0).contains(&t) {
-            return Err(ParamViolation::OutOfRange {
-                field: "temperature".into(),
-                value: t,
-                allowed: "0.0..=2.0".into(),
-            });
-        }
+    if let Some(t) = params.temperature
+        && !(0.0..=2.0).contains(&t)
+    {
+        return Err(ParamViolation::OutOfRange {
+            field: "temperature".into(),
+            value: t,
+            allowed: "0.0..=2.0".into(),
+        });
     }
-    if let Some(p) = params.top_p {
-        if !(0.0..=1.0).contains(&p) {
-            return Err(ParamViolation::OutOfRange {
-                field: "top_p".into(),
-                value: p,
-                allowed: "0.0..=1.0".into(),
-            });
-        }
+    if let Some(p) = params.top_p
+        && !(0.0..=1.0).contains(&p)
+    {
+        return Err(ParamViolation::OutOfRange {
+            field: "top_p".into(),
+            value: p,
+            allowed: "0.0..=1.0".into(),
+        });
     }
-    if let Some(m) = params.max_tokens {
-        if m == 0 {
-            return Err(ParamViolation::ZeroMaxTokens);
-        }
+    if let Some(m) = params.max_tokens
+        && m == 0
+    {
+        return Err(ParamViolation::ZeroMaxTokens);
     }
     Ok(())
 }

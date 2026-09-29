@@ -259,12 +259,12 @@ impl RegistrySnapshot {
             let cfg = self.by_id.get(id).expect("alias target exists");
             return self.build(requested, Arc::clone(cfg));
         }
-        if let Some((provider, _)) = requested.split_once('/') {
-            if provider == "*" {
-                return Err(ResolveError::NotFound {
-                    requested: requested.to_string(),
-                });
-            }
+        if let Some((provider, _)) = requested.split_once('/')
+            && provider == "*"
+        {
+            return Err(ResolveError::NotFound {
+                requested: requested.to_string(),
+            });
         }
         // A bare provider name (`groq`) or a wildcard (`groq/*`) resolves only
         // when exactly one model for that provider is enabled.
@@ -675,7 +675,7 @@ mod tests {
     async fn no_shipped_model_is_priced_free_unless_configured_free() {
         let registry = ModelRegistry::load("config/models.yaml", false, 0).expect("config/models.yaml must load");
         let snapshot = registry.snapshot().await;
-        assert!(snapshot.len() > 0, "the shipped catalogue must not be empty");
+        assert!(!snapshot.is_empty(), "the shipped catalogue must not be empty");
         for id in snapshot.ids() {
             let cfg = &snapshot.by_id[id];
             let configured_free =

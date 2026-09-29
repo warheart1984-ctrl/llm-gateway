@@ -177,27 +177,24 @@ impl ApiKeyAuthenticator {
     /// carries both API keys and JWTs, so a key miss there must be retried
     /// against the token authenticator.
     fn presented_secret<'a>(&self, headers: &'a HeaderMap) -> (Option<&'a str>, PresentedVia) {
-        if let Some(v) = headers.get(&self.api_key_header) {
-            if let Ok(s) = v.to_str() {
-                let s = s.trim();
-                if !s.is_empty() {
-                    return (Some(s), PresentedVia::ApiKeyHeader);
-                }
+        if let Some(v) = headers.get(&self.api_key_header)
+            && let Ok(s) = v.to_str()
+        {
+            let s = s.trim();
+            if !s.is_empty() {
+                return (Some(s), PresentedVia::ApiKeyHeader);
             }
         }
-        if self.accept_bearer {
-            if let Some(v) = headers.get(axum::http::header::AUTHORIZATION) {
-                if let Ok(s) = v.to_str() {
-                    if let Some(token) = s
-                        .strip_prefix("Bearer ")
-                        .or_else(|| s.strip_prefix("bearer "))
-                    {
-                        let token = token.trim();
-                        if !token.is_empty() {
-                            return (Some(token), PresentedVia::Authorization);
-                        }
-                    }
-                }
+        if self.accept_bearer
+            && let Some(v) = headers.get(axum::http::header::AUTHORIZATION)
+            && let Ok(s) = v.to_str()
+            && let Some(token) = s
+                .strip_prefix("Bearer ")
+                .or_else(|| s.strip_prefix("bearer "))
+        {
+            let token = token.trim();
+            if !token.is_empty() {
+                return (Some(token), PresentedVia::Authorization);
             }
         }
         (None, PresentedVia::ApiKeyHeader)
@@ -234,10 +231,10 @@ impl Authenticator for ApiKeyAuthenticator {
         // A key miss on an explicit key header is terminal. A miss in
         // `Authorization` might just be a JWT we were not configured to see
         // inline, so hand it to the token authenticator.
-        if via == PresentedVia::Authorization {
-            if let Some(next) = &self.fallback {
-                return next.authenticate(headers).await;
-            }
+        if via == PresentedVia::Authorization
+            && let Some(next) = &self.fallback
+        {
+            return next.authenticate(headers).await;
         }
         if self.allow_anonymous {
             return Ok(Principal::anonymous());

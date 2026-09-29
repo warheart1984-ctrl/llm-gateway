@@ -87,8 +87,15 @@ pub struct Credential {
     #[serde(default)]
     pub key: Option<String>,
     /// Env var holding the key material. Read at boot, never stored raw.
+    /// A running process cannot see a changed environment, so rotating an
+    /// env-held key needs a restart; use `key_file` to rotate on reload.
     #[serde(default)]
     pub key_env: Option<String>,
+    /// File holding the key material, such as a mounted Docker or Kubernetes
+    /// secret. Re-read on every reload, so replacing the file and reloading
+    /// rotates the key without a restart. Surrounding whitespace is trimmed.
+    #[serde(default)]
+    pub key_file: Option<PathBuf>,
     #[serde(default = "default_scopes")]
     pub scopes: Vec<String>,
     #[serde(default = "default_true")]
@@ -107,6 +114,20 @@ impl Credential {
     /// Resolve the raw secret. Errors are loud at boot rather than a runtime
     /// 401 that looks like a client bug.
     pub fn resolve(&self) -> Result<String, PolicyError> {
+        if let Some(file) = &self.key_file {
+            if self.key.is_some() || self.key_env.is_some() {
+                return Err(PolicyError::Parse {
+                    path: file.clone(),
+                    message: "credential sets `key_file` alongside `key` or `key_env`; pick one".to_string(),
+                });
+            }
+            return std::fs::read_to_string(file)
+                .map(|raw| raw.trim().to_string())
+                .map_err(|e| PolicyError::Parse {
+                    path: file.clone(),
+                    message: format!("credential key_file is unreadable: {e}"),
+                });
+        }
         if let Some(env_name) = &self.key_env {
             return std::env::var(env_name).map_err(|_| PolicyError::Parse {
                 path: PathBuf::from(env_name),
@@ -529,6 +550,7 @@ mod tests {
                 key_id: "ak_1".into(),
                 key: Some("k".into()),
                 key_env: None,
+                key_file: None,
                 scopes: vec![SCOPE_CHAT_STREAM.into()],
                 enabled: true,
             }],
@@ -780,5 +802,21 @@ mod tests {
             .authorize(&principal(), &registry(t), "groq/llama", 9, 10)
             .unwrap_err();
         assert!(matches!(err, AuthorizeError::TooManyMessages { .. }));
+    }
+
+    /// Two sources for one credential is a config mistake, and silently
+    /// picking one hides which secret is live.
+    #[test]
+    fn a_key_file_alongside_another_source_is_rejected() {
+        let cred = Credential {
+            key_id: "k".into(),
+            key: Some("inline".into()),
+            key_env: None,
+            key_file: Some(PathBuf::from("/run/secrets/k")),
+            scopes: vec![SCOPE_CHAT_STREAM.into()],
+            enabled: true,
+        };
+        let err = cred.resolve().unwrap_err();
+        assert!(format!("{err:?}").contains("pick one"), "{err:?}");
     }
 }

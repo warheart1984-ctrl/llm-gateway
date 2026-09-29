@@ -19,6 +19,11 @@ keep_alive_interval_ms = 15000
 max_concurrent_streams_global = 512
 shutdown_grace_ms = 20000
 metrics_enabled = true
+# Serve /metrics (unauthenticated) and /v1/admin/* on a separate listener,
+# and remove both from the public port. Unset, they stay on the public port
+# and /metrics requires the `admin` scope. See "Security posture" in README.
+# ops_port = 9090
+# ops_bind_addr = "127.0.0.1"
 
 [registry]
 models_path = "models.yaml"

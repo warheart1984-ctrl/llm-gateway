@@ -1,0 +1,57 @@
+# Demo configuration. Same shape as config/default.toml; only what the demo
+# needs to differ is changed.
+
+[server]
+bind_addr = "0.0.0.0"
+port = 8080
+request_body_limit_bytes = 1048576
+keep_alive_interval_ms = 15000
+max_concurrent_streams_global = 64
+shutdown_grace_ms = 5000
+metrics_enabled = true
+# The operator surface on its own port: /metrics without credentials, and
+# the admin reload. In a real deployment bind this to an interface tenants
+# cannot reach; here it is published to the host so you can look.
+ops_port = 9090
+ops_bind_addr = "0.0.0.0"
+
+[registry]
+models_path = "models.yaml"
+tenants_path = "tenants.yaml"
+hot_reload = true
+reload_interval_ms = 2000
+
+[auth]
+mode = "api_key"
+api_key_header = "x-api-key"
+accept_bearer = true
+allow_anonymous = false
+
+[governance]
+require_model_allowlist = true
+on_max_tokens_exceeded = "clamp"
+cost_tracking_enabled = true
+
+[governance.default_limits]
+requests_per_minute = 120
+tokens_per_minute = 200000
+max_concurrent_streams = 8
+max_output_tokens = 1024
+daily_budget_nano_usd = 5000000000
+max_messages = 64
+max_prompt_chars = 20000
+
+[upstream]
+connect_timeout_ms = 2000
+stream_read_timeout_ms = 30000
+tcp_keepalive_secs = 75
+pool_max_idle_per_host = 16
+pool_idle_timeout_ms = 90000
+user_agent = "llm-gateway-demo"
+request_usage = true
+
+[telemetry]
+service_name = "llm-gateway-demo"
+service_version = "0.1.0"
+log_format = "json"
+log_filter = "info"

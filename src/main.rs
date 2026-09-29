@@ -92,6 +92,19 @@ async fn run(state: std::sync::Arc<AppState>) -> anyhow::Result<()> {
         });
     }
 
+    // The operator surface on its own listener, when configured. It stops
+    // with the process rather than draining: it holds no streams.
+    if let Some(ops_addr) = state.settings.ops_socket_addr()? {
+        let ops_listener = TcpListener::bind(ops_addr).await?;
+        tracing::info!(address = %ops_listener.local_addr()?, "ops listener up");
+        let ops_app = api::ops_router(state.clone());
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(ops_listener, ops_app).await {
+                tracing::error!(%error, "ops listener failed");
+            }
+        });
+    }
+
     let app = api::router(state.clone());
     let serve = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(grace, state.inflight.clone()));

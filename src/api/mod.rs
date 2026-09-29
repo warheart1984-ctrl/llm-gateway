@@ -26,28 +26,55 @@ pub const ROUTE_LIVE: &str = "/health/live";
 pub const ROUTE_READY: &str = "/health/ready";
 pub const ROUTE_METRICS: &str = "/metrics";
 
+/// The public listener: what tenants call.
+///
+/// With no `ops_port`, the operator surface shares this port: `/metrics`
+/// requires the `admin` scope, since it names every tenant's spend, and the
+/// admin reload is here too. With an `ops_port`, both move to
+/// [`ops_router`] and do not exist on this port at all.
 pub fn router(state: Arc<AppState>) -> Router {
     let body_limit = state.settings.server.request_body_limit_bytes;
+    let separate_ops = state.settings.server.ops_port.is_some();
 
-    let api = Router::new()
+    let mut api = Router::new()
         .route(ROUTE_CHAT_STREAM, post(chat::chat_stream))
         .route(ROUTE_MODELS, get(system::list_models))
-        .route(ROUTE_USAGE, get(system::get_usage))
-        .route(ROUTE_RELOAD, post(system::reload_registry))
-        // Body cap enforced by the extractor, so an oversized request is
-        // rejected before a handler allocates a buffer for it.
-        .layer(DefaultBodyLimit::max(body_limit));
+        .route(ROUTE_USAGE, get(system::get_usage));
+    if !separate_ops {
+        api = api.route(ROUTE_RELOAD, post(system::reload_registry));
+    }
+    // Body cap enforced by the extractor, so an oversized request is rejected
+    // before a handler allocates a buffer for it.
+    let api = api.layer(DefaultBodyLimit::max(body_limit));
 
-    let mut ops = Router::new()
-        .route(ROUTE_LIVE, get(system::live))
-        .route(ROUTE_READY, get(system::ready));
+    let mut ops = health_routes();
+    if state.settings.server.metrics_enabled && !separate_ops {
+        ops = ops.route(ROUTE_METRICS, get(system::metrics_for_admins));
+    }
+
+    finish(Router::new().merge(api).merge(ops), state)
+}
+
+/// The ops listener, served only when `server.ops_port` is set: health,
+/// an unauthenticated `/metrics` for the scraper, and the admin reload (which
+/// still requires the `admin` scope). Network placement is the access control
+/// for the scrape, so bind it where tenants cannot reach.
+pub fn ops_router(state: Arc<AppState>) -> Router {
+    let mut ops = health_routes().route(ROUTE_RELOAD, post(system::reload_registry));
     if state.settings.server.metrics_enabled {
         ops = ops.route(ROUTE_METRICS, get(system::metrics));
     }
+    finish(ops, state)
+}
 
+fn health_routes() -> Router<Arc<AppState>> {
     Router::new()
-        .merge(api)
-        .merge(ops)
+        .route(ROUTE_LIVE, get(system::live))
+        .route(ROUTE_READY, get(system::ready))
+}
+
+fn finish(routes: Router<Arc<AppState>>, state: Arc<AppState>) -> Router {
+    routes
         .fallback(system::not_found)
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
@@ -187,7 +214,7 @@ mod tests {
                 .unwrap()
         };
 
-        let on = router(build_state(true));
+        let on = ops_router(build_state(true));
         let response = on.oneshot(request()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
@@ -202,6 +229,54 @@ mod tests {
             response.status(),
             StatusCode::NOT_FOUND,
             "metrics disabled means no such route"
+        );
+        let off = ops_router(build_state(false));
+        let response = off.oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// On the public port `/metrics` names every tenant's spend, so it is an
+    /// admin operation: no key is a 401, a tenant key without `admin` a 403.
+    #[tokio::test]
+    async fn public_metrics_require_the_admin_scope() {
+        let app = router(build_state(true));
+        let anonymous = Request::builder().uri(ROUTE_METRICS).body(Body::empty()).unwrap();
+        let response = app.clone().oneshot(anonymous).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let tenant = Request::builder()
+            .uri(ROUTE_METRICS)
+            .header("x-api-key", "secret")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(tenant).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// With an ops listener configured, the operator routes leave the public
+    /// port entirely: not a 401 to probe, a 404.
+    #[tokio::test]
+    async fn an_ops_port_removes_operator_routes_from_the_public_port() {
+        let state = build_state(true);
+        let mut settings = (*state.settings).clone();
+        settings.server.ops_port = Some(0);
+        let state = Arc::new(AppState {
+            settings: Arc::new(settings),
+            ..Arc::try_unwrap(state).ok().expect("sole owner")
+        });
+        let public = router(Arc::clone(&state));
+        for (method, uri) in [("GET", ROUTE_METRICS), ("POST", ROUTE_RELOAD)] {
+            let request = Request::builder().method(method).uri(uri).body(Body::empty()).unwrap();
+            let response = public.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+        }
+        let ops = ops_router(state);
+        let request = Request::builder().method("POST").uri(ROUTE_RELOAD).body(Body::empty()).unwrap();
+        let response = ops.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "the ops listener still requires an admin key to reload"
         );
     }
 

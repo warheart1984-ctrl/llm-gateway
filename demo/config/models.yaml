@@ -1,0 +1,20 @@
+# One model, served by the mock provider. `nvidia` with an `endpoint`
+# override is the self-hosted path, so no vendor key is needed.
+#
+# The price is deliberately steep ($8 per million output tokens) so a demo
+# budget of a few thousandths of a dollar runs out in a handful of requests.
+schema_version: 1
+
+models:
+  mock/chat:
+    provider: nvidia
+    display_name: Mock chat model
+    endpoint: http://mock:9000/v1/chat/completions
+    upstream_model: mock-model
+    default_params:
+      max_tokens: 64
+    cost:
+      input_per_mtok_usd: 2.0
+      output_per_mtok_usd: 8.0
+    max_output_tokens: 1024
+    aliases: [mock]

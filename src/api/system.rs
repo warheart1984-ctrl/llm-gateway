@@ -1,9 +1,10 @@
 //! Operational endpoints: model catalogue, quota visibility, health, metrics,
 //! and a control-plane reload.
 //!
-//! All of these require the same API key as chat. Anything that reveals
-//! cross-tenant state (`/v1/usage`, `/metrics`) is scoped to the caller's own
-//! tenant.
+//! The tenant-facing ones require the same API key as chat, and `/v1/usage`
+//! is scoped to the caller's own tenant. `/metrics` is cross-tenant by
+//! nature, so it is either admin-scoped on the public port or served only on
+//! the ops listener; see [`crate::api::ops_router`]. Health probes are open.
 
 use std::sync::Arc;
 
@@ -240,6 +241,20 @@ pub async fn ready(State(state): State<Arc<AppState>>) -> Response {
         )
             .into_response()
     }
+}
+
+/// `/metrics` on the public port. The exposition carries every tenant's
+/// spend and error counts, so on a port tenants can reach it is an admin
+/// operation. A Prometheus scrape config sends the key as a bearer token.
+pub async fn metrics_for_admins(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, ApiError> {
+    let principal = caller(&state, &headers).await?;
+    if !principal.has_scope(crate::governance::auth::SCOPE_ADMIN) {
+        return Err(ApiError::Forbidden("`/metrics` requires the `admin` scope"));
+    }
+    Ok(metrics(State(state)).await)
 }
 
 /// Prometheus text exposition. Refreshes the uptime gauge, then renders.

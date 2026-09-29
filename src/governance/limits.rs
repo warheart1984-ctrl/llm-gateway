@@ -116,6 +116,7 @@ impl SpendLedger {
         self.with_day(now, |pair| *pair)
     }
 
+    #[cfg(test)]
     fn reserve(&self, now: SystemTime, amount: u64) -> u64 {
         self.with_day(now, |pair| {
             pair.1 = pair.1.saturating_add(amount);
@@ -123,12 +124,48 @@ impl SpendLedger {
         })
     }
 
-    /// Correct a reservation once real usage or abandonment is known. Clamps
-    /// at zero so a refund larger than the reservation cannot wrap the counter.
-    fn adjust(&self, now: SystemTime, delta: i128) {
+    /// Check the budget and place the reservation under one lock. Checking in
+    /// one critical section and reserving in another lets a concurrent
+    /// settle overage land in between, and the reservation then overshoots
+    /// the budget it was just checked against. `budget == 0` means no
+    /// ceiling: spend is still recorded, so `/v1/usage` stays truthful.
+    fn try_reserve(&self, now: SystemTime, amount: u64, budget: u64) -> Result<u64, LimitError> {
+        self.with_day(now, |pair| {
+            if budget > 0 {
+                if pair.1 >= budget {
+                    return Err(LimitError::BudgetExhausted {
+                        spent: pair.1,
+                        budget,
+                    });
+                }
+                let remaining = budget - pair.1;
+                if amount > remaining {
+                    return Err(LimitError::BudgetWouldBeExceeded {
+                        estimate: amount,
+                        remaining,
+                    });
+                }
+            }
+            pair.1 = pair.1.saturating_add(amount);
+            Ok(pair.0)
+        })
+    }
+
+    /// Correct a reservation made in day `bucket` once real usage or
+    /// abandonment is known. Clamps at zero so a refund larger than the
+    /// reservation cannot wrap the counter.
+    ///
+    /// A stream reserved at 23:59 UTC and settled at 00:01 belongs to a day
+    /// that has already rolled over. Its refund is dropped: the reservation
+    /// was never on today's ledger, and refunding it there would hand today's
+    /// budget yesterday's money. An overage is still charged, to today, since
+    /// that spend is real and today is the only budget still open.
+    fn correct(&self, now: SystemTime, bucket: u64, delta: i128) {
         self.with_day(now, |pair| {
             if delta < 0 {
-                pair.1 = pair.1.saturating_sub(delta.unsigned_abs().min(u64::MAX as u128) as u64);
+                if pair.0 == bucket {
+                    pair.1 = pair.1.saturating_sub(delta.unsigned_abs().min(u64::MAX as u128) as u64);
+                }
             } else {
                 pair.1 = pair.1.saturating_add(delta.min(u64::MAX as i128) as u64);
             }
@@ -136,22 +173,36 @@ impl SpendLedger {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct TenantState {
     window: Mutex<Window>,
-    semaphore: Arc<Semaphore>,
     spend: SpendLedger,
+    /// Streams in flight, which is also the concurrency cap's counter. A
+    /// semaphore sized at first sight would pin the cap to whatever the
+    /// tenant file said when the tenant first connected; comparing against
+    /// the limit on every admission lets a reload raise or lower it live.
     inflight: AtomicU64,
 }
 
-impl TenantState {
-    fn new(max_concurrent: u32) -> Self {
-        Self {
-            window: Mutex::new(Window::default()),
-            semaphore: Arc::new(Semaphore::new(max_concurrent.max(1) as usize)),
-            spend: SpendLedger::default(),
-            inflight: AtomicU64::new(0),
-        }
+/// One held concurrency slot. Releasing on `Drop` means every early return in
+/// [`LimitEngine::admit`] gives the slot back without a rollback path.
+#[derive(Debug)]
+struct Slot(Arc<TenantState>);
+
+impl Slot {
+    fn try_acquire(state: &Arc<TenantState>, limit: u32) -> Option<Self> {
+        let limit = u64::from(limit.max(1));
+        state
+            .inflight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < limit).then_some(n + 1))
+            .ok()
+            .map(|_| Slot(Arc::clone(state)))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.inflight.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -159,68 +210,88 @@ impl TenantState {
 // Reservation
 // ---------------------------------------------------------------------------
 
-/// RAII admission token. Dropping it releases both concurrency permits. Call
-/// [`Reservation::settle`] exactly once with real usage to correct the cost
-/// reservation; if it is never called, `Drop` charges the prompt estimate.
-/// `Debug` is derived so `unwrap()`/`expect()` on a `Result<Reservation, _>`
-/// works in tests. Neither field is a secret.
+/// RAII admission token. Dropping it releases both concurrency slots.
+///
+/// Exactly one of the closing calls decides what the request costs; every
+/// later call, and `Drop`, is a no-op on the ledger:
+///
+/// | call | when | billed |
+/// |---|---|---|
+/// | [`settle`](Self::settle) | usage is known | actual usage |
+/// | [`abandon`](Self::abandon) | the stream died with no usage | prompt estimate |
+/// | [`release`](Self::release) | the upstream never accepted the request | nothing |
+/// | [`commit_reserved`](Self::commit_reserved) | usage is unobservable | the full reservation |
+///
+/// Unclosed, `Drop` behaves as `abandon`. `Debug` is derived so
+/// `unwrap()`/`expect()` on a `Result<Reservation, _>` works in tests. No field
+/// is a secret.
 #[derive(Debug)]
 pub struct Reservation {
     state: Arc<TenantState>,
     _global_permit: Option<OwnedSemaphorePermit>,
-    _tenant_permit: Option<OwnedSemaphorePermit>,
+    _slot: Option<Slot>,
+    /// What admission put on the ledger: 0 when cost tracking is off, so a
+    /// correction never refunds money that was never charged.
     reserved_nano_usd: u64,
     /// The prompt half of the reservation. Kept so an abandoned stream refunds
     /// only the completion half without needing the cost model at drop time.
     reserved_prompt_nano_usd: u64,
+    /// The UTC day the reservation was charged to. See [`SpendLedger::correct`].
+    bucket: u64,
+    tracked: bool,
     prompt_tokens: u32,
+    max_output_tokens: u32,
     settled: bool,
 }
 
 impl Reservation {
-    /// Commit actual usage and release the concurrency permits.
+    /// Commit actual usage.
     pub fn settle(&mut self, usage: Usage, cost: &CostModel) {
-        if self.settled {
+        if !self.close() {
             return;
         }
-        self.settled = true;
         let prompt = usage.prompt_tokens.max(self.prompt_tokens);
         let completion = usage.completion_tokens;
         let actual = nano_usd_for(prompt, usage.cached_prompt_tokens, completion, cost);
-        let delta = actual as i128 - self.reserved_nano_usd as i128;
-        if delta != 0 {
-            self.state
-                .spend
-                .adjust(std::time::SystemTime::now(), delta);
-        }
-        if completion > 0 {
-            let mut window = self
-                .state
-                .window
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let now = Instant::now();
-            window.evict(now);
-            window.token_events.push_back((now, completion));
-        }
+        self.correct(actual as i128 - self.reserved_nano_usd as i128);
+        self.count_completion_tokens(completion);
     }
 
-/// Release without charging completion tokens — the stream failed before
-    /// producing any. The prompt estimate still stands, because the upstream
-    /// already received and paid for it. Refunds the completion half *now*,
-    /// rather than counting on `Drop`: a client disconnecting mid-stream
-    /// reaches this from `Drop` for the stream state, and a `Drop` that merely
-    /// marks itself settled would leave the over-reserve on the ledger.
-    /// Idempotent — a later `settle` or `Drop` sees `settled` and does nothing.
+    /// Close without charging completion tokens — the stream ended without
+    /// usage the gateway could see. The prompt estimate still stands, because
+    /// the upstream already received and paid for it. Refunds the completion
+    /// half *now*, rather than counting on `Drop`: a client disconnecting
+    /// mid-stream reaches this from `Drop` for the stream state, and a `Drop`
+    /// that merely marks itself settled would leave the over-reserve on the
+    /// ledger.
     pub fn abandon(&mut self) {
-        if self.settled {
+        if !self.close() {
             return;
         }
-        self.settled = true;
-        let refund = self.reserved_nano_usd as i128 - self.reserved_prompt_nano_usd as i128;
-        if refund > 0 {
-            self.state.spend.adjust(SystemTime::now(), -refund);
+        self.refund_completion_half();
+    }
+
+    /// Refund everything: the upstream refused the request or could not be
+    /// reached, so no prompt was processed and nothing is owed. The request
+    /// still counts against the per-minute request window — a rate limit
+    /// counts attempts, not successes.
+    pub fn release(&mut self) {
+        if !self.close() {
+            return;
         }
+        self.correct(-(self.reserved_nano_usd as i128));
+    }
+
+    /// Keep the whole reservation as the bill. For a stream whose usage the
+    /// gateway cannot observe (passthrough framing): the reservation is the
+    /// ceiling the tenant agreed to, and refunding any of it on a guess would
+    /// make opting out of visibility a way to spend for free. The output cap is
+    /// counted against the token-per-minute window for the same reason.
+    pub fn commit_reserved(&mut self) {
+        if !self.close() {
+            return;
+        }
+        self.count_completion_tokens(self.max_output_tokens);
     }
 
     pub fn reserved_nano_usd(&self) -> u64 {
@@ -230,23 +301,49 @@ impl Reservation {
     pub fn prompt_tokens(&self) -> u32 {
         self.prompt_tokens
     }
+
+    /// Mark closed. Returns whether this call was the one that closed it.
+    fn close(&mut self) -> bool {
+        !std::mem::replace(&mut self.settled, true)
+    }
+
+    fn refund_completion_half(&self) {
+        let refund = self.reserved_nano_usd as i128 - self.reserved_prompt_nano_usd as i128;
+        if refund > 0 {
+            self.correct(-refund);
+        }
+    }
+
+    fn correct(&self, delta: i128) {
+        if self.tracked && delta != 0 {
+            self.state.spend.correct(SystemTime::now(), self.bucket, delta);
+        }
+    }
+
+    fn count_completion_tokens(&self, completion: u32) {
+        if completion == 0 {
+            return;
+        }
+        let mut window = self
+            .state
+            .window
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Instant::now();
+        window.evict(now);
+        window.token_events.push_back((now, completion));
+    }
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        if !self.settled {
-            // A stream that died without reporting usage still consumed its
-            // prompt. Release only the completion half of the reservation.
-            let refund = self.reserved_nano_usd as i128 - self.reserved_prompt_nano_usd as i128;
-            if refund > 0 {
-                self.state
-                    .spend
-                    .adjust(std::time::SystemTime::now(), -refund);
-            }
+        // A stream that died without reporting usage still consumed its
+        // prompt. Release only the completion half of the reservation. The
+        // slot and permit fields drop after this body, so the ledger is
+        // corrected before the concurrency slot frees up.
+        if self.close() {
+            self.refund_completion_half();
         }
-        self.state.inflight.fetch_sub(1, Ordering::Relaxed);
-        self._tenant_permit.take();
-        self._global_permit.take();
     }
 }
 
@@ -286,14 +383,11 @@ impl LimitEngine {
         })
     }
 
-    fn state(&self, tenant_id: &str, limits: &LimitProfile) -> Arc<TenantState> {
+    fn state(&self, tenant_id: &str) -> Arc<TenantState> {
         if let Some(existing) = self.tenants.get(tenant_id) {
             return Arc::clone(existing.value());
         }
-        let entry = self
-            .tenants
-            .entry(tenant_id.to_string())
-            .or_insert_with(|| Arc::new(TenantState::new(limits.max_concurrent_streams)));
+        let entry = self.tenants.entry(tenant_id.to_string()).or_default();
         Arc::clone(entry.value())
     }
 
@@ -324,15 +418,15 @@ impl LimitEngine {
             }
         })?;
 
-        let state = self.state(tenant_id, limits);
-        let tenant_permit = Arc::clone(&state.semaphore).try_acquire_owned().map_err(|_| {
+        let state = self.state(tenant_id);
+        let slot = Slot::try_acquire(&state, limits.max_concurrent_streams).ok_or(
             LimitError::ConcurrencyLimited {
                 limit: limits.max_concurrent_streams,
-            }
-        })?;
+            },
+        )?;
 
         let now = Instant::now();
-        let system_now = std::time::SystemTime::now();
+        let system_now = SystemTime::now();
         let mut window = state
             .window
             .lock()
@@ -354,24 +448,17 @@ impl LimitEngine {
             });
         }
 
-        let reserved_total = if self.cost_tracking && limits.daily_budget_nano_usd > 0 {
-            let (_bucket, spent) = state.spend.snapshot(system_now);
-            if spent >= limits.daily_budget_nano_usd {
-                return Err(LimitError::BudgetExhausted {
-                    spent,
-                    budget: limits.daily_budget_nano_usd,
-                });
-            }
-            let remaining = limits.daily_budget_nano_usd - spent;
-            if estimated_cost_nano_usd > remaining {
-                return Err(LimitError::BudgetWouldBeExceeded {
-                    estimate: estimated_cost_nano_usd,
-                    remaining,
-                });
-            }
-            state.spend.reserve(system_now, estimated_cost_nano_usd)
+        // Check-and-reserve is one ledger operation; the window lock held
+        // here serializes this tenant's admissions, but not its settlements.
+        let (bucket, reserved) = if self.cost_tracking {
+            let bucket = state.spend.try_reserve(
+                system_now,
+                estimated_cost_nano_usd,
+                limits.daily_budget_nano_usd,
+            )?;
+            (bucket, estimated_cost_nano_usd)
         } else {
-            0
+            (budget_bucket(system_now), 0)
         };
 
         window.request_times.push_back(now);
@@ -382,24 +469,24 @@ impl LimitEngine {
         }
         drop(window);
 
-        state.inflight.fetch_add(1, Ordering::Relaxed);
-
         tracing::debug!(
             tenant = tenant_id,
             prompt_tokens,
             max_output_tokens,
-            reserved_nano_usd = estimated_cost_nano_usd,
-            tenant_spend_nano_usd = reserved_total,
+            reserved_nano_usd = reserved,
             "admitted"
         );
 
         Ok(Reservation {
             state: Arc::clone(&state),
             _global_permit: Some(global_permit),
-            _tenant_permit: Some(tenant_permit),
-            reserved_nano_usd: estimated_cost_nano_usd,
-            reserved_prompt_nano_usd: estimate.prompt_nano_usd,
+            _slot: Some(slot),
+            reserved_nano_usd: reserved,
+            reserved_prompt_nano_usd: if self.cost_tracking { estimate.prompt_nano_usd } else { 0 },
+            bucket,
+            tracked: self.cost_tracking,
             prompt_tokens,
+            max_output_tokens,
             settled: false,
         })
     }
@@ -737,5 +824,398 @@ mod tests {
         // number of admissions we made.
         drop(engine.admit("t", &l, 10, 10, CostEstimate::default()).await.unwrap());
         assert_eq!(engine.usage("t").requests_last_minute, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Money under concurrency and in every closing order
+    // -----------------------------------------------------------------------
+
+    /// $2/MTok in, $8/MTok out: 2,000 and 8,000 nano-USD per token.
+    fn rates() -> CostModel {
+        cost(2.0, 8.0)
+    }
+
+    fn estimate_for(prompt: u32, max_output: u32) -> CostEstimate {
+        CostEstimate {
+            prompt_nano_usd: nano_usd_for(prompt, None, 0, &rates()),
+            completion_nano_usd: nano_usd_for(0, None, max_output, &rates()),
+        }
+    }
+
+    fn usage(prompt: u32, completion: u32) -> Usage {
+        Usage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: prompt + completion,
+            ..Default::default()
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Close {
+        Settle(u32),
+        Abandon,
+        Release,
+        Commit,
+        Drop,
+    }
+
+    impl Close {
+        fn apply(self, r: &mut Option<Reservation>) {
+            let Some(res) = r.as_mut() else { return };
+            match self {
+                Close::Settle(completion) => res.settle(usage(10, completion), &rates()),
+                Close::Abandon => res.abandon(),
+                Close::Release => res.release(),
+                Close::Commit => res.commit_reserved(),
+                Close::Drop => drop(r.take()),
+            }
+        }
+
+        /// What a request with 10 prompt tokens and a 100-token ceiling owes
+        /// when this is the first closing call.
+        fn owed(self) -> u64 {
+            match self {
+                Close::Settle(completion) => nano_usd_for(10, None, completion, &rates()),
+                Close::Abandon | Close::Drop => estimate_for(10, 100).prompt_nano_usd,
+                Close::Release => 0,
+                Close::Commit => estimate_for(10, 100).total(),
+            }
+        }
+    }
+
+    const CLOSES: [Close; 6] = [
+        Close::Settle(5),
+        Close::Settle(250),
+        Close::Abandon,
+        Close::Release,
+        Close::Commit,
+        Close::Drop,
+    ];
+
+    /// Every ordering of up to three closing calls, exhaustively: the first
+    /// one decides the bill and nothing after it — a second settle, a stray
+    /// abandon, the stream's `Drop` — moves the ledger again. Duplicated
+    /// cleanup is where a refund gets paid twice.
+    #[tokio::test]
+    async fn the_first_closing_call_decides_the_bill_in_every_order() {
+        let mut cases = 0;
+        for a in CLOSES {
+            for b in CLOSES {
+                for c in CLOSES {
+                    let engine = LimitEngine::new(64, true);
+                    let l = limits(0, 0, 8, 10_000_000_000);
+                    let mut r = Some(engine.admit("t", &l, 10, 100, estimate_for(10, 100)).await.unwrap());
+                    for step in [a, b, c] {
+                        step.apply(&mut r);
+                    }
+                    drop(r);
+                    let snap = engine.snapshot("t", &l);
+                    assert_eq!(snap.spent_nano_usd, a.owed(), "sequence {a:?} -> {b:?} -> {c:?}");
+                    assert_eq!(snap.in_flight, 0, "sequence {a:?} -> {b:?} -> {c:?} leaked a slot");
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 216);
+    }
+
+    /// Tiny deterministic PRNG, so the property run needs no dependency and a
+    /// failure reproduces from its seed.
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// Property: however admissions and closings interleave across threads,
+    /// once every reservation is closed the ledger holds exactly what each
+    /// admitted request owes — no lost update, no double refund, no refund of
+    /// a rejected request. The budget is tight enough that many requests are
+    /// refused, so rejections race admissions and settlements too.
+    #[test]
+    fn concurrent_admit_and_close_leave_the_ledger_exact() {
+        let engine = LimitEngine::new(1_024, true);
+        let l = limits(0, 0, 64, 2_000_000_000);
+        let threads: Vec<_> = (0..8u64)
+            .map(|seed| {
+                let engine = Arc::clone(&engine);
+                let l = l.clone();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                    let mut rng = XorShift(0x9E37_79B9_7F4A_7C15 ^ (seed + 1));
+                    let mut owed = 0u64;
+                    let mut admitted = 0u32;
+                    let mut held: Vec<(Reservation, u32, u32)> = Vec::new();
+                    for _ in 0..2_000 {
+                        let prompt = 1 + rng.below(500) as u32;
+                        let max_out = 1 + rng.below(2_000) as u32;
+                        if let Ok(r) = rt.block_on(engine.admit("t", &l, prompt, max_out, estimate_for(prompt, max_out))) {
+                            admitted += 1;
+                            held.push((r, prompt, max_out));
+                        }
+                        // Close a random held reservation about half the time,
+                        // so several are open at once.
+                        if !held.is_empty() && rng.below(2) == 0 {
+                            let i = rng.below(held.len() as u64) as usize;
+                            let (mut r, prompt, max_out) = held.swap_remove(i);
+                            owed += match rng.below(5) {
+                                0 => {
+                                    // Real usage may overshoot the estimate.
+                                    let completion = rng.below(max_out as u64 * 2) as u32;
+                                    r.settle(usage(prompt, completion), &rates());
+                                    nano_usd_for(prompt, None, completion, &rates())
+                                }
+                                1 => {
+                                    r.abandon();
+                                    estimate_for(prompt, max_out).prompt_nano_usd
+                                }
+                                2 => {
+                                    r.release();
+                                    0
+                                }
+                                3 => {
+                                    r.commit_reserved();
+                                    estimate_for(prompt, max_out).total()
+                                }
+                                _ => estimate_for(prompt, max_out).prompt_nano_usd,
+                            };
+                            // A duplicate cleanup must be inert.
+                            r.abandon();
+                            r.release();
+                        }
+                    }
+                    for (r, prompt, max_out) in held {
+                        drop(r);
+                        owed += estimate_for(prompt, max_out).prompt_nano_usd;
+                    }
+                    (owed, admitted)
+                })
+            })
+            .collect();
+
+        let (mut owed, mut admitted) = (0u64, 0u32);
+        for t in threads {
+            let (o, a) = t.join().expect("worker must not panic");
+            owed += o;
+            admitted += a;
+        }
+        let snap = engine.snapshot("t", &l);
+        assert!(admitted > 0, "the property is vacuous if nothing was admitted");
+        assert_eq!(snap.spent_nano_usd, owed, "{admitted} admitted");
+        assert_eq!(snap.in_flight, 0);
+    }
+
+    /// Many streams racing for the last of a budget: exactly as many are
+    /// admitted as fit, however the admissions interleave.
+    #[test]
+    fn concurrent_reservations_near_the_limit_admit_exactly_what_fits() {
+        let per_request = estimate_for(10, 100).total();
+        let l = limits(0, 0, 1_000, per_request * 10 + per_request / 2);
+        for round in 0..20 {
+            let engine = LimitEngine::new(1_024, true);
+            let barrier = Arc::new(std::sync::Barrier::new(64));
+            let threads: Vec<_> = (0..64)
+                .map(|_| {
+                    let engine = Arc::clone(&engine);
+                    let barrier = Arc::clone(&barrier);
+                    let l = l.clone();
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                        barrier.wait();
+                        rt.block_on(engine.admit("t", &l, 10, 100, estimate_for(10, 100)))
+                    })
+                })
+                .collect();
+            let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+            let admitted = results.iter().filter(|r| r.is_ok()).count();
+            assert_eq!(admitted, 10, "round {round}");
+            assert!(
+                results.iter().filter_map(|r| r.as_ref().err()).all(|e| matches!(
+                    e,
+                    LimitError::BudgetWouldBeExceeded { .. } | LimitError::BudgetExhausted { .. }
+                )),
+                "round {round}: every refusal is a budget refusal"
+            );
+            assert_eq!(engine.snapshot("t", &l).spent_nano_usd, per_request * 10);
+        }
+    }
+
+    /// One tenant exhausting its budget and hammering the gate must not move
+    /// another tenant's ledger or starve its admissions.
+    #[test]
+    fn tenant_budgets_are_isolated_under_contention() {
+        let engine = LimitEngine::new(1_024, true);
+        let per_request = estimate_for(10, 100).total();
+        let tight = limits(0, 0, 1_000, per_request * 3);
+        let roomy = limits(0, 0, 1_000, per_request * 1_000);
+        let threads: Vec<_> = (0..16)
+            .map(|i| {
+                let engine = Arc::clone(&engine);
+                let (tight, roomy) = (tight.clone(), roomy.clone());
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                    let (tenant, l) = if i % 2 == 0 { ("noisy", tight) } else { ("quiet", roomy) };
+                    let mut held = Vec::new();
+                    for _ in 0..50 {
+                        if let Ok(r) = rt.block_on(engine.admit(tenant, &l, 10, 100, estimate_for(10, 100))) {
+                            held.push(r);
+                        }
+                    }
+                    held
+                })
+            })
+            .collect();
+        let held: Vec<Reservation> = threads.into_iter().flat_map(|t| t.join().unwrap()).collect();
+        assert_eq!(engine.snapshot("noisy", &tight).spent_nano_usd, per_request * 3);
+        assert_eq!(engine.snapshot("quiet", &roomy).spent_nano_usd, per_request * 400);
+        assert_eq!(held.len(), 403);
+    }
+
+    #[tokio::test]
+    async fn release_refunds_everything_but_still_counts_the_request() {
+        let engine = LimitEngine::new(64, true);
+        let l = limits(0, 0, 8, 10_000_000_000);
+        let mut r = engine.admit("t", &l, 10, 100, estimate_for(10, 100)).await.unwrap();
+        r.release();
+        let snap = engine.snapshot("t", &l);
+        assert_eq!(snap.spent_nano_usd, 0, "a refused upstream costs nothing");
+        assert_eq!(snap.requests_last_minute, 1, "but it was an attempt");
+    }
+
+    #[tokio::test]
+    async fn commit_reserved_bills_the_ceiling_and_counts_its_tokens() {
+        let engine = LimitEngine::new(64, true);
+        let l = limits(0, 0, 8, 10_000_000_000);
+        let mut r = engine.admit("t", &l, 10, 100, estimate_for(10, 100)).await.unwrap();
+        r.commit_reserved();
+        let snap = engine.snapshot("t", &l);
+        assert_eq!(snap.spent_nano_usd, estimate_for(10, 100).total());
+        assert_eq!(snap.tokens_last_minute, 110, "prompt plus the whole output ceiling");
+    }
+
+    /// With cost tracking off nothing is charged, so no closing call may
+    /// refund into the ledger either.
+    #[tokio::test]
+    async fn untracked_reservations_never_touch_the_ledger() {
+        let engine = LimitEngine::new(64, false);
+        let l = limits(0, 0, 8, 1);
+        for close in CLOSES {
+            let mut r = Some(engine.admit("t", &l, 10, 100, estimate_for(10, 100)).await.unwrap());
+            close.apply(&mut r);
+        }
+        assert_eq!(engine.snapshot("t", &l).spent_nano_usd, 0);
+    }
+
+    /// A zero budget means no ceiling, but spend is still recorded so a
+    /// tenant's `/v1/usage` is truthful. A refund used to clamp against a
+    /// ledger that was never charged.
+    #[tokio::test]
+    async fn an_unlimited_budget_still_records_spend() {
+        let engine = LimitEngine::new(64, true);
+        let l = limits(0, 0, 8, 0);
+        let mut r = engine.admit("t", &l, 10, 100, estimate_for(10, 100)).await.unwrap();
+        r.settle(usage(10, 5), &rates());
+        assert_eq!(engine.snapshot("t", &l).spent_nano_usd, nano_usd_for(10, None, 5, &rates()));
+    }
+
+    #[test]
+    fn a_refund_after_rollover_never_reaches_the_new_day() {
+        let ledger = SpendLedger::default();
+        let day1 = SystemTime::UNIX_EPOCH + Duration::from_secs(3 * 86_400);
+        let day2 = SystemTime::UNIX_EPOCH + Duration::from_secs(4 * 86_400);
+        ledger.try_reserve(day1, 1_000, 0).unwrap();
+        ledger.try_reserve(day2, 700, 0).unwrap();
+        // Yesterday's stream settles today for less than it reserved.
+        ledger.correct(day2, 3, -900);
+        assert_eq!(ledger.snapshot(day2), (4, 700), "today keeps only today's spend");
+        // Yesterday's stream settles today for more than it reserved: that
+        // spend is real, so today pays it.
+        ledger.correct(day2, 3, 50);
+        assert_eq!(ledger.snapshot(day2), (4, 750));
+        // Today's own corrections still apply.
+        ledger.correct(day2, 4, -100);
+        assert_eq!(ledger.snapshot(day2), (4, 650));
+    }
+
+    /// Rollover under contention: yesterday's refunds race today's
+    /// reservations, and today's total must be exactly today's reservations.
+    #[test]
+    fn stale_refunds_racing_new_reservations_cannot_erase_todays_spend() {
+        let ledger = Arc::new(SpendLedger::default());
+        let day1 = SystemTime::UNIX_EPOCH + Duration::from_secs(3 * 86_400);
+        let day2 = SystemTime::UNIX_EPOCH + Duration::from_secs(4 * 86_400);
+        ledger.try_reserve(day1, 1_000_000, 0).unwrap();
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let ledger = Arc::clone(&ledger);
+                std::thread::spawn(move || {
+                    for _ in 0..5_000 {
+                        if i % 2 == 0 {
+                            ledger.try_reserve(day2, 3, 0).unwrap();
+                        } else {
+                            ledger.correct(day2, 3, -7);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(ledger.snapshot(day2), (4, 4 * 5_000 * 3));
+    }
+
+    /// The concurrency cap is read on every admission, so a tenant reload
+    /// that raises or lowers it takes effect on the next request.
+    #[tokio::test]
+    async fn the_concurrency_cap_follows_a_reloaded_limit() {
+        let engine = LimitEngine::new(64, false);
+        let one = limits(0, 0, 1, 0);
+        let two = limits(0, 0, 2, 0);
+        let a = engine.admit("t", &one, 1, 1, CostEstimate::default()).await.unwrap();
+        assert!(engine.admit("t", &one, 1, 1, CostEstimate::default()).await.is_err());
+        let b = engine.admit("t", &two, 1, 1, CostEstimate::default()).await.unwrap();
+        assert!(engine.admit("t", &two, 1, 1, CostEstimate::default()).await.is_err());
+        // Lowered while two are in flight: nothing new until below the cap.
+        drop(a);
+        assert_eq!(
+            engine.admit("t", &one, 1, 1, CostEstimate::default()).await.unwrap_err(),
+            LimitError::ConcurrencyLimited { limit: 1 }
+        );
+        drop(b);
+        assert!(engine.admit("t", &one, 1, 1, CostEstimate::default()).await.is_ok());
+    }
+
+    /// Admission refused on a later check must hand its concurrency slot
+    /// back: the slot is taken first, so every refusal path returns it.
+    #[tokio::test]
+    async fn every_refusal_returns_its_concurrency_slot() {
+        let engine = LimitEngine::new(64, true);
+        let rpm = limits(1, 0, 1, 0);
+        drop(engine.admit("rpm", &rpm, 1, 1, CostEstimate::default()).await.unwrap());
+        for _ in 0..5 {
+            assert!(matches!(
+                engine.admit("rpm", &rpm, 1, 1, CostEstimate::default()).await,
+                Err(LimitError::RateLimited { .. })
+            ));
+        }
+        assert_eq!(engine.usage("rpm").in_flight, 0);
+
+        let broke = limits(0, 0, 1, 10);
+        for _ in 0..5 {
+            assert!(engine.admit("broke", &broke, 1, 1, estimate_for(10, 100)).await.is_err());
+        }
+        assert_eq!(engine.usage("broke").in_flight, 0);
+        assert!(engine.admit("broke", &broke, 1, 1, CostEstimate { prompt_nano_usd: 10, completion_nano_usd: 0 }).await.is_ok());
     }
 }

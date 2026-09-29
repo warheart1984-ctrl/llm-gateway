@@ -232,4 +232,44 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// A key held in a mounted secret file rotates on reload: replace the
+    /// file, reload, and the old key stops working with no restart. An
+    /// env-held key cannot do this — a running process never sees a changed
+    /// environment.
+    #[tokio::test]
+    async fn a_key_file_rotates_on_reload() {
+        let dir = tmp_dir("reload-key-file");
+        let secret = dir.join("alpha.key");
+        std::fs::write(&secret, "file-secret-1
+").unwrap();
+        let yaml = format!(
+            "tenants:
+  - tenant_id: alpha
+    enabled: true
+    credentials:
+      - key_id: k1
+        key_file: \"{}\"
+        scopes: [chat:stream]
+    allowed_models: [\"{WHITELISTED}\"]
+    default_model: {WHITELISTED}
+",
+            secret.display().to_string().replace('\\', "/")
+        );
+        write_tenants(&dir.join("tenants.yaml"), &yaml);
+        let state = build_state(&dir);
+        let auth = |key: &'static str| {
+            let state = Arc::clone(&state);
+            async move { state.current_auth().authenticate(&headers_with(&[("x-api-key", key)])).await.is_ok() }
+        };
+
+        assert!(auth("file-secret-1").await, "the trailing newline is trimmed");
+        std::fs::write(&secret, "file-secret-2").unwrap();
+        assert!(auth("file-secret-1").await, "nothing changes until a reload");
+        state.reload_tenants().expect("reload with the rotated file");
+        assert!(auth("file-secret-2").await);
+        assert!(!auth("file-secret-1").await, "the old key is revoked by the reload");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
