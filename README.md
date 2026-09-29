@@ -237,7 +237,7 @@ No API change, no client change.
 ## Testing
 
 ```bash
-cargo test              # 107 tests
+cargo test              # 129 tests
 cargo clippy --all-targets
 cargo bench --bench framing
 ```
