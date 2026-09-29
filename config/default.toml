@@ -1,0 +1,95 @@
+# llm-gateway — effective configuration.
+#
+# Precedence: this file < environment. Environment overrides use
+# `LLM_GATEWAY__<SECTION>__<FIELD>`, e.g.
+#   LLM_GATEWAY__SERVER__PORT=9000
+#   LLM_GATEWAY__GOVERNANCE__DEFAULT_LIMITS__REQUESTS_PER_MINUTE=600
+#
+# Relative paths below resolve against the config directory (LLM_GATEWAY_CONFIG_DIR,
+# default `config/`), so the binary can start from any working directory.
+
+[server]
+bind_addr = "0.0.0.0"
+port = 8080
+# 1 MiB. A chat request is text; anything larger is a mistake or an attack.
+request_body_limit_bytes = 1048576
+# Applied to non-streaming handlers only. A total deadline would fight SSE:
+# a 30s limit on a 4000-token completion is a bug, not a safety feature.
+request_timeout_ms = 30000
+# No upstream bytes for this long mid-stream means a half-open connection.
+stream_idle_timeout_ms = 120000
+# SSE comment ping. Intermediaries reap "idle-looking" connections, and during
+# a long tool call there may be no tokens for a while.
+keep_alive_interval_ms = 15000
+max_concurrent_streams_global = 512
+shutdown_grace_ms = 20000
+metrics_enabled = true
+
+[server.cors]
+# Off by default. The gateway is server-to-server; a browser should reach it
+# through a backend that holds the key.
+enabled = false
+allowed_origins = ["*"]
+allowed_headers = ["authorization", "content-type", "x-api-key", "x-request-id"]
+exposed_headers = ["x-request-id", "x-provider", "x-model", "x-upstream-model", "x-gateway-version"]
+max_age_secs = 600
+
+[registry]
+models_path = "models.yaml"
+tenants_path = "tenants.yaml"
+# Re-read on mtime change. Keeps the data plane up while the control plane
+# edits YAML.
+hot_reload = true
+reload_interval_ms = 5000
+
+[auth]
+# api_key | api_key_or_jwt | disabled
+mode = "api_key"
+api_key_header = "x-api-key"
+accept_bearer = true
+allow_anonymous = false
+
+# [auth.jwt]
+# issuer = "jarvis"
+# audience = "llm-gateway"
+# secret_env = "LLM_GATEWAY_JWT_SECRET"   # name only; the value stays in env
+# leeway_secs = 30
+# required_scopes = ["chat:stream"]
+
+[governance]
+# Deny by default: a tenant calling a model not on its allowlist is a 403.
+require_model_allowlist = true
+# Clamp silently and log, or 400. Clamp is friendlier for a UI that always
+# sends a generous max_tokens.
+on_max_tokens_exceeded = "clamp"
+cost_tracking_enabled = true
+
+[governance.default_limits]
+requests_per_minute = 120
+tokens_per_minute = 200000
+max_concurrent_streams = 16
+max_output_tokens = 8192
+# 5 USD/day.
+daily_budget_micro_usd = 5000000
+max_messages = 512
+max_prompt_chars = 200000
+
+[upstream]
+connect_timeout_ms = 5000
+# Per-chunk read timeout, not a whole-response deadline. An idle SSE stream is
+# torn down rather than pinning a socket forever.
+stream_read_timeout_ms = 120000
+tcp_keepalive_secs = 75
+pool_max_idle_per_host = 64
+pool_idle_timeout_ms = 90000
+user_agent = "llm-gateway/0.1.0"
+# Ask providers for usage in the terminal chunk so billing is exact.
+request_usage = true
+disable_vendor_telemetry = true
+
+[telemetry]
+service_name = "llm-gateway"
+service_version = "0.1.0"
+# pretty | json
+log_format = "json"
+log_filter = "info,llm_gateway=debug"

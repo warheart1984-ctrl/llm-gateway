@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Secrets. `tenants.yaml` references keys by env var; never commit the values.
+.env
+.env.*
+*.key
+*.pem
+
+# Local scratch
+/logs
+*.log

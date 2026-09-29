@@ -1,0 +1,90 @@
+# Tenant registry: who exists, what they may call, and what it may cost.
+#
+# Credentials are referenced by env var, never inlined. At boot the raw value is
+# hashed and only the digest is retained, so a memory dump yields digests rather
+# than keys. `key` is accepted for local development.
+#
+#   setx GATEWAY_KEY_ACME_MAIN gwk_live_...
+#   setx GATEWAY_KEY_JARVIS_MAIN gwk_live_...
+#
+# Reloading this file re-derives the key digests, so a rotation takes effect
+# without a restart: POST /v1/admin/registry/reload (admin scope required).
+
+tenants:
+  - tenant_id: acme
+    display_name: Acme Corp
+    enabled: true
+    credentials:
+      - key_id: ak_acme_main
+        key_env: GATEWAY_KEY_ACME_MAIN
+        scopes: [chat:stream, models:read, admin]
+        enabled: true
+      - key_id: ak_acme_ci
+        key_env: GATEWAY_KEY_ACME_CI
+        # A CI key that cannot reach `/v1/admin/registry/reload` even though
+        # the same tenant's main key can.
+        scopes: [chat:stream, models:read]
+        enabled: true
+    allowed_models:
+      - "groq/*"
+      - "openrouter/gpt-4.1-mini"
+    denied_models:
+      - "groq/gpt-oss-120b"
+    default_model: groq/gpt-oss-20b
+    limits:
+      requests_per_minute: 240
+      tokens_per_minute: 500000
+      max_concurrent_streams: 32
+      max_output_tokens: 8192
+      # 100 USD/day.
+      daily_budget_micro_usd: 100000000
+
+  - tenant_id: jarvis
+    display_name: Jarvis Internal
+    enabled: true
+    # Suffix appended to every model id before resolution: a tenant pinned to
+    # a deployment slot rather than to a raw model name.
+    model_suffix: ""
+    credentials:
+      - key_id: ak_jarvis_main
+        key_env: GATEWAY_KEY_JARVIS_MAIN
+        scopes: [chat:stream, models:read, admin]
+        enabled: true
+    allowed_models:
+      - "*"
+    default_model: groq/gpt-oss-120b
+    limits:
+      requests_per_minute: 1200
+      tokens_per_minute: 4000000
+      max_concurrent_streams: 128
+      max_output_tokens: 32768
+      # 1000 USD/day.
+      daily_budget_micro_usd: 1000000000
+
+  - tenant_id: sandbox
+    display_name: Sandbox (cheap models only)
+    enabled: true
+    credentials:
+      - key_id: ak_sandbox
+        key_env: GATEWAY_KEY_SANDBOX
+        scopes: [chat:stream, models:read]
+        enabled: true
+    # Restricted by allowlist. Everything else is a 403, not a 404: the caller
+    # learns the model exists, which is the intended disclosure for a governed
+    # catalogue.
+    allowed_models:
+      - "groq/gpt-oss-20b"
+      - "nvidia/*"
+    default_model: groq/gpt-oss-20b
+    limits:
+      requests_per_minute: 30
+      tokens_per_minute: 60000
+      max_concurrent_streams: 4
+      max_output_tokens: 2048
+      # 2 USD/day. Enough to develop against, not enough to abuse.
+      daily_budget_micro_usd: 2000000
+    # Per-model parameter policy, applied *over* the caller's params: a pinned
+    # value here cannot be overridden by a request.
+    model_params:
+      groq/gpt-oss-20b:
+        temperature: 0.2

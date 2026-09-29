@@ -1,0 +1,108 @@
+[package]
+name = "llm-gateway"
+version = "0.1.0"
+# 2024 for let-chains, which several of the pre-flight checks read far better with.
+edition = "2024"
+rust-version = "1.85"
+description = "Streaming, multi-tenant, governed LLM chat gateway (Groq / OpenRouter / NVIDIA)"
+license = "MIT"
+publish = false
+
+[lib]
+name = "llm_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "llm-gateway"
+path = "src/main.rs"
+
+[dependencies]
+# ---- async runtime -------------------------------------------------------
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "net"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+async-trait = "0.1"
+
+# ---- web -----------------------------------------------------------------
+axum = { version = "0.8", features = ["macros"] }
+tower = { version = "0.5", features = ["util", "limit", "timeout"] }
+tower-http = { version = "0.6", features = [
+  "trace",
+  "catch-panic",
+  "cors",
+  "request-id",
+  "timeout",
+  "set-header",
+  "normalize-path",
+] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+
+# ---- upstream http client ------------------------------------------------
+# No `gzip`/`brotli`/`charset` on purpose. Transparent decompression buffers
+# before yielding, which destroys token-by-token flush timing — the whole
+# point of this endpoint. `charset` would also transcode the upstream body,
+# which the wire contract does not permit. Compress in front of the gateway,
+# with flushes enabled, not inside it.
+reqwest = { version = "0.12", default-features = false, features = [
+  "json",
+  "stream",
+  "rustls-tls",
+  "http2",
+] }
+eventsource-stream = "0.2"
+
+# ---- config / serialization ---------------------------------------------
+config = { version = "0.14", default-features = false, features = ["toml"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# ---- observability -------------------------------------------------------
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+  "fmt",
+  "env-filter",
+  "json",
+  "ansi",
+  "registry",
+] }
+
+# ---- security ------------------------------------------------------------
+sha2 = "0.10"
+hmac = "0.12"
+subtle = "2"
+base64 = "0.22"
+
+# ---- util ----------------------------------------------------------------
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+dashmap = "6"
+anyhow = "1"
+
+[dev-dependencies]
+# The integration tests drive the real router over real HTTP against a mock
+# upstream, so they need the same client and runtime the binary uses.
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures-util = "0.3"
+uuid = { version = "1", features = ["v4"] }
+serde_json = "1"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "framing"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.bench]
+debug = true

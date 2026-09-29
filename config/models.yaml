@@ -1,0 +1,116 @@
+# Model catalogue.
+#
+# This file is the only place a model id, provider, or upstream URL is
+# defined. The request path contains no model ids. Adding a model is a YAML
+# edit plus a hot reload; adding a *provider* is an adapter plus an entry here.
+#
+# schema_version guards breaking changes to this file's shape.
+schema_version: 1
+
+models:
+  # ---------------------------------------------------------------------------
+  # Groq — lowest TTFT. The default for interactive traffic.
+  # ---------------------------------------------------------------------------
+  # Groq retired llama-3.1-70b-versatile (2025-01-24), then llama-3.3-70b-versatile
+  # and llama-3.1-8b-instant (2026-08-16). These are its named replacements.
+  groq/gpt-oss-120b:
+    provider: groq
+    display_name: GPT-OSS 120B (Groq)
+    # Sent upstream. Defaults to the key with `groq/` stripped; set explicitly
+    # when a vendor needs a different name than the registry id implies.
+    upstream_model: openai/gpt-oss-120b
+    default_params:
+      temperature: 0.7
+      max_tokens: 2048
+      top_p: 0.95
+    cost:
+      input_per_mtok_usd: 0.15
+      output_per_mtok_usd: 0.60
+    latency_slo_ms: 800
+    max_context_tokens: 131072
+    max_output_tokens: 65536
+    aliases: [gpt-oss-120b, fast]
+
+  groq/gpt-oss-20b:
+    provider: groq
+    display_name: GPT-OSS 20B (Groq)
+    upstream_model: openai/gpt-oss-20b
+    default_params:
+      temperature: 0.7
+      max_tokens: 2048
+    cost:
+      input_per_mtok_usd: 0.075
+      output_per_mtok_usd: 0.30
+    latency_slo_ms: 400
+    max_context_tokens: 131072
+    max_output_tokens: 65536
+    aliases: [gpt-oss-20b, cheap-fast]
+
+  # ---------------------------------------------------------------------------
+  # OpenRouter — long tail of models, weaker latency guarantees.
+  # ---------------------------------------------------------------------------
+  openrouter/gpt-4.1-mini:
+    provider: openrouter
+    display_name: GPT-4.1 mini (OpenRouter)
+    upstream_model: openai/gpt-4.1-mini
+    default_params:
+      temperature: 0.7
+      max_tokens: 4096
+    cost:
+      input_per_mtok_usd: 0.40
+      output_per_mtok_usd: 1.60
+    latency_slo_ms: 2500
+    max_context_tokens: 1047576
+    max_output_tokens: 32768
+    aliases: [gpt-4.1-mini, smart-cheap]
+
+  openrouter/claude-sonnet-4:
+    provider: openrouter
+    display_name: Claude Sonnet 4 (OpenRouter)
+    upstream_model: anthropic/claude-sonnet-4
+    default_params:
+      temperature: 1.0
+      max_tokens: 8192
+    cost:
+      input_per_mtok_usd: 3.00
+      output_per_mtok_usd: 15.00
+    latency_slo_ms: 3000
+    max_context_tokens: 200000
+    max_output_tokens: 64000
+    aliases: [sonnet-4, best-writing]
+
+  # ---------------------------------------------------------------------------
+  # NVIDIA — cloud NIM and self-hosted. `endpoint` is what makes local work.
+  # ---------------------------------------------------------------------------
+  nvidia/nemotron-4-340b:
+    provider: nvidia
+    display_name: Nemotron 4 340B (NVIDIA)
+    upstream_model: nvidia/nemotron-4-340b-instruct
+    default_params:
+      temperature: 0.7
+      max_tokens: 2048
+    cost:
+      input_per_mtok_usd: 0.00
+      output_per_mtok_usd: 0.00
+    latency_slo_ms: 1200
+    max_context_tokens: 131072
+    max_output_tokens: 32768
+    aliases: [nemotron-4, nvidia-large]
+
+  # Self-hosted NIM. The `endpoint` override is the whole point: a local
+  # container is reachable with no cloud credential. Switch it by uncommenting.
+  # nvidia/local-nim:
+  #   provider: nvidia
+  #   endpoint: http://localhost:8000/v1/chat/completions
+  #   upstream_model: meta/llama-3.1-8b-instruct
+  #   display_name: Local NIM (llama 3.1 8b)
+  #   default_params:
+  #     temperature: 0.7
+  #     max_tokens: 2048
+  #   cost:
+  #     input_per_mtok_usd: 0.0
+  #     output_per_mtok_usd: 0.0
+  #   latency_slo_ms: 200
+  #   max_context_tokens: 131072
+  #   aliases: [local, onprem]
+  #   enabled: false

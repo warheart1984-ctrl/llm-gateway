@@ -1,0 +1,923 @@
+//! Shared OpenAI-compatible streaming engine.
+//!
+//! Groq, OpenRouter and NVIDIA NIM all speak the same `/chat/completions`
+//! dialect. Rather than triplicate the SSE state machine, the wire handling
+//! lives here and each adapter supplies a [`OpenAiCompatSpec`] describing its
+//! quirks. An adapter that needs genuinely different behaviour (a non-SSE
+//! transport, a bespoke error envelope) implements [`super::ChatProvider`]
+//! directly instead.
+
+use std::{collections::VecDeque, pin::Pin};
+
+use eventsource_stream::Eventsource;
+use futures_core::Stream;
+use futures_util::{StreamExt, TryStreamExt};
+use serde_json::{Map, Value};
+
+use super::{
+    ChatProvider, HeaderList, ProviderError, ProviderRequest, ProviderStream,
+    StreamEvent, Usage, MAX_COMPLETION_TOKENS_MODELS,
+};
+
+/// Per-vendor deviations from the common dialect.
+#[derive(Debug, Clone, Copy)]
+pub struct QuirkFlags {
+    /// Delta keys that carry reasoning tokens, in priority order.
+    pub reasoning_fields: &'static [&'static str],
+    /// Send `stream_options.include_usage`. Providers that reject the field
+    /// get `false` and we fall back to counting.
+    pub send_stream_options: bool,
+    /// Force `max_completion_tokens` even for models that accept `max_tokens`.
+    pub force_completion_token_field: bool,
+    /// Send `seed` at all. Some vendors 400 on it.
+    pub supports_seed: bool,
+    /// Accept a newline-delimited JSON fallback when the response is not
+    /// `text/event-stream` (self-hosted NIM does this).
+    pub accept_json_lines: bool,
+}
+
+impl Default for QuirkFlags {
+    fn default() -> Self {
+        Self {
+            reasoning_fields: &["reasoning_content"],
+            send_stream_options: true,
+            force_completion_token_field: false,
+            supports_seed: true,
+            accept_json_lines: true,
+        }
+    }
+}
+
+pub struct OpenAiCompatSpec {
+    pub provider: &'static str,
+    pub default_endpoint: String,
+    /// Extra provider headers, e.g. OpenRouter's attribution headers.
+    pub extra_headers: fn(&ProviderRequest) -> HeaderList,
+    pub quirks: QuirkFlags,
+}
+
+pub(crate) struct OpenAiCompatAdapter {
+    spec: OpenAiCompatSpec,
+    api_key: Option<String>,
+    client: reqwest::Client,
+}
+
+impl OpenAiCompatAdapter {
+    /// Build with the transport settings from gateway config. A client that
+    /// cannot be constructed is a configuration error and is surfaced at boot,
+    /// not silently replaced with defaults.
+    pub fn new(spec: OpenAiCompatSpec, api_key: Option<String>, client: reqwest::Client) -> Self {
+        Self { spec, api_key, client }
+    }
+
+}
+
+#[async_trait::async_trait]
+impl ChatProvider for OpenAiCompatAdapter {
+    fn name(&self) -> &'static str {
+        self.spec.provider
+    }
+
+    fn base_url(&self) -> Option<&str> {
+        Some(&self.spec.default_endpoint)
+    }
+
+    async fn stream_chat(&self, req: ProviderRequest) -> Result<ProviderStream, ProviderError> {
+        let resp = self.post(&req).await?;
+        Ok(decode(data_stream(resp, self.spec.quirks), self.spec.quirks))
+    }
+
+    /// True byte relay. `bytes_stream()` is moved into the box without
+    /// inspection, so no boundary assumption is made anywhere.
+    async fn stream_chat_raw(&self, req: ProviderRequest) -> Result<super::RawStream, ProviderError> {
+        let resp = self.post(&req).await?;
+        let stream = resp
+            .bytes_stream()
+            .map_err(|e| ProviderError::Stream(e.to_string()));
+        Ok(Box::pin(stream))
+    }
+
+    fn supports_passthrough(&self) -> bool {
+        true
+    }
+}
+
+impl OpenAiCompatAdapter {
+    /// Issue the request and validate the status. Shared by both framings so
+    /// they cannot drift in headers or error handling.
+    async fn post(&self, req: &ProviderRequest) -> Result<reqwest::Response, ProviderError> {
+        let url = req.url(&self.spec)?;
+        let body = build_body(req, &self.spec);
+
+        let mut builder = self
+            .client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::ACCEPT, "text/event-stream");
+        if let Some(key) = &self.api_key {
+            builder = builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"));
+        }
+        for (name, value) in (self.spec.extra_headers)(req) {
+            builder = builder.header(name, value);
+        }
+
+        // reqwest surfaces a client-construction failure as a `Builder` error
+        // from `send()`, so the whole error chain is included in the message:
+        // "builder error" alone is not diagnosable.
+        let resp = builder
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Connect {
+                provider: self.spec.provider.to_string(),
+                message: describe(&e),
+            })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            // The body is read here, before streaming starts, so an upstream
+            // error is a normal HTTP status the client can act on rather than
+            // an error buried inside a 200 SSE stream.
+            let snippet = resp.text().await.unwrap_or_default();
+            return Err(ProviderError::Upstream {
+                status: status.as_u16(),
+                body: snippet,
+                retryable: status.as_u16() == 429 || status.is_server_error(),
+            });
+        }
+        Ok(resp)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Request body
+// ---------------------------------------------------------------------------
+
+fn build_body(req: &ProviderRequest, spec: &OpenAiCompatSpec) -> Map<String, Value> {
+    let q = &spec.quirks;
+    let mut body = Map::with_capacity(12);
+    body.insert("model".into(), Value::String(req.upstream_model.clone()));
+    body.insert(
+        "messages".into(),
+        serde_json::to_value(req.messages.as_ref()).unwrap_or(Value::Array(Vec::new())),
+    );
+    body.insert("stream".into(), Value::Bool(true));
+
+    if q.send_stream_options {
+        body.insert(
+            "stream_options".into(),
+            serde_json::json!({ "include_usage": req.include_usage }),
+        );
+    }
+    if let Some(v) = req.params.temperature {
+        body.insert("temperature".into(), json_f64(v));
+    }
+    if let Some(v) = req.params.top_p {
+        body.insert("top_p".into(), json_f64(v));
+    }
+    if let Some(v) = req.params.max_tokens {
+        let field = if q.force_completion_token_field || needs_completion_token_field(&req.upstream_model) {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+        body.insert(field.into(), Value::from(v));
+    }
+    if let Some(stop) = &req.params.stop {
+        body.insert(
+            "stop".into(),
+            Value::Array(stop.iter().cloned().map(Value::String).collect()),
+        );
+    }
+    if q.supports_seed {
+        if let Some(seed) = req.params.seed {
+            body.insert("seed".into(), Value::from(seed));
+        }
+    }
+    if let Some(v) = req.params.presence_penalty {
+        body.insert("presence_penalty".into(), json_f64(v));
+    }
+    if let Some(v) = req.params.frequency_penalty {
+        body.insert("frequency_penalty".into(), json_f64(v));
+    }
+    // Anything else the caller sent (tools, tool_choice, response_format,
+    // top_k, reasoning_effort, logit_bias, ...) goes straight upstream. The
+    // reserved set is filtered again here rather than trusted from the caller:
+    // a caller must not be able to override `stream` by smuggling it through
+    // `params`.
+    for (k, v) in &req.params.extra {
+        if !crate::router::RESERVED_PARAM_KEYS.contains(&k.as_str()) {
+            body.insert(k.clone(), v.clone());
+        }
+    }
+    body
+}
+
+fn json_f64(v: f64) -> Value {
+    serde_json::Number::from_f64(v).map(Value::Number).unwrap_or(Value::Null)
+}
+
+/// Flatten an error and its `source` chain into one line. reqwest wraps low
+/// level causes, and the top-level message alone ("builder error", "error
+/// sending request") says nothing actionable.
+fn describe(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut source = err.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !parts.iter().any(|p| p == &text) {
+            parts.push(text);
+        }
+        source = cause.source();
+    }
+    parts.join(": ")
+}
+
+pub(crate) fn needs_completion_token_field(upstream_model: &str) -> bool {
+    MAX_COMPLETION_TOKENS_MODELS
+        .iter()
+        .any(|prefix| upstream_model.starts_with(prefix))
+}
+
+// ---------------------------------------------------------------------------
+// Transport decoding
+// ---------------------------------------------------------------------------
+
+type DataStream = Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>;
+
+/// Normalize the transport to a stream of SSE `data:` payloads. Handles real
+/// SSE and, for vendors flagged as tolerant, newline-delimited JSON.
+fn data_stream(resp: reqwest::Response, quirks: QuirkFlags) -> DataStream {
+    // Read content-type before `bytes_stream` consumes the response.
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    let is_sse = content_type.contains("text/event-stream");
+    let bytes = resp.bytes_stream();
+
+    if is_sse {
+        Box::pin(bytes.eventsource().map(|res| {
+            res.map(|ev| ev.data)
+                .map_err(|e| ProviderError::Stream(e.to_string()))
+        }))
+    } else if quirks.accept_json_lines {
+        Box::pin(line_delimited(bytes).map_err(|e| ProviderError::Stream(e.to_string())))
+    } else {
+        // Not SSE and the vendor is not tolerant of a JSON-lines fallback:
+        // surface the real content-type rather than a generic parse error.
+        let seen = if content_type.is_empty() { "<none>" } else { &content_type };
+        Box::pin(futures_util::stream::once(futures_util::future::ready(Err(
+            ProviderError::Protocol(format!("expected text/event-stream, got {seen}")),
+        ))))
+    }
+}
+
+/// Newline-delimited JSON fallback, for self-hosted builds that ignore
+/// `text/event-stream` and emit one JSON object per line.
+fn line_delimited(
+    bytes: impl Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
+) -> impl Stream<Item = Result<String, String>> + Send {
+    // Boxed so the returned stream is `Unpin` and `unfold` can poll it without
+    // pinning gymnastics at every await point.
+    let bytes: Pin<Box<dyn Stream<Item = reqwest::Result<bytes::Bytes>> + Send>> = Box::pin(bytes);
+    futures_util::stream::unfold((bytes, Vec::<u8>::new()), |(mut source, mut buf)| async move {
+        loop {
+            let newline = buf.iter().position(|b| *b == b'\n');
+            if let Some(idx) = newline {
+                let line: Vec<u8> = buf.drain(..=idx).collect();
+                let text = String::from_utf8_lossy(&line).trim().to_string();
+                if !text.is_empty() {
+                    return Some((Ok(text), (source, buf)));
+                }
+                continue;
+            }
+            match source.next().await {
+                None => {
+                    // Flush a trailing line that arrived without a newline.
+                    let rest = String::from_utf8_lossy(&buf).trim().to_string();
+                    return if rest.is_empty() {
+                        None
+                    } else {
+                        Some((Ok(rest), (source, Vec::new())))
+                    };
+                }
+                Some(Err(e)) => return Some((Err(e.to_string()), (source, Vec::new()))),
+                Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+            }
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Wire types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct WireChunk {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    choices: Vec<WireChoice>,
+    #[serde(default)]
+    usage: Option<WireUsage>,
+    /// Some vendors report failures as an in-band object with HTTP 200.
+    #[serde(default)]
+    error: Option<WireError>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct WireChoice {
+    // Providers number choices when `n > 1`. Only index 0 is meaningful here,
+    // so it is accepted and ignored rather than rejected.
+    #[serde(default)]
+    #[allow(dead_code)]
+    index: u32,
+    #[serde(default)]
+    delta: Option<WireDelta>,
+    #[serde(default)]
+    finish_reason: Option<Value>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct WireDelta {
+    // An assistant role delta opens every stream. Informational only.
+    #[serde(default)]
+    #[allow(dead_code)]
+    role: Option<String>,
+    #[serde(default)]
+    content: Option<Value>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<WireToolCallDelta>>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct WireToolCallDelta {
+    #[serde(default)]
+    index: Option<u32>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+    #[serde(default)]
+    function: Option<WireFunctionDelta>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct WireFunctionDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+struct WireUsage {
+    #[serde(default)]
+    prompt_tokens: u32,
+    #[serde(default)]
+    completion_tokens: u32,
+    #[serde(default)]
+    total_tokens: u32,
+    #[serde(default)]
+    completion_tokens_details: Option<WireCompletionDetails>,
+    #[serde(default)]
+    prompt_tokens_details: Option<WirePromptDetails>,
+}
+
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+struct WireCompletionDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u32>,
+}
+
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+struct WirePromptDetails {
+    #[serde(default)]
+    cached_tokens: Option<u32>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct WireError {
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    code: Option<String>,
+}
+
+impl From<WireUsage> for Usage {
+    fn from(w: WireUsage) -> Self {
+        let reasoning_tokens = w.completion_tokens_details.and_then(|d| d.reasoning_tokens);
+        let cached_prompt_tokens = w.prompt_tokens_details.and_then(|d| d.cached_tokens);
+        let total = if w.total_tokens > 0 {
+            w.total_tokens
+        } else {
+            w.prompt_tokens.saturating_add(w.completion_tokens)
+        };
+        Usage {
+            prompt_tokens: w.prompt_tokens,
+            completion_tokens: w.completion_tokens,
+            total_tokens: total,
+            reasoning_tokens,
+            cached_prompt_tokens,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chunk -> event translation
+// ---------------------------------------------------------------------------
+
+struct DecodeState {
+    data: DataStream,
+    quirks: QuirkFlags,
+    pending: VecDeque<Result<StreamEvent, ProviderError>>,
+    started: bool,
+    eof: bool,
+    finish_reason: Option<String>,
+    usage: Option<Usage>,
+    finish_emitted: bool,
+    /// Set once an error has been surfaced, so we stop pulling.
+    poisoned: bool,
+    frames: u64,
+}
+
+fn decode(data: DataStream, quirks: QuirkFlags) -> ProviderStream {
+    let state = DecodeState {
+        data,
+        quirks,
+        pending: VecDeque::with_capacity(4),
+        started: false,
+        eof: false,
+        finish_reason: None,
+        usage: None,
+        finish_emitted: false,
+        poisoned: false,
+        frames: 0,
+    };
+    Box::pin(futures_util::stream::unfold(state, |mut st| async move {
+        let quirks = st.quirks;
+        loop {
+            if let Some(item) = st.pending.pop_front() {
+                return Some((item, st));
+            }
+            if st.poisoned {
+                return None;
+            }
+            if st.eof {
+                if st.finish_emitted {
+                    return None;
+                }
+                st.finish_emitted = true;
+                let event = StreamEvent::Finished {
+                    finish_reason: st.finish_reason.take(),
+                    usage: st.usage.take(),
+                };
+                st.pending.push_back(Ok(event));
+                continue;
+            }
+
+            let frame = match st.data.next().await {
+                None => {
+                    st.eof = true;
+                    continue;
+                }
+                Some(Err(err)) => {
+                    st.poisoned = true;
+                    st.pending.push_back(Err(err));
+                    continue;
+                }
+                Some(Ok(payload)) => payload,
+            };
+
+            let trimmed = frame.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // SSE terminator. Some servers close right after it, some don't.
+            if trimmed == "[DONE]" {
+                st.eof = true;
+                continue;
+            }
+
+            st.frames += 1;
+            let chunk: WireChunk = match serde_json::from_str(trimmed) {
+                Ok(c) => c,
+                Err(err) => {
+                    st.poisoned = true;
+                    st.pending.push_back(Err(ProviderError::Protocol(format!(
+                        "{}: {err}",
+                        super::truncate(trimmed, 160)
+                    ))));
+                    continue;
+                }
+            };
+
+            let events = translate(&chunk, &quirks, &mut st);
+            st.pending.extend(events);
+        }
+    }))
+}
+
+fn translate(
+    chunk: &WireChunk,
+    quirks: &QuirkFlags,
+    st: &mut DecodeState,
+) -> Vec<Result<StreamEvent, ProviderError>> {
+    // An in-band error object means the request is dead, not the connection.
+    if let Some(err) = &chunk.error {
+        st.poisoned = true;
+        let message = err
+            .message
+            .clone()
+            .or_else(|| err.code.clone())
+            .or_else(|| err.kind.clone())
+            .unwrap_or_else(|| "upstream reported an unspecified error".to_string());
+        return vec![Err(ProviderError::Upstream {
+            status: 502,
+            body: message,
+            // The HTTP status was 200 and the failure arrived in-band, so there
+            // is no signal about whether it was transient. Optimistic: a caller
+            // that retries a mid-stream failure gets a fresh attempt, and one
+            // that treats it as fatal would abandon a stream that may have been
+            // recoverable. The provider's own `code` is the only hint, and
+            // vendors use it inconsistently.
+            retryable: true,
+        })];
+    }
+
+    let mut out = Vec::with_capacity(2);
+
+    if !st.started && (chunk.id.is_some() || !chunk.choices.is_empty()) {
+        st.started = true;
+        out.push(Ok(StreamEvent::Started {
+            upstream_id: chunk.id.clone(),
+            upstream_model: chunk.model.clone(),
+        }));
+    }
+
+    for choice in &chunk.choices {
+        if let Some(reason) = &choice.finish_reason
+            && !reason.is_null()
+        {
+            st.finish_reason = finish_reason_name(reason);
+        }
+        let Some(delta) = &choice.delta else { continue };
+
+        let reasoning = quirks
+            .reasoning_fields
+            .iter()
+            .find_map(|field| match *field {
+                "reasoning_content" => delta.reasoning_content.clone(),
+                "reasoning" => delta.reasoning.clone(),
+                _ => None,
+            })
+            .filter(|r| !r.is_empty());
+
+        let content = delta
+            .content
+            .as_ref()
+            .and_then(text_from_value)
+            .filter(|c| !c.is_empty());
+
+        if let Some(tool_calls) = &delta.tool_calls {
+            for (position, tc) in tool_calls.iter().enumerate() {
+                let function = tc.function.as_ref();
+                let arguments = tc
+                    .arguments
+                    .clone()
+                    .or_else(|| function.and_then(|f| f.arguments.clone()));
+                let name = tc.name.clone().or_else(|| function.and_then(|f| f.name.clone()));
+                if arguments.is_none() && name.is_none() && tc.id.is_none() {
+                    continue;
+                }
+                out.push(Ok(StreamEvent::ToolCallDelta {
+                    index: tc.index.unwrap_or(position as u32),
+                    id: tc.id.clone(),
+                    name,
+                    arguments,
+                }));
+            }
+        }
+
+        if content.is_some() || reasoning.is_some() {
+            out.push(Ok(StreamEvent::Delta { content, reasoning }));
+        }
+    }
+
+    if let Some(usage) = chunk.usage.clone() {
+        st.usage = Some(usage.into());
+    }
+
+    out
+}
+
+fn finish_reason_name(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// `content` is usually a string but OpenRouter can return an array of parts,
+/// and every provider sends `null` for non-text frames.
+fn text_from_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(items) => {
+            let mut out = String::new();
+            for item in items {
+                if let Some(s) = item.as_str() {
+                    out.push_str(s);
+                    continue;
+                }
+                if let Some(s) = item.get("text").and_then(Value::as_str) {
+                    out.push_str(s);
+                }
+            }
+            (!out.is_empty()).then_some(out)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::{HeaderList, ResolvedParams};
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    /// `translate` returns `Result<StreamEvent, ProviderError>` items. Compare
+    /// the success shape without needing `ProviderError: PartialEq`.
+    fn assert_event(
+        actual: &Result<StreamEvent, ProviderError>,
+        expected: StreamEvent,
+    ) {
+        match actual {
+            Ok(event) => assert_eq!(*event, expected),
+            Err(err) => panic!("expected {expected:?}, got error {err:?}"),
+        }
+    }
+
+    fn quirks() -> QuirkFlags {
+        QuirkFlags::default()
+    }
+
+    fn st() -> DecodeState {
+        DecodeState {
+            data: Box::pin(futures_util::stream::empty::<Result<String, ProviderError>>()),
+            quirks: quirks(),
+            pending: VecDeque::new(),
+            started: false,
+            eof: false,
+            finish_reason: None,
+            usage: None,
+            finish_emitted: false,
+            poisoned: false,
+            frames: 0,
+        }
+    }
+
+    #[test]
+    fn content_delta_maps_to_stream_event() {
+        let chunk: WireChunk =
+            serde_json::from_str(r#"{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"Hel"}}]}"#).unwrap();
+        let mut s = st();
+        let events = translate(&chunk, &quirks(), &mut s);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], Ok(StreamEvent::Started { .. })));
+        assert_event(
+            &events[1],
+            StreamEvent::Delta { content: Some("Hel".into()), reasoning: None },
+        );
+    }
+
+    #[test]
+    fn null_content_is_ignored() {
+        let chunk: WireChunk = serde_json::from_str(
+            r#"{"id":"c1","choices":[{"index":0,"delta":{"role":"assistant","content":null}}]}"#,
+        )
+        .unwrap();
+        let mut s = st();
+        let events = translate(&chunk, &quirks(), &mut s);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], Ok(StreamEvent::Started { .. })));
+    }
+
+    #[test]
+    fn reasoning_is_kept_out_of_content() {
+        let chunk: WireChunk = serde_json::from_str(
+            r#"{"id":"c1","choices":[{"index":0,"delta":{"reasoning_content":"think"}}]}"#,
+        )
+        .unwrap();
+        let mut s = st();
+        let events = translate(&chunk, &quirks(), &mut s);
+        let last = events.last().unwrap();
+        assert_event(
+            last,
+            StreamEvent::Delta { content: None, reasoning: Some("think".into()) },
+        );
+    }
+
+    #[test]
+    fn in_band_error_object_surfaces_as_provider_error() {
+        let chunk: WireChunk =
+            serde_json::from_str(r#"{"error":{"message":"bad key","code":"invalid_api_key"}}"#).unwrap();
+        let mut s = st();
+        let events = translate(&chunk, &quirks(), &mut s);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Err(ProviderError::Upstream { status, body, .. }) => {
+                assert_eq!(*status, 502);
+                assert_eq!(body, "bad key");
+            }
+            other => panic!("expected upstream error, got {other:?}"),
+        }
+        assert!(s.poisoned);
+    }
+
+    #[test]
+    fn an_in_band_error_is_reported_as_retryable() {
+        let chunk: WireChunk = serde_json::from_str(r#"{"error":{"message":"boom"}}"#).unwrap();
+        let mut s = st();
+        let events = translate(&chunk, &quirks(), &mut s);
+        match &events[0] {
+            Err(ProviderError::Upstream { status, retryable, .. }) => {
+                assert_eq!(*status, 502);
+                assert!(*retryable, "a 200-then-error carries no transience signal");
+            }
+            other => panic!("expected upstream error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_on_a_choice_less_chunk_is_captured() {
+        let chunk: WireChunk = serde_json::from_str(
+            r#"{"id":"c1","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4}}"#,
+        )
+        .unwrap();
+        let mut s = st();
+        translate(&chunk, &quirks(), &mut s);
+        let u = s.usage.expect("usage captured");
+        assert_eq!(u.prompt_tokens, 10);
+        assert_eq!(u.completion_tokens, 4);
+        assert_eq!(u.total_tokens, 14);
+    }
+
+    #[test]
+    fn array_content_is_flattened() {
+        let chunk: WireChunk = serde_json::from_str(
+            r#"{"id":"c1","choices":[{"index":0,"delta":{"content":[{"type":"text","text":"ab"},{"type":"text","text":"cd"}]}}]}"#,
+        )
+        .unwrap();
+        let mut s = st();
+        let events = translate(&chunk, &quirks(), &mut s);
+        assert_event(
+            events.last().unwrap(),
+            StreamEvent::Delta { content: Some("abcd".into()), reasoning: None },
+        );
+    }
+
+    async fn collect(frames: &[&str]) -> Vec<Result<StreamEvent, ProviderError>> {
+        let payloads: Vec<Result<String, ProviderError>> = frames
+            .iter()
+            .map(|f| Ok((*f).to_string()))
+            .collect();
+        let stream = decode(
+            Box::pin(futures_util::stream::iter(payloads)),
+            quirks(),
+        );
+        futures_util::StreamExt::collect::<Vec<_>>(stream).await
+    }
+
+    #[tokio::test]
+    async fn a_terminal_event_is_emitted_at_end_of_stream() {
+        // Mirrors the real OpenAI shape: content deltas, then a finish_reason
+        // frame, then a separate usage frame, then [DONE].
+        let events = collect(&[
+            r#"{"id":"c1","choices":[{"index":0,"delta":{"content":"Hi"}}]}"#,
+            r#"{"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            r#"{"id":"c1","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3}}"#,
+            "[DONE]",
+        ])
+        .await;
+
+        let last = events.last().expect("at least one event");
+        match last {
+            Ok(StreamEvent::Finished { finish_reason, usage }) => {
+                assert_eq!(finish_reason.as_deref(), Some("stop"));
+                let u = usage.expect("usage present");
+                assert_eq!(u.prompt_tokens, 12);
+                assert_eq!(u.completion_tokens, 3);
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn exactly_one_terminal_event_is_emitted() {
+        let events = collect(&[
+            r#"{"id":"c1","choices":[{"index":0,"delta":{"content":"Hi"}}]}"#,
+            r#"{"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            "[DONE]",
+        ])
+        .await;
+        let terminals = events
+            .iter()
+            .filter(|e| matches!(e, Ok(StreamEvent::Finished { .. })))
+            .count();
+        assert_eq!(terminals, 1, "a duplicate finish would double-count usage");
+    }
+
+    #[tokio::test]
+    async fn a_stream_ending_without_done_still_finishes() {
+        // Some proxies close the socket instead of sending [DONE]. The client
+        // must still get a terminal event, or it waits forever.
+        let events = collect(&[r#"{"id":"c1","choices":[{"index":0,"delta":{"content":"Hi"}}]}"#])
+            .await;
+        assert!(matches!(events.last(), Some(Ok(StreamEvent::Finished { .. }))));
+    }
+
+    #[tokio::test]
+    async fn usage_on_a_choice_less_frame_reaches_the_terminal_event() {
+        let events = collect(&[
+            r#"{"id":"c1","choices":[{"index":0,"delta":{"content":"Hi"}}]}"#,
+            r#"{"id":"c1","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":2}}"#,
+            "[DONE]",
+        ])
+        .await;
+        match events.last() {
+            Some(Ok(StreamEvent::Finished { usage: Some(u), .. })) => {
+                assert_eq!(u.prompt_tokens, 7);
+                assert_eq!(u.completion_tokens, 2);
+            }
+            other => panic!("expected Finished with usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn body_uses_completion_token_field_for_reasoning_models() {
+        let req = ProviderRequest {
+            request_id: Uuid::nil(),
+            tenant_id: "t".into(),
+            key_id: "k".into(),
+            upstream_model: "o3-mini".into(),
+            endpoint: None,
+            messages: Arc::new(vec![]),
+            params: ResolvedParams { max_tokens: Some(512), ..Default::default() },
+            include_usage: true,
+        };
+        let spec = OpenAiCompatSpec {
+            provider: "test",
+            default_endpoint: "http://localhost/v1/chat/completions".into(),
+            extra_headers: |_| HeaderList::new(),
+            quirks: quirks(),
+        };
+        let body = build_body(&req, &spec);
+        assert_eq!(body.get("max_completion_tokens"), Some(&Value::from(512)));
+        assert!(!body.contains_key("max_tokens"));
+    }
+
+    #[test]
+    fn body_never_forwards_reserved_keys() {
+        let req = ProviderRequest {
+            request_id: Uuid::nil(),
+            tenant_id: "t".into(),
+            key_id: "k".into(),
+            upstream_model: "m".into(),
+            endpoint: None,
+            messages: Arc::new(vec![]),
+            params: ResolvedParams {
+                include_usage: true,
+                extra: [("stream".to_string(), Value::Bool(false))].into_iter().collect(),
+                ..Default::default()
+            },
+            include_usage: true,
+        };
+        let spec = OpenAiCompatSpec {
+            provider: "test",
+            default_endpoint: "http://x/v1/chat/completions".into(),
+            extra_headers: |_| HeaderList::new(),
+            quirks: quirks(),
+        };
+        let body = build_body(&req, &spec);
+        // A caller-supplied stream: false must not reach the provider:
+        // this endpoint is streaming-only, and honouring it would produce a
+        // non-SSE body on an SSE route.
+        assert_eq!(body.get("stream"), Some(&Value::Bool(true)));
+    }
+}
