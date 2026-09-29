@@ -1,0 +1,107 @@
+# The quality gate, from a clean checkout, on every push and PR.
+#
+# What "passing" means here is reproducibility, not one green run:
+#   - `--locked` everywhere, so CI builds the exact dependency graph in
+#     Cargo.lock rather than whatever resolves today;
+#   - warnings are errors, so the gate cannot quietly erode;
+#   - the test suite runs several times, on Linux and Windows, because the
+#     money and streaming tests are concurrent and a flake is a finding;
+#   - the declared `rust-version` is built, so the MSRV is a fact, not a claim.
+
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # The integration tests are timing-sensitive by design (TTFT, disconnects);
+  # incremental artefacts only slow a from-scratch CI build down.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked --all-targets
+      - name: Test, repeated
+        shell: bash
+        run: |
+          for run in 1 2 3; do
+            echo "::group::run $run"
+            cargo test --locked --all-targets
+            echo "::endgroup::"
+          done
+      - name: Money tests under load
+        # The concurrency and property tests again, with the default test
+        # thread pool contending for cores, several times over.
+        shell: bash
+        run: |
+          for run in 1 2 3 4 5; do
+            cargo test --locked --lib governance::limits
+          done
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: echo "version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Check on the declared MSRV
+        run: cargo check --locked --all-targets
+
+  bench:
+    # Compiles and runs the framing benchmark in criterion's quick mode, so a
+    # benchmark that no longer builds or panics fails the gate. The numbers
+    # from a shared runner are not comparable run to run and are not
+    # asserted; they are printed for the record.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Framing benchmark (quick)
+        run: cargo bench --locked --bench framing -- --quick
+
+  demo:
+    # The docker compose demo, end to end: build the image, start the mock
+    # provider and the gateway, run the scripted client, and fail if any of
+    # its checks fail.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the demo
+        working-directory: demo
+        run: docker compose up --build --abort-on-container-exit --exit-code-from client
+      - name: Gateway logs
+        if: always()
+        working-directory: demo
+        run: docker compose logs gateway

@@ -48,12 +48,18 @@ enum Scenario {
     ToolCalls,
     /// A comment line plus a `data:`-only frame, as OpenRouter emits.
     CommentKeepalive,
+    /// `Happy`, but response headers wait for a permit on the mock's gate, so
+    /// a test can hold any number of streams open at the upstream.
+    Gated,
+    /// Content deltas and a finish, but no usage anywhere.
+    NoUsage,
 }
 
 #[derive(Clone)]
 struct MockState {
     scenario: Scenario,
     calls: Arc<AtomicU64>,
+    gate: Arc<tokio::sync::Semaphore>,
     last_body: Arc<std::sync::Mutex<Option<Value>>>,
 }
 
@@ -67,6 +73,7 @@ impl MockUpstream {
         let state = MockState {
             scenario,
             calls: Arc::new(AtomicU64::new(0)),
+            gate: Arc::new(tokio::sync::Semaphore::new(0)),
             last_body: Arc::new(std::sync::Mutex::new(None)),
         };
         let app = Router::new()
@@ -86,6 +93,10 @@ impl MockUpstream {
 
     fn last_body(&self) -> Option<Value> {
         self.state.last_body.lock().unwrap().clone()
+    }
+
+    fn open_gate(&self, permits: usize) {
+        self.state.gate.add_permits(permits);
     }
 
 }
@@ -125,9 +136,22 @@ async fn handle(State(state): State<MockState>, Json(body): Json<Value>) -> Resp
     state.calls.fetch_add(1, Ordering::SeqCst);
     *state.last_body.lock().unwrap() = Some(body);
 
+    let scenario = match state.scenario {
+        Scenario::Gated => {
+            state.gate.acquire().await.expect("gate open").forget();
+            Scenario::Happy
+        }
+        other => other,
+    };
 
-
-    match state.scenario {
+    match scenario {
+        Scenario::Gated => unreachable!("rewritten to Happy above"),
+        Scenario::NoUsage => sse_response(vec![
+            chunk("c7", "one two three four"),
+            chunk("c7", " five six seven eight"),
+            sse(&json!({ "id": "c7", "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] }).to_string()),
+            "data: [DONE]\n\n".to_string(),
+        ]),
         Scenario::UpstreamReject => (
             StatusCode::TOO_MANY_REQUESTS,
             Json(json!({ "error": { "message": "rate limit exceeded", "code": "rate_limited" } })),
@@ -254,6 +278,7 @@ impl Gateway {
     }
 
     async fn start_with(upstream: &MockUpstream, extra_models: &str) -> Self {
+        captured_logs::install();
         let dir = tempdir::TempDir::new("llm-gateway-test");
         // Test-provided models may carry a placeholder endpoint, so substitute
         // the live mock address into every entry.
@@ -333,6 +358,21 @@ tenants:
       max_concurrent_streams: 8
       max_output_tokens: 4096
       daily_budget_nano_usd: 50000
+  - tenant_id: tight
+    enabled: true
+    credentials:
+      - key_id: ak_tight
+        key: test-key-tight
+        scopes: [chat:stream]
+    allowed_models: ["*"]
+    limits:
+      requests_per_minute: 1000
+      tokens_per_minute: 10000000
+      max_concurrent_streams: 64
+      max_output_tokens: 4096
+      # Room for three 128-token reservations on mock/chat (~1.03M nano-USD
+      # each), never four.
+      daily_budget_nano_usd: 3500000
   - tenant_id: nocreds
     enabled: true
     credentials:
@@ -565,14 +605,14 @@ async fn a_refused_upstream_is_not_counted_as_a_stream() {
     let (status, _, _) = gw.post_chat(TEST_KEY, chat_body()).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
 
-    let (_, metrics) = gw.get("/metrics", "").await;
+    let (_, metrics) = gw.get("/metrics", TEST_KEY).await;
     assert!(metrics.contains("gw_streams_started_total 0"), "{metrics}");
     assert!(metrics.contains("gw_upstream_errors_total 1"), "{metrics}");
     assert!(
         metrics.contains("gw_model_errors_total{provider=\"nvidia\",model=\"mock/chat\"} 1"),
         "{metrics}"
     );
-    // The request still consumed the reservation, so cost is accounted.
+    // The slot is released; the cost side is `a_refused_upstream_costs_the_tenant_nothing`.
     let (_, usage) = gw.get("/v1/usage", TEST_KEY).await;
     let usage: Value = serde_json::from_str(&usage).unwrap();
     assert_eq!(usage["streams_in_flight"], 0, "the slot must be released");
@@ -902,7 +942,7 @@ async fn metrics_expose_request_and_stream_counters() {
     let gw = Gateway::start(&upstream).await;
     gw.post_chat(TEST_KEY, chat_body()).await;
 
-    let (status, text) = gw.get("/metrics", "").await;
+    let (status, text) = gw.get("/metrics", TEST_KEY).await;
     assert_eq!(status, StatusCode::OK);
     assert!(text.contains("gw_streams_completed_total 1"), "{text}");
     assert!(text.contains("gw_prompt_tokens_total 12"), "{text}");
@@ -1050,7 +1090,7 @@ async fn client_disconnect_releases_quota_and_stops_upstream_work() {
     assert_eq!(status, StatusCode::OK, "{body}");
 
     // And the interrupted stream is recorded as a client abort, not a success.
-    let (_, metrics) = gw.get("/metrics", "").await;
+    let (_, metrics) = gw.get("/metrics", TEST_KEY).await;
     assert!(
         metrics.contains("gw_streams_client_aborted_total 1"),
         "expected one client abort: {metrics}"
@@ -1110,6 +1150,280 @@ async fn an_interrupted_stream_does_not_leak_concurrency_slots() {
     assert_eq!(status, StatusCode::OK);
     let usage: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(usage["streams_in_flight"], 0, "slots leaked: {text}");
+}
+
+async fn spent(gw: &Gateway, key: &str) -> u64 {
+    let (status, text) = gw.get("/v1/usage", key).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    serde_json::from_str::<Value>(&text).unwrap()["spent_nano_usd"]
+        .as_u64()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_refused_upstream_costs_the_tenant_nothing() {
+    // The upstream answered 429 before streaming: it processed no prompt and
+    // bills nothing, so neither does the gateway.
+    let upstream = MockUpstream::start(Scenario::UpstreamReject).await;
+    let gw = Gateway::start(&upstream).await;
+    let (status, _, _) = gw.post_chat(TEST_KEY, chat_body()).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(spent(&gw, TEST_KEY).await, 0);
+}
+
+#[tokio::test]
+async fn an_unreachable_upstream_costs_the_tenant_nothing() {
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let extra = r#"  mock/down:
+    provider: nvidia
+    endpoint: http://127.0.0.1:9/v1/chat/completions
+    upstream_model: mock-model
+    default_params:
+      max_tokens: 64
+    cost:
+      input_per_mtok_usd: 1.0
+      output_per_mtok_usd: 1.0
+"#;
+    let gw = Gateway::start_with(&upstream, extra).await;
+    let mut body = chat_body();
+    body["model"] = json!("mock/down");
+    let (status, _, _) = gw.post_chat(TEST_KEY, body).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(spent(&gw, TEST_KEY).await, 0);
+    let (_, usage) = gw.get("/v1/usage", TEST_KEY).await;
+    assert!(usage.contains("\"streams_in_flight\":0"), "{usage}");
+}
+
+#[tokio::test]
+async fn passthrough_is_billed_the_full_reservation() {
+    // The gateway cannot see passthrough usage, so the reservation is the
+    // bill. Refunding the completion half would make passthrough a way
+    // around the budget: stream a whole completion, pay for the prompt.
+    let upstream = MockUpstream::start(Scenario::CommentKeepalive).await;
+    let gw = Gateway::start(&upstream).await;
+
+    let mut body = chat_body();
+    body["framing"] = json!("passthrough");
+    let (status, headers, _) = gw.post_chat(TEST_KEY, body).await;
+    assert_eq!(status, StatusCode::OK);
+    let reserved: u64 = headers["x-reserved-nano-usd"].to_str().unwrap().parse().unwrap();
+    assert!(reserved >= 128 * 8_000, "reserved {reserved}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(spent(&gw, TEST_KEY).await, reserved);
+}
+
+#[tokio::test]
+async fn a_stream_without_reported_usage_bills_what_it_delivered() {
+    // No usage from the upstream used to settle at zero completion tokens:
+    // a whole answer for the price of its prompt. The delivered deltas are
+    // the floor, and the `end` frame reports exactly what the ledger holds.
+    let upstream = MockUpstream::start(Scenario::NoUsage).await;
+    let gw = Gateway::start(&upstream).await;
+
+    let (status, headers, body) = gw.post_chat(TEST_KEY, chat_body()).await;
+    assert_eq!(status, StatusCode::OK);
+    let end = parse_sse(&body)
+        .into_iter()
+        .find(|(e, _)| e.as_deref() == Some("end"))
+        .map(|(_, d)| serde_json::from_str::<Value>(&d).unwrap())
+        .expect("end frame");
+    let completion = end["usage"]["completion_tokens"].as_u64().unwrap();
+    assert!(completion >= 2, "two content deltas were delivered: {end}");
+    let reserved: u64 = headers["x-reserved-nano-usd"].to_str().unwrap().parse().unwrap();
+    let billed = spent(&gw, TEST_KEY).await;
+    assert_eq!(billed, end["cost_nano_usd"].as_u64().unwrap(), "end frame and ledger agree");
+    assert!(billed < reserved, "the unused ceiling is refunded");
+}
+
+#[tokio::test]
+async fn concurrent_streams_near_the_budget_admit_exactly_what_fits() {
+    // Ten simultaneous streams against a budget with room for three. The mock
+    // holds every admitted stream at its gate, so all ten reservations are
+    // live at once and none can settle early and free budget.
+    let upstream = MockUpstream::start(Scenario::Gated).await;
+    let gw = Arc::new(Gateway::start(&upstream).await);
+
+    let rejected = Arc::new(AtomicU64::new(0));
+    let requests: Vec<_> = (0..10)
+        .map(|_| {
+            let gw = Arc::clone(&gw);
+            let rejected = Arc::clone(&rejected);
+            tokio::spawn(async move {
+                let (status, _, _) = gw.post_chat("test-key-tight", chat_body()).await;
+                if status == StatusCode::PAYMENT_REQUIRED {
+                    rejected.fetch_add(1, Ordering::SeqCst);
+                }
+                status
+            })
+        })
+        .collect();
+
+    // Every request is decided once it was either refused or reached the
+    // upstream. Nothing is released until then.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while upstream.calls() + rejected.load(Ordering::SeqCst) < 10 {
+        assert!(tokio::time::Instant::now() < deadline, "requests never settled");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(upstream.calls(), 3, "exactly three reservations fit");
+
+    // Another tenant is admitted while `tight` is pinned at its ceiling: it
+    // reaches the upstream with the gate still shut.
+    let other = {
+        let gw = Arc::clone(&gw);
+        tokio::spawn(async move { gw.post_chat(TEST_KEY, chat_body()).await.0 })
+    };
+    while upstream.calls() < 4 {
+        assert!(tokio::time::Instant::now() < deadline, "tenant budgets are not isolated");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    upstream.open_gate(10);
+    assert_eq!(other.await.unwrap(), StatusCode::OK);
+    let mut statuses = Vec::new();
+    for r in requests {
+        statuses.push(r.await.unwrap());
+    }
+    assert_eq!(statuses.iter().filter(|s| **s == StatusCode::OK).count(), 3);
+    assert_eq!(rejected.load(Ordering::SeqCst), 7);
+}
+
+#[tokio::test]
+async fn credentials_and_prompts_never_reach_the_logs() {
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let gw = Gateway::start(&upstream).await;
+    let marker = format!("prompt-marker-{}", uuid::Uuid::new_v4());
+
+    // A streamed request, a refused one, and a malformed one, all carrying
+    // the key and the marker.
+    let mut body = chat_body();
+    body["messages"] = json!([{ "role": "user", "content": marker }]);
+    let (status, _, _) = gw.post_chat(TEST_KEY, body.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let mut denied = body.clone();
+    denied["model"] = json!("mock/chat");
+    gw.post_chat("test-key-locked", denied).await;
+    let mut malformed = body;
+    malformed["messages"] = json!([{ "role": "user", "content": marker, "bogus": { "deep": marker } }]);
+    malformed["params"] = json!({ "max_tokens": "not-a-number" });
+    gw.post_chat(TEST_KEY, malformed).await;
+    // Bearer form too.
+    let client = reqwest::Client::new();
+    client
+        .get(gw.url("/v1/usage"))
+        .header("authorization", format!("Bearer {TEST_KEY}"))
+        .send()
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let logs = captured_logs::contents();
+    assert!(logs.contains("stream complete"), "log capture is not working");
+    for secret in [TEST_KEY, "test-key-locked", marker.as_str()] {
+        assert!(!logs.contains(secret), "`{secret}` reached a log line");
+    }
+}
+
+#[tokio::test]
+async fn an_oversized_header_block_is_refused_before_routing() {
+    // hyper's defaults cap a request at 100 headers; the gateway relies on
+    // that rather than re-implementing it. This pins the behavior so a server
+    // upgrade that changes it is noticed.
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let gw = Gateway::start(&upstream).await;
+
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut sock = tokio::net::TcpStream::connect(gw.addr).await.expect("connect");
+    let mut head = format!("GET /health/live HTTP/1.1\r\nhost: {}\r\n", gw.addr);
+    for i in 0..200 {
+        head.push_str(&format!("x-filler-{i}: {i}\r\n"));
+    }
+    head.push_str("\r\n");
+    sock.write_all(head.as_bytes()).await.expect("write head");
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf))
+        .await
+        .expect("answered")
+        .unwrap_or(0);
+    let status_line = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        status_line.starts_with("HTTP/1.1 431"),
+        "expected 431, got {status_line:?}"
+    );
+}
+
+#[tokio::test]
+async fn metric_labels_come_from_config_never_from_the_request() {
+    // A label value per request is unbounded cardinality: a scraper-killer
+    // an unauthenticated caller could trigger. Unknown models, unknown keys
+    // and junk tenants must not mint a series.
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let gw = Gateway::start(&upstream).await;
+    let junk = format!("junk{}", uuid::Uuid::new_v4().simple());
+
+    let mut body = chat_body();
+    body["model"] = json!(format!("mock/{junk}"));
+    gw.post_chat(TEST_KEY, body).await;
+    gw.post_chat(&junk, chat_body()).await;
+    let mut body = chat_body();
+    body["metadata"] = json!({ "tenant": junk, "model": junk });
+    gw.post_chat(TEST_KEY, body).await;
+
+    let (status, metrics) = gw.get("/metrics", TEST_KEY).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!metrics.contains(&junk), "a request minted a label: {metrics}");
+}
+
+#[tokio::test]
+async fn public_metrics_need_an_admin_key() {
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let gw = Gateway::start(&upstream).await;
+    assert_eq!(gw.get("/metrics", "").await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(gw.get("/metrics", "test-key-throttled").await.0, StatusCode::FORBIDDEN);
+    assert_eq!(gw.get("/metrics", TEST_KEY).await.0, StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// Captured logs
+// ---------------------------------------------------------------------------
+
+/// One process-wide subscriber, at the shipped filter's `debug` for the
+/// gateway plus everything at `info`, writing into a buffer the redaction
+/// test reads. Every test in this binary logs into it, so a leak from any of
+/// them fails the check.
+mod captured_logs {
+    use std::sync::{Mutex, OnceLock};
+
+    static BUFFER: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+
+    struct Sink;
+
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            BUFFER.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    pub fn install() {
+        INSTALLED.get_or_init(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(tracing_subscriber::EnvFilter::new("info,llm_gateway=trace"))
+                .with_writer(|| Sink)
+                .finish();
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+    }
+
+    pub fn contents() -> String {
+        String::from_utf8_lossy(&BUFFER.lock().unwrap()).into_owned()
+    }
 }
 
 // ---------------------------------------------------------------------------

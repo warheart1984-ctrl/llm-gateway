@@ -291,16 +291,17 @@ impl Metrics {
             ("budget", g.cost_reservation_rejected_total.load(Ordering::Relaxed)),
             ("model", g.model_denied_total.load(Ordering::Relaxed)),
         ];
-        for (reason, value) in rejections {
-            metric(
-                &mut out,
-                "gw_requests_rejected_by_reason_total",
-                "counter",
-                "Requests rejected during governance.",
-                &[("reason", reason)],
-                value,
-            );
-        }
+        let rejections: Vec<(String, u64)> = rejections
+            .into_iter()
+            .map(|(reason, value)| (render_labels(&[("reason", reason)], &[]), value))
+            .collect();
+        family(
+            &mut out,
+            "gw_requests_rejected_by_reason_total",
+            "counter",
+            "Requests rejected during governance, by reason.",
+            rejections.iter().map(|(l, v)| (l.as_str(), *v)),
+        );
         metric(
             &mut out,
             "gw_streams_started_total",
@@ -408,35 +409,67 @@ impl Metrics {
         for entry in self.by_model.iter() {
             models.insert(entry.key().clone(), Arc::clone(entry.value()));
         }
-        for (key, m) in models {
-            let (provider, model) = key.split_once('/').unwrap_or((key.as_str(), ""));
-            // A model name may contain a quote or backslash. Prometheus requires
-            // those escaped, and anything that cannot be escaped safely becomes
-            // a fixed placeholder so the scrape stays parseable.
-            let labels = [
-                ("provider", safe_label(provider)),
-                ("model", safe_label(model)),
-            ];
-            metric(&mut out, "gw_model_streams_started_total", "counter", "Connections opened per model.", &labels, m.streams_started.load(Ordering::Relaxed));
-            metric(&mut out, "gw_model_streams_total", "counter", "Streams that ran per model.", &labels, m.streams.load(Ordering::Relaxed));
-            metric(&mut out, "gw_model_errors_total", "counter", "Failed streams per model.", &labels, m.errors.load(Ordering::Relaxed));
-            metric(&mut out, "gw_model_prompt_tokens_total", "counter", "Prompt tokens per model.", &labels, m.prompt_tokens.load(Ordering::Relaxed));
-            metric(&mut out, "gw_model_completion_tokens_total", "counter", "Completion tokens per model.", &labels, m.completion_tokens.load(Ordering::Relaxed));
-            metric(&mut out, "gw_model_cost_nano_usd_total", "counter", "Spend per model, nano-USD.", &labels, m.cost_nano_usd.load(Ordering::Relaxed));
-            histogram_summary(&mut out, "gw_model_ttft_ms", "Time to first token per model.", m.ttft_ms_sum.load(Ordering::Relaxed), m.ttft_ms_count.load(Ordering::Relaxed));
-            histogram_summary(&mut out, "gw_model_duration_ms", "Stream duration per model.", m.duration_ms_sum.load(Ordering::Relaxed), m.streams.load(Ordering::Relaxed));
+        // One family at a time: the exposition format allows a single HELP and
+        // TYPE per metric name, followed by all its series. Interleaving them
+        // per model (as this once did) makes the second model's HELP a parse
+        // error, and one bad line fails the whole scrape.
+        //
+        // A model name may contain a quote or backslash. Anything that cannot
+        // be escaped safely becomes a fixed placeholder so the scrape stays
+        // parseable.
+        let models: Vec<(String, Arc<ModelRollup>)> = models
+            .into_iter()
+            .map(|(key, m)| {
+                let (provider, model) = key.split_once('/').unwrap_or((key.as_str(), ""));
+                let labels = render_labels(
+                    &[("provider", safe_label(provider)), ("model", safe_label(model))],
+                    &[],
+                );
+                (labels, m)
+            })
+            .collect();
+        type ModelCounter = fn(&ModelRollup) -> u64;
+        let model_counters: [(&str, &str, ModelCounter); 6] = [
+            ("gw_model_streams_started_total", "Connections opened per model.", |m| m.streams_started.load(Ordering::Relaxed)),
+            ("gw_model_streams_total", "Streams that ran per model.", |m| m.streams.load(Ordering::Relaxed)),
+            ("gw_model_errors_total", "Failed streams per model.", |m| m.errors.load(Ordering::Relaxed)),
+            ("gw_model_prompt_tokens_total", "Prompt tokens per model.", |m| m.prompt_tokens.load(Ordering::Relaxed)),
+            ("gw_model_completion_tokens_total", "Completion tokens per model.", |m| m.completion_tokens.load(Ordering::Relaxed)),
+            ("gw_model_cost_nano_usd_total", "Spend per model, nano-USD.", |m| m.cost_nano_usd.load(Ordering::Relaxed)),
+        ];
+        for (name, help, value) in model_counters {
+            family(&mut out, name, "counter", help, models.iter().map(|(l, m)| (l.as_str(), value(m))));
         }
+        summary_family(
+            &mut out,
+            "gw_model_ttft_ms",
+            "Time to first token per model.",
+            models.iter().map(|(l, m)| (l.as_str(), m.ttft_ms_sum.load(Ordering::Relaxed), m.ttft_ms_count.load(Ordering::Relaxed))),
+        );
+        summary_family(
+            &mut out,
+            "gw_model_duration_ms",
+            "Stream duration per model.",
+            models.iter().map(|(l, m)| (l.as_str(), m.duration_ms_sum.load(Ordering::Relaxed), m.streams.load(Ordering::Relaxed))),
+        );
 
         let mut tenants: BTreeMap<String, Arc<TenantRollup>> = BTreeMap::new();
         for entry in self.by_tenant.iter() {
             tenants.insert(entry.key().clone(), Arc::clone(entry.value()));
         }
-        for (tenant, t) in tenants {
-            let labels = [("tenant", safe_label(&tenant))];
-            metric(&mut out, "gw_tenant_streams_total", "counter", "Streams per tenant.", &labels, t.streams.load(Ordering::Relaxed));
-            metric(&mut out, "gw_tenant_policy_denied_total", "counter", "Policy denials per tenant.", &labels, t.denied.load(Ordering::Relaxed));
-            metric(&mut out, "gw_tenant_errors_total", "counter", "Failed streams per tenant.", &labels, t.errors.load(Ordering::Relaxed));
-            metric(&mut out, "gw_tenant_cost_nano_usd_total", "counter", "Spend per tenant, nano-USD.", &labels, t.cost_nano_usd.load(Ordering::Relaxed));
+        let tenants: Vec<(String, Arc<TenantRollup>)> = tenants
+            .into_iter()
+            .map(|(tenant, t)| (render_labels(&[("tenant", safe_label(&tenant))], &[]), t))
+            .collect();
+        type TenantCounter = fn(&TenantRollup) -> u64;
+        let tenant_counters: [(&str, &str, TenantCounter); 4] = [
+            ("gw_tenant_streams_total", "Streams per tenant.", |t| t.streams.load(Ordering::Relaxed)),
+            ("gw_tenant_policy_denied_total", "Policy denials per tenant.", |t| t.denied.load(Ordering::Relaxed)),
+            ("gw_tenant_errors_total", "Failed streams per tenant.", |t| t.errors.load(Ordering::Relaxed)),
+            ("gw_tenant_cost_nano_usd_total", "Spend per tenant, nano-USD.", |t| t.cost_nano_usd.load(Ordering::Relaxed)),
+        ];
+        for (name, help, value) in tenant_counters {
+            family(&mut out, name, "counter", help, tenants.iter().map(|(l, t)| (l.as_str(), value(t))));
         }
 
         out
@@ -463,12 +496,62 @@ fn metric(out: &mut String, name: &str, kind: &str, help: &str, labels: &[(&str,
     let _ = writeln!(out, "{name}{} {value}", render_labels(labels, &[]));
 }
 
+/// A labelled counter family: metadata once, then one series per label set.
+/// Nothing is written for an empty family, so a fresh process does not
+/// advertise metrics it has no series for.
+fn family<'a>(
+    out: &mut String,
+    name: &str,
+    kind: &str,
+    help: &str,
+    series: impl IntoIterator<Item = (&'a str, u64)>,
+) {
+    let mut series = series.into_iter().peekable();
+    if series.peek().is_none() {
+        return;
+    }
+    let _ = writeln!(out, "# HELP {name} {help}");
+    let _ = writeln!(out, "# TYPE {name} {kind}");
+    for (labels, value) in series {
+        let _ = writeln!(out, "{name}{labels} {value}");
+    }
+}
+
+/// The labelled counterpart of [`histogram_summary`].
+fn summary_family<'a>(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    series: impl IntoIterator<Item = (&'a str, u64, u64)>,
+) {
+    let series: Vec<_> = series.into_iter().collect();
+    if series.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "# HELP {name} {help}");
+    let _ = writeln!(out, "# TYPE {name} summary");
+    for (labels, sum, count) in &series {
+        let _ = writeln!(out, "{name}_sum{labels} {sum}");
+        let _ = writeln!(out, "{name}_count{labels} {count}");
+    }
+    // `_avg` is not part of the summary type, so it is its own family.
+    if series.iter().any(|(_, _, count)| *count > 0) {
+        let _ = writeln!(out, "# TYPE {name}_avg gauge");
+        for (labels, sum, count) in &series {
+            if *count > 0 {
+                let _ = writeln!(out, "{name}_avg{labels} {:.3}", *sum as f64 / *count as f64);
+            }
+        }
+    }
+}
+
 fn histogram_summary(out: &mut String, name: &str, help: &str, sum: u64, count: u64) {
     let _ = writeln!(out, "# HELP {name} {help}");
     let _ = writeln!(out, "# TYPE {name} summary");
     let _ = writeln!(out, "{name}_sum {sum}");
     let _ = writeln!(out, "{name}_count {count}");
     if count > 0 {
+        let _ = writeln!(out, "# TYPE {name}_avg gauge");
         let _ = writeln!(out, "{name}_avg {:.3}", sum as f64 / count as f64);
     }
 }
@@ -537,6 +620,62 @@ mod tests {
         assert!(text.contains("gw_tenant_cost_nano_usd_total{tenant=\"acme\"} 2468"));
         assert_eq!(m.tokens(), (20, 40));
         assert_eq!(m.spend_nano_usd(), 2468);
+    }
+
+    /// The structural rules a Prometheus text parser enforces, checked over
+    /// an exposition with several models and tenants: one HELP and one TYPE
+    /// per family, each before the family's samples, all of a family's
+    /// samples contiguous, and no series (name plus labels) twice.
+    #[test]
+    fn the_exposition_is_valid_with_many_models_and_tenants() {
+        let m = Metrics::new(std::time::Instant::now());
+        let summary = StreamSummary { prompt_tokens: 1, completion_tokens: 1, ..Default::default() };
+        for (provider, model, tenant) in [("groq", "a", "t1"), ("groq", "b", "t2"), ("nvidia", "c", "t3")] {
+            m.stream_started(provider, model);
+            m.stream_finished(provider, model, tenant, &summary, 10, Some(5));
+        }
+        m.stream_failed_to_start("groq", "b");
+        let text = m.render();
+
+        let family_of = |sample: &str| -> String {
+            let name = sample.split(['{', ' ']).next().unwrap();
+            for suffix in ["_sum", "_count"] {
+                if let Some(base) = name.strip_suffix(suffix)
+                    && text.contains(&format!("# TYPE {base} summary"))
+                {
+                    return base.to_string();
+                }
+            }
+            name.to_string()
+        };
+        let mut helped = std::collections::HashSet::new();
+        let mut typed = std::collections::HashSet::new();
+        let mut closed = std::collections::HashSet::new();
+        let mut series = std::collections::HashSet::new();
+        let mut current = String::new();
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("# HELP ") {
+                let name = rest.split(' ').next().unwrap().to_string();
+                assert!(helped.insert(name.clone()), "second HELP for {name}:\n{text}");
+            } else if let Some(rest) = line.strip_prefix("# TYPE ") {
+                let name = rest.split(' ').next().unwrap().to_string();
+                assert!(typed.insert(name.clone()), "second TYPE for {name}:\n{text}");
+            } else {
+                let fam = family_of(line);
+                if fam != current {
+                    assert!(!closed.contains(&fam), "{fam} samples are not contiguous:\n{text}");
+                    if !current.is_empty() {
+                        closed.insert(std::mem::replace(&mut current, fam.clone()));
+                    } else {
+                        current = fam.clone();
+                    }
+                }
+                assert!(typed.contains(&fam), "{fam} sampled before its TYPE:\n{text}");
+                let key = line.rsplit_once(' ').unwrap().0.to_string();
+                assert!(series.insert(key.clone()), "duplicate series {key}:\n{text}");
+            }
+        }
+        assert!(text.contains("gw_model_ttft_ms_sum{provider=\"groq\",model=\"b\"} 5"), "{text}");
     }
 
     #[test]

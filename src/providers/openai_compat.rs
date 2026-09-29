@@ -189,10 +189,10 @@ fn build_body(req: &ProviderRequest, spec: &OpenAiCompatSpec) -> Map<String, Val
             Value::Array(stop.iter().cloned().map(Value::String).collect()),
         );
     }
-    if q.supports_seed {
-        if let Some(seed) = req.params.seed {
-            body.insert("seed".into(), Value::from(seed));
-        }
+    if q.supports_seed
+        && let Some(seed) = req.params.seed
+    {
+        body.insert("seed".into(), Value::from(seed));
     }
     if let Some(v) = req.params.presence_penalty {
         body.insert("presence_penalty".into(), json_f64(v));

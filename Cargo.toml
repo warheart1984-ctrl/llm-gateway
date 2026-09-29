@@ -3,7 +3,9 @@ name = "llm-gateway"
 version = "0.1.0"
 # 2024 for let-chains, which several of the pre-flight checks read far better with.
 edition = "2024"
-rust-version = "1.85"
+# Let-chains stabilized in 1.88, and the locked dependency graph needs it too:
+# 1.85 cannot resolve it. CI builds this exact version.
+rust-version = "1.88"
 description = "Streaming, multi-tenant, governed LLM chat gateway (Groq / OpenRouter / NVIDIA)"
 license = "MIT"
 publish = false

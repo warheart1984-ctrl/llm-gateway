@@ -389,6 +389,9 @@ async fn dispatch(
 
     // 6. Admit against quotas, reserving cost before the connection opens so a
     //    tenant cannot overspend by opening many streams at once.
+    //    The provider is resolved first: a routing failure is a config error,
+    //    and must not cost the tenant anything.
+    let provider = router::provider_for(&resolved, &state.providers)?.clone();
     let prompt_tokens = estimate_prompt_tokens(&req.messages);
     let cost = CostEstimate {
         prompt_nano_usd: estimate_cost_nano_usd(&resolved.config.cost, prompt_tokens, 0),
@@ -409,8 +412,6 @@ async fn dispatch(
         Some(explicit) => Framing::parse(Some(explicit)),
         None => Framing::parse(headers.get("x-gateway-framing").and_then(|v| v.to_str().ok())),
     };
-
-    let provider = router::provider_for(&resolved, &state.providers)?.clone();
 
     let request = ProviderRequest {
         request_id: Uuid::parse_str(request_id).unwrap_or_else(|_| Uuid::new_v4()),
@@ -447,7 +448,7 @@ async fn dispatch(
 
 async fn normalized_response(
     state: &Arc<AppState>,
-    admitted: Admitted,
+    mut admitted: Admitted,
     span: &mut RequestSpan,
 ) -> Result<Response, RequestError> {
     let provider = admitted.resolved.provider().to_string();
@@ -464,6 +465,8 @@ async fn normalized_response(
             stream
         }
         Err(err) => {
+            // No 2xx, so the upstream processed nothing and bills nothing.
+            admitted.reservation.release();
             state.metrics.stream_failed_to_start(&provider, &model);
             return Err(err.into());
         }
@@ -486,6 +489,8 @@ async fn normalized_response(
             prompt_tokens: admitted.prompt_tokens,
             ..Default::default()
         },
+        observed_completion_tokens: 0,
+        usage_reported: false,
         first_content: false,
         emitted_start: false,
         finished: false,
@@ -562,6 +567,11 @@ struct NormalizedState {
     metadata: Option<Map<String, Value>>,
     max_output_tokens: u32,
     summary: StreamSummary,
+    /// Completion tokens estimated from the deltas actually delivered. Billed
+    /// when the upstream never reports usage: a stream cut at 99% must not
+    /// cost the same as one cut before its first token.
+    observed_completion_tokens: u32,
+    usage_reported: bool,
     first_content: bool,
     emitted_start: bool,
     finished: bool,
@@ -584,14 +594,7 @@ impl NormalizedState {
         }
         self.finished = true;
 
-        let usage = self.current_usage();
-        self.reservation.settle(usage, &self.cost_model);
-        let cost = estimate_cost_nano_usd(
-            &self.cost_model,
-            self.summary.prompt_tokens,
-            self.summary.completion_tokens,
-        );
-        self.summary.cost_nano_usd = cost;
+        let cost = self.settle();
 
         let mut out: Vec<Event> = Vec::with_capacity(3);
         if let Some(event) = extra {
@@ -608,7 +611,34 @@ impl NormalizedState {
         self.emit_summary();
     }
 
+    /// Settle the reservation against the best usage figure available and
+    /// return the cost billed. Reported usage wins; without it, the
+    /// completion is the estimate from delivered deltas, capped at the output
+    /// ceiling the tenant reserved for.
+    fn settle(&mut self) -> u64 {
+        if !self.usage_reported {
+            self.summary.completion_tokens =
+                self.observed_completion_tokens.min(self.max_output_tokens);
+        }
+        let usage = self.current_usage();
+        self.reservation.settle(usage, &self.cost_model);
+        let cost = estimate_cost_nano_usd(
+            &self.cost_model,
+            self.summary.prompt_tokens,
+            self.summary.completion_tokens,
+        );
+        self.summary.cost_nano_usd = cost;
+        cost
+    }
+
+    fn observe_output(&mut self, text: &str) {
+        self.observed_completion_tokens = self
+            .observed_completion_tokens
+            .saturating_add(estimate_output_tokens(text));
+    }
+
     fn apply_usage(&mut self, usage: Usage) {
+        self.usage_reported = true;
         self.summary.prompt_tokens = usage.prompt_tokens.max(self.summary.prompt_tokens);
         self.summary.completion_tokens = usage.completion_tokens;
         self.summary.reasoning_tokens = usage.reasoning_tokens.unwrap_or(0);
@@ -729,6 +759,9 @@ async fn next_frame(state: &mut NormalizedState) -> Option<Frame> {
                         );
                     }
                     StreamEvent::Delta { content, reasoning } => {
+                        for text in [content, reasoning].into_iter().flatten() {
+                            state.observe_output(text);
+                        }
                         if let Some(token) = content {
                             out.push(Event::default().data(token_json(token)));
                         }
@@ -741,6 +774,9 @@ async fn next_frame(state: &mut NormalizedState) -> Option<Frame> {
                         }
                     }
                     StreamEvent::ToolCallDelta { index, id, name, arguments } => {
+                        for text in [name, arguments].into_iter().flatten() {
+                            state.observe_output(text);
+                        }
                         out.push(
                             Event::default()
                                 .event("tool")
@@ -772,10 +808,11 @@ impl Drop for NormalizedState {
     fn drop(&mut self) {
         // Reached only when the stream is dropped before finishing, which in
         // practice means the client disconnected. Dropping `inner` closes the
-        // upstream connection, and the reservation refunds its completion half.
+        // upstream connection. What was delivered is billed; the rest of the
+        // completion reservation is refunded.
         if !self.finished {
             self.summary.aborted_by_client = true;
-            self.reservation.abandon();
+            self.settle();
             self.emit_summary();
         }
         self.inflight
@@ -886,6 +923,16 @@ fn reasoning_json(text: &str) -> String {
     out
 }
 
+/// Tokens in a delivered delta, by the same chars-per-token ratio the prompt
+/// estimate uses. At least one: an upstream frame carrying text carried a
+/// token.
+fn estimate_output_tokens(text: &str) -> u32 {
+    if text.is_empty() {
+        return 0;
+    }
+    ((text.chars().count() as f64) / 3.5).ceil().max(1.0) as u32
+}
+
 fn push_json_string(value: &str, out: &mut String) {
     match serde_json::to_string(value) {
         Ok(encoded) => out.push_str(&encoded),
@@ -907,7 +954,7 @@ fn push_json_string(value: &str, out: &mut String) {
 /// which is why per-token budgeting is unavailable here.
 async fn passthrough_response(
     state: &Arc<AppState>,
-    admitted: Admitted,
+    mut admitted: Admitted,
     span: &RequestSpan,
 ) -> Result<Response, RequestError> {
     let provider_name = admitted.resolved.provider().to_string();
@@ -922,6 +969,7 @@ async fn passthrough_response(
             stream
         }
         Err(err) => {
+            admitted.reservation.release();
             state.metrics.stream_failed_to_start(&provider_name, &model_id);
             return Err(err.into());
         }
@@ -944,6 +992,7 @@ async fn passthrough_response(
             model: admitted.resolved.registry_id.clone(),
             provider: admitted.resolved.provider().to_string(),
             tenant: admitted.principal.tenant_id.to_string(),
+            max_output_tokens: admitted.max_output_tokens,
             summary: StreamSummary {
                 prompt_tokens: admitted.prompt_tokens,
                 ..Default::default()
@@ -971,6 +1020,7 @@ struct RawStream {
     model: String,
     provider: String,
     tenant: String,
+    max_output_tokens: u32,
     summary: StreamSummary,
     first: bool,
     finished: bool,
@@ -986,7 +1036,7 @@ impl Stream for RawStream {
             Poll::Ready(None) => {
                 if !this.finished {
                     this.finished = true;
-                    this.reservation.abandon();
+                    this.reservation.commit_reserved();
                     this.emit();
                 }
                 Poll::Ready(None)
@@ -996,7 +1046,7 @@ impl Stream for RawStream {
                     this.finished = true;
                     this.summary.error_code = Some(err.code());
                     this.summary.error_retryable = err.retryable();
-                    this.reservation.abandon();
+                    this.reservation.commit_reserved();
                     this.emit();
                 }
                 Poll::Ready(Some(Err(err)))
@@ -1019,7 +1069,7 @@ impl Drop for RawStream {
     fn drop(&mut self) {
         if !self.finished {
             self.summary.aborted_by_client = true;
-            self.reservation.abandon();
+            self.reservation.commit_reserved();
             self.emit();
         }
         self.inflight
@@ -1030,15 +1080,13 @@ impl Drop for RawStream {
 impl RawStream {
     fn emit(&self) {
         let mut summary = self.summary.clone();
-        if summary.cost_nano_usd == 0 {
-            // Content is never parsed in this mode, so cost is the reserved
-            // figure. Reported as an estimate rather than a measured total.
-            summary.cost_nano_usd = estimate_cost_nano_usd(
-                &self.cost_model,
-                summary.prompt_tokens,
-                0,
-            );
-        }
+        // Content is never parsed in this mode, so the bill is the full
+        // reservation: prompt estimate plus the output ceiling.
+        summary.cost_nano_usd = estimate_cost_nano_usd(
+            &self.cost_model,
+            summary.prompt_tokens,
+            self.max_output_tokens,
+        );
         logging::log_stream_complete(&self.span, &summary);
         self.metrics.stream_finished(
             &self.provider,

@@ -1,0 +1,39 @@
+# Two demo tenants. Keys come from files mounted as compose secrets, so
+# replacing a file under demo/secrets/ and letting hot reload pick up a touch
+# of this file rotates the key without restarting anything.
+
+tenants:
+  - tenant_id: demo
+    display_name: Demo (generous)
+    enabled: true
+    credentials:
+      - key_id: ak_demo
+        key_file: /run/secrets/demo_key
+        scopes: [chat:stream, models:read, admin]
+    allowed_models: ["mock/*"]
+    default_model: mock/chat
+    limits:
+      requests_per_minute: 120
+      tokens_per_minute: 200000
+      max_concurrent_streams: 8
+      max_output_tokens: 1024
+      daily_budget_nano_usd: 1000000000   # 1 USD
+
+  - tenant_id: shoestring
+    display_name: Shoestring (tiny budget)
+    enabled: true
+    credentials:
+      - key_id: ak_shoestring
+        key_file: /run/secrets/shoestring_key
+        scopes: [chat:stream, models:read]
+    allowed_models: ["mock/*"]
+    default_model: mock/chat
+    limits:
+      requests_per_minute: 120
+      tokens_per_minute: 200000
+      max_concurrent_streams: 8
+      max_output_tokens: 1024
+      # 0.001 USD. A 64-token request reserves about 0.00052 USD up front and
+      # settles near 0.0002, so a few succeed and then the reservation no
+      # longer fits: 402 before any upstream connection opens.
+      daily_budget_nano_usd: 1000000
