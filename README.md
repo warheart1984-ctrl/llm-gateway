@@ -91,6 +91,7 @@ data: [DONE]
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/v1/chat/stream` | SSE chat completion |
+| `POST` | `/v1/chat/complete` | The same request, answered as one JSON document |
 | `GET` | `/v1/models` | Catalogue, filtered to the caller's allowlist |
 | `GET` | `/v1/usage` | Caller's own quota and spend |
 | `POST` | `/v1/admin/registry/reload` | Re-read `models.yaml` / `tenants.yaml` (admin scope) |
@@ -101,6 +102,36 @@ data: [DONE]
 With `server.ops_port` set, `/metrics` (unauthenticated) and the admin reload
 move to that listener and no longer exist on the public port. See
 [Security posture](#security-posture).
+
+## Non-streaming: `/v1/chat/complete`
+
+The request body is the one `/v1/chat/stream` takes, minus streaming:
+`stream` must be `false` or absent (`true` is a 400 `stream_not_allowed`),
+and `framing` is ignored. Governance is shared code, not a copy. Auth,
+allowlists, parameter precedence, rate limits, concurrency and budget
+reservation apply identically, and both endpoints draw on the same quotas.
+
+```bash
+curl http://localhost:8080/v1/chat/complete \
+  -H 'x-api-key: gwk_live_...' -H 'content-type: application/json' \
+  -d '{"model":"groq/gpt-oss-120b","messages":[{"role":"user","content":"hi"}],"params":{"max_tokens":200}}'
+```
+
+```json
+{
+  "request_id": "...", "model": "groq/gpt-oss-120b", "tenant": "acme",
+  "content": "Hello!", "reasoning": null, "tool_calls": [],
+  "finish_reason": "stop",
+  "usage": {"prompt_tokens": 9, "completion_tokens": 3, "reasoning_tokens": 0, "total_tokens": 12},
+  "cost_nano_usd": 3150, "duration_ms": 412,
+  "upstream_id": "...", "upstream_model": "openai/gpt-oss-120b", "metadata": null
+}
+```
+
+The answer carries what the stream's `start`, token, `reasoning`, `tool` and
+`end` frames carry. Reasoning stays out of `content`, and a tool-call-only
+answer has `content: ""`. Errors use the same statuses and error body as the
+stream endpoint, and the same `x-*` response headers are set.
 
 ## Framing
 
@@ -207,8 +238,12 @@ later cleanup path is a no-op on the ledger:
 | Stream finishes, upstream reports usage | actual usage |
 | Stream finishes or fails mid-way, no usage reported | prompt + completion estimated from the deltas actually delivered |
 | Client disconnects mid-stream | same: prompt + what was delivered before the hang-up |
-| Upstream refuses or is unreachable (no 2xx) | nothing — it processed no prompt |
+| Upstream refuses or is unreachable (no 2xx), or answers 200 with an in-band `{"error": ...}` | nothing — it processed no prompt |
 | `passthrough` framing, any ending | the full reservation |
+| Completion answered, upstream reports usage | actual usage |
+| Completion answered, no usage reported | prompt + completion estimated from the returned text |
+| Completion accepted, then the answer is unreadable | the prompt |
+| Client disconnects while a completion is pending | the full reservation: a non-streaming upstream finishes and bills the answer anyway, and the gateway never sees its usage |
 
 A reservation made before UTC midnight and settled after it is charged to the
 day it was made in: a refund to a day that has rolled over is dropped rather
@@ -280,10 +315,11 @@ retained — a memory dump yields digests, not credentials.
 
 ## Adding a provider
 
-1. Implement `ChatProvider` in `src/providers/<name>.rs`. One method:
-   `stream_chat(request) -> AsyncTokenStream`. If the vendor is
-   OpenAI-compatible, `OpenAiCompatAdapter` plus a `QuirkFlags` spec is usually
-   the whole adapter.
+1. Implement `ChatProvider` in `src/providers/<name>.rs`: `stream_chat`
+   for `/v1/chat/stream`, and `complete` for `/v1/chat/complete` (without
+   it, that endpoint answers 502 for the provider's models). If the vendor is
+   OpenAI-compatible, `OpenAiCompatAdapter` plus a `QuirkFlags` spec is
+   usually the whole adapter, both methods included.
 2. Register it in `src/bootstrap.rs`.
 3. Add a `models.yaml` entry.
 
@@ -323,7 +359,7 @@ What the gateway does itself, and what it expects of the deployment around it.
 ## Testing
 
 ```bash
-cargo test --locked --all-targets                  # 155 tests
+cargo test --locked --all-targets                  # 169 tests
 cargo clippy --locked --all-targets -- -D warnings
 cargo bench --bench framing                        # add `-- --quick` for a fast pass
 ```

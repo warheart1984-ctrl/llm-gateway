@@ -441,6 +441,22 @@ impl Usage {
     }
 }
 
+/// A whole answer from a non-streaming call: the same information a stream
+/// carries across its events, delivered at once.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Completion {
+    pub upstream_id: Option<String>,
+    pub upstream_model: Option<String>,
+    /// Empty when the model answered with tool calls only.
+    pub content: String,
+    /// Chain of thought, kept out of `content` exactly as on the stream path.
+    pub reasoning: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
+    pub finish_reason: Option<String>,
+    /// `None` when the provider reported no usage; the caller estimates.
+    pub usage: Option<Usage>,
+}
+
 // ---------------------------------------------------------------------------
 // Request / errors / trait
 // ---------------------------------------------------------------------------
@@ -496,6 +512,27 @@ pub enum ProviderError {
     Protocol(String),
     #[error("no upstream bytes within {0:?}")]
     IdleTimeout(Duration),
+}
+
+impl ProviderError {
+    /// Whether the upstream accepted the request (answered 2xx) before this
+    /// failure. It decides the bill: a request the upstream never accepted
+    /// processed no prompt and costs nothing, while one it accepted and then
+    /// failed mid-answer has consumed its prompt.
+    ///
+    /// An in-band `{"error": ...}` object inside a 200 is reported as an
+    /// `Upstream` error and counted as *not* accepted: the vendor rejected
+    /// the request, it just said so in the body.
+    pub fn accepted_by_upstream(&self) -> bool {
+        match self {
+            ProviderError::NotConfigured(_)
+            | ProviderError::Connect { .. }
+            | ProviderError::Upstream { .. } => false,
+            ProviderError::Stream(_)
+            | ProviderError::Protocol(_)
+            | ProviderError::IdleTimeout(_) => true,
+        }
+    }
 }
 
 fn body_suffix(body: &str) -> String {
@@ -577,6 +614,17 @@ pub trait ChatProvider: Send + Sync + 'static {
     /// Whether [`ChatProvider::stream_chat_raw`] is implemented.
     fn supports_passthrough(&self) -> bool {
         false
+    }
+
+    /// One request, one JSON answer, no stream. Errors are split the same way
+    /// as the stream path: a refusal or transport failure before a 2xx is
+    /// [`ProviderError::accepted_by_upstream`] `== false`, and a failure
+    /// reading or parsing an accepted answer is `true`.
+    async fn complete(&self, _req: ProviderRequest) -> Result<Completion, ProviderError> {
+        Err(ProviderError::NotConfigured(format!(
+            "provider `{}` does not support non-streaming completions",
+            self.name()
+        )))
     }
 
     /// Cheap readiness probe target, if the provider has one.

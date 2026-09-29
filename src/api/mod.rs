@@ -19,6 +19,7 @@ use serde_json::json;
 use crate::state::AppState;
 
 pub const ROUTE_CHAT_STREAM: &str = "/v1/chat/stream";
+pub const ROUTE_CHAT_COMPLETE: &str = "/v1/chat/complete";
 pub const ROUTE_MODELS: &str = "/v1/models";
 pub const ROUTE_USAGE: &str = "/v1/usage";
 pub const ROUTE_RELOAD: &str = "/v1/admin/registry/reload";
@@ -38,6 +39,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 
     let mut api = Router::new()
         .route(ROUTE_CHAT_STREAM, post(chat::chat_stream))
+        .route(ROUTE_CHAT_COMPLETE, post(chat::chat_complete))
         .route(ROUTE_MODELS, get(system::list_models))
         .route(ROUTE_USAGE, get(system::get_usage));
     if !separate_ops {

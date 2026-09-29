@@ -1,4 +1,5 @@
-//! Shared OpenAI-compatible streaming engine.
+//! Shared OpenAI-compatible engine: the SSE stream decoder, and the
+//! one-shot JSON completion that shares its request building and errors.
 //!
 //! Groq, OpenRouter and NVIDIA NIM all speak the same `/chat/completions`
 //! dialect. Rather than triplicate the SSE state machine, the wire handling
@@ -15,7 +16,7 @@ use futures_util::{StreamExt, TryStreamExt};
 use serde_json::{Map, Value};
 
 use super::{
-    ChatProvider, HeaderList, ProviderError, ProviderRequest, ProviderStream,
+    ChatProvider, Completion, HeaderList, ProviderError, ProviderRequest, ProviderStream,
     StreamEvent, Usage, MAX_COMPLETION_TOKENS_MODELS,
 };
 
@@ -83,14 +84,31 @@ impl ChatProvider for OpenAiCompatAdapter {
     }
 
     async fn stream_chat(&self, req: ProviderRequest) -> Result<ProviderStream, ProviderError> {
-        let resp = self.post(&req).await?;
+        let resp = self.post(&req, true).await?;
         Ok(decode(data_stream(resp, self.spec.quirks), self.spec.quirks))
+    }
+
+    async fn complete(&self, req: ProviderRequest) -> Result<Completion, ProviderError> {
+        let resp = self.post(&req, false).await?;
+        // A non-streaming answer is one JSON document. A body that cannot be
+        // read (reset, read timeout) is a transport failure after acceptance.
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| ProviderError::Stream(describe(&e)))?;
+        let value: Value = serde_json::from_slice(&bytes).map_err(|e| {
+            ProviderError::Protocol(format!(
+                "upstream answer was not JSON ({e}): {}",
+                super::truncate(&String::from_utf8_lossy(&bytes), 160)
+            ))
+        })?;
+        parse_completion(&value, self.spec.quirks)
     }
 
     /// True byte relay. `bytes_stream()` is moved into the box without
     /// inspection, so no boundary assumption is made anywhere.
     async fn stream_chat_raw(&self, req: ProviderRequest) -> Result<super::RawStream, ProviderError> {
-        let resp = self.post(&req).await?;
+        let resp = self.post(&req, true).await?;
         let stream = resp
             .bytes_stream()
             .map_err(|e| ProviderError::Stream(e.to_string()));
@@ -103,17 +121,22 @@ impl ChatProvider for OpenAiCompatAdapter {
 }
 
 impl OpenAiCompatAdapter {
-    /// Issue the request and validate the status. Shared by both framings so
-    /// they cannot drift in headers or error handling.
-    async fn post(&self, req: &ProviderRequest) -> Result<reqwest::Response, ProviderError> {
+    /// Issue the request and validate the status. Shared by both framings and
+    /// the one-shot completion so they cannot drift in headers or error
+    /// handling. `streaming` selects the body's `stream` flag and the
+    /// `Accept` header: ask for what the caller is prepared to read.
+    async fn post(&self, req: &ProviderRequest, streaming: bool) -> Result<reqwest::Response, ProviderError> {
         let url = req.url(&self.spec)?;
-        let body = build_body(req, &self.spec);
+        let body = build_body(req, &self.spec, streaming);
 
         let mut builder = self
             .client
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::ACCEPT, "text/event-stream");
+            .header(
+                reqwest::header::ACCEPT,
+                if streaming { "text/event-stream" } else { "application/json" },
+            );
         if let Some(key) = &self.api_key {
             builder = builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"));
         }
@@ -153,7 +176,7 @@ impl OpenAiCompatAdapter {
 // Request body
 // ---------------------------------------------------------------------------
 
-fn build_body(req: &ProviderRequest, spec: &OpenAiCompatSpec) -> Map<String, Value> {
+fn build_body(req: &ProviderRequest, spec: &OpenAiCompatSpec, streaming: bool) -> Map<String, Value> {
     let q = &spec.quirks;
     let mut body = Map::with_capacity(12);
     body.insert("model".into(), Value::String(req.upstream_model.clone()));
@@ -161,9 +184,11 @@ fn build_body(req: &ProviderRequest, spec: &OpenAiCompatSpec) -> Map<String, Val
         "messages".into(),
         serde_json::to_value(req.messages.as_ref()).unwrap_or(Value::Array(Vec::new())),
     );
-    body.insert("stream".into(), Value::Bool(true));
+    body.insert("stream".into(), Value::Bool(streaming));
 
-    if q.send_stream_options {
+    // `stream_options` means nothing without a stream, and some vendors 400
+    // on it in a non-streaming call. Usage comes back in the body regardless.
+    if streaming && q.send_stream_options {
         body.insert(
             "stream_options".into(),
             serde_json::json!({ "include_usage": req.include_usage }),
@@ -407,7 +432,7 @@ struct WirePromptDetails {
     cached_tokens: Option<u32>,
 }
 
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, Clone, serde::Deserialize)]
 struct WireError {
     #[serde(default)]
     message: Option<String>,
@@ -415,6 +440,65 @@ struct WireError {
     kind: Option<String>,
     #[serde(default)]
     code: Option<String>,
+}
+
+/// A completed (non-streaming) response: `message` where a chunk has `delta`.
+#[derive(Debug, Default, serde::Deserialize)]
+struct WireCompletion {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    choices: Vec<WireMessageChoice>,
+    #[serde(default)]
+    usage: Option<WireUsage>,
+    #[serde(default)]
+    error: Option<WireError>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct WireMessageChoice {
+    #[serde(default)]
+    message: Option<WireMessage>,
+    #[serde(default)]
+    finish_reason: Option<Value>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct WireMessage {
+    #[serde(default)]
+    content: Option<Value>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<WireCompletedToolCall>>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct WireCompletedToolCall {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    function: Option<WireFunctionDelta>,
+}
+
+impl From<WireCompletedToolCall> for super::ToolCall {
+    fn from(c: WireCompletedToolCall) -> Self {
+        let function = c.function.unwrap_or_default();
+        Self {
+            id: c.id.unwrap_or_default(),
+            kind: c.kind.unwrap_or_else(|| "function".to_string()),
+            function: super::FunctionCall {
+                name: function.name.unwrap_or_default(),
+                arguments: function.arguments.unwrap_or_default(),
+            },
+        }
+    }
 }
 
 impl From<WireUsage> for Usage {
@@ -434,6 +518,75 @@ impl From<WireUsage> for Usage {
             cached_prompt_tokens,
         }
     }
+}
+
+/// An in-band `{"error": ...}` object inside a 200: the request is dead, not
+/// the connection. Shared by the stream and completion paths so the decision
+/// lives in one place.
+///
+/// The HTTP status was 200 and the failure arrived in-band, so there is no
+/// signal about whether it was transient. Optimistic: a caller that retries
+/// gets a fresh attempt, and one that treats it as fatal would abandon a
+/// request that may have been recoverable. The provider's own `code` is the
+/// only hint, and vendors use it inconsistently.
+fn in_band_error(err: WireError) -> ProviderError {
+    let message = err
+        .message
+        .or(err.code)
+        .or(err.kind)
+        .unwrap_or_else(|| "upstream reported an unspecified error".to_string());
+    ProviderError::Upstream {
+        status: 502,
+        body: message,
+        retryable: true,
+    }
+}
+
+/// Translate a completed JSON answer into a [`Completion`].
+///
+/// Lenient like the stream path: the first choice wins, absent or unreadable
+/// content becomes an empty string (a tool-call-only answer has none), and a
+/// missing `finish_reason` stays `None`.
+fn parse_completion(value: &Value, quirks: QuirkFlags) -> Result<Completion, ProviderError> {
+    let mut wire: WireCompletion = serde_json::from_value(value.clone()).map_err(|err| {
+        ProviderError::Protocol(format!("{}: {err}", super::truncate(&value.to_string(), 160)))
+    })?;
+    if let Some(err) = wire.error.take() {
+        return Err(in_band_error(err));
+    }
+
+    let mut completion = Completion {
+        upstream_id: wire.id.take(),
+        upstream_model: wire.model.take(),
+        usage: wire.usage.take().map(Usage::from),
+        ..Default::default()
+    };
+    if let Some(choice) = wire.choices.into_iter().next() {
+        completion.finish_reason = choice.finish_reason.as_ref().and_then(finish_reason_name);
+        if let Some(message) = choice.message {
+            completion.content = message
+                .content
+                .as_ref()
+                .and_then(text_from_value)
+                .unwrap_or_default();
+            completion.reasoning = quirks
+                .reasoning_fields
+                .iter()
+                .find_map(|field| match *field {
+                    "reasoning_content" => message.reasoning_content.clone(),
+                    "reasoning" => message.reasoning.clone(),
+                    _ => None,
+                })
+                .filter(|r| !r.is_empty());
+            completion.tool_calls = message
+                .tool_calls
+                .unwrap_or_default()
+                .into_iter()
+                .map(super::ToolCall::from)
+                .collect();
+        }
+    }
+    Ok(completion)
 }
 
 // ---------------------------------------------------------------------------
@@ -539,23 +692,7 @@ fn translate(
     // An in-band error object means the request is dead, not the connection.
     if let Some(err) = &chunk.error {
         st.poisoned = true;
-        let message = err
-            .message
-            .clone()
-            .or_else(|| err.code.clone())
-            .or_else(|| err.kind.clone())
-            .unwrap_or_else(|| "upstream reported an unspecified error".to_string());
-        return vec![Err(ProviderError::Upstream {
-            status: 502,
-            body: message,
-            // The HTTP status was 200 and the failure arrived in-band, so there
-            // is no signal about whether it was transient. Optimistic: a caller
-            // that retries a mid-stream failure gets a fresh attempt, and one
-            // that treats it as fatal would abandon a stream that may have been
-            // recoverable. The provider's own `code` is the only hint, and
-            // vendors use it inconsistently.
-            retryable: true,
-        })];
+        return vec![Err(in_band_error(err.clone()))];
     }
 
     let mut out = Vec::with_capacity(2);
@@ -887,7 +1024,7 @@ mod tests {
             extra_headers: |_| HeaderList::new(),
             quirks: quirks(),
         };
-        let body = build_body(&req, &spec);
+        let body = build_body(&req, &spec, true);
         assert_eq!(body.get("max_completion_tokens"), Some(&Value::from(512)));
         assert!(!body.contains_key("max_tokens"));
     }
@@ -914,10 +1051,96 @@ mod tests {
             extra_headers: |_| HeaderList::new(),
             quirks: quirks(),
         };
-        let body = build_body(&req, &spec);
-        // A caller-supplied stream: false must not reach the provider:
-        // this endpoint is streaming-only, and honouring it would produce a
-        // non-SSE body on an SSE route.
+        let body = build_body(&req, &spec, true);
+        // A caller-supplied `stream: false` must not reach the provider: the
+        // gateway decides the transport per endpoint, and honouring it would
+        // produce a non-SSE body on an SSE route.
         assert_eq!(body.get("stream"), Some(&Value::Bool(true)));
+
+        // Nor can the caller turn a completion into a stream.
+        let mut req = req;
+        req.params.extra.insert("stream".into(), Value::Bool(true));
+        let body = build_body(&req, &spec, false);
+        assert_eq!(body.get("stream"), Some(&Value::Bool(false)));
+    }
+
+    #[test]
+    fn a_completion_body_carries_no_stream_options() {
+        let req = ProviderRequest {
+            request_id: Uuid::nil(),
+            tenant_id: "t".into(),
+            key_id: "k".into(),
+            upstream_model: "m".into(),
+            endpoint: None,
+            messages: Arc::new(vec![]),
+            params: ResolvedParams::default(),
+            include_usage: true,
+        };
+        let spec = OpenAiCompatSpec {
+            provider: "test",
+            default_endpoint: "http://x/v1/chat/completions".into(),
+            extra_headers: |_| HeaderList::new(),
+            quirks: quirks(),
+        };
+        assert!(build_body(&req, &spec, true).contains_key("stream_options"));
+        assert!(!build_body(&req, &spec, false).contains_key("stream_options"));
+    }
+
+    #[test]
+    fn a_completion_parses_content_reasoning_and_usage() {
+        let value: Value = serde_json::from_str(
+            r#"{"id":"c9","model":"m-1","choices":[{"index":0,"finish_reason":"stop",
+                "message":{"role":"assistant","content":"Hello","reasoning_content":"think"}}],
+                "usage":{"prompt_tokens":10,"completion_tokens":2,
+                         "completion_tokens_details":{"reasoning_tokens":1}}}"#,
+        )
+        .unwrap();
+        let c = parse_completion(&value, quirks()).unwrap();
+        assert_eq!(c.upstream_id.as_deref(), Some("c9"));
+        assert_eq!(c.upstream_model.as_deref(), Some("m-1"));
+        assert_eq!(c.content, "Hello");
+        assert_eq!(c.reasoning.as_deref(), Some("think"));
+        assert_eq!(c.finish_reason.as_deref(), Some("stop"));
+        let u = c.usage.unwrap();
+        assert_eq!((u.prompt_tokens, u.completion_tokens, u.total_tokens), (10, 2, 12));
+        assert_eq!(u.reasoning_tokens, Some(1));
+    }
+
+    #[test]
+    fn a_tool_call_only_completion_has_empty_content() {
+        let value: Value = serde_json::from_str(
+            r#"{"choices":[{"finish_reason":"tool_calls","message":{"content":null,
+                "tool_calls":[{"id":"call_1","type":"function",
+                  "function":{"name":"get_weather","arguments":"{\"city\":\"NYC\"}"}}]}}]}"#,
+        )
+        .unwrap();
+        let c = parse_completion(&value, quirks()).unwrap();
+        assert_eq!(c.content, "");
+        assert_eq!(c.tool_calls.len(), 1);
+        assert_eq!(c.tool_calls[0].id, "call_1");
+        assert_eq!(c.tool_calls[0].function.name, "get_weather");
+        assert_eq!(c.tool_calls[0].function.arguments, r#"{"city":"NYC"}"#);
+        assert!(c.usage.is_none(), "absent usage stays absent for the caller to estimate");
+    }
+
+    #[test]
+    fn an_in_band_error_in_a_completion_is_a_retryable_upstream_refusal() {
+        let value: Value = serde_json::from_str(r#"{"error":{"code":"overloaded"}}"#).unwrap();
+        let err = parse_completion(&value, quirks()).unwrap_err();
+        match &err {
+            ProviderError::Upstream { status, body, retryable } => {
+                assert_eq!((*status, body.as_str(), *retryable), (502, "overloaded", true));
+            }
+            other => panic!("expected upstream error, got {other:?}"),
+        }
+        assert!(!err.accepted_by_upstream(), "an in-band refusal costs nothing");
+    }
+
+    #[test]
+    fn a_malformed_completion_is_a_protocol_error_after_acceptance() {
+        let value: Value = serde_json::from_str(r#"{"choices":"not-a-list"}"#).unwrap();
+        let err = parse_completion(&value, quirks()).unwrap_err();
+        assert!(matches!(err, ProviderError::Protocol(_)), "{err:?}");
+        assert!(err.accepted_by_upstream());
     }
 }

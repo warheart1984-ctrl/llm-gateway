@@ -18,6 +18,9 @@
 //! Both run identical governance *before* the first byte is written, and both
 //! propagate client cancellation upstream (dropping the body drops the reqwest
 //! response, which closes the connection).
+//!
+//! `POST /v1/chat/complete` is the non-streaming sibling: the same request
+//! body, the same governance, one JSON answer. See [`chat_complete`].
 
 use std::{
     pin::Pin,
@@ -51,13 +54,23 @@ use crate::{
         auth::Principal, limits::CostEstimate, limits::Reservation, AuthorizeError, LimitError,
     },
     observability::{logging, metrics::RejectionKind, RequestSpan, StreamSummary},
-    providers::{ChatMessage, ChatProvider, ProviderError, ProviderRequest, StreamEvent, Usage},
+    providers::{
+        ChatMessage, ChatProvider, Completion, ProviderError, ProviderRequest, StreamEvent, Usage,
+    },
     router::{self, estimate_cost_nano_usd, estimate_prompt_tokens, merge_params, validate_params},
     state::AppState,
 };
 
 /// Bumped only for a breaking change to the normalized frame contract.
 pub const API_VERSION: &str = "v1";
+
+/// Which endpoint a request arrived on. Governance is identical; only the
+/// transport of the answer differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Stream,
+    Complete,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Framing {
@@ -103,6 +116,8 @@ enum RequestError {
     NoMessages,
     #[error("`stream` must be true on /v1/chat/stream")]
     StreamRequired,
+    #[error("`stream` must be false or absent on /v1/chat/complete; use /v1/chat/stream to stream")]
+    StreamNotAllowed,
     #[error("`params.max_tokens` is required so the gateway can reserve a cost budget")]
     MaxTokensRequired,
     #[error("request body is not valid JSON: {0}")]
@@ -130,6 +145,7 @@ impl RequestError {
             RequestError::MissingModel
             | RequestError::NoMessages
             | RequestError::StreamRequired
+            | RequestError::StreamNotAllowed
             | RequestError::MaxTokensRequired
             | RequestError::BadJson(_)
             | RequestError::Param(_) => StatusCode::BAD_REQUEST,
@@ -158,6 +174,7 @@ impl RequestError {
             RequestError::MissingModel => "missing_model",
             RequestError::NoMessages => "no_messages",
             RequestError::StreamRequired => "stream_required",
+            RequestError::StreamNotAllowed => "stream_not_allowed",
             RequestError::MaxTokensRequired => "max_tokens_required",
             RequestError::BadJson(_) => "invalid_json",
             RequestError::PayloadTooLarge => "payload_too_large",
@@ -221,13 +238,35 @@ impl RequestError {
 // Handler
 // ---------------------------------------------------------------------------
 
-/// Extractors run in order, so the header map is taken before the body.
+/// `POST /v1/chat/stream`. Extractors run in order, so the header map is
+/// taken before the body.
 #[axum::debug_handler]
 pub async fn chat_stream(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    handle(state, headers, body, Mode::Stream).await
+}
+
+/// `POST /v1/chat/complete`: the same request body and the same governance
+/// as the stream endpoint, answered with one JSON document. `framing` is
+/// ignored here; there is no stream to frame.
+///
+/// Billing follows the stream path's rules, with one difference forced by
+/// the transport: a client that disconnects while waiting is billed the full
+/// reservation, because a non-streaming upstream typically finishes, and
+/// bills, the whole answer regardless, and the gateway never sees its usage.
+#[axum::debug_handler]
+pub async fn chat_complete(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle(state, headers, body, Mode::Complete).await
+}
+
+async fn handle(state: Arc<AppState>, headers: HeaderMap, body: Bytes, mode: Mode) -> Response {
     let request_id = Uuid::new_v4().to_string();
     let mut span = RequestSpan::new(request_id.clone());
     state.metrics.request_observed();
@@ -235,7 +274,15 @@ pub async fn chat_stream(
     // Returns `Response` rather than `Result<Response, RequestError>` so every
     // rejection is a fully-formed response with its own headers, built in one
     // place below.
-    match dispatch(&state, &headers, &body, &mut span, &request_id).await {
+    let outcome = match admit(&state, &headers, &body, &mut span, &request_id, mode).await {
+        Err(err) => Err(err),
+        Ok(admitted) => match (mode, admitted.framing) {
+            (Mode::Complete, _) => complete_response(&state, admitted, &span).await,
+            (Mode::Stream, Framing::Passthrough) => passthrough_response(&state, admitted, &span).await,
+            (Mode::Stream, Framing::Normalized) => normalized_response(&state, admitted, &mut span).await,
+        },
+    };
+    match outcome {
         Ok(response) => response,
         Err(err) => {
             if let Some(kind) = err.rejection_kind() {
@@ -287,13 +334,17 @@ struct Admitted {
     metadata: Option<Map<String, Value>>,
 }
 
-async fn dispatch(
+/// Everything before the upstream connection: authenticate, parse, authorize,
+/// resolve, merge parameters, and reserve cost. Shared by both endpoints, so
+/// a governance rule cannot apply to one and not the other.
+async fn admit(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     body: &Bytes,
     span: &mut RequestSpan,
     request_id: &str,
-) -> Result<Response, RequestError> {
+    mode: Mode,
+) -> Result<Admitted, RequestError> {
     // 0. Body cap, checked before any parsing or authentication work. The
     //    extractor's own limit returns 413 without reaching the handler, so
     //    this is the backstop for a limit configured below the buffer size.
@@ -316,8 +367,10 @@ async fn dispatch(
     if req.messages.is_empty() {
         return Err(RequestError::NoMessages);
     }
-    if req.stream == Some(false) {
-        return Err(RequestError::StreamRequired);
+    match (mode, req.stream) {
+        (Mode::Stream, Some(false)) => return Err(RequestError::StreamRequired),
+        (Mode::Complete, Some(true)) => return Err(RequestError::StreamNotAllowed),
+        _ => {}
     }
 
     // 3. Authorize: may this tenant call this model, at this size?
@@ -424,7 +477,7 @@ async fn dispatch(
         include_usage: state.settings.upstream.request_usage,
     };
 
-    let admitted = Admitted {
+    Ok(Admitted {
         principal,
         resolved,
         provider,
@@ -434,12 +487,7 @@ async fn dispatch(
         max_output_tokens,
         framing,
         metadata: req.metadata,
-    };
-
-    match admitted.framing {
-        Framing::Passthrough => passthrough_response(state, admitted, span).await,
-        Framing::Normalized => normalized_response(state, admitted, span).await,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -939,6 +987,197 @@ fn push_json_string(value: &str, out: &mut String) {
         // Unreachable: `str` always serialises. Never emit invalid JSON.
         Err(_) => out.push_str("\"\""),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Non-streaming completion
+// ---------------------------------------------------------------------------
+
+/// Owns the reservation while the upstream call is in flight, so every way
+/// the request can end closes it exactly once. If the handler future is
+/// dropped mid-await (the client disconnected), `Drop` bills the full
+/// reservation and records a client abort.
+struct CompletionGuard {
+    reservation: Reservation,
+    span: RequestSpan,
+    metrics: crate::observability::SharedMetrics,
+    inflight: Arc<std::sync::atomic::AtomicU64>,
+    cost_model: router::CostModel,
+    tenant: String,
+    max_output_tokens: u32,
+    summary: StreamSummary,
+    closed: bool,
+}
+
+impl CompletionGuard {
+    fn record(&self, accepted: bool) {
+        if accepted {
+            self.metrics.stream_started(&self.span.provider, &self.span.model);
+        }
+        logging::log_stream_complete(&self.span, &self.summary);
+        self.metrics.stream_finished(
+            &self.span.provider,
+            &self.span.model,
+            &self.tenant,
+            &self.summary,
+            self.span.elapsed_ms() as u64,
+            None,
+        );
+    }
+}
+
+impl Drop for CompletionGuard {
+    fn drop(&mut self) {
+        if !self.closed {
+            self.closed = true;
+            self.summary.aborted_by_client = true;
+            self.reservation.commit_reserved();
+            self.summary.cost_nano_usd = estimate_cost_nano_usd(
+                &self.cost_model,
+                self.summary.prompt_tokens,
+                self.max_output_tokens,
+            );
+            self.record(true);
+        }
+        self.inflight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+async fn complete_response(
+    state: &Arc<AppState>,
+    admitted: Admitted,
+    span: &RequestSpan,
+) -> Result<Response, RequestError> {
+    let headers = response_headers(span, &admitted.resolved, &admitted.principal, &admitted.reservation);
+    // Counted as in flight for the whole wait, so a graceful shutdown drains
+    // a completion the same way it drains a stream.
+    state.inflight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let mut guard = CompletionGuard {
+        reservation: admitted.reservation,
+        span: span.clone(),
+        metrics: Arc::clone(&state.metrics),
+        inflight: Arc::clone(&state.inflight),
+        cost_model: admitted.resolved.config.cost.clone(),
+        tenant: admitted.principal.tenant_id.to_string(),
+        max_output_tokens: admitted.max_output_tokens,
+        summary: StreamSummary {
+            prompt_tokens: admitted.prompt_tokens,
+            ..Default::default()
+        },
+        closed: false,
+    };
+
+    let completion = match admitted.provider.complete(admitted.request).await {
+        Ok(completion) => completion,
+        Err(err) => {
+            guard.closed = true;
+            guard.summary.error_code = Some(err.code());
+            guard.summary.error_retryable = err.retryable();
+            if err.accepted_by_upstream() {
+                // Accepted, then failed while answering: the prompt was
+                // consumed, the answer never arrived.
+                guard.reservation.abandon();
+                guard.summary.cost_nano_usd =
+                    estimate_cost_nano_usd(&guard.cost_model, guard.summary.prompt_tokens, 0);
+                guard.record(true);
+            } else {
+                // Refused or unreachable: nothing was processed.
+                guard.reservation.release();
+                state.metrics.stream_failed_to_start(&guard.span.provider, &guard.span.model);
+            }
+            return Err(err.into());
+        }
+    };
+
+    guard.closed = true;
+    let usage = billable_usage(&completion, guard.summary.prompt_tokens, guard.max_output_tokens);
+    guard.reservation.settle(usage, &guard.cost_model);
+    let cost = estimate_cost_nano_usd(&guard.cost_model, usage.prompt_tokens, usage.completion_tokens);
+
+    let s = &mut guard.summary;
+    s.prompt_tokens = usage.prompt_tokens;
+    s.completion_tokens = usage.completion_tokens;
+    s.reasoning_tokens = usage.reasoning_tokens.unwrap_or(0);
+    s.cost_nano_usd = cost;
+    s.finish_reason.clone_from(&completion.finish_reason);
+    s.upstream_id.clone_from(&completion.upstream_id);
+    s.upstream_model.clone_from(&completion.upstream_model);
+    s.events = 1;
+    let payload = completion_payload(&completion, &usage, cost, &guard, admitted.metadata.as_ref());
+    guard.summary.bytes_out = payload.len() as u64;
+    state.metrics.bytes_to_client(payload.len() as u64);
+    guard.record(true);
+
+    let mut response = (StatusCode::OK, payload).into_response();
+    let mut headers = headers;
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.remove(HeaderName::from_static("x-accel-buffering"));
+    *response.headers_mut() = headers;
+    Ok(response)
+}
+
+/// Usage to bill: what the upstream reported, else an estimate from the
+/// answer itself, capped at the ceiling that was reserved, by the same rule
+/// as a stream that ends without usage. The prompt is never billed below the
+/// pre-flight estimate the reservation was built on.
+fn billable_usage(completion: &Completion, estimated_prompt: u32, max_output_tokens: u32) -> Usage {
+    let reported = completion.usage.unwrap_or_default();
+    let completion_tokens = match completion.usage {
+        Some(u) => u.completion_tokens,
+        None => {
+            let texts = std::iter::once(completion.content.as_str())
+                .chain(completion.reasoning.as_deref())
+                .chain(completion.tool_calls.iter().flat_map(|t| {
+                    [t.function.name.as_str(), t.function.arguments.as_str()]
+                }));
+            texts
+                .map(estimate_output_tokens)
+                .fold(0u32, u32::saturating_add)
+                .min(max_output_tokens)
+        }
+    };
+    let prompt_tokens = reported.prompt_tokens.max(estimated_prompt);
+    Usage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens.saturating_add(completion_tokens),
+        reasoning_tokens: reported.reasoning_tokens,
+        // Billed without the cache discount, like the stream path, so the
+        // reported cost and the ledger always agree.
+        cached_prompt_tokens: None,
+    }
+}
+
+/// The v1 completion document: everything the stream's `start`, token,
+/// `reasoning`, `tool` and `end` frames carry, in one object.
+fn completion_payload(
+    completion: &Completion,
+    usage: &Usage,
+    cost_nano_usd: u64,
+    guard: &CompletionGuard,
+    metadata: Option<&Map<String, Value>>,
+) -> String {
+    json!({
+        "request_id": guard.span.request_id,
+        "model": guard.span.model,
+        "tenant": guard.tenant,
+        "content": completion.content,
+        "reasoning": completion.reasoning,
+        "tool_calls": completion.tool_calls,
+        "finish_reason": completion.finish_reason,
+        "usage": {
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "reasoning_tokens": usage.reasoning_tokens.unwrap_or(0),
+            "total_tokens": usage.total_tokens,
+        },
+        "cost_nano_usd": cost_nano_usd,
+        "duration_ms": guard.span.elapsed_ms(),
+        "upstream_id": completion.upstream_id,
+        "upstream_model": completion.upstream_model,
+        "metadata": metadata,
+    })
+    .to_string()
 }
 
 // ---------------------------------------------------------------------------

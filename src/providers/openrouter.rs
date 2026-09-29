@@ -94,4 +94,8 @@ impl ChatProvider for OpenRouterAdapter {
     fn supports_passthrough(&self) -> bool {
         true
     }
+
+    async fn complete(&self, req: ProviderRequest) -> Result<super::Completion, ProviderError> {
+        self.inner.complete(req).await
+    }
 }
