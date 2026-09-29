@@ -195,24 +195,12 @@ impl TenantRegistry {
         self.key_records.clone()
     }
 
-    pub fn len(&self) -> usize {
+pub fn len(&self) -> usize {
         self.by_id.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.by_id.is_empty()
-    }
-
-    pub fn reload(&self) -> Result<Self, PolicyError> {
-        let text = std::fs::read_to_string(&self.path).map_err(|source| PolicyError::Io {
-            path: self.path.clone(),
-            source,
-        })?;
-        let file: TenantFile = serde_yaml::from_str(&text).map_err(|e| PolicyError::Parse {
-            path: self.path.clone(),
-            message: e.to_string(),
-        })?;
-        Self::from_file(file, self.path.clone())
     }
 }
 

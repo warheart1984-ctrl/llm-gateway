@@ -143,9 +143,9 @@ pub async fn build(settings: Settings) -> Result<Arc<AppState>, BootError> {
     Ok(Arc::new(AppState {
         settings,
         models,
-        tenants,
+        tenants: std::sync::RwLock::new(tenants),
         providers,
-        auth,
+        auth: std::sync::RwLock::new(auth),
         policy,
         limits,
         metrics,

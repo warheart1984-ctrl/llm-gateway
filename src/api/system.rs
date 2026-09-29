@@ -74,7 +74,7 @@ impl IntoResponse for ApiError {
 
 /// Resolve the caller, or 401. Every operational route goes through this.
 async fn caller(state: &Arc<AppState>, headers: &axum::http::HeaderMap) -> Result<Principal, ApiError> {
-    state.auth.authenticate(headers).await.map_err(|_| ApiError::Unauthorized)
+    state.current_auth().authenticate(headers).await.map_err(|_| ApiError::Unauthorized)
 }
 
 /// `GET /v1/models` — the catalogue, filtered to what this tenant may call.
@@ -84,8 +84,8 @@ pub async fn list_models(
     headers: axum::http::HeaderMap,
 ) -> Result<Response, ApiError> {
     let principal = caller(&state, &headers).await?;
-    let tenant = state
-        .tenants
+    let tenants = state.current_tenants();
+    let tenant = tenants
         .get(&principal.tenant_id)
         .ok_or(ApiError::TenantUnknown)?;
     let snapshot = state.models.snapshot().await;
@@ -132,8 +132,8 @@ pub async fn get_usage(
     headers: axum::http::HeaderMap,
 ) -> Result<Response, ApiError> {
     let principal = caller(&state, &headers).await?;
-    let tenant = state
-        .tenants
+    let tenants = state.current_tenants();
+    let tenant = tenants
         .get(&principal.tenant_id)
         .ok_or(ApiError::TenantUnknown)?;
     let limits = state.policy.limits_for(&tenant);
@@ -176,22 +176,21 @@ pub async fn reload_registry(
         .await
         .map_err(|e| ApiError::ReloadFailed(format!("model registry reload failed: {e}")))?;
     let tenants = state
-        .tenants
-        .reload()
+        .reload_tenants()
         .map_err(|e| ApiError::ReloadFailed(format!("tenant registry reload failed: {e}")))?;
 
     tracing::info!(
         actor = %principal.key_id,
         tenant = %principal.tenant_id,
         generation = models,
-        tenants = tenants.len(),
+        tenants,
         "registry reloaded"
     );
     Ok(Json(json!({
         "status": "reloaded",
         "model_generation": models,
         "models": state.models.snapshot().await.len(),
-        "tenants": tenants.len(),
+        "tenants": tenants,
     }))
     .into_response())
 }

@@ -50,22 +50,41 @@ async fn run(state: std::sync::Arc<AppState>) -> anyhow::Result<()> {
         settings = ?config::redacted_settings(&state.settings),
         providers = ?state.providers.names(),
         models = state.models.snapshot().await.len(),
-        tenants = state.tenants.len(),
+        tenants = state.current_tenants().len(),
         version = llm_gateway::VERSION,
         "llm-gateway listening"
     );
 
     // Hot reload: poll the registry mtime off the request path so a control
-    // plane edit takes effect without dropping in-flight streams.
+    // plane edit takes effect without dropping in-flight streams. A tenant
+    // file that fails to load keeps the previous registry serving; the mtime
+    // is remembered either way so a broken file is not re-litigated every tick.
     if hot_reload {
         let reload_state = std::sync::Arc::clone(&state);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(reload_interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let tenants_path = reload_state.settings.registry.tenants_path.clone();
+            let mut tenants_mtime = tenants_file_mtime(&tenants_path);
             loop {
                 ticker.tick().await;
                 if let Some(generation) = reload_state.models.reload_if_changed().await {
                     tracing::info!(generation, "model registry hot-reloaded");
+                }
+                let mtime = tenants_file_mtime(&tenants_path);
+                if mtime.is_some() && mtime != tenants_mtime {
+                    tenants_mtime = mtime;
+                    match reload_state.reload_tenants() {
+                        Ok(tenants) => {
+                            tracing::info!(tenants, "tenant registry hot-reloaded")
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                "tenant registry reload failed; keeping previous generation"
+                            )
+                        }
+                    };
                 }
             }
         });
@@ -110,6 +129,12 @@ async fn shutdown_signal(grace: std::time::Duration) {
         _ = &mut draining => tracing::warn!("grace period expired; closing remaining streams"),
         _ = wait_for_drain() => tracing::info!("all in-flight streams settled"),
     }
+}
+
+/// Modified timestamp of the tenant file, for the hot-reload poll. `None` when
+/// the file is missing or unreadable, which the poll treats as "no change".
+fn tenants_file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
 }
 
 /// Poll in-flight streams to zero, bounded by the grace period.

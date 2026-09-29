@@ -263,6 +263,11 @@ pub struct JwtAuthenticator {
     issuer: String,
     audience: String,
     leeway_secs: u64,
+    /// Baseline grant for a token that carries no `scope` claim, mirroring how
+    /// an API-key credential with no `scopes` list defaults to `chat:stream`.
+    /// An *explicit* claim is honoured verbatim and needs no approved list, so
+    /// operators who issue narrowly-scoped tokens keep working.
+    required_scopes: Vec<Scope>,
     now: Box<dyn Fn() -> u64 + Send + Sync>,
 }
 
@@ -273,6 +278,7 @@ impl JwtAuthenticator {
             issuer: cfg.issuer.clone(),
             audience: cfg.audience.clone(),
             leeway_secs: cfg.leeway_secs,
+            required_scopes: cfg.required_scopes.iter().map(Scope::exact).collect(),
             now: Box::new(unix_now),
         }
     }
@@ -350,13 +356,24 @@ impl JwtAuthenticator {
             .ok_or_else(|| AuthError::Malformed("missing `tenant_id` claim".into()))?;
 
         let scopes = match claims.get("scope") {
-            Some(serde_json::Value::String(s)) => s.split_whitespace().map(Scope::exact).collect(),
-            Some(serde_json::Value::Array(items)) => items
-                .iter()
-                .filter_map(|i| i.as_str())
-                .map(Scope::exact)
-                .collect(),
-            _ => Vec::new(),
+            Some(serde_json::Value::String(s)) => {
+                let parsed: Vec<Scope> = s.split_whitespace().map(Scope::exact).collect();
+                if parsed.is_empty() {
+                    self.required_scopes.clone()
+                } else {
+                    parsed
+                }
+            }
+            Some(serde_json::Value::Array(items)) => {
+                let parsed: Vec<Scope> =
+                    items.iter().filter_map(|i| i.as_str()).map(Scope::exact).collect();
+                if parsed.is_empty() {
+                    self.required_scopes.clone()
+                } else {
+                    parsed
+                }
+            }
+            _ => self.required_scopes.clone(),
         };
 
         Ok(Principal {
@@ -559,6 +576,48 @@ mod tests {
         assert_eq!(&*p.tenant_id, "acme");
         assert_eq!(p.scheme.as_ref(), "jwt");
         assert!(p.has_scope(SCOPE_MODELS_READ));
+    }
+
+    #[tokio::test]
+    async fn scopeless_jwt_falls_back_to_required_scopes() {
+        let now = 1_700_000_000u64;
+        let a = jwt_auth(now);
+        let header = b64(&serde_json::json!({"alg":"HS256","typ":"JWT"}));
+        // No `scope` claim at all.
+        let claims = b64(&serde_json::json!({
+            "iss":"jarvis","aud":"llm-gateway","tenant_id":"acme","jti":"j1",
+            "exp": now + 60
+        }));
+        let token = sign("test-secret", &header, &claims);
+        let p = a
+            .authenticate(&headers_with(&[("authorization", &format!("Bearer {token}"))]))
+            .await
+            .unwrap();
+        assert!(
+            p.has_scope(SCOPE_CHAT_STREAM),
+            "a scopeless token must receive the configured required_scopes"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_jwt_scopes_are_not_supplemented() {
+        let now = 1_700_000_000u64;
+        let a = jwt_auth(now);
+        let header = b64(&serde_json::json!({"alg":"HS256","typ":"JWT"}));
+        let claims = b64(&serde_json::json!({
+            "iss":"jarvis","aud":"llm-gateway","tenant_id":"acme","jti":"j1",
+            "scope":"models:read","exp": now + 60
+        }));
+        let token = sign("test-secret", &header, &claims);
+        let p = a
+            .authenticate(&headers_with(&[("authorization", &format!("Bearer {token}"))]))
+            .await
+            .unwrap();
+        assert!(p.has_scope(SCOPE_MODELS_READ));
+        assert!(
+            !p.has_scope(SCOPE_CHAT_STREAM),
+            "an explicit scope claim must not be padded with required_scopes"
+        );
     }
 
     #[tokio::test]

@@ -302,7 +302,7 @@ async fn dispatch(
     }
 
     // 1. Authenticate.
-    let principal = state.auth.authenticate(headers).await?;
+    let principal = state.current_auth().authenticate(headers).await?;
     span.tenant_id = principal.tenant_id.to_string();
     span.key_id = principal.key_id.to_string();
     span.scheme = principal.scheme.to_string();
@@ -322,9 +322,10 @@ async fn dispatch(
 
     // 3. Authorize: may this tenant call this model, at this size?
     let prompt_chars: usize = req.messages.iter().map(ChatMessage::approx_chars).sum();
+    let tenants = state.current_tenants();
     let decision = state.policy.authorize(
         &principal,
-        &state.tenants,
+        &tenants,
         &req.model,
         req.messages.len(),
         prompt_chars,
