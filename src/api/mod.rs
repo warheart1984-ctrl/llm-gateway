@@ -35,10 +35,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         // rejected before a handler allocates a buffer for it.
         .layer(DefaultBodyLimit::max(body_limit));
 
-    let ops = Router::new()
+    let mut ops = Router::new()
         .route(ROUTE_LIVE, get(system::live))
-        .route(ROUTE_READY, get(system::ready))
-        .route(ROUTE_METRICS, get(system::metrics));
+        .route(ROUTE_READY, get(system::ready));
+    if state.settings.server.metrics_enabled {
+        ops = ops.route(ROUTE_METRICS, get(system::metrics));
+    }
 
     Router::new()
         .merge(api)
@@ -76,4 +78,83 @@ async fn request_context(
     );
     let _ = &state;
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn build_state(metrics_enabled: bool) -> Arc<AppState> {
+        let dir = std::env::temp_dir().join(format!("llm-gateway-router-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tenants_path = dir.join("tenants.yaml");
+        std::fs::write(
+            &tenants_path,
+            "tenants:\n  - tenant_id: alpha\n    enabled: true\n    credentials:\n      - key_id: k1\n        key: \"secret\"\n        scopes: [chat:stream]\n    allowed_models: [\"*\"]\n    default_model: groq/gpt-oss-20b\n",
+        )
+        .unwrap();
+
+        let mut settings = crate::config::Settings::default();
+        settings.server.metrics_enabled = metrics_enabled;
+        settings.registry.tenants_path = tenants_path;
+        let settings = Arc::new(settings);
+
+        let models = crate::router::ModelRegistry::load("config/models.yaml", false, 0).unwrap();
+        let tenants =
+            crate::governance::policy::TenantRegistry::load(&settings.registry.tenants_path)
+                .unwrap();
+        let auth =
+            crate::governance::auth::build_authenticator(&settings.auth, tenants.key_records())
+                .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        Arc::new(AppState {
+            settings,
+            models,
+            tenants: std::sync::RwLock::new(tenants),
+            auth: std::sync::RwLock::new(auth),
+            policy: crate::governance::policy::PolicyEngine::new(
+                true,
+                crate::config::DEFAULT_LIMITS,
+            ),
+            providers: crate::router::ProviderPool::new(vec![]),
+            limits: crate::governance::limits::LimitEngine::new(8, false),
+            metrics: crate::observability::Metrics::new(std::time::Instant::now()),
+            started_at: std::time::Instant::now(),
+            inflight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        })
+    }
+
+    /// `metrics_enabled` is a deployment decision about whether the scrape
+    /// endpoint exists at all. Disabled means the route is not mounted — a 404,
+    /// not a 200 with an empty body that a scraper then has to interpret.
+    #[tokio::test]
+    async fn metrics_route_is_mounted_only_when_enabled() {
+        let request = || {
+            Request::builder()
+                .uri(ROUTE_METRICS)
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let on = router(build_state(true));
+        let response = on.oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("gw_requests_total"),
+            "a scraped /metrics must carry the gateway counters"
+        );
+
+        let off = router(build_state(false));
+        let response = off.oneshot(request()).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "metrics disabled means no such route"
+        );
+    }
 }

@@ -40,6 +40,7 @@ struct Counters {
     duration_ms_sum: AtomicU64,
     duration_ms_count: AtomicU64,
     cost_reservation_rejected_total: AtomicU64,
+    model_denied_total: AtomicU64,
     rate_limited_total: AtomicU64,
     concurrency_limited_total: AtomicU64,
     policy_denied_total: AtomicU64,
@@ -150,7 +151,9 @@ impl Metrics {
                 self.global.cost_reservation_rejected_total
                     .fetch_add(1, Ordering::Relaxed);
             }
-            RejectionKind::Model => {}
+            RejectionKind::Model => {
+                self.global.model_denied_total.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -276,8 +279,8 @@ impl Metrics {
             &mut out,
             "gw_requests_rejected_total",
             "counter",
-            "Requests rejected during governance, by reason.",
-            &[("reason", "auth"), ("reason", "policy"), ("reason", "rate_limit"), ("reason", "concurrency"), ("reason", "budget"), ("reason", "model")],
+            "Requests rejected during governance.",
+            &[],
             g.requests_rejected_total.load(Ordering::Relaxed),
         );
         let rejections = [
@@ -286,6 +289,7 @@ impl Metrics {
             ("rate_limit", g.rate_limited_total.load(Ordering::Relaxed)),
             ("concurrency", g.concurrency_limited_total.load(Ordering::Relaxed)),
             ("budget", g.cost_reservation_rejected_total.load(Ordering::Relaxed)),
+            ("model", g.model_denied_total.load(Ordering::Relaxed)),
         ];
         for (reason, value) in rejections {
             metric(
@@ -577,5 +581,72 @@ mod tests {
             render_labels(&[("provider", "groq"), ("model", "llama")], &[]),
             r#"{provider="groq",model="llama"}"#
         );
+    }
+
+    #[test]
+    fn rejected_reasons_balance_to_the_rejected_total() {
+        let m = Metrics::new(std::time::Instant::now());
+        for kind in [
+            RejectionKind::Auth,
+            RejectionKind::Policy,
+            RejectionKind::RateLimit,
+            RejectionKind::Concurrency,
+            RejectionKind::Budget,
+            RejectionKind::Model,
+        ] {
+            m.rejection(kind);
+        }
+        m.rejection(RejectionKind::Model);
+        let text = m.render();
+        assert!(text.contains("gw_requests_rejected_total 7"));
+
+        // One sample line per reason, including `model`, which used to be
+        // counted into the total but never surfaced by reason.
+        let by_reason: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("gw_requests_rejected_by_reason_total"))
+            .collect();
+        assert_eq!(by_reason.len(), 6, "one sample per reason: {by_reason:?}");
+        for (reason, count) in [
+            ("auth", "1"),
+            ("policy", "1"),
+            ("rate_limit", "1"),
+            ("concurrency", "1"),
+            ("budget", "1"),
+            ("model", "2"),
+        ] {
+            let needle = format!("reason=\"{reason}\"");
+            assert!(
+                by_reason
+                    .iter()
+                    .any(|l| l.contains(&needle) && l.ends_with(count)),
+                "missing {needle} = {count} in {by_reason:?}"
+            );
+        }
+
+        // The rollup of the labelled series equals the bare total, so nothing
+        // is double-counted and no reason is silently dropped.
+        let sum: u64 = by_reason
+            .iter()
+            .filter_map(|l| l.split_whitespace().last())
+            .filter_map(|v| v.parse::<u64>().ok())
+            .sum();
+        assert_eq!(sum, 7);
+    }
+
+    #[test]
+    fn the_rejected_total_renders_unlabeled() {
+        // The old exposition put six `reason` labels on one line, which the
+        // format does not allow; the total is a bare counter and the breakdown
+        // lives on the by-reason series.
+        let m = Metrics::new(std::time::Instant::now());
+        m.rejection(RejectionKind::Auth);
+        let text = m.render();
+        for line in text
+            .lines()
+            .filter(|l| l.starts_with("gw_requests_rejected_total"))
+        {
+            assert!(!line.contains('{'), "total must be a bare counter line: {line}");
+        }
     }
 }
