@@ -323,7 +323,7 @@ What the gateway does itself, and what it expects of the deployment around it.
 ## Testing
 
 ```bash
-cargo test --locked --all-targets                  # 155 tests
+cargo test --locked --all-targets                  # 182 tests
 cargo clippy --locked --all-targets -- -D warnings
 cargo bench --bench framing                        # add `-- --quick` for a fast pass
 ```
@@ -332,6 +332,13 @@ CI (`.github/workflows/ci.yml`) runs that gate from a clean checkout on Linux
 and Windows: the full suite three times over, the money tests five more times,
 clippy with warnings as errors, a build on the declared `rust-version`, the
 benchmark in quick mode, and the docker compose demo end to end.
+
+`tests/pressure.rs` is the boundary pressure suite: one test per attack on
+the claim that an unauthorised or financially inadmissible request never
+reaches the provider, checked by counting what the provider actually
+received. It includes tests that pin today's known gaps (restart, replicas,
+replay) as failing open. The claim → test → result table is
+[docs/boundary-pressure-tests.md](docs/boundary-pressure-tests.md).
 
 `tests/integration.rs` drives the real router over real HTTP against a mock
 upstream with scenario-driven SSE, covering the v1 contract, reasoning
