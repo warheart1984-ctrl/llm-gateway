@@ -128,6 +128,7 @@ fn sse_body(frames: Vec<Result<String, std::io::Error>>) -> Response {
 
 async fn answer(State(state): State<ProviderState>, Json(body): Json<Value>) -> Response {
     state.calls.fetch_add(1, Ordering::SeqCst);
+    let streaming = body["stream"] != json!(false);
     *state.last_body.lock().unwrap() = Some(body);
     match state.behaviour {
         Provider::Refusing => {
@@ -137,6 +138,9 @@ async fn answer(State(state): State<ProviderState>, Json(body): Json<Value>) -> 
         Provider::Hung => std::future::pending::<()>().await,
         Provider::Gated => state.gate.acquire().await.expect("gate").forget(),
         Provider::Healthy | Provider::DiesMidStream => {}
+    }
+    if !streaming {
+        return completion_answer(state.behaviour);
     }
     if state.behaviour == Provider::DiesMidStream {
         return sse_body(vec![
@@ -154,6 +158,29 @@ async fn answer(State(state): State<ProviderState>, Json(body): Json<Value>) -> 
                        "usage": { "prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15 } }))),
         Ok("data: [DONE]\n\n".to_string()),
     ])
+}
+
+/// The non-streaming answer: one JSON document with the same usage as the
+/// streamed one, or, for `DiesMidStream`, half a document and a dead socket.
+fn completion_answer(behaviour: Provider) -> Response {
+    let whole = json!({
+        "id": "p1", "model": "mock-model",
+        "choices": [{ "index": 0, "finish_reason": "stop",
+                      "message": { "role": "assistant", "content": "Hello, world" } }],
+        "usage": { "prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15 }
+    });
+    if behaviour == Provider::DiesMidStream {
+        let text = whole.to_string();
+        let mut response = sse_body(vec![
+            Ok(text[..text.len() / 2].to_string()),
+            Err(std::io::Error::other("provider connection lost")),
+        ]);
+        response
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
+        return response;
+    }
+    Json(whole).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +398,15 @@ impl Gateway {
 
     async fn chat(&self, key: Option<&str>, body: Value) -> Reply {
         let mut request = reqwest::Client::new().post(self.url("/v1/chat/stream")).json(&body);
+        if let Some(key) = key {
+            request = request.header("x-api-key", key);
+        }
+        self.send(request).await
+    }
+
+    /// The second door: `POST /v1/chat/complete`.
+    async fn complete(&self, key: Option<&str>, body: Value) -> Reply {
+        let mut request = reqwest::Client::new().post(self.url("/v1/chat/complete")).json(&body);
         if let Some(key) = key {
             request = request.header("x-api-key", key);
         }
@@ -863,7 +899,165 @@ async fn ledger_every_refusal_is_recorded_with_request_tenant_and_reason() {
 }
 
 // ===========================================================================
-// 7. Known gaps: where the boundary does NOT hold today
+// 7. The second door: POST /v1/chat/complete
+// ===========================================================================
+//
+// The non-streaming endpoint shares the governance code with the stream
+// endpoint. These tests check that it cannot be used to get around the
+// boundary: every refusal still leaves the provider untouched, and both
+// doors draw on one budget.
+
+#[tokio::test]
+async fn second_door_identity_and_authority_hold() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let gw = Deployment::new(&provider).boot().await;
+
+    for (key, expected) in [
+        (None, StatusCode::UNAUTHORIZED),
+        (Some("key-admin-"), StatusCode::UNAUTHORIZED),
+        (Some("key-switched-off"), StatusCode::UNAUTHORIZED),
+        (Some("key-readonly"), StatusCode::FORBIDDEN),
+        (Some("key-dormant"), StatusCode::FORBIDDEN),
+    ] {
+        let reply = gw.complete(key, standard_request()).await;
+        assert_eq!(reply.status, expected, "{key:?}: {}", reply.body);
+    }
+    assert_eq!(provider.calls(), 0);
+}
+
+#[tokio::test]
+async fn second_door_model_access_holds() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let gw = Deployment::new(&provider).boot().await;
+
+    for (key, model) in [
+        ("key-narrow", "mock/other"),
+        ("key-app", "mock/forbidden"),
+        ("key-app", "mock/nope"),
+    ] {
+        let mut body = standard_request();
+        body["model"] = json!(model);
+        let reply = gw.complete(Some(key), body).await;
+        assert!(reply.status.is_client_error(), "{key} {model}: {}", reply.body);
+    }
+    assert_eq!(provider.calls(), 0);
+
+    let mut body = standard_request();
+    body["params"] = json!({ "max_tokens": 32, "model": "attacker/expensive-model", "stream": true });
+    assert_eq!(gw.complete(Some("key-app"), body).await.status, StatusCode::OK);
+    let sent = provider.last_body();
+    assert_eq!(sent["model"], "mock-model");
+    assert_eq!(sent["stream"], false, "the caller cannot turn a completion into a stream");
+}
+
+#[tokio::test]
+async fn second_door_worst_case_exposure_is_refused_up_front() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let gw = Deployment::new(&provider).boot().await;
+
+    let mut body = standard_request();
+    body["params"] = json!({ "max_tokens": 4000 });
+    let reply = gw.complete(Some("key-tight"), body).await;
+    assert_eq!(reply.status, StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(provider.calls(), 0);
+    let body = json!({ "model": "mock/uncapped", "messages": [{ "role": "user", "content": "hi" }] });
+    assert_eq!(gw.complete(Some("key-app"), body).await.status, StatusCode::BAD_REQUEST);
+    assert_eq!(provider.calls(), 0);
+}
+
+#[tokio::test]
+async fn second_door_both_doors_draw_on_one_budget() {
+    // Twenty simultaneous requests, alternating between the two doors,
+    // against a budget with room for three. If the doors kept separate
+    // books, six would get through.
+    let provider = MockProvider::start(Provider::Gated).await;
+    let gw = Arc::new(Deployment::new(&provider).boot().await);
+
+    let refused = Arc::new(AtomicU64::new(0));
+    let burst: Vec<_> = (0..20)
+        .map(|i| {
+            let (gw, refused) = (Arc::clone(&gw), Arc::clone(&refused));
+            tokio::spawn(async move {
+                let reply = if i % 2 == 0 {
+                    gw.chat(Some("key-tight"), standard_request()).await
+                } else {
+                    gw.complete(Some("key-tight"), standard_request()).await
+                };
+                if reply.status == StatusCode::PAYMENT_REQUIRED {
+                    refused.fetch_add(1, Ordering::SeqCst);
+                }
+                reply.status
+            })
+        })
+        .collect();
+
+    eventually("every request admitted or refused", || {
+        provider.calls() + refused.load(Ordering::SeqCst) == 20
+    })
+    .await;
+    assert_eq!(provider.calls(), 3, "one budget across both doors");
+    provider.open_gate(20);
+    let statuses = futures_util::future::join_all(burst).await;
+    assert_eq!(statuses.into_iter().filter(|s| *s.as_ref().unwrap() == StatusCode::OK).count(), 3);
+}
+
+#[tokio::test]
+async fn second_door_a_hung_provider_cannot_pin_budget_or_slots() {
+    let provider = MockProvider::start(Provider::Hung).await;
+    let gw = Deployment::new(&provider)
+        .boot_with(|s| s.upstream.stream_read_timeout_ms = 300)
+        .await;
+
+    let reply = tokio::time::timeout(Duration::from_secs(10), gw.complete(Some("key-app"), standard_request()))
+        .await
+        .expect("the gateway must give up on a hung provider");
+    assert_eq!(reply.status, StatusCode::BAD_GATEWAY, "{}", reply.body);
+    assert_eq!(gw.spent("key-app").await, 0, "no answer, no charge");
+    assert_eq!(gw.in_flight("key-app").await, 0);
+}
+
+#[tokio::test]
+async fn second_door_a_provider_dying_mid_answer_bills_the_prompt_only() {
+    let provider = MockProvider::start(Provider::DiesMidStream).await;
+    let gw = Deployment::new(&provider).boot().await;
+
+    let reply = gw.complete(Some("key-app"), standard_request()).await;
+    assert_eq!(reply.status, StatusCode::BAD_GATEWAY, "{}", reply.body);
+    let spent = gw.spent("key-app").await;
+    // Accepted, then the answer never arrived: the prompt was consumed, the
+    // 128-token output reservation (1,024,000 nano-USD) is refunded.
+    assert!(spent > 0 && spent < 128 * 8_000, "prompt only: {spent}");
+    assert_eq!(gw.in_flight("key-app").await, 0);
+}
+
+#[tokio::test]
+async fn second_door_a_disconnect_storm_leaks_no_slots_and_bills_each_reservation() {
+    // A client that gives up on a completion is billed its reservation: the
+    // provider will finish and bill the answer anyway, unseen.
+    let provider = MockProvider::start(Provider::Gated).await;
+    let gw = Deployment::new(&provider).boot().await;
+
+    let impatient = reqwest::Client::builder().timeout(Duration::from_millis(150)).build().unwrap();
+    let storm: Vec<_> = (0..20)
+        .map(|_| {
+            impatient
+                .post(gw.url("/v1/chat/complete"))
+                .header("x-api-key", "key-app")
+                .json(&small_request())
+                .send()
+        })
+        .collect();
+    for result in futures_util::future::join_all(storm).await {
+        assert!(result.is_err(), "every client gave up");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(gw.in_flight("key-app").await, 0, "no slot outlives its client");
+    // small_request reserves 3 x 2,000 + 5 x 8,000 = 46,000 nano-USD.
+    assert_eq!(gw.spent("key-app").await, 20 * 46_000);
+}
+
+// ===========================================================================
+// 8. Known gaps: where the boundary does NOT hold today
 // ===========================================================================
 //
 // Each of these asserts the current, fail-open behaviour. When the gap is
@@ -922,6 +1116,26 @@ async fn gap_a_replayed_request_is_executed_and_billed_again() {
             .header("x-api-key", "key-app")
             .header("x-request-id", "client-request-0001")
             .header("idempotency-key", "client-request-0001")
+            .json(&standard_request())
+    };
+    assert_eq!(gw.send(replay()).await.status, StatusCode::OK);
+    assert_eq!(gw.send(replay()).await.status, StatusCode::OK, "GAP: not recognised as a replay");
+    assert_eq!(provider.calls(), 2, "GAP: executed twice");
+    assert_eq!(gw.spent("key-app").await, 2 * HEALTHY_ANSWER_COST, "GAP: billed twice");
+}
+
+/// The same gap through the second door, where it matters more: a client
+/// that times out on a slow completion and retries pays twice.
+#[tokio::test]
+async fn gap_a_replayed_completion_is_executed_and_billed_again() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let gw = Deployment::new(&provider).boot().await;
+
+    let replay = || {
+        reqwest::Client::new()
+            .post(gw.url("/v1/chat/complete"))
+            .header("x-api-key", "key-app")
+            .header("idempotency-key", "client-request-0002")
             .json(&standard_request())
     };
     assert_eq!(gw.send(replay()).await.status, StatusCode::OK);
