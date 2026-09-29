@@ -64,7 +64,7 @@ pub struct StreamSummary {
     pub completion_tokens: u32,
     pub reasoning_tokens: u32,
     pub cached_prompt_tokens: u32,
-    pub cost_micro_usd: u64,
+    pub cost_nano_usd: u64,
     pub finish_reason: Option<String>,
     /// Upstream correlation ids, captured from the first provider frame.
     pub upstream_id: Option<String>,
@@ -147,7 +147,7 @@ pub fn log_stream_complete(span: &RequestSpan, outcome: &StreamSummary) {
         reasoning_tokens = outcome.reasoning_tokens,
         cached_prompt_tokens = outcome.cached_prompt_tokens,
         total_tokens = total,
-        cost_micro_usd = outcome.cost_micro_usd,
+        cost_nano_usd = outcome.cost_nano_usd,
         events = outcome.events,
         bytes_out = outcome.bytes_out,
         client_abort = outcome.aborted_by_client,

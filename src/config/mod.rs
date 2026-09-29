@@ -247,9 +247,9 @@ pub struct LimitProfile {
     pub max_concurrent_streams: u32,
     #[serde(default)]
     pub max_output_tokens: u32,
-    /// Daily spend ceiling in micro-USD (1 USD = 1_000_000).
+    /// Daily spend ceiling in nano-USD (1 USD = 1_000_000_000).
     #[serde(default)]
-    pub daily_budget_micro_usd: u64,
+    pub daily_budget_nano_usd: u64,
     #[serde(default)]
     pub max_messages: usize,
     #[serde(default)]
@@ -262,7 +262,7 @@ pub const DEFAULT_LIMITS: LimitProfile = LimitProfile {
     tokens_per_minute: 200_000,
     max_concurrent_streams: 16,
     max_output_tokens: 8_192,
-    daily_budget_micro_usd: 5_000_000,
+    daily_budget_nano_usd: 5_000_000_000,
     max_messages: 512,
     max_prompt_chars: 200_000,
 };
@@ -283,7 +283,7 @@ impl LimitProfile {
             tokens_per_minute: pick!(tokens_per_minute),
             max_concurrent_streams: pick!(max_concurrent_streams),
             max_output_tokens: pick!(max_output_tokens),
-            daily_budget_micro_usd: pick!(daily_budget_micro_usd),
+            daily_budget_nano_usd: pick!(daily_budget_nano_usd),
             max_messages: pick!(max_messages),
             max_prompt_chars: pick!(max_prompt_chars),
         }

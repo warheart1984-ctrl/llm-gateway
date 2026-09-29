@@ -144,9 +144,9 @@ pub async fn get_usage(
         "requests_last_minute": snapshot.requests_last_minute,
         "tokens_last_minute": snapshot.tokens_last_minute,
         "streams_in_flight": snapshot.in_flight,
-        "spent_micro_usd": snapshot.spent_micro_usd,
-        "remaining_micro_usd": snapshot.remaining_micro_usd(),
-        "daily_budget_micro_usd": snapshot.budget_micro_usd,
+        "spent_nano_usd": snapshot.spent_nano_usd,
+        "remaining_nano_usd": snapshot.remaining_nano_usd(),
+        "daily_budget_nano_usd": snapshot.budget_nano_usd,
         "budget_day": snapshot.budget_label,
         "limits": {
             "requests_per_minute": limits.requests_per_minute,

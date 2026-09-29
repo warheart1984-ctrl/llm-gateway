@@ -52,7 +52,7 @@ use crate::{
     },
     observability::{logging, metrics::RejectionKind, RequestSpan, StreamSummary},
     providers::{ChatMessage, ChatProvider, ProviderError, ProviderRequest, StreamEvent, Usage},
-    router::{self, estimate_cost_micro_usd, estimate_prompt_tokens, merge_params, validate_params},
+    router::{self, estimate_cost_nano_usd, estimate_prompt_tokens, merge_params, validate_params},
     state::AppState,
 };
 
@@ -390,8 +390,8 @@ async fn dispatch(
     //    tenant cannot overspend by opening many streams at once.
     let prompt_tokens = estimate_prompt_tokens(&req.messages);
     let cost = CostEstimate {
-        prompt_micro_usd: estimate_cost_micro_usd(&resolved.config.cost, prompt_tokens, 0),
-        completion_micro_usd: estimate_cost_micro_usd(&resolved.config.cost, 0, max_output_tokens),
+        prompt_nano_usd: estimate_cost_nano_usd(&resolved.config.cost, prompt_tokens, 0),
+        completion_nano_usd: estimate_cost_nano_usd(&resolved.config.cost, 0, max_output_tokens),
     };
     let reservation = state
         .limits
@@ -521,8 +521,8 @@ fn response_headers(
     h.insert(HeaderName::from_static("x-gateway-version"), HeaderValue::from_static(API_VERSION));
     h.insert(HeaderName::from_static("x-tenant"), header_value(&principal.tenant_id));
     h.insert(
-        HeaderName::from_static("x-reserved-micro-usd"),
-        header_value(&reservation.reserved_micro_usd().to_string()),
+        HeaderName::from_static("x-reserved-nano-usd"),
+        header_value(&reservation.reserved_nano_usd().to_string()),
     );
     h
 }
@@ -578,12 +578,12 @@ impl NormalizedState {
 
         let usage = self.current_usage();
         self.reservation.settle(usage, &self.cost_model);
-        let cost = estimate_cost_micro_usd(
+        let cost = estimate_cost_nano_usd(
             &self.cost_model,
             self.summary.prompt_tokens,
             self.summary.completion_tokens,
         );
-        self.summary.cost_micro_usd = cost;
+        self.summary.cost_nano_usd = cost;
 
         let mut out: Vec<Event> = Vec::with_capacity(3);
         if let Some(event) = extra {
@@ -831,7 +831,7 @@ fn tool_json(index: u32, id: &Option<String>, name: &Option<String>, arguments: 
 /// Always followed by `[DONE]`.
 fn end_event(
     summary: &StreamSummary,
-    cost_micro_usd: u64,
+    cost_nano_usd: u64,
     duration_ms: u128,
     ttft_ms: Option<u128>,
 ) -> Event {
@@ -843,7 +843,7 @@ fn end_event(
             "reasoning_tokens": summary.reasoning_tokens,
             "total_tokens": summary.prompt_tokens + summary.completion_tokens,
         },
-        "cost_micro_usd": cost_micro_usd,
+        "cost_nano_usd": cost_nano_usd,
         "duration_ms": duration_ms,
         "ttft_ms": ttft_ms,
         "upstream_id": summary.upstream_id,
@@ -1011,10 +1011,10 @@ impl Drop for RawStream {
 impl RawStream {
     fn emit(&self) {
         let mut summary = self.summary.clone();
-        if summary.cost_micro_usd == 0 {
+        if summary.cost_nano_usd == 0 {
             // Content is never parsed in this mode, so cost is the reserved
             // figure. Reported as an estimate rather than a measured total.
-            summary.cost_micro_usd = estimate_cost_micro_usd(
+            summary.cost_nano_usd = estimate_cost_nano_usd(
                 &self.cost_model,
                 summary.prompt_tokens,
                 0,

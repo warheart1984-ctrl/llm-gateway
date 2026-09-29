@@ -123,43 +123,66 @@ pub struct CostModel {
     pub cached_input_per_mtok_usd: Option<f64>,
 }
 
+/// Nano-USD per 1M tokens: the scale factor from a `$X` per-1M-tokens rate to
+/// an integer nano-USD per-token rate.
+///
+/// `1 USD = 1e9 nano-USD`, so `$X` per 1M tokens is `X * 1e9 / 1e6 = X * 1e3`
+/// nano-USD per token.
+const NANO_USD_SCALE: f64 = 1_000.0;
+
 impl CostModel {
-    /// Micro-USD per single token.
+    /// Nano-USD per single token.
     ///
-    /// The units cancel: a rate of `$X` per 1M tokens is `X` dollars spread
-    /// over 1e6 tokens, which is `X` micro-dollars per token (since 1 USD is
-    /// 1e6 micro-USD). So the rate passes through unchanged and all spend
-    /// arithmetic stays in integer space.
+    /// The rate is scaled up to nano-USD so that it lands on an integer. The
+    /// alternative, nano-USD, does not: real prices are fractional at that
+    /// precision, so `$0.075` per 1M tokens is 0.075 nano-USD per token, and
+    /// rounding it to an integer would either erase the price (`0.075 -> 0`,
+    /// a free model) or inflate it several-fold (`0.59 -> 1`).
     ///
-    /// Worked example: `input_per_mtok_usd: 0.59` -> 0.59 micro-USD/token ->
-    /// 590 micro-USD per 1K tokens.
-    pub fn input_micro_usd_per_token(&self) -> u64 {
-        sanitize_rate(self.input_per_mtok_usd)
+    /// Nano-USD is exact for every rate with up to three decimal places per
+    /// 1M tokens, which covers the whole shipped catalogue. A rate needing
+    /// more precision is rejected by [`RegistryFile`] validation rather than
+    /// silently rounded here.
+    ///
+    /// Worked example: `input_per_mtok_usd: 0.075` -> 75 nano-USD/token ->
+    /// 75,000 nano-USD per 1K tokens.
+    pub fn input_nano_usd_per_token(&self) -> u64 {
+        nano_usd_per_token(self.input_per_mtok_usd)
     }
 
-    pub fn output_micro_usd_per_token(&self) -> u64 {
-        sanitize_rate(self.output_per_mtok_usd)
+    pub fn output_nano_usd_per_token(&self) -> u64 {
+        nano_usd_per_token(self.output_per_mtok_usd)
     }
 
-    pub fn cached_input_micro_usd_per_token(&self) -> u64 {
+    pub fn cached_input_nano_usd_per_token(&self) -> u64 {
         match self.cached_input_per_mtok_usd {
-            Some(v) => sanitize_rate(v),
-            None => self.input_micro_usd_per_token(),
+            Some(v) => nano_usd_per_token(v),
+            None => self.input_nano_usd_per_token(),
         }
     }
 
     pub fn is_free(&self) -> bool {
-        self.input_micro_usd_per_token() == 0 && self.output_micro_usd_per_token() == 0
+        self.input_nano_usd_per_token() == 0 && self.output_nano_usd_per_token() == 0
     }
 }
 
-/// A sub-micro-USD rate is sub-cent precision; rounding keeps integer
-/// arithmetic exact and stops a malformed config from producing a free tier.
-fn sanitize_rate(usd_per_mtok: f64) -> u64 {
+/// Convert a `$ per 1M tokens` rate to an exact integer nano-USD per token.
+///
+/// A rate that is not representable at nano-USD precision (more than three
+/// decimal places per 1M tokens) is rounded to the nearest nano-USD, which is
+/// a relative error below 1e-9 at any price above a millionth of a dollar.
+/// Rejecting it instead would break perfectly reasonable catalogue entries, so
+/// rounding is correct here; what is *not* correct is rounding at nano-USD
+/// precision, which is what this function replaces.
+fn nano_usd_per_token(usd_per_mtok: f64) -> u64 {
     if !usd_per_mtok.is_finite() || usd_per_mtok <= 0.0 {
         return 0;
     }
-    usd_per_mtok.round() as u64
+    let scaled = usd_per_mtok * NANO_USD_SCALE;
+    if scaled >= u64::MAX as f64 {
+        return u64::MAX;
+    }
+    scaled.round() as u64
 }
 
 impl ModelConfig {
@@ -588,30 +611,51 @@ mod tests {
     }
 
     #[test]
-    fn usd_per_mtok_equals_micro_usd_per_token() {
-        // $0.59 / 1M tokens == 0.59 micro-USD per token.
+    fn usd_per_mtok_equals_nano_usd_per_token() {
+        // $0.59 / 1M tokens == 590 nano-USD per token.
         let c = CostModel {
             input_per_mtok_usd: 0.59,
             output_per_mtok_usd: 0.79,
             cached_input_per_mtok_usd: None,
         };
-        assert_eq!(c.input_micro_usd_per_token(), 1); // rounds 0.59
-        assert_eq!(c.output_micro_usd_per_token(), 1); // rounds 0.79
+        assert_eq!(c.input_nano_usd_per_token(), 590);
+        assert_eq!(c.output_nano_usd_per_token(), 790);
         assert!(!c.is_free());
     }
 
+    /// Rates below $1 per 1M tokens are exactly the ones an integer
+    /// micro-USD-per-token cannot represent: $0.075/MTok is 0.075 micro-USD per
+    /// token, so rounding it to an integer yields 0 and makes the model free
+    /// to the budget engine. Every value below used to collapse to 0 or 1.
     #[test]
-    fn sub_micro_usd_rates_round_to_nearest_micro_usd() {
-        let c = CostModel { input_per_mtok_usd: 2.0, output_per_mtok_usd: 8.0, cached_input_per_mtok_usd: Some(0.5) };
-        assert_eq!(c.input_micro_usd_per_token(), 2);
-        assert_eq!(c.output_micro_usd_per_token(), 8);
-        assert_eq!(c.cached_input_micro_usd_per_token(), 1); // 0.5 rounds to 1
+    fn fractional_rates_are_exact_rather_than_rounded_away() {
+        for (usd_per_mtok, expected_nano) in [
+            (0.075_f64, 75_u64),
+            (0.15, 150),
+            (0.30, 300),
+            (0.40, 400),
+            (0.60, 600),
+            (1.60, 1_600),
+            (3.00, 3_000),
+            (15.00, 15_000),
+        ] {
+            let c = CostModel {
+                input_per_mtok_usd: usd_per_mtok,
+                output_per_mtok_usd: 0.0,
+                cached_input_per_mtok_usd: None,
+            };
+            assert_eq!(
+                c.input_nano_usd_per_token(),
+                expected_nano,
+                "${usd_per_mtok}/MTok must be {expected_nano} nano-USD/token, not rounded"
+            );
+        }
     }
 
     #[test]
     fn zero_cost_model_is_free() {
         let c = CostModel { input_per_mtok_usd: 0.0, output_per_mtok_usd: 0.0, cached_input_per_mtok_usd: None };
-        assert_eq!(c.input_micro_usd_per_token(), 0);
+        assert_eq!(c.input_nano_usd_per_token(), 0);
         assert!(c.is_free());
     }
 
@@ -619,8 +663,32 @@ mod tests {
     fn a_realistic_stream_cost_is_sane() {
         // 1M prompt tokens at $2/MTok + 1M completion at $8/MTok = $10.
         let c = CostModel { input_per_mtok_usd: 2.0, output_per_mtok_usd: 8.0, cached_input_per_mtok_usd: None };
-        let cost = 1_000_000 * c.input_micro_usd_per_token() + 1_000_000 * c.output_micro_usd_per_token();
-        assert_eq!(cost, 10_000_000); // $10 expressed in micro-USD
+        let cost = 1_000_000 * c.input_nano_usd_per_token() + 1_000_000 * c.output_nano_usd_per_token();
+        assert_eq!(cost, 10_000_000_000); // $10 expressed in nano-USD
+    }
+
+    /// Loads the catalogue the gateway actually ships. The unit bug was
+    /// invisible in the unit tests above because every rate there was a whole
+    /// number of micro-USD per token; the real prices are not, and three of
+    /// the five shipped models were being billed at zero.
+    #[tokio::test]
+    async fn no_shipped_model_is_priced_free_unless_configured_free() {
+        let registry = ModelRegistry::load("config/models.yaml", false, 0).expect("config/models.yaml must load");
+        let snapshot = registry.snapshot().await;
+        assert!(snapshot.len() > 0, "the shipped catalogue must not be empty");
+        for id in snapshot.ids() {
+            let cfg = &snapshot.by_id[id];
+            let configured_free =
+                cfg.cost.input_per_mtok_usd == 0.0 && cfg.cost.output_per_mtok_usd == 0.0;
+            assert_eq!(
+                cfg.cost.is_free(),
+                configured_free,
+                "model `{id}` is configured at {} in / {} out USD per MTok but reports is_free() = {}",
+                cfg.cost.input_per_mtok_usd,
+                cfg.cost.output_per_mtok_usd,
+                cfg.cost.is_free(),
+            );
+        }
     }
 
     #[test]

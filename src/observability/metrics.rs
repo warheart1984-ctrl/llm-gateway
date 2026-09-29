@@ -33,7 +33,7 @@ struct Counters {
     delta_events_total: AtomicU64,
     prompt_tokens_total: AtomicU64,
     completion_tokens_total: AtomicU64,
-    cost_micro_usd_total: AtomicU64,
+    cost_nano_usd_total: AtomicU64,
     bytes_to_client_total: AtomicU64,
     ttft_ms_sum: AtomicU64,
     ttft_ms_count: AtomicU64,
@@ -56,7 +56,7 @@ struct ModelRollup {
     duration_ms_sum: AtomicU64,
     prompt_tokens: AtomicU64,
     completion_tokens: AtomicU64,
-    cost_micro_usd: AtomicU64,
+    cost_nano_usd: AtomicU64,
     ttft_ms_sum: AtomicU64,
     ttft_ms_count: AtomicU64,
 }
@@ -67,7 +67,7 @@ struct TenantRollup {
     streams: AtomicU64,
     errors: AtomicU64,
     denied: AtomicU64,
-    cost_micro_usd: AtomicU64,
+    cost_nano_usd: AtomicU64,
     prompt_tokens: AtomicU64,
     completion_tokens: AtomicU64,
 }
@@ -186,8 +186,8 @@ impl Metrics {
             .fetch_add(summary.prompt_tokens as u64, Ordering::Relaxed);
         g.completion_tokens_total
             .fetch_add(summary.completion_tokens as u64, Ordering::Relaxed);
-        g.cost_micro_usd_total
-            .fetch_add(summary.cost_micro_usd, Ordering::Relaxed);
+        g.cost_nano_usd_total
+            .fetch_add(summary.cost_nano_usd, Ordering::Relaxed);
         g.duration_ms_sum.fetch_add(duration_ms, Ordering::Relaxed);
         g.duration_ms_count.fetch_add(1, Ordering::Relaxed);
         if let Some(ttft) = ttft_ms {
@@ -205,8 +205,8 @@ impl Metrics {
             .fetch_add(summary.prompt_tokens as u64, Ordering::Relaxed);
         m.completion_tokens
             .fetch_add(summary.completion_tokens as u64, Ordering::Relaxed);
-        m.cost_micro_usd
-            .fetch_add(summary.cost_micro_usd, Ordering::Relaxed);
+        m.cost_nano_usd
+            .fetch_add(summary.cost_nano_usd, Ordering::Relaxed);
         if let Some(ttft) = ttft_ms {
             m.ttft_ms_sum.fetch_add(ttft, Ordering::Relaxed);
             m.ttft_ms_count.fetch_add(1, Ordering::Relaxed);
@@ -221,8 +221,8 @@ impl Metrics {
         if failed {
             t.errors.fetch_add(1, Ordering::Relaxed);
         }
-        t.cost_micro_usd
-            .fetch_add(summary.cost_micro_usd, Ordering::Relaxed);
+        t.cost_nano_usd
+            .fetch_add(summary.cost_nano_usd, Ordering::Relaxed);
         t.prompt_tokens
             .fetch_add(summary.prompt_tokens as u64, Ordering::Relaxed);
         t.completion_tokens
@@ -255,8 +255,8 @@ impl Metrics {
         )
     }
 
-    pub fn spend_micro_usd(&self) -> u64 {
-        self.global.cost_micro_usd_total.load(Ordering::Relaxed)
+    pub fn spend_nano_usd(&self) -> u64 {
+        self.global.cost_nano_usd_total.load(Ordering::Relaxed)
     }
 
     /// Prometheus text exposition format, version 0.0.4.
@@ -355,11 +355,11 @@ impl Metrics {
         );
         metric(
             &mut out,
-            "gw_cost_micro_usd_total",
+            "gw_cost_nano_usd_total",
             "counter",
-            "Estimated spend in micro-USD (1 USD = 1e6).",
+            "Estimated spend in nano-USD (1 USD = 1e6).",
             &[],
-            g.cost_micro_usd_total.load(Ordering::Relaxed),
+            g.cost_nano_usd_total.load(Ordering::Relaxed),
         );
         metric(
             &mut out,
@@ -418,7 +418,7 @@ impl Metrics {
             metric(&mut out, "gw_model_errors_total", "counter", "Failed streams per model.", &labels, m.errors.load(Ordering::Relaxed));
             metric(&mut out, "gw_model_prompt_tokens_total", "counter", "Prompt tokens per model.", &labels, m.prompt_tokens.load(Ordering::Relaxed));
             metric(&mut out, "gw_model_completion_tokens_total", "counter", "Completion tokens per model.", &labels, m.completion_tokens.load(Ordering::Relaxed));
-            metric(&mut out, "gw_model_cost_micro_usd_total", "counter", "Spend per model, micro-USD.", &labels, m.cost_micro_usd.load(Ordering::Relaxed));
+            metric(&mut out, "gw_model_cost_nano_usd_total", "counter", "Spend per model, nano-USD.", &labels, m.cost_nano_usd.load(Ordering::Relaxed));
             histogram_summary(&mut out, "gw_model_ttft_ms", "Time to first token per model.", m.ttft_ms_sum.load(Ordering::Relaxed), m.ttft_ms_count.load(Ordering::Relaxed));
             histogram_summary(&mut out, "gw_model_duration_ms", "Stream duration per model.", m.duration_ms_sum.load(Ordering::Relaxed), m.streams.load(Ordering::Relaxed));
         }
@@ -432,7 +432,7 @@ impl Metrics {
             metric(&mut out, "gw_tenant_streams_total", "counter", "Streams per tenant.", &labels, t.streams.load(Ordering::Relaxed));
             metric(&mut out, "gw_tenant_policy_denied_total", "counter", "Policy denials per tenant.", &labels, t.denied.load(Ordering::Relaxed));
             metric(&mut out, "gw_tenant_errors_total", "counter", "Failed streams per tenant.", &labels, t.errors.load(Ordering::Relaxed));
-            metric(&mut out, "gw_tenant_cost_micro_usd_total", "counter", "Spend per tenant, micro-USD.", &labels, t.cost_micro_usd.load(Ordering::Relaxed));
+            metric(&mut out, "gw_tenant_cost_nano_usd_total", "counter", "Spend per tenant, nano-USD.", &labels, t.cost_nano_usd.load(Ordering::Relaxed));
         }
 
         out
@@ -522,7 +522,7 @@ mod tests {
         let summary = StreamSummary {
             prompt_tokens: 10,
             completion_tokens: 20,
-            cost_micro_usd: 1234,
+            cost_nano_usd: 1234,
             events: 20,
             ..Default::default()
         };
@@ -530,9 +530,9 @@ mod tests {
         m.stream_finished("groq", "llama", "acme", &summary, 700, Some(60));
         let text = m.render();
         assert!(text.contains("gw_model_streams_total{provider=\"groq\",model=\"llama\"} 2"));
-        assert!(text.contains("gw_tenant_cost_micro_usd_total{tenant=\"acme\"} 2468"));
+        assert!(text.contains("gw_tenant_cost_nano_usd_total{tenant=\"acme\"} 2468"));
         assert_eq!(m.tokens(), (20, 40));
-        assert_eq!(m.spend_micro_usd(), 2468);
+        assert_eq!(m.spend_nano_usd(), 2468);
     }
 
     #[test]

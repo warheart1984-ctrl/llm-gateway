@@ -64,7 +64,7 @@ data: {"token":" is"}
 data: {"token":" ..."}
 
 event: end
-data: {"finish_reason":"stop","usage":{"prompt_tokens":18,"completion_tokens":12,...},"cost_micro_usd":23,...}
+data: {"finish_reason":"stop","usage":{"prompt_tokens":18,"completion_tokens":12,...},"cost_nano_usd":9900,...}
 
 data: [DONE]
 ```
@@ -99,7 +99,7 @@ Provider frames are decoded and re-emitted under the gateway's own contract:
 | `tool` | `{"index","id","name","arguments"}` | tool-call deltas, forwarded intact |
 | `meta` | `{"upstream_id","upstream_model"}` | upstream correlation ids |
 | `error` | `{"error":{"code","message","retryable"},"request_id"}` | in-band failure after headers were sent |
-| `end` | `{"finish_reason","usage","cost_micro_usd","duration_ms","ttft_ms"}` | then `data: [DONE]` |
+| `end` | `{"finish_reason","usage","cost_nano_usd","duration_ms","ttft_ms"}` | then `data: [DONE]` |
 
 This buys cross-provider uniformity, per-tenant billing, and a client surface
 that does not change when a vendor changes their wire format. It costs a decode
@@ -194,7 +194,7 @@ requests_per_minute = 120
 tokens_per_minute = 200000
 max_concurrent_streams = 16
 max_output_tokens = 8192
-daily_budget_micro_usd = 5000000   # 1 USD = 1_000_000 micro-USD
+daily_budget_nano_usd = 5000000000   # 1 USD = 1_000_000_000 nano-USD
 ```
 
 `config/models.yaml` is the only place a model, provider, or upstream URL is

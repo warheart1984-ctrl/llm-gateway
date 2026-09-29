@@ -110,11 +110,11 @@ pub fn estimate_prompt_tokens(messages: &[crate::providers::ChatMessage]) -> u32
     ((chars as f64) / 3.5).ceil() as u32
 }
 
-/// Micro-USD a request is expected to cost, given the effective output cap.
+    /// Nano-USD a request is expected to cost, given the effective output cap.
 /// Reserved before the stream opens, settled with real usage afterwards.
-pub fn estimate_cost_micro_usd(cost: &CostModel, prompt_tokens: u32, max_output_tokens: u32) -> u64 {
-    prompt_tokens as u64 * cost.input_micro_usd_per_token()
-        + max_output_tokens as u64 * cost.output_micro_usd_per_token()
+pub fn estimate_cost_nano_usd(cost: &CostModel, prompt_tokens: u32, max_output_tokens: u32) -> u64 {
+    prompt_tokens as u64 * cost.input_nano_usd_per_token()
+        + max_output_tokens as u64 * cost.output_nano_usd_per_token()
 }
 
 /// True when the model must be addressed with `max_completion_tokens` instead

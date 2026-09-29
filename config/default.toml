@@ -70,7 +70,7 @@ tokens_per_minute = 200000
 max_concurrent_streams = 16
 max_output_tokens = 8192
 # 5 USD/day.
-daily_budget_micro_usd = 5000000
+daily_budget_nano_usd = 5000000000
 max_messages = 512
 max_prompt_chars = 200000
 

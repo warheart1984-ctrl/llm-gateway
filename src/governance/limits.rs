@@ -38,9 +38,9 @@ pub enum LimitError {
     },
     #[error("concurrent stream limit reached ({limit} in flight)")]
     ConcurrencyLimited { limit: u32 },
-    #[error("daily budget exhausted: {spent} micro-USD spent, budget is {budget} micro-USD")]
+    #[error("daily budget exhausted: {spent} nano-USD spent, budget is {budget} nano-USD")]
     BudgetExhausted { spent: u64, budget: u64 },
-    #[error("this request would cost about {estimate} micro-USD, more than the {remaining} micro-USD left in today's budget")]
+    #[error("this request would cost about {estimate} nano-USD, more than the {remaining} nano-USD left in today's budget")]
     BudgetWouldBeExceeded { estimate: u64, remaining: u64 },
     #[error("output token limit exceeded: requested {requested}, tenant allows at most {limit}")]
     OutputTokensExceeded { requested: u32, limit: u32 },
@@ -83,7 +83,7 @@ impl Window {
     }
 }
 
-/// Day-bucketed spend in micro-USD. Integer only: money is not a float.
+/// Day-bucketed spend in nano-USD. Integer only: money is not a float.
 #[derive(Debug, Default)]
 struct SpendLedger {
     bucket: AtomicU64,
@@ -176,10 +176,10 @@ pub struct Reservation {
     state: Arc<TenantState>,
     _global_permit: Option<OwnedSemaphorePermit>,
     _tenant_permit: Option<OwnedSemaphorePermit>,
-    reserved_micro_usd: u64,
+    reserved_nano_usd: u64,
     /// The prompt half of the reservation. Kept so an abandoned stream refunds
     /// only the completion half without needing the cost model at drop time.
-    reserved_prompt_micro_usd: u64,
+    reserved_prompt_nano_usd: u64,
     prompt_tokens: u32,
     settled: bool,
 }
@@ -193,8 +193,8 @@ impl Reservation {
         self.settled = true;
         let prompt = usage.prompt_tokens.max(self.prompt_tokens);
         let completion = usage.completion_tokens;
-        let actual = micro_usd_for(prompt, usage.cached_prompt_tokens, completion, cost);
-        let delta = actual as i128 - self.reserved_micro_usd as i128;
+        let actual = nano_usd_for(prompt, usage.cached_prompt_tokens, completion, cost);
+        let delta = actual as i128 - self.reserved_nano_usd as i128;
         if delta != 0 {
             self.state
                 .spend
@@ -218,8 +218,8 @@ impl Reservation {
         self.settled = true;
     }
 
-    pub fn reserved_micro_usd(&self) -> u64 {
-        self.reserved_micro_usd
+    pub fn reserved_nano_usd(&self) -> u64 {
+        self.reserved_nano_usd
     }
 
     pub fn prompt_tokens(&self) -> u32 {
@@ -232,7 +232,7 @@ impl Drop for Reservation {
         if !self.settled {
             // A stream that died without reporting usage still consumed its
             // prompt. Release only the completion half of the reservation.
-            let refund = self.reserved_micro_usd as i128 - self.reserved_prompt_micro_usd as i128;
+            let refund = self.reserved_nano_usd as i128 - self.reserved_prompt_nano_usd as i128;
             if refund > 0 {
                 self.state
                     .spend
@@ -245,21 +245,21 @@ impl Drop for Reservation {
     }
 }
 
-fn micro_usd_for(
+fn nano_usd_for(
     prompt_tokens: u32,
     cached_prompt_tokens: Option<u32>,
     completion_tokens: u32,
     cost: &CostModel,
 ) -> u64 {
-    let input_rate = cost.input_micro_usd_per_token();
-    let cached_rate = cost.cached_input_micro_usd_per_token();
+    let input_rate = cost.input_nano_usd_per_token();
+    let cached_rate = cost.cached_input_nano_usd_per_token();
     let (fresh, cached) = match cached_prompt_tokens {
         Some(c) => (prompt_tokens.saturating_sub(c), c),
         None => (prompt_tokens, 0),
     };
     fresh as u64 * input_rate
         + cached as u64 * cached_rate
-        + completion_tokens as u64 * cost.output_micro_usd_per_token()
+        + completion_tokens as u64 * cost.output_nano_usd_per_token()
 }
 
 // ---------------------------------------------------------------------------
@@ -302,7 +302,7 @@ impl LimitEngine {
         max_output_tokens: u32,
         estimate: CostEstimate,
     ) -> Result<Reservation, LimitError> {
-        let estimated_cost_micro_usd = estimate.total();
+        let estimated_cost_nano_usd = estimate.total();
         // `0` means "no ceiling", matching the rest of `LimitProfile`.
         if limits.max_output_tokens > 0 && max_output_tokens > limits.max_output_tokens {
             return Err(LimitError::OutputTokensExceeded {
@@ -349,22 +349,22 @@ impl LimitEngine {
             });
         }
 
-        let reserved_total = if self.cost_tracking && limits.daily_budget_micro_usd > 0 {
+        let reserved_total = if self.cost_tracking && limits.daily_budget_nano_usd > 0 {
             let (_bucket, spent) = state.spend.snapshot(system_now);
-            if spent >= limits.daily_budget_micro_usd {
+            if spent >= limits.daily_budget_nano_usd {
                 return Err(LimitError::BudgetExhausted {
                     spent,
-                    budget: limits.daily_budget_micro_usd,
+                    budget: limits.daily_budget_nano_usd,
                 });
             }
-            let remaining = limits.daily_budget_micro_usd - spent;
-            if estimated_cost_micro_usd > remaining {
+            let remaining = limits.daily_budget_nano_usd - spent;
+            if estimated_cost_nano_usd > remaining {
                 return Err(LimitError::BudgetWouldBeExceeded {
-                    estimate: estimated_cost_micro_usd,
+                    estimate: estimated_cost_nano_usd,
                     remaining,
                 });
             }
-            state.spend.reserve(system_now, estimated_cost_micro_usd)
+            state.spend.reserve(system_now, estimated_cost_nano_usd)
         } else {
             0
         };
@@ -383,8 +383,8 @@ impl LimitEngine {
             tenant = tenant_id,
             prompt_tokens,
             max_output_tokens,
-            reserved_micro_usd = estimated_cost_micro_usd,
-            tenant_spend_micro_usd = reserved_total,
+            reserved_nano_usd = estimated_cost_nano_usd,
+            tenant_spend_nano_usd = reserved_total,
             "admitted"
         );
 
@@ -392,8 +392,8 @@ impl LimitEngine {
             state: Arc::clone(&state),
             _global_permit: Some(global_permit),
             _tenant_permit: Some(tenant_permit),
-            reserved_micro_usd: estimated_cost_micro_usd,
-            reserved_prompt_micro_usd: estimate.prompt_micro_usd,
+            reserved_nano_usd: estimated_cost_nano_usd,
+            reserved_prompt_nano_usd: estimate.prompt_nano_usd,
             prompt_tokens,
             settled: false,
         })
@@ -430,8 +430,8 @@ impl LimitEngine {
             requests_last_minute: usage.requests_last_minute,
             tokens_last_minute: usage.tokens_last_minute,
             in_flight: usage.in_flight,
-            spent_micro_usd: spent,
-            budget_micro_usd: limits.daily_budget_micro_usd,
+            spent_nano_usd: spent,
+            budget_nano_usd: limits.daily_budget_nano_usd,
             budget_bucket: bucket,
             budget_label: budget_bucket_label(bucket),
         }
@@ -446,14 +446,14 @@ impl LimitEngine {
 /// the completion half without re-deriving rates.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CostEstimate {
-    pub prompt_micro_usd: u64,
-    pub completion_micro_usd: u64,
+    pub prompt_nano_usd: u64,
+    pub completion_nano_usd: u64,
 }
 
 impl CostEstimate {
     pub fn total(&self) -> u64 {
-        self.prompt_micro_usd
-            .saturating_add(self.completion_micro_usd)
+        self.prompt_nano_usd
+            .saturating_add(self.completion_nano_usd)
     }
 }
 
@@ -470,15 +470,15 @@ pub struct BudgetSnapshot {
     pub requests_last_minute: u32,
     pub tokens_last_minute: u32,
     pub in_flight: u64,
-    pub spent_micro_usd: u64,
-    pub budget_micro_usd: u64,
+    pub spent_nano_usd: u64,
+    pub budget_nano_usd: u64,
     pub budget_bucket: u64,
     pub budget_label: String,
 }
 
 impl BudgetSnapshot {
-    pub fn remaining_micro_usd(&self) -> u64 {
-        self.budget_micro_usd.saturating_sub(self.spent_micro_usd)
+    pub fn remaining_nano_usd(&self) -> u64 {
+        self.budget_nano_usd.saturating_sub(self.spent_nano_usd)
     }
 }
 
@@ -489,7 +489,7 @@ pub struct UsageDelta {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
-    pub cost_micro_usd: u64,
+    pub cost_nano_usd: u64,
 }
 
 #[cfg(test)]
@@ -502,7 +502,7 @@ mod tests {
             tokens_per_minute: tokens,
             max_concurrent_streams: concurrent,
             max_output_tokens: 8_192,
-            daily_budget_micro_usd: budget,
+            daily_budget_nano_usd: budget,
             max_messages: 100,
             max_prompt_chars: 1_000_000,
         }
@@ -571,28 +571,25 @@ mod tests {
     #[tokio::test]
     async fn settle_corrects_the_reservation_to_actual_usage() {
         let engine = LimitEngine::new(64, true);
-        // $2/MTok in, $8/MTok out == 2000 and 8000 micro-USD per token.
+        // $2/MTok in, $8/MTok out == 2,000 and 8,000 nano-USD per token.
         let c = cost(2.0, 8.0);
-        let l = limits(0, 0, 8, 10_000_000);
-        // 10 prompt tokens at 2 micro-USD = 20. Reserve for 100 completion at
-        // 8 micro-USD = 800, total 820.
-        let mut r = engine
-            .admit(
-                "t",
-                &l,
-                10,
-                100,
-                CostEstimate { prompt_micro_usd: 20, completion_micro_usd: 800 },
-            )
-            .await
-            .unwrap();
-        assert_eq!(engine.snapshot("t", &l).spent_micro_usd, 820);
+        let l = limits(0, 0, 8, 10_000_000_000);
+        // The estimate is derived from the same rate table that settles it, so
+        // the two cannot disagree. 10 prompt tokens = 20,000; reserving for 100
+        // completion = 800,000; total 820,000.
+        let estimate = CostEstimate {
+            prompt_nano_usd: nano_usd_for(10, None, 0, &c),
+            completion_nano_usd: nano_usd_for(0, None, 100, &c),
+        };
+        let mut r = engine.admit("t", &l, 10, 100, estimate).await.unwrap();
+        assert_eq!(engine.snapshot("t", &l).spent_nano_usd, 820_000);
         r.settle(
             Usage { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, ..Default::default() },
             &c,
         );
-        // Actual: 10 * 2 + 5 * 8 = 60. The 760 over-reserve is refunded.
-        assert_eq!(engine.snapshot("t", &l).spent_micro_usd, 60);
+        // Actual: 10 * 2,000 + 5 * 8,000 = 60,000. The 760,000 over-reserve is
+        // refunded.
+        assert_eq!(engine.snapshot("t", &l).spent_nano_usd, 60_000);
     }
 
     #[tokio::test]
@@ -605,21 +602,21 @@ mod tests {
                 &l,
                 10,
                 100,
-                CostEstimate { prompt_micro_usd: 20, completion_micro_usd: 800 },
+                CostEstimate { prompt_nano_usd: 20, completion_nano_usd: 800 },
             )
             .await
             .unwrap();
-        assert_eq!(engine.snapshot("t", &l).spent_micro_usd, 820);
+        assert_eq!(engine.snapshot("t", &l).spent_nano_usd, 820);
         drop(r);
         // Only the prompt half is kept; the completion reservation is refunded.
-        assert_eq!(engine.snapshot("t", &l).spent_micro_usd, 20);
+        assert_eq!(engine.snapshot("t", &l).spent_nano_usd, 20);
     }
 
     #[tokio::test]
     async fn budget_would_be_exceeded_is_distinct_from_exhausted() {
         let engine = LimitEngine::new(64, true);
         let l = limits(0, 0, 8, 1_000);
-        let err = engine.admit("t", &l, 10, 10, CostEstimate { prompt_micro_usd: 2_500, completion_micro_usd: 2_500 }).await.unwrap_err();
+        let err = engine.admit("t", &l, 10, 10, CostEstimate { prompt_nano_usd: 2_500, completion_nano_usd: 2_500 }).await.unwrap_err();
         assert!(matches!(err, LimitError::BudgetWouldBeExceeded { estimate: 5_000, remaining: 1_000 }));
     }
 
@@ -629,17 +626,19 @@ mod tests {
         let l = limits(0, 0, 8, 1_000);
         // Reserving the full budget is allowed exactly once.
         let mut r = engine
-            .admit("t", &l, 1, 1, CostEstimate { prompt_micro_usd: 500, completion_micro_usd: 500 })
+            .admit("t", &l, 1, 1, CostEstimate { prompt_nano_usd: 500, completion_nano_usd: 500 })
             .await
             .unwrap();
-        assert_eq!(engine.snapshot("t", &l).spent_micro_usd, 1_000);
+        assert_eq!(engine.snapshot("t", &l).spent_nano_usd, 1_000);
         // Settling at the reserved amount leaves the budget exactly exhausted.
+        // $0.001/MTok is 1 nano-USD per token, so 500 + 500 tokens bills
+        // exactly the 1,000 nano-USD that was reserved.
         r.settle(
             Usage { prompt_tokens: 500, completion_tokens: 500, total_tokens: 1_000, ..Default::default() },
-            &CostModel { input_per_mtok_usd: 1.0, output_per_mtok_usd: 1.0, cached_input_per_mtok_usd: None },
+            &CostModel { input_per_mtok_usd: 0.001, output_per_mtok_usd: 0.001, cached_input_per_mtok_usd: None },
         );
         let err = engine
-            .admit("t", &l, 1, 1, CostEstimate { prompt_micro_usd: 1, completion_micro_usd: 0 })
+            .admit("t", &l, 1, 1, CostEstimate { prompt_nano_usd: 1, completion_nano_usd: 0 })
             .await
             .unwrap_err();
         assert!(matches!(err, LimitError::BudgetExhausted { spent: 1_000, budget: 1_000 }));
@@ -652,10 +651,10 @@ mod tests {
             output_per_mtok_usd: 8.0,
             cached_input_per_mtok_usd: Some(0.5),
         };
-        // Rates are micro-USD per token: $2/MTok -> 2, $0.50/MTok -> 1 (rounded
-        // from 0.5), $8/MTok -> 8. 800 of 1_000 prompt tokens were cached.
-        let cost = micro_usd_for(1_000, Some(800), 100, &c);
-        assert_eq!(cost, 200 * 2 + 800 + 100 * 8);
+        // Rates are nano-USD per token: $2/MTok -> 2,000, $0.50/MTok -> 500,
+        // $8/MTok -> 8,000. 800 of 1_000 prompt tokens were cached.
+        let cost = nano_usd_for(1_000, Some(800), 100, &c);
+        assert_eq!(cost, 200 * 2_000 + 800 * 500 + 100 * 8_000);
     }
 
     #[tokio::test]

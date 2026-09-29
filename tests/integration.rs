@@ -290,7 +290,7 @@ tenants:
       tokens_per_minute: 200000
       max_concurrent_streams: 8
       max_output_tokens: 4096
-      daily_budget_micro_usd: 100000000
+      daily_budget_nano_usd: 100000000000
     model_params:
       mock/chat:
         temperature: 0.1
@@ -306,7 +306,7 @@ tenants:
       tokens_per_minute: 1000
       max_concurrent_streams: 1
       max_output_tokens: 64
-      daily_budget_micro_usd: 100000000
+      daily_budget_nano_usd: 100000000000
   - tenant_id: throttled
     enabled: true
     credentials:
@@ -319,7 +319,7 @@ tenants:
       tokens_per_minute: 200000
       max_concurrent_streams: 8
       max_output_tokens: 4096
-      daily_budget_micro_usd: 100000000
+      daily_budget_nano_usd: 100000000000
   - tenant_id: broke
     enabled: true
     credentials:
@@ -332,7 +332,7 @@ tenants:
       tokens_per_minute: 200000
       max_concurrent_streams: 8
       max_output_tokens: 4096
-      daily_budget_micro_usd: 50
+      daily_budget_nano_usd: 50000
   - tenant_id: nocreds
     enabled: true
     credentials:
@@ -345,7 +345,7 @@ tenants:
       tokens_per_minute: 1
       max_concurrent_streams: 1
       max_output_tokens: 1
-      daily_budget_micro_usd: 1
+      daily_budget_nano_usd: 1000
 "#;
         std::fs::write(dir.path().join("models.yaml"), models).unwrap();
         std::fs::write(dir.path().join("tenants.yaml"), tenants).unwrap();
@@ -505,8 +505,8 @@ async fn streams_tokens_under_the_v1_contract() {
     assert_eq!(end["finish_reason"], "stop");
     assert_eq!(end["usage"]["prompt_tokens"], 12);
     assert_eq!(end["usage"]["completion_tokens"], 3);
-    // 12 * 2 + 3 * 8 micro-USD.
-    assert_eq!(end["cost_micro_usd"], 48);
+    // 12 * 2,000 + 3 * 8,000 nano-USD.
+    assert_eq!(end["cost_nano_usd"], 48_000);
 }
 
 #[tokio::test]
@@ -834,8 +834,8 @@ async fn rate_limit_returns_429_with_retry_after() {
 
 #[tokio::test]
 async fn budget_exhaustion_returns_402_before_spending_anything() {
-    // `broke` has a 50 micro-USD daily budget. A request reserving prompt plus
-    // 128 output tokens at 2/8 micro-USD per token costs 10 + 1024 micro-USD,
+    // `broke` has a 50,000 nano-USD daily budget. A request reserving prompt plus
+    // 128 output tokens at 2/8 nano-USD per token costs 10 + 1024 nano-USD,
     // which is more than the whole budget.
     let upstream = MockUpstream::start(Scenario::Happy).await;
     let gw = Gateway::start(&upstream).await;
@@ -859,7 +859,7 @@ async fn usage_endpoint_reports_the_callers_own_tenant() {
     let usage: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(usage["tenant_id"], "acme");
     assert_eq!(usage["requests_last_minute"], 1);
-    assert_eq!(usage["spent_micro_usd"], 48);
+    assert_eq!(usage["spent_nano_usd"], 48_000);
     assert_eq!(usage["streams_in_flight"], 0);
     assert!(usage["budget_day"].as_str().unwrap().len() == 10);
 }
@@ -907,7 +907,7 @@ async fn metrics_expose_request_and_stream_counters() {
     assert!(text.contains("gw_streams_completed_total 1"), "{text}");
     assert!(text.contains("gw_prompt_tokens_total 12"), "{text}");
     assert!(text.contains("gw_completion_tokens_total 3"), "{text}");
-    assert!(text.contains("gw_cost_micro_usd_total 48"), "{text}");
+    assert!(text.contains("gw_cost_nano_usd_total 48000"), "{text}");
     assert!(text.contains("gw_tenant_streams_total{tenant=\"acme\"} 1"), "{text}");
     assert!(text.contains("# TYPE gw_streams_completed_total counter"));
 }
@@ -1081,10 +1081,10 @@ async fn a_disconnected_stream_still_settles_its_prompt_cost() {
     assert_eq!(status, StatusCode::OK);
     let usage: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(usage["streams_in_flight"], 0, "the slot must be released");
-    // Prompt is a few tokens at 2 micro-USD each; completion is refunded.
-    let spent = usage["spent_micro_usd"].as_u64().unwrap();
+    // Prompt is a few tokens at 2,000 nano-USD each; completion is refunded.
+    let spent = usage["spent_nano_usd"].as_u64().unwrap();
     assert!(spent > 0, "an abort must still be billed for its prompt: {text}");
-    assert!(spent < 2_048, "the completion reservation must be refunded: {text}");
+    assert!(spent < 2_048_000, "the completion reservation must be refunded: {text}");
 }
 
 #[tokio::test]
