@@ -53,6 +53,21 @@ enum Scenario {
     Gated,
     /// Content deltas and a finish, but no usage anywhere.
     NoUsage,
+    /// A 404 whose body names the operator's account and quotes a key, the
+    /// shape NVIDIA answers with for a function the account cannot see.
+    LeakyReject,
+    /// An in-band `{"error": ...}` carrying the same account id and key.
+    LeakyInBand,
+}
+
+/// Stands in for the operator's provider account id in [`Scenario::LeakyReject`]
+/// and [`Scenario::LeakyInBand`]. Must reach the logs, never a tenant.
+const ACCOUNT_MARKER: &str = "acct-7c1e9f02d4";
+/// A key-shaped string in the same bodies. Must reach neither.
+const LEAKED_KEY: &str = "nvapi-leakedKey0123456789abcdef";
+
+fn leaky_detail() -> String {
+    format!("Function 'f-1': Not found for account '{ACCOUNT_MARKER}' (key {LEAKED_KEY})")
 }
 
 #[derive(Clone)]
@@ -145,7 +160,7 @@ async fn handle(State(state): State<MockState>, Json(body): Json<Value>) -> Resp
         other => other,
     };
 
-    if !streaming && scenario != Scenario::UpstreamReject {
+    if !streaming && !matches!(scenario, Scenario::UpstreamReject | Scenario::LeakyReject) {
         return completion_answer(scenario).await;
     }
 
@@ -162,6 +177,15 @@ async fn handle(State(state): State<MockState>, Json(body): Json<Value>) -> Resp
             Json(json!({ "error": { "message": "rate limit exceeded", "code": "rate_limited" } })),
         )
             .into_response(),
+        Scenario::LeakyReject => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "status": 404, "title": "Not Found", "detail": leaky_detail() })),
+        )
+            .into_response(),
+        Scenario::LeakyInBand => sse_response(vec![
+            chunk("c8", "partial"),
+            sse(&json!({ "error": { "message": leaky_detail(), "code": "internal" } }).to_string()),
+        ]),
         Scenario::Happy => sse_response(vec![
             chunk("c1", "Hello"),
             chunk("c1", ", "),
@@ -279,11 +303,12 @@ async fn completion_answer(scenario: Scenario) -> Response {
             9,
         ),
         Scenario::MidStreamError => json!({ "error": { "message": "upstream exploded", "code": "internal" } }),
+        Scenario::LeakyInBand => json!({ "error": { "message": leaky_detail(), "code": "internal" } }),
         Scenario::SlowFirstToken => {
             tokio::time::sleep(Duration::from_millis(300)).await;
             with_usage(message(json!({ "content": "eventual" }), "stop"), 12, 1)
         }
-        Scenario::UpstreamReject | Scenario::Gated => unreachable!("handled by the caller"),
+        Scenario::UpstreamReject | Scenario::LeakyReject | Scenario::Gated => unreachable!("handled by the caller"),
     };
     Json(body).into_response()
 }
@@ -650,7 +675,8 @@ async fn mid_stream_error_is_reported_as_an_event_not_a_silent_truncation() {
         .find(|(e, _)| e.as_deref() == Some("error"))
         .map(|(_, d)| serde_json::from_str::<Value>(d).unwrap())
         .expect("error event");
-    assert!(err["error"]["message"].as_str().unwrap().contains("upstream exploded"), "{err}");
+    // The vendor's words stay in the logs; the client gets the class.
+    assert_eq!(err["error"]["message"], "the upstream provider failed to answer (HTTP 502)", "{err}");
     // An in-band `error` object is an upstream failure reported with HTTP 200,
     // so the adapter synthesises a 502 and the code is `upstream_error`.
     assert_eq!(err["error"]["code"], "upstream_error");
@@ -1386,9 +1412,62 @@ async fn credentials_and_prompts_never_reach_the_logs() {
 
     let logs = captured_logs::contents();
     assert!(logs.contains("stream complete"), "log capture is not working");
-    for secret in [TEST_KEY, "test-key-locked", marker.as_str()] {
+    for secret in [TEST_KEY, "test-key-locked", marker.as_str(), LEAKED_KEY] {
         assert!(!logs.contains(secret), "`{secret}` reached a log line");
     }
+}
+
+#[tokio::test]
+async fn vendor_error_bodies_reach_the_logs_but_never_the_tenant() {
+    let leaks = |text: &str| text.contains(ACCOUNT_MARKER) || text.contains("leakedKey");
+
+    // Refused before streaming: a real status, a generic sentence.
+    let upstream = MockUpstream::start(Scenario::LeakyReject).await;
+    let gw = Gateway::start(&upstream).await;
+    let (status, _, text) = gw.post_chat(TEST_KEY, chat_body()).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(!leaks(&text), "a vendor body reached the tenant: {text}");
+    let err: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(err["error"]["code"], "upstream_rejected_request");
+    assert_eq!(err["error"]["retryable"], false);
+    assert_eq!(err["error"]["message"], "the upstream provider refused the request (HTTP 404)");
+    let (status, _, text) = gw.post_complete(TEST_KEY, complete_body()).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(!leaks(&text), "a vendor body reached the tenant: {text}");
+    let refused = gw;
+
+    // Failed in-band: the SSE `error` event and the completion's error body.
+    let upstream = MockUpstream::start(Scenario::LeakyInBand).await;
+    let gw = Gateway::start(&upstream).await;
+    let (status, _, text) = gw.post_chat(TEST_KEY, chat_body()).await;
+    assert_eq!(status, StatusCode::OK);
+    let event = parse_sse(&text)
+        .into_iter()
+        .find(|(e, _)| e.as_deref() == Some("error"))
+        .map(|(_, d)| d)
+        .expect("error event");
+    assert!(!leaks(&event), "a vendor body reached the SSE error event: {event}");
+    let (status, _, text) = gw.post_complete(TEST_KEY, complete_body()).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(!leaks(&text), "a vendor body reached the tenant: {text}");
+    let err: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(err["error"]["code"], "upstream_error");
+    assert_eq!(err["error"]["retryable"], true);
+
+    // The decision record keeps the class, not the vendor's words.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for gw in [&refused, &gw] {
+        let (status, record) = gw.get("/v1/admin/decisions?tenant=acme&limit=100", TEST_KEY).await;
+        assert_eq!(status, StatusCode::OK, "{record}");
+        assert!(record.contains("the upstream provider"), "no provider failure was recorded: {record}");
+        assert!(!leaks(&record), "a vendor body reached the decision record: {record}");
+    }
+
+    // The operator still sees what the vendor said, minus the key.
+    let logs = captured_logs::contents();
+    assert!(logs.contains(ACCOUNT_MARKER), "the vendor's detail must reach the logs");
+    assert!(logs.contains("upstream failed mid-stream"), "the in-band failure was not logged");
+    assert!(!logs.contains("leakedKey"), "a key-shaped string reached a log line");
 }
 
 #[tokio::test]

@@ -579,6 +579,29 @@ impl ProviderError {
         }
     }
 
+    /// What the calling tenant is told. A fixed sentence per class, never
+    /// the vendor's words: an upstream body can carry the operator's provider
+    /// account ids, billing state or key fragments, and none of that is the
+    /// tenant's business. The full detail goes to the logs instead, through
+    /// [`crate::observability::logging::redact_secrets`].
+    pub fn client_message(&self) -> String {
+        match self {
+            ProviderError::NotConfigured(_) => "the provider for this model is not configured on the gateway".into(),
+            ProviderError::Connect { .. } => "the gateway could not reach the upstream provider".into(),
+            ProviderError::Upstream { status, .. } => match *status {
+                429 => "the upstream provider is rate limiting requests; retry shortly".into(),
+                503 | 529 => format!("the upstream provider is overloaded; retry shortly (HTTP {status})"),
+                504 => "the upstream provider timed out; retry shortly (HTTP 504)".into(),
+                400..=499 => format!("the upstream provider refused the request (HTTP {status})"),
+                500..=599 => format!("the upstream provider failed to answer (HTTP {status})"),
+                _ => format!("the upstream provider returned an unexpected response (HTTP {status})"),
+            },
+            ProviderError::Stream(_) => "the connection to the upstream provider failed mid-response".into(),
+            ProviderError::Protocol(_) => "the upstream provider sent a response the gateway could not read".into(),
+            ProviderError::IdleTimeout(after) => format!("the upstream provider sent nothing for {after:?}"),
+        }
+    }
+
     pub fn status_hint(&self) -> u16 {
         match self {
             ProviderError::Upstream { status, .. } => *status,

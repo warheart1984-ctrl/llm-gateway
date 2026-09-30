@@ -123,6 +123,64 @@ pub fn redact_header(name: &str, value: &str) -> Option<String> {
     }
 }
 
+/// Longest piece of vendor text kept in one log field.
+const DETAIL_MAX: usize = 1000;
+
+/// Prefixes of credentials the gateway or its vendors issue.
+const KEY_PREFIXES: &[&str] = &["sk-", "sk_", "nvapi-", "gsk_", "gwk_", "xai-", "pk-", "rk-", "AIza", "eyJ"];
+
+/// A run of at least this many token characters that mixes letters and
+/// digits is treated as a secret even without a known prefix. A hyphenated
+/// UUID (36) stays readable, so vendor correlation ids survive.
+const OPAQUE_MIN: usize = 40;
+
+/// Vendor text made fit for a log line: anything shaped like a credential is
+/// replaced by `[redacted]` and the result is bounded to [`DETAIL_MAX`]
+/// characters. Upstream error bodies sometimes quote the key that was sent,
+/// and the logs must not become a second place keys live.
+///
+/// Heuristic by design: a token is a run of ASCII letters, digits, `-` and
+/// `_`; it is redacted when it starts with a known key prefix, follows the
+/// word `Bearer`, or is long and opaque.
+pub fn redact_secrets(text: &str) -> String {
+    let is_token_char = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    let mut out = String::with_capacity(text.len().min(DETAIL_MAX + 16));
+    let mut after_bearer = false;
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        // A bearer credential runs to the next delimiter, dots included, so a
+        // JWT goes whole.
+        if after_bearer && !c.is_whitespace() {
+            let end = rest
+                .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | '}' | ']'))
+                .unwrap_or(rest.len());
+            out.push_str("[redacted]");
+            after_bearer = false;
+            rest = &rest[end..];
+            continue;
+        }
+        if !is_token_char(c) {
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+            continue;
+        }
+        let end = rest.find(|c: char| !is_token_char(c)).unwrap_or(rest.len());
+        let token = &rest[..end];
+        let opaque = token.len() >= OPAQUE_MIN
+            && token.chars().any(|c| c.is_ascii_digit())
+            && token.chars().any(|c| c.is_ascii_alphabetic());
+        let keyed = KEY_PREFIXES.iter().any(|p| token.len() > p.len() + 8 && token.starts_with(p));
+        if keyed || opaque {
+            out.push_str("[redacted]");
+        } else {
+            out.push_str(token);
+        }
+        after_bearer = token.eq_ignore_ascii_case("bearer");
+        rest = &rest[end..];
+    }
+    crate::providers::truncate(&out, DETAIL_MAX)
+}
+
 /// One line per finished stream, at `info`, with everything needed to
 /// reconstruct the request without grepping.
 pub fn log_stream_complete(span: &RequestSpan, outcome: &StreamSummary) {
@@ -177,6 +235,20 @@ mod tests {
         assert!(s.ttft_ms().is_none());
         s.mark_first_token();
         assert!(s.ttft_ms().is_some());
+    }
+
+    #[test]
+    fn key_shaped_tokens_are_redacted_and_the_rest_kept() {
+        let body = r#"{"error":"Incorrect API key sk-or-v1-0123456789abcdef for account 'acct42'","auth":"Bearer abc.def"}"#;
+        let out = redact_secrets(body);
+        assert!(!out.contains("0123456789abcdef"), "{out}");
+        assert!(!out.contains("abc") && !out.contains("def"), "the bearer token must go whole: {out}");
+        assert!(out.contains("acct42") && out.contains("Incorrect API key"), "{out}");
+        let opaque = "a1".repeat(30);
+        assert_eq!(redact_secrets(&format!("id {opaque} end")), "id [redacted] end");
+        let uuid = "7f3a9c1e-1234-4d5e-9abc-0123456789ab";
+        assert_eq!(redact_secrets(uuid), uuid, "a correlation id stays readable");
+        assert!(redact_secrets(&"x ".repeat(5000)).chars().count() <= DETAIL_MAX + 1);
     }
 
     #[test]
