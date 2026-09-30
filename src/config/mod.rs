@@ -51,6 +51,10 @@ pub enum LedgerBackend {
     /// A shared, durable Postgres ledger: survives restarts, and every
     /// replica draws on one budget.
     Postgres,
+    /// A durable ledger in a local SQLite file: survives restarts, no
+    /// database server. One file per gateway; replicas do not share it, so
+    /// several replicas need `quota_split_replicas`.
+    Sqlite,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -75,6 +79,19 @@ pub struct LedgerConfig {
     /// replay: `kid:base64key[,kid:base64key...]`, first key seals. Unset
     /// means answers are not stored, so completions are not replayed.
     pub response_keys_env: String,
+    /// The SQLite database file. Relative paths resolve against the config
+    /// directory. Must be on a local disk; its directory must exist.
+    pub sqlite_path: PathBuf,
+    /// Quota-split mode for replicas without a shared database: `N` gateway
+    /// replicas each enforce `budget * margin% / N` (rounded down) of every
+    /// tenant's budget on their own durable SQLite ledger, so together they
+    /// can never exceed it. `0` is off. Requires `backend = "sqlite"`. Every
+    /// replica must use the same N, and N should change only at the UTC day
+    /// boundary: a replica added mid-day brings a fresh share.
+    pub quota_split_replicas: u32,
+    /// Share of the budget the replicas may use in total, 1 to 100. Below
+    /// 100 keeps headroom that no replica can spend.
+    pub quota_split_margin_percent: u32,
 }
 
 impl Default for LedgerConfig {
@@ -89,6 +106,9 @@ impl Default for LedgerConfig {
             sweep_interval_secs: 60,
             idempotency_retention_secs: 86_400,
             response_keys_env: "LLM_GATEWAY_RESPONSE_KEYS".to_string(),
+            sqlite_path: PathBuf::from("ledger.sqlite3"),
+            quota_split_replicas: 0,
+            quota_split_margin_percent: 100,
         }
     }
 }
@@ -436,6 +456,9 @@ impl Settings {
         }
         if self.registry.tenants_path.is_relative() {
             self.registry.tenants_path = base_dir.join(&self.registry.tenants_path);
+        }
+        if self.ledger.sqlite_path.is_relative() {
+            self.ledger.sqlite_path = base_dir.join(&self.ledger.sqlite_path);
         }
         self
     }

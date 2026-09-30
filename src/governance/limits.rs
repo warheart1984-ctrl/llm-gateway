@@ -359,6 +359,25 @@ fn nano_usd_for(
 // Engine
 // ---------------------------------------------------------------------------
 
+/// Quota-split mode: this replica enforces its fixed share of every
+/// tenant's budget, so `replicas` gateways that each hold their own durable
+/// ledger can never together exceed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuotaSplit {
+    pub replicas: u32,
+    /// Share of the budget the replicas may use in total, 1 to 100.
+    pub margin_percent: u32,
+}
+
+impl QuotaSplit {
+    /// `budget * margin% / replicas`, rounded down, in integer arithmetic.
+    /// Rounding down is what makes the bound exact: `replicas` shares sum to
+    /// at most `budget`.
+    pub fn share(self, budget: u64) -> u64 {
+        (budget as u128 * u128::from(self.margin_percent.min(100)) / 100 / u128::from(self.replicas.max(1))) as u64
+    }
+}
+
 /// Everything admission needs to know about one request.
 #[derive(Debug, Clone)]
 pub struct AdmitRequest<'a> {
@@ -377,6 +396,7 @@ pub struct LimitEngine {
     global: Arc<Semaphore>,
     cost_tracking: bool,
     ledger: Arc<dyn Ledger>,
+    quota_split: Option<QuotaSplit>,
 }
 
 impl LimitEngine {
@@ -386,12 +406,36 @@ impl LimitEngine {
     }
 
     pub fn with_ledger(max_concurrent_global: usize, cost_tracking: bool, ledger: Arc<dyn Ledger>) -> Arc<Self> {
+        Self::with_ledger_split(max_concurrent_global, cost_tracking, ledger, None)
+    }
+
+    /// An engine that enforces this replica's share of every budget.
+    pub fn with_ledger_split(
+        max_concurrent_global: usize,
+        cost_tracking: bool,
+        ledger: Arc<dyn Ledger>,
+        quota_split: Option<QuotaSplit>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             tenants: DashMap::new(),
             global: Arc::new(Semaphore::new(max_concurrent_global.max(1))),
             cost_tracking,
             ledger,
+            quota_split,
         })
+    }
+
+    pub fn quota_split(&self) -> Option<QuotaSplit> {
+        self.quota_split
+    }
+
+    /// The budget this process enforces: the tenant's whole budget, or this
+    /// replica's share of it. `0` still means no ceiling.
+    fn enforced_budget(&self, budget: u64) -> u64 {
+        match self.quota_split {
+            Some(split) if budget > 0 => split.share(budget),
+            _ => budget,
+        }
     }
 
     pub fn ledger(&self) -> &Arc<dyn Ledger> {
@@ -491,6 +535,17 @@ impl LimitEngine {
         // does not consume rate limit.
         let tracked = self.cost_tracking;
         let recorded = tracked || req.idempotency.is_some();
+        let budget = self.enforced_budget(limits.daily_budget_nano_usd);
+        // A real budget whose share rounds down to zero must refuse, not
+        // reach the ledger as `0`, which means "no ceiling": that would turn
+        // the smallest budgets into unlimited ones.
+        if tracked && limits.daily_budget_nano_usd > 0 && budget == 0 {
+            state.window().withdraw(now, req.prompt_tokens);
+            return Err(LimitError::BudgetWouldBeExceeded {
+                estimate: estimated_cost_nano_usd,
+                remaining: 0,
+            });
+        }
         let bucket = if recorded {
             let decision = self
                 .ledger
@@ -500,7 +555,7 @@ impl LimitEngine {
                     now: SystemTime::now(),
                     amount_nano_usd: if tracked { estimated_cost_nano_usd } else { 0 },
                     prompt_nano_usd: if tracked { req.estimate.prompt_nano_usd } else { 0 },
-                    budget_nano_usd: if tracked { limits.daily_budget_nano_usd } else { 0 },
+                    budget_nano_usd: if tracked { budget } else { 0 },
                     idempotency: req.idempotency.clone(),
                 })
                 .await;
@@ -569,7 +624,7 @@ impl LimitEngine {
             tokens_last_minute: usage.tokens_last_minute,
             in_flight: usage.in_flight,
             spent_nano_usd: spent,
-            budget_nano_usd: limits.daily_budget_nano_usd,
+            budget_nano_usd: self.enforced_budget(limits.daily_budget_nano_usd),
             budget_bucket: bucket,
             budget_label: budget_bucket_label(bucket),
         })
@@ -1275,5 +1330,58 @@ mod tests {
         }
         assert_eq!(engine.usage("broke").in_flight, 0);
         assert!(engine.admit("broke", &broke, 1, 1, CostEstimate { prompt_nano_usd: 10, completion_nano_usd: 0 }).await.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Quota split
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn replica_shares_never_sum_past_the_budget() {
+        // Exhaustive over awkward budgets, replica counts and margins: the
+        // shares, rounded down, can never add up to more than the budget.
+        for budget in [1u64, 2, 3, 7, 99, 1_000, 1_000_003, u64::MAX / 3] {
+            for replicas in 1..=9u32 {
+                for margin_percent in [1u32, 50, 95, 99, 100] {
+                    let split = QuotaSplit { replicas, margin_percent };
+                    let total = split.share(budget) as u128 * u128::from(replicas);
+                    assert!(total <= budget as u128, "{budget} {replicas} {margin_percent}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn each_replica_enforces_only_its_share() {
+        let per_request = estimate_for(10, 100).total();
+        let split = QuotaSplit { replicas: 3, margin_percent: 100 };
+        // Room for 6 requests in all, so 2 per replica.
+        let l = limits(0, 0, 64, per_request * 6 + 5);
+        let replica = LimitEngine::with_ledger_split(64, true, Arc::new(MemoryLedger::default()), Some(split));
+        let mut held = Vec::new();
+        while let Ok(r) = replica.admit("t", &l, 10, 100, estimate_for(10, 100)).await {
+            held.push(r);
+        }
+        assert_eq!(held.len(), 2);
+        assert_eq!(snap(&replica, "t", &l).budget_nano_usd, split.share(l.daily_budget_nano_usd));
+    }
+
+    /// The fail-open trap: a real budget whose share rounds down to zero
+    /// would reach the ledger as `0`, which means "no ceiling".
+    #[tokio::test]
+    async fn a_share_that_rounds_to_zero_refuses_instead_of_unlimiting() {
+        let split = QuotaSplit { replicas: 3, margin_percent: 100 };
+        let l = limits(0, 0, 64, 2);
+        let replica = LimitEngine::with_ledger_split(64, true, Arc::new(MemoryLedger::default()), Some(split));
+        let err = replica
+            .admit("t", &l, 1, 1, CostEstimate { prompt_nano_usd: 1, completion_nano_usd: 0 })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LimitError::BudgetWouldBeExceeded { remaining: 0, .. }), "{err:?}");
+        assert_eq!(snap(&replica, "t", &l).spent_nano_usd, 0);
+        assert_eq!(replica.usage("t").requests_last_minute, 0, "a refusal consumes no rate limit");
+
+        let unlimited = limits(0, 0, 64, 0);
+        assert!(replica.admit("t", &unlimited, 1, 1, CostEstimate::default()).await.is_ok(), "0 is still no ceiling");
     }
 }

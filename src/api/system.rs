@@ -160,6 +160,18 @@ pub async fn get_usage(
         "spent_nano_usd": snapshot.spent_nano_usd,
         "remaining_nano_usd": snapshot.remaining_nano_usd(),
         "daily_budget_nano_usd": snapshot.budget_nano_usd,
+        // In quota-split mode the budget above is this replica's share, and
+        // `spent` is what this replica has spent of it.
+        "budget_scope": match state.limits.quota_split() {
+            None => json!("tenant"),
+            Some(split) => json!({
+                "replica_share": {
+                    "replicas": split.replicas,
+                    "margin_percent": split.margin_percent,
+                    "tenant_budget_nano_usd": limits.daily_budget_nano_usd,
+                }
+            }),
+        },
         "budget_day": snapshot.budget_label,
         "limits": {
             "requests_per_minute": limits.requests_per_minute,

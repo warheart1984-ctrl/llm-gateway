@@ -258,12 +258,38 @@ isolation, rollover) and end to end in `tests/integration.rs`.
 
 Where spend lives is a choice, `[ledger] backend`:
 
-| | `memory` (default) | `postgres` |
-|---|---|---|
-| Survives a restart | no: spend resets to zero | yes |
-| Replicas share one budget | no: each enforces the full budget | yes |
-| Repeated `Idempotency-Key` recognised | within one process | across all replicas |
-| Ledger unreachable | cannot happen | 503 `ledger_unavailable`; readiness fails; no request executes |
+| | `memory` (default) | `sqlite` | `postgres` |
+|---|---|---|---|
+| Survives a restart | no: spend resets to zero | yes | yes |
+| Replicas share one budget | no: each enforces the full budget | no: use quota split (below) | yes |
+| Repeated `Idempotency-Key` recognised | within one process | across restarts, on one host | across all replicas |
+| Needs a database server | no | no: one local file | yes |
+| Ledger unreachable | cannot happen | 503; the gateway will not start without it | 503 `ledger_unavailable`; readiness fails; no request executes |
+
+`sqlite` is the Postgres design on a local file (`[ledger] sqlite_path`,
+relative to the config directory). WAL journal with `synchronous = FULL`,
+so a reservation is on disk before the provider is called, and every
+transaction starts with `BEGIN IMMEDIATE`, which serializes admissions even
+between processes sharing the file. Keep the file on a local disk, not a
+network filesystem, and give each gateway its own.
+
+**Quota split, for replicas without a shared database.** Set
+`quota_split_replicas = N` (and optionally `quota_split_margin_percent`) on
+N replicas, each on its own `sqlite` file. Each replica enforces
+`budget * margin% / N` of every tenant's budget, rounded down, so together
+they can never exceed it; `/v1/usage` reports the share as
+`budget_scope.replica_share`. The costs are plain:
+
+- **It strands budget.** One replica cannot spend another's unused share.
+  A shared Postgres ledger does not have this cost.
+- **N is fixed.** Every replica must use the same N. A replica added
+  mid-day starts with a fresh share on top of what the others already
+  spent, so change N only at the UTC day boundary.
+- **It refuses unsafe setups.** On the `memory` ledger a restart would hand
+  a replica a fresh share, and on `postgres` the replicas already share one
+  budget, so the gateway will not boot with either. A tenant budget whose
+  share rounds down to zero is refused outright; zero would otherwise mean
+  "no ceiling".
 
 With `postgres`, every change to money is one conditional statement, so the
 database decides, not any gateway process:
@@ -392,7 +418,7 @@ What the gateway does itself, and what it expects of the deployment around it.
 ## Testing
 
 ```bash
-cargo test --locked --all-targets                  # 228 tests
+cargo test --locked --all-targets                  # 245 tests
 cargo clippy --locked --all-targets -- -D warnings
 cargo bench --bench framing                        # add `-- --quick` for a fast pass
 ```

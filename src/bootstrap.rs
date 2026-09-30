@@ -128,11 +128,17 @@ pub async fn build_with_ledger(
         settings.governance.require_model_allowlist,
         settings.governance.default_limits.clone(),
     );
-    tracing::info!(backend = ledger.backend(), "spend ledger ready");
-    let limits = LimitEngine::with_ledger(
+    let quota_split = quota_split(&settings.ledger, ledger.backend())?;
+    tracing::info!(
+        backend = ledger.backend(),
+        quota_split_replicas = quota_split.map(|s| s.replicas).unwrap_or(0),
+        "spend ledger ready"
+    );
+    let limits = LimitEngine::with_ledger_split(
         settings.server.max_concurrent_streams_global,
         settings.governance.cost_tracking_enabled,
         ledger,
+        quota_split,
     );
 
     // Report which catalogue entries cannot currently be served. Not fatal:
@@ -184,6 +190,21 @@ async fn build_ledger(
     let retention = Duration::from_secs(cfg.idempotency_retention_secs);
     match cfg.backend {
         LedgerBackend::Memory => Ok(Arc::new(MemoryLedger::new(retention))),
+        LedgerBackend::Sqlite => {
+            let ledger = crate::governance::ledger::SqliteLedger::connect(
+                crate::governance::ledger::sqlite::SqliteOptions {
+                    path: cfg.sqlite_path.clone(),
+                    timeout: Duration::from_millis(cfg.timeout_ms),
+                    sweep_after: Duration::from_secs(cfg.sweep_after_secs),
+                    sweep_interval: Duration::from_secs(cfg.sweep_interval_secs),
+                    idempotency_retention: retention,
+                    sealer: response_sealer(&cfg.response_keys_env)?,
+                },
+            )
+            .await
+            .map_err(BootError::Ledger)?;
+            Ok(ledger)
+        }
         LedgerBackend::Postgres => {
             let url = std::env::var(&cfg.url_env).map_err(|_| {
                 BootError::Ledger(format!("backend is postgres but `{}` is not set", cfg.url_env))
@@ -226,4 +247,33 @@ fn response_sealer(
             Ok(None)
         }
     }
+}
+
+/// Quota-split mode, validated against the ledger actually in use. It is
+/// only sound on a durable ledger that is private to this replica: on the
+/// in-memory ledger a restart would hand this replica a fresh share (failing
+/// open), and on Postgres the replicas already share one budget exactly, so
+/// splitting would only strand it.
+fn quota_split(
+    cfg: &crate::config::LedgerConfig,
+    backend: &str,
+) -> Result<Option<crate::governance::QuotaSplit>, BootError> {
+    if cfg.quota_split_replicas == 0 {
+        return Ok(None);
+    }
+    if backend != "sqlite" {
+        return Err(BootError::Ledger(format!(
+            "quota_split_replicas needs backend = \"sqlite\" (a durable ledger private to each replica), not `{backend}`"
+        )));
+    }
+    if !(1..=100).contains(&cfg.quota_split_margin_percent) {
+        return Err(BootError::Ledger(format!(
+            "quota_split_margin_percent must be 1 to 100, got {}",
+            cfg.quota_split_margin_percent
+        )));
+    }
+    Ok(Some(crate::governance::QuotaSplit {
+        replicas: cfg.quota_split_replicas,
+        margin_percent: cfg.quota_split_margin_percent,
+    }))
 }

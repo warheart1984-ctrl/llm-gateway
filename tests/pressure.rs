@@ -345,7 +345,8 @@ async fn postgres_ledger(
             url: url.to_string(),
             schema: schema.to_string(),
             max_connections: 8,
-            timeout: Duration::from_millis(2000),
+            // A loaded machine's deadline: see `local_ledger`.
+            timeout: Duration::from_millis(5000),
             sweep_after: Duration::from_secs(3_600),
             sweep_interval: Duration::from_secs(3_600),
             idempotency_retention: Duration::from_secs(86_400),
@@ -405,6 +406,14 @@ impl Deployment {
     }
 
     async fn boot_with(&self, tweak: impl FnOnce(&mut llm_gateway::config::Settings)) -> Gateway {
+        self.try_boot_with(tweak).await.expect("boot gateway")
+    }
+
+    /// Boot, or report why the gateway refused to start.
+    async fn try_boot_with(
+        &self,
+        tweak: impl FnOnce(&mut llm_gateway::config::Settings),
+    ) -> Result<Gateway, String> {
         let mut settings = llm_gateway::config::Settings {
             server: llm_gateway::config::ServerConfig {
                 bind_addr: "127.0.0.1".into(),
@@ -426,14 +435,14 @@ impl Deployment {
         };
         tweak(&mut settings);
         let state = match &self.ledger {
-            LedgerChoice::Memory => llm_gateway::bootstrap::build(settings).await.expect("boot gateway"),
+            LedgerChoice::Memory => llm_gateway::bootstrap::build(settings).await.map_err(|e| e.to_string())?,
             // A fresh ledger client per boot, exactly as a separate process
             // would have: nothing is shared but the database.
             LedgerChoice::Shared { url, schema, sealed } => {
-                let ledger = postgres_ledger(url, schema, *sealed).await.expect("connect ledger");
+                let ledger = postgres_ledger(url, schema, *sealed).await?;
                 llm_gateway::bootstrap::build_with_ledger(settings, ledger)
                     .await
-                    .expect("boot gateway")
+                    .map_err(|e| e.to_string())?
             }
         };
         let app = llm_gateway::api::router(state);
@@ -443,7 +452,26 @@ impl Deployment {
             let _ = axum::serve(listener, app).await;
         });
         tokio::time::sleep(Duration::from_millis(30)).await;
-        Gateway { addr, task, _config: Arc::clone(&self.dir) }
+        Ok(Gateway { addr, task, _config: Arc::clone(&self.dir) })
+    }
+
+    /// Settings for a gateway on its own SQLite ledger file in this
+    /// deployment's directory, optionally as one of `split` replicas.
+    fn local_ledger(&self, file: &str, split: Option<u32>) -> impl FnOnce(&mut llm_gateway::config::Settings) {
+        let path = self.dir.path().join(file);
+        move |s| {
+            s.ledger.backend = llm_gateway::config::LedgerBackend::Sqlite;
+            s.ledger.sqlite_path = path;
+            // The suite runs dozens of gateways in parallel on one disk, each
+            // syncing every commit. These tests assert admission outcomes, not
+            // latency, so they give the ledger a loaded machine's deadline.
+            s.ledger.timeout_ms = 5_000;
+            // No sealing key in these tests: answers are simply not stored.
+            s.ledger.response_keys_env = "LLM_GATEWAY_PRESSURE_NO_KEYS".into();
+            if let Some(replicas) = split {
+                s.ledger.quota_split_replicas = replicas;
+            }
+        }
     }
 }
 
@@ -1322,23 +1350,30 @@ async fn shared_ledger_a_burst_across_replicas_admits_exactly_what_fits() {
     let deployment = Deployment::shared(&provider, &url);
     let replicas = [Arc::new(deployment.boot().await), Arc::new(deployment.boot().await)];
 
-    let refused = Arc::new(AtomicU64::new(0));
+    // Every answer that comes back before the gate opens is recorded, so a
+    // refusal of the wrong kind names itself instead of looking like a hang.
+    let answered: Arc<std::sync::Mutex<Vec<(StatusCode, String)>>> = Arc::default();
     let burst: Vec<_> = (0..20)
         .map(|i| {
-            let (gw, refused) = (Arc::clone(&replicas[i % 2]), Arc::clone(&refused));
+            let (gw, answered) = (Arc::clone(&replicas[i % 2]), Arc::clone(&answered));
             tokio::spawn(async move {
                 let reply = gw.chat(Some("key-tight"), standard_request()).await;
-                if reply.status == StatusCode::PAYMENT_REQUIRED {
-                    refused.fetch_add(1, Ordering::SeqCst);
+                if reply.status != StatusCode::OK {
+                    answered.lock().unwrap().push((reply.status, reply.body.clone()));
                 }
                 reply.status
             })
         })
         .collect();
-    eventually("every request admitted or refused", || {
-        provider.calls() + refused.load(Ordering::SeqCst) == 20
+    eventually("every request admitted or answered", || {
+        provider.calls() as usize + answered.lock().unwrap().len() == 20
     })
     .await;
+    let answered = answered.lock().unwrap().clone();
+    assert!(
+        answered.iter().all(|(status, _)| *status == StatusCode::PAYMENT_REQUIRED),
+        "every refusal must be a budget refusal: {answered:#?}"
+    );
     assert_eq!(provider.calls(), 3, "one budget across both replicas");
     provider.open_gate(20);
     let statuses = futures_util::future::join_all(burst).await;
@@ -1502,7 +1537,145 @@ async fn shared_ledger_an_answer_moved_to_another_row_is_not_served() {
 }
 
 // ===========================================================================
-// 10. Known gaps of the in-memory ledger
+// 10. The local ledger (SQLite) and quota-split replicas
+// ===========================================================================
+//
+// No database server needed, so these run everywhere, Windows included.
+
+#[tokio::test]
+async fn local_ledger_a_restart_keeps_todays_spend() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let deployment = Deployment::new(&provider);
+
+    let first = deployment.boot_with(deployment.local_ledger("ledger.sqlite3", None)).await;
+    assert_eq!(first.chat(Some("key-oneshot"), small_request()).await.status, StatusCode::OK);
+    eventually_async("the settlement is durable", || async { first.spent("key-oneshot").await == HEALTHY_ANSWER_COST }).await;
+    drop(first); // crash
+
+    let restarted = deployment.boot_with(deployment.local_ledger("ledger.sqlite3", None)).await;
+    assert_eq!(restarted.spent("key-oneshot").await, HEALTHY_ANSWER_COST, "the ledger outlived the process");
+    assert_eq!(
+        restarted.chat(Some("key-oneshot"), small_request()).await.status,
+        StatusCode::PAYMENT_REQUIRED,
+        "an exhausted tenant stays exhausted after a restart"
+    );
+    assert_eq!(provider.calls(), 1);
+}
+
+#[tokio::test]
+async fn local_ledger_a_repeated_key_is_recognised_after_a_restart() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let deployment = Deployment::new(&provider);
+    async fn send(gw: &Gateway) -> Reply {
+        gw.send(with_key(reqwest::Client::new().post(gw.url("/v1/chat/stream")), "local-1").json(&standard_request()))
+            .await
+    }
+
+    let first = deployment.boot_with(deployment.local_ledger("ledger.sqlite3", None)).await;
+    assert_eq!(send(&first).await.status, StatusCode::OK);
+    eventually_async("the settlement is durable", || async { first.spent("key-app").await == HEALTHY_ANSWER_COST }).await;
+    drop(first);
+
+    let restarted = deployment.boot_with(deployment.local_ledger("ledger.sqlite3", None)).await;
+    let replay = send(&restarted).await;
+    assert_eq!(replay.status, StatusCode::CONFLICT, "{}", replay.body);
+    assert_eq!(replay.code(), "duplicate_request");
+    assert_eq!(provider.calls(), 1, "executed once across the restart");
+}
+
+#[tokio::test]
+async fn quota_split_a_burst_across_replicas_admits_exactly_the_shares() {
+    // Two replicas with separate SQLite files and no shared database. `tight`
+    // has room for three standard requests; each replica's half-share has
+    // room for one. Without the split, each replica would admit three: six.
+    let provider = MockProvider::start(Provider::Gated).await;
+    let deployment = Deployment::new(&provider);
+    let replicas = [
+        Arc::new(deployment.boot_with(deployment.local_ledger("replica-a.sqlite3", Some(2))).await),
+        Arc::new(deployment.boot_with(deployment.local_ledger("replica-b.sqlite3", Some(2))).await),
+    ];
+
+    let refused = Arc::new(AtomicU64::new(0));
+    let burst: Vec<_> = (0..20)
+        .map(|i| {
+            let (gw, refused) = (Arc::clone(&replicas[i % 2]), Arc::clone(&refused));
+            tokio::spawn(async move {
+                let reply = gw.chat(Some("key-tight"), standard_request()).await;
+                if reply.status == StatusCode::PAYMENT_REQUIRED {
+                    refused.fetch_add(1, Ordering::SeqCst);
+                }
+                reply.status
+            })
+        })
+        .collect();
+    eventually("every request admitted or refused", || {
+        provider.calls() + refused.load(Ordering::SeqCst) == 20
+    })
+    .await;
+    assert_eq!(provider.calls(), 2, "one share per replica, and the shares fit the budget");
+    provider.open_gate(20);
+    let statuses = futures_util::future::join_all(burst).await;
+    assert_eq!(statuses.into_iter().filter(|s| *s.as_ref().unwrap() == StatusCode::OK).count(), 2);
+}
+
+#[tokio::test]
+async fn quota_split_a_restarted_replica_keeps_its_spent_share() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let deployment = Deployment::new(&provider);
+
+    let replica = deployment.boot_with(deployment.local_ledger("replica-a.sqlite3", Some(2))).await;
+    assert_eq!(replica.chat(Some("key-tight"), standard_request()).await.status, StatusCode::OK);
+    eventually_async("the settlement is durable", || async { replica.spent("key-tight").await == HEALTHY_ANSWER_COST }).await;
+    drop(replica);
+
+    let restarted = deployment.boot_with(deployment.local_ledger("replica-a.sqlite3", Some(2))).await;
+    let usage = restarted.get("/v1/usage", "key-tight").await.json();
+    assert_eq!(usage["spent_nano_usd"], HEALTHY_ANSWER_COST, "the share's spend survived");
+    assert_eq!(usage["daily_budget_nano_usd"], 3_500_000 / 2, "this replica enforces half");
+    assert_eq!(usage["budget_scope"]["replica_share"]["replicas"], 2);
+    assert_eq!(usage["budget_scope"]["replica_share"]["tenant_budget_nano_usd"], 3_500_000);
+}
+
+#[tokio::test]
+async fn quota_split_refuses_to_boot_where_it_would_fail_open() {
+    // On the in-memory ledger a restart would hand the replica a fresh share.
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let deployment = Deployment::new(&provider);
+    let err = deployment
+        .try_boot_with(|s| s.ledger.quota_split_replicas = 2)
+        .await
+        .err()
+        .expect("a split on the in-memory ledger must not boot");
+    assert!(err.contains("sqlite"), "{err}");
+
+    let err = deployment
+        .try_boot_with(|s| {
+            deployment.local_ledger("margin.sqlite3", Some(2))(s);
+            s.ledger.quota_split_margin_percent = 0;
+        })
+        .await
+        .err()
+        .expect("a 0% margin must not boot");
+    assert!(err.contains("margin"), "{err}");
+}
+
+#[tokio::test]
+async fn local_ledger_a_gateway_will_not_start_without_its_ledger() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let deployment = Deployment::new(&provider);
+    let err = deployment
+        .try_boot_with(|s| {
+            s.ledger.backend = llm_gateway::config::LedgerBackend::Sqlite;
+            s.ledger.sqlite_path = std::path::PathBuf::from("/definitely/not/a/dir/ledger.sqlite3");
+        })
+        .await
+        .err()
+        .expect("an unopenable ledger must stop the gateway starting");
+    assert!(err.contains("ledger"), "{err}");
+}
+
+// ===========================================================================
+// 11. Known gaps of the in-memory ledger
 // ===========================================================================
 //
 // The in-memory ledger is per process by design. These pin what that means,
