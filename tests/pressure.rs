@@ -53,6 +53,9 @@ enum Provider {
     Hung,
     /// Starts streaming, then the connection dies mid-answer.
     DiesMidStream,
+    /// Sends one token, waits for a gate permit, then finishes normally
+    /// with the usual usage: a stream that runs as long as the test likes.
+    HeldMidStream,
 }
 
 #[derive(Clone)]
@@ -137,10 +140,36 @@ async fn answer(State(state): State<ProviderState>, Json(body): Json<Value>) -> 
         }
         Provider::Hung => std::future::pending::<()>().await,
         Provider::Gated => state.gate.acquire().await.expect("gate").forget(),
-        Provider::Healthy | Provider::DiesMidStream => {}
+        Provider::Healthy | Provider::DiesMidStream | Provider::HeldMidStream => {}
     }
     if !streaming {
         return completion_answer(state.behaviour);
+    }
+    if state.behaviour == Provider::HeldMidStream {
+        let gate = Arc::clone(&state.gate);
+        let frames = futures_util::stream::unfold(0u8, move |step| {
+            let gate = Arc::clone(&gate);
+            async move {
+                let frame = match step {
+                    0 => token("Hello"),
+                    1 => {
+                        gate.acquire().await.expect("gate").forget();
+                        token(", world")
+                    }
+                    2 => sse(json!({ "id": "p1", "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] })),
+                    3 => sse(json!({ "id": "p1", "choices": [],
+                                    "usage": { "prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15 } })),
+                    4 => "data: [DONE]\n\n".to_string(),
+                    _ => return None,
+                };
+                Some((Ok::<_, std::io::Error>(frame), step + 1))
+            }
+        });
+        let mut response = Response::new(Body::from_stream(frames));
+        response
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("text/event-stream"));
+        return response;
     }
     if state.behaviour == Provider::DiesMidStream {
         return sse_body(vec![
@@ -289,6 +318,32 @@ fn tenants_yaml(include_rotating_key: bool) -> String {
         key: key-dormant
         scopes: [chat:stream]
     allowed_models: ["mock/*"]
+  - tenant_id: capped
+    enabled: true
+    credentials:
+      - key_id: ak_capped
+        key: key-capped
+        scopes: [chat:stream]
+    allowed_models: ["mock/*"]
+    limits:
+      requests_per_minute: 10000
+      tokens_per_minute: 100000000
+      max_concurrent_streams: 3
+      max_output_tokens: 4096
+      daily_budget_nano_usd: 100000000000
+  - tenant_id: paced
+    enabled: true
+    credentials:
+      - key_id: ak_paced
+        key: key-paced
+        scopes: [chat:stream]
+    allowed_models: ["mock/*"]
+    limits:
+      requests_per_minute: 6
+      tokens_per_minute: 100000000
+      max_concurrent_streams: 256
+      max_output_tokens: 4096
+      daily_budget_nano_usd: 100000000000
   - tenant_id: strict
     enabled: true
     require_idempotency_key: true
@@ -347,7 +402,7 @@ async fn postgres_ledger(
             max_connections: 8,
             // A loaded machine's deadline: see `local_ledger`.
             timeout: Duration::from_millis(5000),
-            sweep_after: Duration::from_secs(3_600),
+            lease: Duration::from_secs(60),
             sweep_interval: Duration::from_secs(3_600),
             idempotency_retention: Duration::from_secs(86_400),
             sealer,
@@ -1513,6 +1568,88 @@ async fn shared_ledger_a_burst_across_replicas_admits_exactly_what_fits() {
 }
 
 #[tokio::test]
+async fn shared_ledger_concurrency_is_one_cap_across_replicas() {
+    // `capped` allows 3 streams at once. Twenty simultaneous requests split
+    // across two replicas: exactly 3 reach the provider, not 3 per replica.
+    let Some(url) = test_database_url() else { return };
+    let provider = MockProvider::start(Provider::Gated).await;
+    let deployment = Deployment::shared(&provider, &url);
+    let replicas = [Arc::new(deployment.boot().await), Arc::new(deployment.boot().await)];
+
+    let answered: Arc<std::sync::Mutex<Vec<(StatusCode, String)>>> = Arc::default();
+    let burst: Vec<_> = (0..20)
+        .map(|i| {
+            let (gw, answered) = (Arc::clone(&replicas[i % 2]), Arc::clone(&answered));
+            tokio::spawn(async move {
+                let reply = gw.chat(Some("key-capped"), small_request()).await;
+                if reply.status != StatusCode::OK {
+                    answered.lock().unwrap().push((reply.status, reply.code()));
+                }
+            })
+        })
+        .collect();
+    eventually("every request admitted or refused", || {
+        provider.calls() as usize + answered.lock().unwrap().len() == 20
+    })
+    .await;
+    assert_eq!(provider.calls(), 3, "one concurrency cap across both replicas");
+    let refusals = answered.lock().unwrap().clone();
+    assert!(
+        refusals.iter().all(|(s, c)| *s == StatusCode::TOO_MANY_REQUESTS && c == "concurrency_limited"),
+        "{refusals:?}"
+    );
+    provider.open_gate(20);
+    futures_util::future::join_all(burst).await;
+}
+
+#[tokio::test]
+async fn shared_ledger_settlements_racing_admissions_never_deadlock() {
+    // Every settlement writes the tenant's rate counters while other
+    // admissions for the same tenant hold its day row. Both must take the
+    // locks in one order, or Postgres aborts one of them and a healthy
+    // request gets a 503.
+    let Some(url) = test_database_url() else { return };
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let deployment = Deployment::shared(&provider, &url);
+    let replicas = [Arc::new(deployment.boot().await), Arc::new(deployment.boot().await)];
+    let burst: Vec<_> = (0..40)
+        .map(|i| {
+            let gw = Arc::clone(&replicas[i % 2]);
+            tokio::spawn(async move { gw.chat(Some("key-app"), small_request()).await })
+        })
+        .collect();
+    let replies: Vec<Reply> = futures_util::future::join_all(burst).await.into_iter().map(Result::unwrap).collect();
+    let failed: Vec<String> = replies
+        .iter()
+        .filter(|r| r.status != StatusCode::OK)
+        .map(|r| format!("{} {}", r.status, r.body))
+        .collect();
+    assert!(failed.is_empty(), "{} of 40 failed: {failed:#?}", failed.len());
+}
+
+#[tokio::test]
+async fn shared_ledger_the_rate_limit_is_one_window_across_replicas() {
+    // `paced` allows 6 requests a minute, in total, across both replicas.
+    let Some(url) = test_database_url() else { return };
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let deployment = Deployment::shared(&provider, &url);
+    let (a, b) = (deployment.boot().await, deployment.boot().await);
+    wait_for_mid_minute().await;
+    let mut admitted = 0;
+    for i in 0..14 {
+        let gw = if i % 2 == 0 { &a } else { &b };
+        let reply = gw.chat(Some("key-paced"), small_request()).await;
+        match reply.status {
+            StatusCode::OK => admitted += 1,
+            StatusCode::TOO_MANY_REQUESTS => assert_eq!(reply.code(), "rate_limited"),
+            other => panic!("unexpected {other}: {}", reply.body),
+        }
+    }
+    assert_eq!(admitted, 6, "one minute's quota across both replicas, not one per replica");
+    assert_eq!(provider.calls(), 6);
+}
+
+#[tokio::test]
 async fn shared_ledger_a_repeated_key_is_recognised_across_replicas() {
     let Some(url) = test_database_url() else { return };
     let provider = MockProvider::start(Provider::Healthy).await;
@@ -1828,6 +1965,73 @@ async fn local_ledger_a_gateway_will_not_start_without_its_ledger() {
         .err()
         .expect("an unopenable ledger must stop the gateway starting");
     assert!(err.contains("ledger"), "{err}");
+}
+
+/// Wait until at least 15 s remain in the current UTC minute, so a test that
+/// counts within one rate window cannot straddle two.
+async fn wait_for_mid_minute() {
+    loop {
+        let second = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            % 60;
+        if second < 45 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+#[tokio::test]
+async fn local_ledger_a_long_stream_is_never_swept_while_live() {
+    // A 1 s lease and a stream held open for 4 s. Without renewal the
+    // sweeper would take the live reservation, bill it in full and ignore
+    // its real settlement. With it, the stream settles at its real usage.
+    let provider = MockProvider::start(Provider::HeldMidStream).await;
+    let deployment = Deployment::new(&provider);
+    let gw = deployment
+        .boot_with(|s| {
+            deployment.local_ledger("lease.sqlite3", None)(s);
+            s.ledger.lease_secs = 1;
+            s.ledger.sweep_interval_secs = 1;
+        })
+        .await;
+
+    let mut response = reqwest::Client::new()
+        .post(gw.url("/v1/chat/stream"))
+        .header("x-api-key", "key-app")
+        .json(&standard_request())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let reserved: u64 = response.headers()["x-reserved-nano-usd"].to_str().unwrap().parse().unwrap();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    provider.open_gate(1);
+    let mut body = String::new();
+    while let Some(chunk) = response.chunk().await.unwrap() {
+        body.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    assert!(body.contains("event: end"), "{body}");
+    eventually_async("the settlement is durable", || async { gw.spent("key-app").await != reserved }).await;
+    assert_eq!(gw.spent("key-app").await, HEALTHY_ANSWER_COST, "billed its real usage, never swept");
+}
+
+#[tokio::test]
+async fn quota_split_divides_the_rate_limit_too() {
+    // `paced` allows 6 requests a minute; each of 2 split replicas enforces 3.
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let deployment = Deployment::new(&provider);
+    let replica = deployment.boot_with(deployment.local_ledger("paced-split.sqlite3", Some(2))).await;
+    wait_for_mid_minute().await;
+    let mut admitted = 0;
+    for _ in 0..6 {
+        if replica.chat(Some("key-paced"), small_request()).await.status == StatusCode::OK {
+            admitted += 1;
+        }
+    }
+    assert_eq!(admitted, 3, "this replica's share of the minute");
 }
 
 #[tokio::test]

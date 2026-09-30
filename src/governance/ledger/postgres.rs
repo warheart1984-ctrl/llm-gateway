@@ -13,12 +13,22 @@
 //! * **Idempotency** keys are claimed in the admission transaction, under a
 //!   unique index, so a key and its charge commit together or not at all.
 //!
+//! * **Rate and concurrency limits** are enforced in the same admission
+//!   transaction: requests and tokens per aligned UTC minute with the same
+//!   conditional-update pattern, and concurrency as the tenant's count of
+//!   open reservations with a live lease. Every replica sees one set of books.
+//!
 //! Closings are queued to one writer task, because the gateway closes
 //! reservations from `Drop`, which cannot wait on the network. The writer
-//! applies them in order and retries until each is durable. A closing lost to
-//! a crash leaves its reservation `open`; the sweeper closes such rows as
-//! `swept` after `sweep_after`, billing the full reservation, because after a
-//! crash the real usage is unknowable.
+//! applies them in order and retries until each is durable.
+//!
+//! **Leases.** Every reservation carries `lease_expires_at`. This process
+//! renews the leases of every reservation it still holds, in one statement,
+//! every third of the lease, until each reservation's closing is durable. A
+//! crashed process renews nothing, so its leases lapse; the sweeper closes
+//! reservations whose lease has lapsed as `swept`, billing the full
+//! reservation, because after a crash the real usage is unknowable. A stream
+//! that simply runs long keeps its lease and is never swept while live.
 
 use std::{
     str::FromStr,
@@ -29,6 +39,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use dashmap::DashMap;
 use sqlx::{
     PgPool, Row,
     postgres::{PgConnectOptions, PgPoolOptions},
@@ -58,9 +69,9 @@ pub struct PostgresOptions {
     /// Bound on every admission and snapshot, including waiting for a
     /// connection. A slow database refuses requests rather than hanging them.
     pub timeout: Duration,
-    /// An `open` reservation older than this is treated as orphaned by a
-    /// crash. Must comfortably exceed the longest request.
-    pub sweep_after: Duration,
+    /// How long a reservation's lease lasts without renewal. The holder
+    /// renews every third of it; after a crash it lapses within this.
+    pub lease: Duration,
     pub sweep_interval: Duration,
     pub idempotency_retention: Duration,
     /// Seals answers kept for idempotent replay. Without it no answer is
@@ -85,6 +96,10 @@ pub struct PostgresLedger {
     retention: Duration,
     sealer: Option<Arc<ResponseSealer>>,
     sweeper: JoinHandle<()>,
+    renewer: JoinHandle<()>,
+    lease: Duration,
+    /// Reservations this process holds, whose leases it renews.
+    live: Arc<DashMap<uuid::Uuid, ()>>,
     decision_queue: mpsc::Sender<Decision>,
     decisions_dropped: Arc<AtomicU64>,
 }
@@ -101,6 +116,7 @@ impl std::fmt::Debug for WriterMsg {
 impl Drop for PostgresLedger {
     fn drop(&mut self) {
         self.sweeper.abort();
+        self.renewer.abort();
     }
 }
 
@@ -167,13 +183,16 @@ impl PostgresLedger {
 
         let (writer, inbox) = mpsc::unbounded_channel();
         let pending = Arc::new(AtomicU64::new(0));
-        tokio::spawn(run_writer(pool.clone(), inbox, Arc::clone(&pending), opts.sealer.clone()));
-        let sweeper = tokio::spawn(run_sweeper(
+        let live: Arc<DashMap<uuid::Uuid, ()>> = Arc::default();
+        tokio::spawn(run_writer(
             pool.clone(),
-            opts.sweep_after,
-            opts.sweep_interval,
-            opts.decision_retention,
+            inbox,
+            Arc::clone(&pending),
+            opts.sealer.clone(),
+            Arc::clone(&live),
         ));
+        let sweeper = tokio::spawn(run_sweeper(pool.clone(), opts.sweep_interval, opts.decision_retention));
+        let renewer = tokio::spawn(run_renewer(pool.clone(), Arc::clone(&live), opts.lease));
         let (decision_queue, decision_inbox) = mpsc::channel(DECISION_QUEUE);
         let decisions_dropped = Arc::new(AtomicU64::new(0));
         tokio::spawn(run_decision_writer(pool.clone(), decision_inbox, Arc::clone(&decisions_dropped)));
@@ -186,6 +205,9 @@ impl PostgresLedger {
             retention: opts.idempotency_retention,
             sealer: opts.sealer,
             sweeper,
+            renewer,
+            lease: opts.lease,
+            live,
             decision_queue,
             decisions_dropped,
         }))
@@ -201,10 +223,10 @@ impl PostgresLedger {
         self.pending.load(Ordering::Relaxed)
     }
 
-    /// Close every reservation left `open` for longer than `older_than` as
-    /// `swept`, keeping its full reservation as the bill. Returns how many.
-    pub async fn sweep(&self, older_than: Duration) -> Result<u64, String> {
-        sweep(&self.pool, older_than).await.map_err(|e| e.to_string())
+    /// Close every reservation whose lease has lapsed as `swept`, keeping
+    /// its full reservation as the bill. Returns how many.
+    pub async fn sweep(&self) -> Result<u64, String> {
+        sweep(&self.pool).await.map_err(|e| e.to_string())
     }
 
     /// A stored answer, if it opens for this exact row. Anything that does
@@ -280,6 +302,29 @@ impl PostgresLedger {
             .bind(today)
             .execute(&mut *tx)
             .await?;
+        // Lock the tenant's day row before anything is counted: from here to
+        // commit, this tenant's admissions on every replica go one at a time,
+        // so the concurrency count and the rate counters cannot be raced.
+        sqlx::query("SELECT spent_nano_usd FROM spend_days WHERE tenant_id = $1 AND day = $2 FOR UPDATE")
+            .bind(r.tenant_id)
+            .bind(today)
+            .fetch_one(&mut *tx)
+            .await?;
+        if r.limits.max_concurrent > 0 {
+            let live: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM reservations
+                  WHERE tenant_id = $1 AND state = 'open' AND lease_expires_at > now()",
+            )
+            .bind(r.tenant_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if live >= i64::from(r.limits.max_concurrent) {
+                return Ok(Err(LedgerRefusal::ConcurrencyLimited { limit: r.limits.max_concurrent }));
+            }
+        }
+        if let Some(refusal) = charge_rate(&mut tx, r).await? {
+            return Ok(Err(refusal));
+        }
         let amount = to_i64(r.amount_nano_usd);
         let budget = to_i64(r.budget_nano_usd);
         // The whole budget rule in one statement. `spent < budget` as well as
@@ -317,8 +362,8 @@ impl PostgresLedger {
 
         let inserted = sqlx::query(
             "INSERT INTO reservations
-                 (id, tenant_id, day, reserved_nano_usd, prompt_nano_usd, idempotency_key, fingerprint)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                 (id, tenant_id, day, reserved_nano_usd, prompt_nano_usd, idempotency_key, fingerprint, lease_expires_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, now() + make_interval(secs => $8))",
         )
         .bind(r.id)
         .bind(r.tenant_id)
@@ -327,6 +372,7 @@ impl PostgresLedger {
         .bind(to_i64(r.prompt_nano_usd))
         .bind(r.idempotency.as_ref().map(|c| c.key))
         .bind(r.idempotency.as_ref().map(|c| c.fingerprint.clone()))
+        .bind(self.lease.as_secs_f64())
         .execute(&mut *tx)
         .await;
         match inserted {
@@ -339,8 +385,59 @@ impl PostgresLedger {
             Err(e) => return Err(e),
         }
         tx.commit().await?;
+        self.live.insert(r.id, ());
         Ok(Ok(today as u64))
     }
+}
+
+/// Minutes since the Unix epoch, by the database clock: the rate window.
+const MINUTE: &str = "(floor(extract(epoch from now()) / 60))::bigint";
+
+/// Count this admission against the tenant's aligned minute, or refuse. The
+/// whole check is one conditional update, so it cannot be raced; a refusal
+/// rolls back with the transaction and consumes nothing.
+async fn charge_rate(
+    tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+    r: &NewReservation<'_>,
+) -> Result<Option<LedgerRefusal>, sqlx::Error> {
+    let (rpm, tpm, prompt) = (
+        i64::from(r.limits.requests_per_minute),
+        i64::from(r.limits.tokens_per_minute),
+        i64::from(r.limits.prompt_tokens),
+    );
+    sqlx::query(&format!(
+        "INSERT INTO rate_minutes (tenant_id, minute) VALUES ($1, {MINUTE}) ON CONFLICT DO NOTHING"
+    ))
+    .bind(r.tenant_id)
+    .execute(&mut **tx)
+    .await?;
+    let counted: Option<i64> = sqlx::query_scalar(&format!(
+        "UPDATE rate_minutes SET requests = requests + 1, tokens = tokens + $2
+          WHERE tenant_id = $1 AND minute = {MINUTE}
+            AND ($3 = 0 OR requests < $3)
+            AND ($4 = 0 OR tokens + $2 <= $4)
+      RETURNING requests"
+    ))
+    .bind(r.tenant_id)
+    .bind(prompt)
+    .bind(rpm)
+    .bind(tpm)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if counted.is_some() {
+        return Ok(None);
+    }
+    let (requests, tokens): (i64, i64) = sqlx::query_as(&format!(
+        "SELECT requests, tokens FROM rate_minutes WHERE tenant_id = $1 AND minute = {MINUTE}"
+    ))
+    .bind(r.tenant_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(Some(if rpm > 0 && requests >= rpm {
+        LedgerRefusal::RateLimited { done: requests as u32, limit: rpm as u32 }
+    } else {
+        LedgerRefusal::TokenRateLimited { done: tokens as u32, requested: prompt as u32, limit: tpm as u32 }
+    }))
 }
 
 async fn apply_close(pool: &PgPool, c: &Closing, sealed_response: Option<&str>) -> Result<(), sqlx::Error> {
@@ -392,6 +489,20 @@ async fn apply_close(pool: &PgPool, c: &Closing, sealed_response: Option<&str>) 
             .execute(&mut *tx)
             .await?;
     }
+    // Lock order, the same as admission's: reservation, then the day row
+    // (above), then the rate counters (here). The reverse order deadlocks
+    // against a concurrent admission of the same tenant.
+    // Completion tokens are real usage: counted in the minute they settle.
+    if c.completion_tokens > 0 {
+        sqlx::query(&format!(
+            "INSERT INTO rate_minutes (tenant_id, minute, tokens) VALUES ($1, {MINUTE}, $2)
+             ON CONFLICT (tenant_id, minute) DO UPDATE SET tokens = rate_minutes.tokens + $2"
+        ))
+        .bind(&tenant)
+        .bind(i64::from(c.completion_tokens))
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await
 }
 
@@ -403,6 +514,7 @@ async fn run_writer(
     mut inbox: mpsc::UnboundedReceiver<WriterMsg>,
     pending: Arc<AtomicU64>,
     sealer: Option<Arc<ResponseSealer>>,
+    live: Arc<DashMap<uuid::Uuid, ()>>,
 ) {
     while let Some(msg) = inbox.recv().await {
         match msg {
@@ -432,20 +544,52 @@ async fn run_writer(
                         }
                     }
                 }
+                // Renewal stops only now that the closing is durable: a
+                // backlog must not let a finished reservation's lease lapse
+                // and be swept before its real settlement lands.
+                live.remove(&closing.id);
                 pending.fetch_sub(1, Ordering::Relaxed);
             }
         }
     }
 }
 
-async fn sweep(pool: &PgPool, older_than: Duration) -> Result<u64, sqlx::Error> {
+/// Renew the lease of every reservation this process holds, in one
+/// statement, every third of the lease.
+async fn run_renewer(pool: PgPool, live: Arc<DashMap<uuid::Uuid, ()>>, lease: Duration) {
+    let mut ticker = tokio::time::interval((lease / 3).max(Duration::from_millis(200)));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        let ids: Vec<uuid::Uuid> = live.iter().map(|e| *e.key()).collect();
+        if ids.is_empty() {
+            continue;
+        }
+        if let Err(error) = sqlx::query(
+            "UPDATE reservations SET lease_expires_at = now() + make_interval(secs => $2)
+              WHERE id = ANY($1) AND state = 'open'",
+        )
+        .bind(&ids)
+        .bind(lease.as_secs_f64())
+        .execute(&pool)
+        .await
+        {
+            tracing::warn!(%error, reservations = ids.len(), "lease renewal failed; will retry");
+        }
+    }
+}
+
+async fn sweep(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let swept = sqlx::query(
         "UPDATE reservations SET state = 'swept', delta_nano_usd = 0, closed_at = now()
-          WHERE state = 'open' AND created_at < now() - make_interval(secs => $1)",
+          WHERE state = 'open' AND lease_expires_at < now()",
     )
-    .bind(older_than.as_secs_f64())
     .execute(pool)
     .await?;
+    // Rate windows older than an hour can never matter again.
+    sqlx::query(&format!("DELETE FROM rate_minutes WHERE minute < {MINUTE} - 60"))
+        .execute(pool)
+        .await?;
     Ok(swept.rows_affected())
 }
 
@@ -478,7 +622,7 @@ async fn run_decision_writer(pool: PgPool, mut inbox: mpsc::Receiver<Decision>, 
     }
 }
 
-async fn run_sweeper(pool: PgPool, sweep_after: Duration, interval: Duration, decision_retention: Duration) {
+async fn run_sweeper(pool: PgPool, interval: Duration, decision_retention: Duration) {
     let mut ticker = tokio::time::interval(interval.max(Duration::from_secs(1)));
     loop {
         ticker.tick().await;
@@ -489,7 +633,7 @@ async fn run_sweeper(pool: PgPool, sweep_after: Duration, interval: Duration, de
         {
             tracing::warn!(%error, "decision retention sweep failed; will retry");
         }
-        match sweep(&pool, sweep_after).await {
+        match sweep(&pool).await {
             Ok(0) => {}
             Ok(n) => tracing::warn!(
                 reservations = n,
@@ -547,6 +691,10 @@ impl Ledger for PostgresLedger {
 
     fn backend(&self) -> &'static str {
         "postgres"
+    }
+
+    fn enforces_limits(&self) -> bool {
+        true
     }
 
     fn record_decision(&self, decision: Decision) {

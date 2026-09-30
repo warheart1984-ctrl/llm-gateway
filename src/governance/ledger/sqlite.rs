@@ -15,6 +15,10 @@
 //! * **Conditional transitions.** Admission is
 //!   `UPDATE … WHERE spent < budget AND spent + amount <= budget`; closing is
 //!   `UPDATE … WHERE id = ? AND state = 'open'`.
+//! * **Leases, rate and concurrency limits** exactly as in the Postgres
+//!   ledger: a held reservation's lease is renewed until its closing is
+//!   durable, the sweeper takes only lapsed leases, and requests, tokens and
+//!   live reservations are counted in the admission transaction.
 //!
 //! What it is not: shared between hosts. Keep the file on a local disk (SQLite
 //! over a network filesystem does not lock reliably), and give each replica
@@ -31,6 +35,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use dashmap::DashMap;
 use sqlx::{
     Row, SqlitePool,
     error::ErrorKind,
@@ -58,7 +63,8 @@ pub struct SqliteOptions {
     /// Bound on every admission and snapshot, including waiting for the
     /// write lock. A busy or broken database refuses requests.
     pub timeout: Duration,
-    pub sweep_after: Duration,
+    /// How long a reservation's lease lasts without renewal.
+    pub lease: Duration,
     pub sweep_interval: Duration,
     pub idempotency_retention: Duration,
     pub sealer: Option<Arc<ResponseSealer>>,
@@ -89,6 +95,9 @@ pub struct SqliteLedger {
     retention: Duration,
     sealer: Option<Arc<ResponseSealer>>,
     sweeper: JoinHandle<()>,
+    renewer: JoinHandle<()>,
+    lease: Duration,
+    live: Arc<DashMap<Uuid, ()>>,
     decision_queue: mpsc::Sender<Decision>,
     decisions_dropped: Arc<AtomicU64>,
 }
@@ -96,6 +105,7 @@ pub struct SqliteLedger {
 impl Drop for SqliteLedger {
     fn drop(&mut self) {
         self.sweeper.abort();
+        self.renewer.abort();
     }
 }
 
@@ -149,13 +159,16 @@ impl SqliteLedger {
 
         let (writer, inbox) = mpsc::unbounded_channel();
         let pending = Arc::new(AtomicU64::new(0));
-        tokio::spawn(run_writer(pool.clone(), inbox, Arc::clone(&pending), opts.sealer.clone()));
-        let sweeper = tokio::spawn(run_sweeper(
+        let live: Arc<DashMap<Uuid, ()>> = Arc::default();
+        tokio::spawn(run_writer(
             pool.clone(),
-            opts.sweep_after,
-            opts.sweep_interval,
-            opts.decision_retention,
+            inbox,
+            Arc::clone(&pending),
+            opts.sealer.clone(),
+            Arc::clone(&live),
         ));
+        let sweeper = tokio::spawn(run_sweeper(pool.clone(), opts.sweep_interval, opts.decision_retention));
+        let renewer = tokio::spawn(run_renewer(pool.clone(), Arc::clone(&live), opts.lease));
         let (decision_queue, decision_inbox) = mpsc::channel(DECISION_QUEUE);
         let decisions_dropped = Arc::new(AtomicU64::new(0));
         tokio::spawn(run_decision_writer(pool.clone(), decision_inbox, Arc::clone(&decisions_dropped)));
@@ -168,6 +181,9 @@ impl SqliteLedger {
             retention: opts.idempotency_retention,
             sealer: opts.sealer,
             sweeper,
+            renewer,
+            lease: opts.lease,
+            live,
             decision_queue,
             decisions_dropped,
         }))
@@ -182,10 +198,10 @@ impl SqliteLedger {
         self.pending.load(Ordering::Relaxed)
     }
 
-    /// Close every reservation left `open` for longer than `older_than` as
-    /// `swept`, keeping its full reservation as the bill. Returns how many.
-    pub async fn sweep(&self, older_than: Duration) -> Result<u64, String> {
-        sweep(&self.pool, older_than).await.map_err(|e| e.to_string())
+    /// Close every reservation whose lease has lapsed as `swept`, keeping
+    /// its full reservation as the bill. Returns how many.
+    pub async fn sweep(&self) -> Result<u64, String> {
+        sweep(&self.pool).await.map_err(|e| e.to_string())
     }
 
     fn open_response(&self, tenant_id: &str, id: Uuid, stored: Option<String>) -> Option<String> {
@@ -253,6 +269,23 @@ impl SqliteLedger {
             .bind(today)
             .execute(&mut *tx)
             .await?;
+        // `BEGIN IMMEDIATE` already holds the write lock, so counting here
+        // cannot be raced by any other admission, in or out of this process.
+        if r.limits.max_concurrent > 0 {
+            let live: i64 = sqlx::query_scalar(&format!(
+                "SELECT count(*) FROM reservations
+                  WHERE tenant_id = ?1 AND state = 'open' AND lease_expires_at > {NOW}"
+            ))
+            .bind(r.tenant_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if live >= i64::from(r.limits.max_concurrent) {
+                return Ok(Err(LedgerRefusal::ConcurrencyLimited { limit: r.limits.max_concurrent }));
+            }
+        }
+        if let Some(refusal) = charge_rate(&mut tx, r).await? {
+            return Ok(Err(refusal));
+        }
         let amount = to_i64(r.amount_nano_usd);
         let budget = to_i64(r.budget_nano_usd);
         // The same rule as Postgres, including `spent < budget`: the short
@@ -289,8 +322,9 @@ impl SqliteLedger {
 
         let inserted = sqlx::query(&format!(
             "INSERT INTO reservations
-                 (id, tenant_id, day, reserved_nano_usd, prompt_nano_usd, idempotency_key, fingerprint, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, {NOW})"
+                 (id, tenant_id, day, reserved_nano_usd, prompt_nano_usd, idempotency_key, fingerprint,
+                  created_at, lease_expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, {NOW}, {NOW} + ?8)"
         ))
         .bind(r.id.to_string())
         .bind(r.tenant_id)
@@ -299,6 +333,7 @@ impl SqliteLedger {
         .bind(to_i64(r.prompt_nano_usd))
         .bind(r.idempotency.as_ref().map(|c| c.key))
         .bind(r.idempotency.as_ref().map(|c| c.fingerprint.clone()))
+        .bind(lease_secs(self.lease))
         .execute(&mut *tx)
         .await;
         match inserted {
@@ -309,8 +344,62 @@ impl SqliteLedger {
             Err(e) => return Err(e),
         }
         tx.commit().await?;
+        self.live.insert(r.id, ());
         Ok(Ok(today.max(0) as u64))
     }
+}
+
+/// Whole seconds, at least one: SQLite times here are Unix seconds.
+fn lease_secs(lease: Duration) -> i64 {
+    lease.as_secs().max(1) as i64
+}
+
+const MINUTE: &str = "(CAST(strftime('%s', 'now') AS INTEGER) / 60)";
+
+/// Count this admission against the tenant's aligned minute, or refuse. See
+/// the Postgres ledger's function of the same name.
+async fn charge_rate(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    r: &NewReservation<'_>,
+) -> Result<Option<LedgerRefusal>, sqlx::Error> {
+    let (rpm, tpm, prompt) = (
+        i64::from(r.limits.requests_per_minute),
+        i64::from(r.limits.tokens_per_minute),
+        i64::from(r.limits.prompt_tokens),
+    );
+    sqlx::query(&format!(
+        "INSERT INTO rate_minutes (tenant_id, minute) VALUES (?1, {MINUTE}) ON CONFLICT DO NOTHING"
+    ))
+    .bind(r.tenant_id)
+    .execute(&mut **tx)
+    .await?;
+    let counted: Option<i64> = sqlx::query_scalar(&format!(
+        "UPDATE rate_minutes SET requests = requests + 1, tokens = tokens + ?2
+          WHERE tenant_id = ?1 AND minute = {MINUTE}
+            AND (?3 = 0 OR requests < ?3)
+            AND (?4 = 0 OR tokens + ?2 <= ?4)
+      RETURNING requests"
+    ))
+    .bind(r.tenant_id)
+    .bind(prompt)
+    .bind(rpm)
+    .bind(tpm)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if counted.is_some() {
+        return Ok(None);
+    }
+    let (requests, tokens): (i64, i64) = sqlx::query_as(&format!(
+        "SELECT requests, tokens FROM rate_minutes WHERE tenant_id = ?1 AND minute = {MINUTE}"
+    ))
+    .bind(r.tenant_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(Some(if rpm > 0 && requests >= rpm {
+        LedgerRefusal::RateLimited { done: requests as u32, limit: rpm as u32 }
+    } else {
+        LedgerRefusal::TokenRateLimited { done: tokens as u32, requested: prompt as u32, limit: tpm as u32 }
+    }))
 }
 
 async fn apply_close(pool: &SqlitePool, c: &Closing, sealed_response: Option<&str>) -> Result<(), sqlx::Error> {
@@ -359,6 +448,20 @@ async fn apply_close(pool: &SqlitePool, c: &Closing, sealed_response: Option<&st
             .execute(&mut *tx)
             .await?;
     }
+    // Lock order, the same as admission's: reservation, then the day row
+    // (above), then the rate counters (here). The reverse order deadlocks
+    // against a concurrent admission of the same tenant.
+    // Completion tokens are real usage: counted in the minute they settle.
+    if c.completion_tokens > 0 {
+        sqlx::query(&format!(
+            "INSERT INTO rate_minutes (tenant_id, minute, tokens) VALUES (?1, {MINUTE}, ?2)
+             ON CONFLICT (tenant_id, minute) DO UPDATE SET tokens = tokens + ?2"
+        ))
+        .bind(&tenant)
+        .bind(i64::from(c.completion_tokens))
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await
 }
 
@@ -367,6 +470,7 @@ async fn run_writer(
     mut inbox: mpsc::UnboundedReceiver<WriterMsg>,
     pending: Arc<AtomicU64>,
     sealer: Option<Arc<ResponseSealer>>,
+    live: Arc<DashMap<Uuid, ()>>,
 ) {
     while let Some(msg) = inbox.recv().await {
         match msg {
@@ -394,20 +498,49 @@ async fn run_writer(
                         }
                     }
                 }
+                live.remove(&closing.id);
                 pending.fetch_sub(1, Ordering::Relaxed);
             }
         }
     }
 }
 
-async fn sweep(pool: &SqlitePool, older_than: Duration) -> Result<u64, sqlx::Error> {
+/// Renew the lease of every reservation this process holds, in one
+/// statement, every third of the lease.
+async fn run_renewer(pool: SqlitePool, live: Arc<DashMap<Uuid, ()>>, lease: Duration) {
+    let mut ticker = tokio::time::interval((lease / 3).max(Duration::from_millis(200)));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        let ids: Vec<String> = live.iter().map(|e| e.key().to_string()).collect();
+        if ids.is_empty() {
+            continue;
+        }
+        let list = serde_json::to_string(&ids).unwrap_or_else(|_| "[]".into());
+        if let Err(error) = sqlx::query(&format!(
+            "UPDATE reservations SET lease_expires_at = {NOW} + ?2
+              WHERE state = 'open' AND id IN (SELECT value FROM json_each(?1))"
+        ))
+        .bind(list)
+        .bind(lease_secs(lease))
+        .execute(&pool)
+        .await
+        {
+            tracing::warn!(%error, reservations = ids.len(), "lease renewal failed; will retry");
+        }
+    }
+}
+
+async fn sweep(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
     let swept = sqlx::query(&format!(
         "UPDATE reservations SET state = 'swept', delta_nano_usd = 0, closed_at = {NOW}
-          WHERE state = 'open' AND created_at < {NOW} - ?1"
+          WHERE state = 'open' AND lease_expires_at < {NOW}"
     ))
-    .bind(older_than.as_secs() as i64)
     .execute(pool)
     .await?;
+    sqlx::query(&format!("DELETE FROM rate_minutes WHERE minute < {MINUTE} - 60"))
+        .execute(pool)
+        .await?;
     Ok(swept.rows_affected())
 }
 
@@ -440,7 +573,7 @@ async fn run_decision_writer(pool: SqlitePool, mut inbox: mpsc::Receiver<Decisio
     }
 }
 
-async fn run_sweeper(pool: SqlitePool, sweep_after: Duration, interval: Duration, decision_retention: Duration) {
+async fn run_sweeper(pool: SqlitePool, interval: Duration, decision_retention: Duration) {
     let mut ticker = tokio::time::interval(interval.max(Duration::from_secs(1)));
     loop {
         ticker.tick().await;
@@ -451,7 +584,7 @@ async fn run_sweeper(pool: SqlitePool, sweep_after: Duration, interval: Duration
         {
             tracing::warn!(%error, "decision retention sweep failed; will retry");
         }
-        match sweep(&pool, sweep_after).await {
+        match sweep(&pool).await {
             Ok(0) => {}
             Ok(n) => tracing::warn!(
                 reservations = n,
@@ -507,6 +640,10 @@ impl Ledger for SqliteLedger {
 
     fn backend(&self) -> &'static str {
         "sqlite"
+    }
+
+    fn enforces_limits(&self) -> bool {
+        true
     }
 
     fn record_decision(&self, decision: Decision) {
@@ -568,7 +705,7 @@ impl Ledger for SqliteLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::governance::ledger::{IdempotencyClaim, Outcome};
+    use crate::governance::ledger::{IdempotencyClaim, Outcome, SharedLimits};
 
     struct TempFile(PathBuf);
 
@@ -594,7 +731,7 @@ mod tests {
         SqliteLedger::connect(SqliteOptions {
             path: file.0.clone(),
             timeout: Duration::from_secs(5),
-            sweep_after: Duration::from_secs(3_600),
+            lease: Duration::from_secs(60),
             sweep_interval: Duration::from_secs(3_600),
             idempotency_retention: Duration::from_secs(86_400),
             sealer: Some(Arc::new(ResponseSealer::from_keys(KEYS).unwrap())),
@@ -613,6 +750,7 @@ mod tests {
             prompt_nano_usd: amount / 4,
             budget_nano_usd: budget,
             idempotency: None,
+            limits: crate::governance::ledger::SharedLimits::default(),
         }
     }
 
@@ -625,6 +763,7 @@ mod tests {
             outcome,
             at: SystemTime::now(),
             response: None,
+            completion_tokens: 0,
         }
     }
 
@@ -682,14 +821,15 @@ mod tests {
         };
         let reopened = open(&file).await;
         assert_eq!(spent(&reopened, "t").await, 1_000, "the reservation was durable before the crash");
-        sqlx::query(&format!("UPDATE reservations SET created_at = {NOW} - 7200 WHERE id = ?1"))
+        // The dead process renewed nothing: its lease lapses.
+        sqlx::query(&format!("UPDATE reservations SET lease_expires_at = {NOW} - 1 WHERE id = ?1"))
             .bind(id.to_string())
             .execute(reopened.pool())
             .await
             .unwrap();
         // The background sweeper also runs at boot and may get there first;
         // what matters is the end state, whoever swept it.
-        assert!(reopened.sweep(Duration::from_secs(3_600)).await.unwrap() <= 1);
+        assert!(reopened.sweep().await.unwrap() <= 1);
         let state: String = sqlx::query_scalar("SELECT state FROM reservations WHERE id = ?1")
             .bind(id.to_string())
             .fetch_one(reopened.pool())
@@ -711,8 +851,8 @@ mod tests {
         ledger.try_reserve(reservation("t", 500, 0)).await.unwrap();
         for (id, _) in [(Uuid::new_v4(), ()), (Uuid::new_v4(), ())] {
             sqlx::query(&format!(
-                "INSERT INTO reservations (id, tenant_id, day, reserved_nano_usd, prompt_nano_usd, created_at)
-                 VALUES (?1, 't', ?2, 1000, 100, {NOW})"
+                "INSERT INTO reservations (id, tenant_id, day, reserved_nano_usd, prompt_nano_usd, created_at, lease_expires_at)
+                 VALUES (?1, 't', ?2, 1000, 100, {NOW}, {NOW} + 3600)"
             ))
             .bind(id.to_string())
             .bind(today - 1)
@@ -727,8 +867,8 @@ mod tests {
 
         let late = Uuid::new_v4();
         sqlx::query(&format!(
-            "INSERT INTO reservations (id, tenant_id, day, reserved_nano_usd, prompt_nano_usd, created_at)
-             VALUES (?1, 't', ?2, 1000, 100, {NOW})"
+            "INSERT INTO reservations (id, tenant_id, day, reserved_nano_usd, prompt_nano_usd, created_at, lease_expires_at)
+             VALUES (?1, 't', ?2, 1000, 100, {NOW}, {NOW} + 3600)"
         ))
         .bind(late.to_string())
         .bind(today - 1)
@@ -816,5 +956,154 @@ mod tests {
             .count();
         assert_eq!(admitted, 10);
         assert_eq!(spent(&a, "t").await, 1_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // Leases and shared limits
+    // -----------------------------------------------------------------------
+
+    async fn open_with_lease(file: &TempFile, lease: Duration) -> Arc<SqliteLedger> {
+        SqliteLedger::connect(SqliteOptions {
+            path: file.0.clone(),
+            timeout: Duration::from_secs(5),
+            lease,
+            sweep_interval: Duration::from_secs(3_600),
+            idempotency_retention: Duration::from_secs(86_400),
+            sealer: None,
+            decision_retention: Duration::from_secs(86_400),
+        })
+        .await
+        .unwrap()
+    }
+
+    fn limited<'a>(tenant: &'a str, limits: SharedLimits) -> NewReservation<'a> {
+        NewReservation { limits, ..reservation(tenant, 100, 0) }
+    }
+
+    async fn state_of(ledger: &SqliteLedger, id: Uuid) -> String {
+        sqlx::query_scalar("SELECT state FROM reservations WHERE id = ?1")
+            .bind(id.to_string())
+            .fetch_one(ledger.pool())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_held_reservation_is_never_swept_while_its_holder_lives() {
+        // A 1 s lease, held for three: the holder keeps renewing it, so the
+        // sweeper never takes a reservation that is still being served.
+        let file = TempFile::new();
+        let ledger = open_with_lease(&file, Duration::from_secs(1)).await;
+        let r = reservation("t", 1_000, 0);
+        let bucket = ledger.try_reserve(r.clone()).await.unwrap();
+        for _ in 0..6 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(ledger.sweep().await.unwrap(), 0, "a live lease was swept");
+        }
+        assert_eq!(state_of(&ledger, r.id).await, "open");
+        ledger.close(closing(r.id, "t", bucket, -700, Outcome::Settled));
+        ledger.flush().await;
+        assert_eq!(state_of(&ledger, r.id).await, "settled");
+        assert_eq!(spent(&ledger, "t").await, 300, "billed its real usage, not the reservation");
+    }
+
+    #[tokio::test]
+    async fn concurrency_is_one_cap_across_processes() {
+        let file = TempFile::new();
+        let (a, b) = (open(&file).await, open(&file).await);
+        let caps = SharedLimits { max_concurrent: 3, ..Default::default() };
+        let tasks: Vec<_> = (0..12)
+            .map(|i| {
+                let ledger = if i % 2 == 0 { Arc::clone(&a) } else { Arc::clone(&b) };
+                tokio::spawn(async move { ledger.try_reserve(limited("t", caps)).await })
+            })
+            .collect();
+        let results: Vec<_> = futures_util::future::join_all(tasks).await.into_iter().map(Result::unwrap).collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 3);
+        assert!(results
+            .iter()
+            .filter_map(|r| r.as_ref().err())
+            .all(|e| *e == LedgerRefusal::ConcurrencyLimited { limit: 3 }));
+    }
+
+    #[tokio::test]
+    async fn requests_per_minute_is_exact_across_processes_and_refusals_are_free() {
+        let file = TempFile::new();
+        let (a, b) = (open(&file).await, open(&file).await);
+        let rate = SharedLimits { requests_per_minute: 5, ..Default::default() };
+        // Far from a minute boundary, so all twenty land in one window.
+        wait_for_mid_minute().await;
+        let tasks: Vec<_> = (0..20)
+            .map(|i| {
+                let ledger = if i % 2 == 0 { Arc::clone(&a) } else { Arc::clone(&b) };
+                tokio::spawn(async move { ledger.try_reserve(limited("t", rate)).await })
+            })
+            .collect();
+        let results: Vec<_> = futures_util::future::join_all(tasks).await.into_iter().map(Result::unwrap).collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 5);
+        let counted: i64 = sqlx::query_scalar(&format!(
+            "SELECT requests FROM rate_minutes WHERE tenant_id = 't' AND minute = {MINUTE}"
+        ))
+        .fetch_one(a.pool())
+        .await
+        .unwrap();
+        assert_eq!(counted, 5, "the fifteen refusals consumed nothing");
+    }
+
+    #[tokio::test]
+    async fn completion_tokens_count_against_the_minute_they_settle_in() {
+        let file = TempFile::new();
+        let ledger = open(&file).await;
+        let tpm = |prompt| SharedLimits { tokens_per_minute: 100, prompt_tokens: prompt, ..Default::default() };
+        wait_for_mid_minute().await;
+        let first = limited("t", tpm(30));
+        let bucket = ledger.try_reserve(first.clone()).await.unwrap();
+        let mut done = closing(first.id, "t", bucket, 0, Outcome::Settled);
+        done.completion_tokens = 60;
+        ledger.close(done);
+        ledger.flush().await;
+        assert_eq!(
+            ledger.try_reserve(limited("t", tpm(20))).await.unwrap_err(),
+            LedgerRefusal::TokenRateLimited { done: 90, requested: 20, limit: 100 },
+            "30 prompt + 60 completion leaves room for 10, not 20"
+        );
+        ledger.try_reserve(limited("t", tpm(10))).await.expect("exactly the room left");
+    }
+
+    #[tokio::test]
+    async fn the_rate_window_is_an_aligned_minute() {
+        // Fixed, aligned windows: a full minute does not limit the next one.
+        // That is the documented boundary burst: a tenant can spend its
+        // limit at 12:00:59 and again at 12:01:00.
+        let file = TempFile::new();
+        let ledger = open(&file).await;
+        let rate = SharedLimits { requests_per_minute: 2, ..Default::default() };
+        wait_for_mid_minute().await;
+        sqlx::query(&format!("INSERT INTO rate_minutes (tenant_id, minute, requests) VALUES ('t', {MINUTE} - 1, 2)"))
+            .execute(ledger.pool())
+            .await
+            .unwrap();
+        ledger.try_reserve(limited("t", rate)).await.expect("last minute's full window is over");
+        ledger.try_reserve(limited("t", rate)).await.expect("two in this minute");
+        assert_eq!(
+            ledger.try_reserve(limited("t", rate)).await.unwrap_err(),
+            LedgerRefusal::RateLimited { done: 2, limit: 2 }
+        );
+    }
+
+    /// Wait until at least 15 s remain in the current UTC minute, so a test
+    /// that counts within one window cannot straddle two.
+    async fn wait_for_mid_minute() {
+        loop {
+            let second = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                % 60;
+            if second < 45 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 }

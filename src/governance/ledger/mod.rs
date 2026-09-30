@@ -51,6 +51,24 @@ pub struct NewReservation<'a> {
     /// `0` means no ceiling.
     pub budget_nano_usd: u64,
     pub idempotency: Option<IdempotencyClaim<'a>>,
+    /// Rate and concurrency limits, for ledgers that enforce them across
+    /// processes ([`Ledger::enforces_limits`]). Ignored by the others.
+    pub limits: SharedLimits,
+}
+
+/// The per-tenant limits a shared ledger enforces in the admission
+/// transaction. `0` means no ceiling, as everywhere in `LimitProfile`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SharedLimits {
+    /// Reservations open at once with a live lease.
+    pub max_concurrent: u32,
+    /// Admissions in the current aligned UTC minute.
+    pub requests_per_minute: u32,
+    /// Prompt tokens at admission plus completion tokens at settlement, in
+    /// the current aligned UTC minute.
+    pub tokens_per_minute: u32,
+    /// This request's prompt tokens, counted at admission.
+    pub prompt_tokens: u32,
 }
 
 /// A client-supplied idempotency key and the fingerprint of the request it
@@ -110,6 +128,8 @@ pub struct Closing {
     /// The answer, kept so a replay under the same idempotency key can be
     /// served without calling the provider again. Completions only.
     pub response: Option<String>,
+    /// Completion tokens to count against the tenant's tokens-per-minute.
+    pub completion_tokens: u32,
 }
 
 /// Why the ledger refused a reservation. Each is a final answer for this
@@ -132,6 +152,10 @@ pub enum LedgerRefusal {
     /// The ledger could not be reached or did not answer in time. The
     /// request is refused: admitting without a ledger is failing open.
     Unavailable(String),
+    /// Shared limits, enforced by ledgers that span processes.
+    RateLimited { done: u32, limit: u32 },
+    TokenRateLimited { done: u32, requested: u32, limit: u32 },
+    ConcurrencyLimited { limit: u32 },
 }
 
 #[async_trait::async_trait]
@@ -156,6 +180,13 @@ pub trait Ledger: Send + Sync + std::fmt::Debug {
 
     /// Backend name, for logs and readiness.
     fn backend(&self) -> &'static str;
+
+    /// Whether this ledger enforces rate and concurrency limits itself, in
+    /// the admission transaction, across every process that shares it. When
+    /// it does, the in-process windows only report; they do not decide.
+    fn enforces_limits(&self) -> bool {
+        false
+    }
 
     /// Record a routine refusal or failure. Never blocks and never fails the
     /// caller: if it cannot be kept, it is dropped and counted.

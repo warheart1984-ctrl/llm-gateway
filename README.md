@@ -330,8 +330,14 @@ database decides, not any gateway process:
   clock, so replicas with skewed clocks agree on midnight.
 - **The reservation is committed before the provider is called.** A crash
   can leave a reservation open, but never a provider call without a record.
-  A sweeper closes reservations left open longer than `sweep_after_secs`,
-  billing the full reservation, because after a crash the usage is unknowable.
+  Every reservation holds a **lease** (`lease_secs`, default 60). The
+  gateway renews the leases it holds in one statement every third of that,
+  until each reservation's closing is durable. A crashed process renews
+  nothing, so its leases lapse, and the sweeper closes reservations whose
+  lease has lapsed, billing the full reservation, because after a crash the
+  usage is unknowable. A stream that simply runs long keeps renewing and is
+  never swept while live. (`sweep_after_secs`, the older name for the
+  setting, is still accepted.)
 - **Closing** is `UPDATE … WHERE state = 'open'`, so a duplicate close from
   any process changes nothing. Closings are queued to one writer that
   retries until each one is durable, and graceful shutdown flushes the queue.
@@ -373,8 +379,24 @@ so a key rotates by putting the new one first. Generate one with
 and a repeated completion gets 409 instead of a replay. A malformed key
 setting stops the gateway starting.
 
-**Still per process on every backend:** rate-limit windows and concurrency
-caps. Behind N replicas, divide them by N.
+**Rate limits and concurrency are shared too,** on `sqlite` and `postgres`,
+decided in the same admission transaction as the budget:
+
+- **Concurrency** is the tenant's count of open reservations with a live
+  lease, counted under the tenant's day-row lock. Across replicas it is one
+  cap. A crashed replica's reservations keep their slots until their leases
+  lapse, which errs toward refusing.
+- **Requests and tokens per minute** are counters per tenant per aligned UTC
+  minute, charged with a conditional `UPDATE`. A refusal rolls back and
+  consumes nothing. Completion tokens count in the minute they settle in.
+- **It is a fixed window, not a sliding one.** It is exact and shared, but a
+  tenant can use a full minute's quota at 12:00:59 and another at 12:01:00:
+  up to twice the rate across a boundary. The in-memory ledger keeps its
+  per-process sliding window.
+- With quota split, each replica enforces its share of these limits as well,
+  and a limit whose share rounds down to zero refuses outright.
+- `/v1/usage`'s `requests_last_minute`, `tokens_last_minute` and
+  `streams_in_flight` are this process's view. The shared counters decide.
 
 ### The decision record
 
@@ -482,7 +504,7 @@ What the gateway does itself, and what it expects of the deployment around it.
 ## Testing
 
 ```bash
-cargo test --locked --all-targets                  # 260 tests
+cargo test --locked --all-targets                  # 270 tests
 cargo clippy --locked --all-targets -- -D warnings
 cargo bench --bench framing                        # add `-- --quick` for a fast pass
 ```
@@ -506,7 +528,9 @@ docker run -d --name llmgw-pg -e POSTGRES_PASSWORD=gatewaytest -e POSTGRES_DB=ga
 LLM_GATEWAY_TEST_DATABASE_URL="postgres://postgres:gatewaytest@127.0.0.1:55432/gateway?sslmode=disable" cargo test --test pressure
 ```
 
-The SQLite ledger and quota-split tests need no server and always run.
+The SQLite ledger, lease and quota-split tests need no server and always
+run. Tests that count within one rate window wait until at least 15 s of the
+current minute remain, so they cannot straddle a boundary.
 
 `tests/crash.rs` starts the real `llm-gateway` binary as a separate
 process, kills it outright (no destructors, no graceful shutdown) at each

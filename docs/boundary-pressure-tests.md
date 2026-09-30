@@ -128,6 +128,9 @@ there instead of skipping them.
 | 20 simultaneous requests across two replicas, room for 3 | exactly 3 reach the provider | `shared_ledger_a_burst_across_replicas_admits_exactly_what_fits` | HOLDS |
 | Same key sent to two different replicas | executed once, the second served from the ledger | `shared_ledger_a_repeated_key_is_recognised_across_replicas` | HOLDS |
 | Database connection cut mid-run | 503 `ledger_unavailable`; provider receives nothing; readiness fails | `shared_ledger_a_dead_ledger_fails_closed` | HOLDS |
+| 20 simultaneous requests across two replicas, concurrency cap 3 | exactly 3 reach the provider, the rest 429 `concurrency_limited`: one cap, not one per replica | `shared_ledger_concurrency_is_one_cap_across_replicas` | HOLDS |
+| 14 requests alternating between two replicas, 6 allowed per minute | exactly 6 admitted: one window, not one per replica | `shared_ledger_the_rate_limit_is_one_window_across_replicas` | HOLDS |
+| 40 completions racing on two replicas: settlements write the rate counters while admissions hold the day row | all 40 succeed; the database never has to abort a deadlocked transaction | `shared_ledger_settlements_racing_admissions_never_deadlock` | HOLDS |
 | Ledger unreachable at startup | the gateway refuses to start; the error does not echo credentials | `shared_ledger_a_gateway_will_not_start_without_its_ledger` | HOLDS |
 | Read the stored answers straight from the database | ciphertext only (AES-256-GCM); the replay still returns the real answer | `shared_ledger_stored_answers_are_sealed` | HOLDS |
 | No sealing key configured | no answer stored at all; a repeat is recognised and billed once, with 409 instead of a replay | `shared_ledger_without_a_key_stores_no_answer` | HOLDS |
@@ -143,6 +146,8 @@ No database server, so these run on every platform, Windows included.
 | Same `Idempotency-Key` after a restart | recognised; executed once across the restart | `local_ledger_a_repeated_key_is_recognised_after_a_restart` | HOLDS |
 | SQLite ledger cannot be opened | the gateway refuses to start | `local_ledger_a_gateway_will_not_start_without_its_ledger` | HOLDS |
 | 20 simultaneous requests across two split replicas, no shared database, room for 3 | exactly one share per replica reaches the provider: 2, where unsplit replicas would admit 6 | `quota_split_a_burst_across_replicas_admits_exactly_the_shares` | HOLDS |
+| A split replica's rate limit | each replica enforces its share of the minute | `quota_split_divides_the_rate_limit_too` | HOLDS |
+| A stream held open for 4 s against a 1 s lease | its lease keeps renewing; never swept while live; billed its real usage | `local_ledger_a_long_stream_is_never_swept_while_live` | HOLDS |
 | A split replica restarts | its spent share survives; `/v1/usage` reports the share and the tenant budget | `quota_split_a_restarted_replica_keeps_its_spent_share` | HOLDS |
 | A split configured on a ledger that would fail open, or with a 0% margin | the gateway refuses to start | `quota_split_refuses_to_boot_where_it_would_fail_open` | HOLDS |
 | A tenant budget whose share rounds down to zero | refused, never treated as "no ceiling" | `a_share_that_rounds_to_zero_refuses_instead_of_unlimiting` (unit) | HOLDS |
@@ -170,7 +175,6 @@ code path as the kills below.
 |---|---|---|---|
 | Restart, on the in-memory ledger | spend is forgotten | `gap_memory_ledger_a_restart_forgets_todays_spend` | **GAP by design:** memory is opt-in; the default is `sqlite` |
 | Two replicas, on the in-memory ledger | each enforces the full budget | `gap_memory_ledger_replicas_each_enforce_the_full_budget` | **GAP by design:** use `postgres`, or `sqlite` with quota split |
-| Rate limits and concurrency caps across replicas | enforced per process, on every ledger backend | none | NOT BUILT |
 | HOLD (neither GO nor NO-GO: wait for approval) | no such decision exists | none | NOT BUILT |
 
 The in-memory ledger is for tests and development, chosen explicitly, and
@@ -196,6 +200,13 @@ request, and the decision table every refusal, failure and operator action.
   pressure test.
 - **Quota split ignored:** both split pressure tests fail, and the unit test
   for each replica's share.
+- **Lease renewal disabled:** the held-reservation ledger test and the
+  4-second stream test fail; the live reservation is swept.
+- **Shared concurrency count or rate condition removed from the Postgres
+  SQL:** the cross-replica cap and window tests each fail.
+- **Closing's lock order reversed** (rate counters before the day row, as
+  first written in this change): the racing-settlements test fails 5 runs
+  in 5 with deadlock-aborted 503s; restored, it passes 5 in 5.
 - **Crash tests:** switching idempotency off makes the retry across a kill
   execute twice; disabling the sweeper leaves the orphaned reservation open
   and unbilled. Both caught.
