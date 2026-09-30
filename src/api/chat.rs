@@ -293,6 +293,16 @@ impl RequestError {
         }
     }
 
+    /// The sentence the caller is shown, and the one the decision record
+    /// keeps. A provider failure is a fixed sentence per class: the vendor's
+    /// own words stay in the logs (see [`ProviderError::client_message`]).
+    fn client_message(&self) -> String {
+        match self {
+            RequestError::Provider(e) => e.client_message(),
+            other => other.to_string(),
+        }
+    }
+
     fn error_type(&self) -> &'static str {
         match self.status() {
             StatusCode::BAD_REQUEST => "invalid_request_error",
@@ -411,7 +421,7 @@ async fn handle(state: Arc<AppState>, headers: HeaderMap, body: Bytes, mode: Mod
             if let Some(kind) = err.rejection_kind() {
                 state.metrics.rejection(kind);
             }
-            logging::log_rejected(&request_id, &span.tenant_id, err.code(), &err.to_string());
+            logging::log_rejected(&request_id, &span.tenant_id, err.code(), &logging::redact_secrets(&err.to_string()));
             record_decision(&state, &span, &request_id, mode, &err);
 
             let status = err.status();
@@ -419,7 +429,7 @@ async fn handle(state: Arc<AppState>, headers: HeaderMap, body: Bytes, mode: Mod
                 "error": {
                     "code": err.code(),
                     "type": err.error_type(),
-                    "message": err.to_string(),
+                    "message": err.client_message(),
                     "retryable": err.retryable(),
                 },
                 "request_id": request_id,
@@ -459,10 +469,11 @@ fn record_decision(state: &AppState, span: &RequestSpan, request_id: &str, mode:
         return;
     }
     // A parser's message can quote the offending value, which may be prompt
-    // text; the record keeps a fixed sentence instead.
+    // text, and a vendor's can name the operator's account; the record keeps
+    // a fixed sentence for both.
     let reason = match err {
         RequestError::BadJson(_) => "request body is not valid JSON".to_string(),
-        other => other.to_string(),
+        other => other.client_message(),
     };
     let decision = Decision {
         request_id: Uuid::parse_str(request_id).unwrap_or_else(|_| Uuid::nil()),
@@ -1012,6 +1023,13 @@ async fn next_frame(state: &mut NormalizedState) -> Option<Frame> {
                 // code, so it is reported in-band on its own event and the
                 // stream still terminates cleanly.
                 state.upstream_done = true;
+                tracing::warn!(
+                    request_id = %state.request_id,
+                    tenant = %state.tenant,
+                    code = err.code(),
+                    detail = %logging::redact_secrets(&err.to_string()),
+                    "upstream failed mid-stream"
+                );
                 state.summary.error_code = Some(err.code());
                 state.summary.error_retryable = err.retryable();
                 state.emit_terminal(Some(
@@ -1159,12 +1177,13 @@ fn meta_payload(upstream_id: &Option<String>, upstream_model: &Option<String>) -
 }
 
 /// A mid-stream failure. Carries a stable `code` and whether a retry could work,
-/// so a client can branch without string matching.
+/// so a client can branch without string matching. The message is the generic
+/// one; the vendor's detail was logged where the failure was seen.
 fn error_payload(err: &ProviderError, request_id: &str) -> String {
     json!({
         "error": {
             "code": err.code(),
-            "message": err.to_string(),
+            "message": err.client_message(),
             "retryable": err.retryable(),
         },
         "request_id": request_id,
@@ -1540,6 +1559,13 @@ impl Stream for RawStream {
             Poll::Ready(Some(Err(err))) => {
                 if !this.finished {
                     this.finished = true;
+                    tracing::warn!(
+                        request_id = %this.span.request_id,
+                        tenant = %this.tenant,
+                        code = err.code(),
+                        detail = %logging::redact_secrets(&err.to_string()),
+                        "upstream failed mid-stream"
+                    );
                     this.summary.error_code = Some(err.code());
                     this.summary.error_retryable = err.retryable();
                     this.reservation.commit_reserved();
