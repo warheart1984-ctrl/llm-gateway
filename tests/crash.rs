@@ -141,9 +141,9 @@ impl Install {
             .env("LLM_GATEWAY__SERVER__BIND_ADDR", "127.0.0.1")
             .env("LLM_GATEWAY__SERVER__PORT", port.to_string())
             .env("LLM_GATEWAY__REGISTRY__HOT_RELOAD", "false")
-            // Orphans become sweepable after 2 s, and the sweeper looks every
-            // second, so a restart recovers them within the test.
-            .env("LLM_GATEWAY__LEDGER__SWEEP_AFTER_SECS", "2")
+            // A 2 s lease: a killed process's leases lapse within 2 s, and the
+            // sweeper looks every second, so a restart recovers them quickly.
+            .env("LLM_GATEWAY__LEDGER__LEASE_SECS", "2")
             .env("LLM_GATEWAY__LEDGER__SWEEP_INTERVAL_SECS", "1")
             .env("LLM_GATEWAY__LEDGER__TIMEOUT_MS", "5000")
             .env("LLM_GATEWAY__TELEMETRY__LOG_FILTER", "warn")

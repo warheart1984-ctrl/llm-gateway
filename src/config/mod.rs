@@ -70,9 +70,13 @@ pub struct LedgerConfig {
     /// the database is down, requests are refused with 503: there is no
     /// setting that admits without the ledger, because that fails open.
     pub timeout_ms: u64,
-    /// An `open` reservation older than this is treated as orphaned by a
-    /// crash and billed in full. Keep it well above the longest request.
-    pub sweep_after_secs: u64,
+    /// How long a reservation's lease lasts without renewal, in seconds. The
+    /// gateway renews the leases it holds every third of this; after a crash
+    /// they lapse within it and the sweeper bills them in full. A long stream
+    /// keeps renewing and is never swept while live. Accepts the older name
+    /// `sweep_after_secs`.
+    #[serde(alias = "sweep_after_secs")]
+    pub lease_secs: u64,
     pub sweep_interval_secs: u64,
     /// How long a completed request's Idempotency-Key is remembered.
     pub idempotency_retention_secs: u64,
@@ -111,7 +115,7 @@ impl Default for LedgerConfig {
             schema: "public".to_string(),
             max_connections: 16,
             timeout_ms: 1_000,
-            sweep_after_secs: 3_600,
+            lease_secs: 60,
             sweep_interval_secs: 60,
             idempotency_retention_secs: 86_400,
             response_keys_env: "LLM_GATEWAY_RESPONSE_KEYS".to_string(),

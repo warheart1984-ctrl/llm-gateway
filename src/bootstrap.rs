@@ -205,7 +205,7 @@ async fn build_ledger(
                 crate::governance::ledger::sqlite::SqliteOptions {
                     path: cfg.sqlite_path.clone(),
                     timeout: Duration::from_millis(cfg.timeout_ms),
-                    sweep_after: Duration::from_secs(cfg.sweep_after_secs),
+                    lease: Duration::from_secs(cfg.lease_secs),
                     sweep_interval: Duration::from_secs(cfg.sweep_interval_secs),
                     idempotency_retention: retention,
                     sealer: response_sealer(&cfg.response_keys_env)?,
@@ -226,7 +226,7 @@ async fn build_ledger(
                 schema: cfg.schema.clone(),
                 max_connections: cfg.max_connections,
                 timeout: Duration::from_millis(cfg.timeout_ms),
-                sweep_after: Duration::from_secs(cfg.sweep_after_secs),
+                lease: Duration::from_secs(cfg.lease_secs),
                 sweep_interval: Duration::from_secs(cfg.sweep_interval_secs),
                 idempotency_retention: retention,
                 sealer,

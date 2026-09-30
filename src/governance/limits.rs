@@ -32,6 +32,7 @@ use uuid::Uuid;
 use super::budget_bucket_label;
 use super::ledger::{
     Closing, Fingerprinter, IdempotencyClaim, Ledger, LedgerRefusal, MemoryLedger, NewReservation, Outcome,
+    SharedLimits,
 };
 use crate::{config::LimitProfile, providers::Usage, router::CostModel};
 
@@ -80,6 +81,11 @@ impl From<LedgerRefusal> for LimitError {
                 LimitError::DuplicateRequest { original, billed_nano_usd, response }
             }
             LedgerRefusal::Unavailable(_) => LimitError::LedgerUnavailable,
+            LedgerRefusal::RateLimited { done, limit } => LimitError::RateLimited { done, limit },
+            LedgerRefusal::TokenRateLimited { done, requested, limit } => {
+                LimitError::TokenRateLimited { done, requested, limit }
+            }
+            LedgerRefusal::ConcurrencyLimited { limit } => LimitError::ConcurrencyLimited { limit },
         }
     }
 }
@@ -231,7 +237,7 @@ impl Reservation {
         let prompt = usage.prompt_tokens.max(self.prompt_tokens);
         let completion = usage.completion_tokens;
         let actual = nano_usd_for(prompt, usage.cached_prompt_tokens, completion, cost);
-        self.finish(Outcome::Settled, actual as i128 - self.reserved_nano_usd as i128);
+        self.finish(Outcome::Settled, actual as i128 - self.reserved_nano_usd as i128, completion);
         self.count_completion_tokens(completion);
     }
 
@@ -246,7 +252,7 @@ impl Reservation {
         if !self.close() {
             return;
         }
-        self.finish(Outcome::Abandoned, self.completion_refund());
+        self.finish(Outcome::Abandoned, self.completion_refund(), 0);
     }
 
     /// Refund everything: the upstream refused the request or could not be
@@ -258,7 +264,7 @@ impl Reservation {
         if !self.close() {
             return;
         }
-        self.finish(Outcome::Released, -(self.reserved_nano_usd as i128));
+        self.finish(Outcome::Released, -(self.reserved_nano_usd as i128), 0);
     }
 
     /// Keep the whole reservation as the bill. For a stream whose usage the
@@ -270,7 +276,7 @@ impl Reservation {
         if !self.close() {
             return;
         }
-        self.finish(Outcome::Committed, 0);
+        self.finish(Outcome::Committed, 0, self.max_output_tokens);
         self.count_completion_tokens(self.max_output_tokens);
     }
 
@@ -302,7 +308,7 @@ impl Reservation {
         (self.reserved_prompt_nano_usd as i128 - self.reserved_nano_usd as i128).min(0)
     }
 
-    fn finish(&mut self, outcome: Outcome, delta: i128) {
+    fn finish(&mut self, outcome: Outcome, delta: i128, completion_tokens: u32) {
         if !self.recorded {
             return;
         }
@@ -314,6 +320,7 @@ impl Reservation {
             outcome,
             at: SystemTime::now(),
             response: self.response.take(),
+            completion_tokens,
         });
     }
 
@@ -335,7 +342,7 @@ impl Drop for Reservation {
         // slot and permit fields drop after this body, so the ledger is
         // corrected before the concurrency slot frees up.
         if self.close() {
-            self.finish(Outcome::Abandoned, self.completion_refund());
+            self.finish(Outcome::Abandoned, self.completion_refund(), 0);
         }
     }
 }
@@ -448,6 +455,17 @@ impl LimitEngine {
         }
     }
 
+    /// A rate or concurrency limit as this process enforces it: whole, or
+    /// this replica's share. `0` still means no ceiling; a real limit whose
+    /// share rounds down to zero is reported as `Some(0)` so the caller can
+    /// refuse rather than treat it as unlimited.
+    fn enforced_limit(&self, limit: u32) -> u32 {
+        match self.quota_split {
+            Some(split) if limit > 0 => split.share(u64::from(limit)) as u32,
+            _ => limit,
+        }
+    }
+
     pub fn ledger(&self) -> &Arc<dyn Ledger> {
         &self.ledger
     }
@@ -502,34 +520,57 @@ impl LimitEngine {
             }
         })?;
 
+        // The limits this process enforces: whole, or this replica's share.
+        // A real limit whose share rounds down to zero refuses outright; as
+        // `0` it would mean "no ceiling".
+        let concurrent = self.enforced_limit(limits.max_concurrent_streams);
+        let requests_per_minute = self.enforced_limit(limits.requests_per_minute);
+        let tokens_per_minute = self.enforced_limit(limits.tokens_per_minute);
+        if limits.max_concurrent_streams > 0 && concurrent == 0 {
+            return Err(LimitError::ConcurrencyLimited { limit: 0 });
+        }
+        if limits.requests_per_minute > 0 && requests_per_minute == 0 {
+            return Err(LimitError::RateLimited { done: 0, limit: 0 });
+        }
+        if limits.tokens_per_minute > 0 && tokens_per_minute == 0 {
+            return Err(LimitError::TokenRateLimited { done: 0, requested: req.prompt_tokens, limit: 0 });
+        }
+
+        // A ledger shared across processes enforces rate and concurrency
+        // limits in its admission transaction. The in-process window then
+        // only records, for `/v1/usage`; deciding locally as well would
+        // refuse on a sliding window what the shared fixed window allows.
+        let shared = self.ledger.enforces_limits();
+
         let state = self.state(req.tenant_id);
-        let slot = Slot::try_acquire(&state, limits.max_concurrent_streams).ok_or(
+        let slot = Slot::try_acquire(&state, concurrent).ok_or(
             LimitError::ConcurrencyLimited {
-                limit: limits.max_concurrent_streams,
+                limit: concurrent,
             },
         )?;
 
-        // Phase 1, under the window lock: check the rate limits and record
-        // this attempt, so concurrent admissions see it.
+        // Phase 1, under the window lock: check the rate limits (when this
+        // process decides them) and record this attempt, so concurrent
+        // admissions see it.
         let now = Instant::now();
         {
             let mut window = state.window();
             window.evict(now);
-            if limits.requests_per_minute > 0 && window.request_times.len() as u32 >= limits.requests_per_minute {
-                return Err(LimitError::RateLimited {
-                    done: window.request_times.len() as u32,
-                    limit: limits.requests_per_minute,
-                });
-            }
-            let used_tokens = window.tokens();
-            if limits.tokens_per_minute > 0
-                && used_tokens.saturating_add(req.prompt_tokens) > limits.tokens_per_minute
-            {
-                return Err(LimitError::TokenRateLimited {
-                    done: used_tokens,
-                    requested: req.prompt_tokens,
-                    limit: limits.tokens_per_minute,
-                });
+            if !shared {
+                if requests_per_minute > 0 && window.request_times.len() as u32 >= requests_per_minute {
+                    return Err(LimitError::RateLimited {
+                        done: window.request_times.len() as u32,
+                        limit: requests_per_minute,
+                    });
+                }
+                let used_tokens = window.tokens();
+                if tokens_per_minute > 0 && used_tokens.saturating_add(req.prompt_tokens) > tokens_per_minute {
+                    return Err(LimitError::TokenRateLimited {
+                        done: used_tokens,
+                        requested: req.prompt_tokens,
+                        limit: tokens_per_minute,
+                    });
+                }
             }
             window.request_times.push_back(now);
             window.token_events.push_back((now, req.prompt_tokens));
@@ -540,11 +581,12 @@ impl LimitEngine {
         }
 
         // Phase 2, no lock held: the ledger decides, atomically, whether the
-        // money and the idempotency key are available. A refusal takes the
-        // attempt back out of the window: a request that was never admitted
-        // does not consume rate limit.
+        // money, the idempotency key and (on a shared ledger) the rate and
+        // concurrency headroom are available. A refusal takes the attempt
+        // back out of the window: a request that was never admitted does not
+        // consume rate limit.
         let tracked = self.cost_tracking;
-        let recorded = tracked || req.idempotency.is_some();
+        let recorded = tracked || req.idempotency.is_some() || shared;
         let budget = self.enforced_budget(limits.daily_budget_nano_usd);
         // A real budget whose share rounds down to zero must refuse, not
         // reach the ledger as `0`, which means "no ceiling": that would turn
@@ -567,6 +609,13 @@ impl LimitEngine {
                     prompt_nano_usd: if tracked { req.estimate.prompt_nano_usd } else { 0 },
                     budget_nano_usd: if tracked { budget } else { 0 },
                     idempotency: req.idempotency.clone(),
+                    limits: SharedLimits {
+                        // The local slot treats 0 as 1; the ledger must agree.
+                        max_concurrent: concurrent.max(1),
+                        requests_per_minute,
+                        tokens_per_minute,
+                        prompt_tokens: req.prompt_tokens,
+                    },
                 })
                 .await;
             match decision {

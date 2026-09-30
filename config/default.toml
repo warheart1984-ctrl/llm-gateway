@@ -96,9 +96,11 @@ max_connections = 16
 # There is deliberately no option to admit without the ledger. On the sqlite
 # backend with a slow or busy disk, raise it rather than see spurious 503s.
 timeout_ms = 1000
-# An open reservation older than this was orphaned by a crash and is billed
-# in full. Keep it well above the longest stream.
-sweep_after_secs = 3600
+# A reservation's lease, in seconds. The gateway renews the leases it holds
+# every third of this; after a crash they lapse within it, and the sweeper
+# bills those reservations in full. A long stream keeps renewing and is never
+# swept while live. (`sweep_after_secs`, the older name, is still accepted.)
+lease_secs = 60
 sweep_interval_secs = 60
 idempotency_retention_secs = 86400
 # Env var NAME holding the keys that seal answers kept for replay (postgres):
