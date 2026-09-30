@@ -1262,6 +1262,41 @@ async fn an_unreachable_upstream_costs_the_tenant_nothing() {
 }
 
 #[tokio::test]
+async fn a_models_template_overhead_is_reserved_but_never_billed() {
+    // The same request to two models priced alike, one of which declares 100
+    // tokens of vendor template: it reserves 100 prompt tokens more, and the
+    // bill, set by the reported usage, is the same.
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let extra = r#"  mock/templated:
+    provider: nvidia
+    endpoint: http://REPLACE_ME/v1/chat/completions
+    upstream_model: mock-model
+    prompt_overhead_tokens: 100
+    cost:
+      input_per_mtok_usd: 2.0
+      output_per_mtok_usd: 8.0
+"#;
+    let gw = Gateway::start_with(&upstream, extra).await;
+    let mut measured = Vec::new();
+    for model in ["mock/chat", "mock/templated"] {
+        let mut body = chat_body();
+        body["model"] = json!(model);
+        let before = spent(&gw, TEST_KEY).await;
+        let (status, headers, text) = gw.post_chat(TEST_KEY, body).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let reserved: u64 = headers["x-reserved-nano-usd"].to_str().unwrap().parse().unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        measured.push((reserved, spent(&gw, TEST_KEY).await - before));
+    }
+    let [(plain_reserved, plain_billed), (templated_reserved, templated_billed)] = measured[..] else {
+        unreachable!()
+    };
+    assert_eq!(templated_reserved - plain_reserved, 100 * 2_000, "100 tokens more reserved, at the input rate");
+    assert_eq!(templated_billed, plain_billed, "and not a token more billed");
+    assert!(templated_billed > 0);
+}
+
+#[tokio::test]
 async fn passthrough_is_billed_the_full_reservation() {
     // The gateway cannot see passthrough usage, so the reservation is the
     // bill. Refunding the completion half would make passthrough a way

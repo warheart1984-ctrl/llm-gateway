@@ -93,6 +93,14 @@ pub struct ModelConfig {
     pub default_params: Map<String, Value>,
     #[serde(default)]
     pub cost: CostModel,
+    /// Prompt tokens the vendor adds around every request: its chat template,
+    /// a default system prompt. The gateway cannot see them, so the prompt
+    /// estimate alone runs low (a short prompt to Groq's gpt-oss is billed ~79
+    /// tokens against ~13 estimated). Added to the *reservation* only, so the
+    /// budget check covers what the vendor will count; the bill is still the
+    /// vendor's reported usage. The live suite checks these numbers.
+    #[serde(default)]
+    pub prompt_overhead_tokens: u32,
     /// Time-to-first-token p95 budget in ms. Used for routing preference and
     /// as an SLO signal, not as a hard cutoff.
     #[serde(default)]
@@ -536,6 +544,7 @@ mod tests {
             display_name: None,
             default_params: Map::new(),
             cost: CostModel::default(),
+            prompt_overhead_tokens: 0,
             latency_slo_ms: None,
             max_context_tokens: None,
             max_output_tokens: None,

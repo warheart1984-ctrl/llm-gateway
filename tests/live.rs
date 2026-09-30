@@ -177,18 +177,21 @@ struct Target {
     /// Nano-USD per prompt and completion token, from the catalogue.
     input_rate: u64,
     output_rate: u64,
+    /// The catalogue's allowance for the vendor's prompt template.
+    prompt_overhead: u32,
 }
 
 impl Target {
     async fn new(provider: &'static str, model: String, models_yaml: &Path) -> Self {
         let registry = llm_gateway::router::ModelRegistry::load(models_yaml, false, 0).expect("load catalogue");
         let snapshot = registry.snapshot().await;
-        let cost = &snapshot.by_id.get(&model).unwrap_or_else(|| panic!("`{model}` is not in the catalogue")).cost;
+        let config = snapshot.by_id.get(&model).unwrap_or_else(|| panic!("`{model}` is not in the catalogue"));
         Self {
             provider,
             missing: format!("live/missing-{provider}"),
-            input_rate: cost.input_nano_usd_per_token(),
-            output_rate: cost.output_nano_usd_per_token(),
+            input_rate: config.cost.input_nano_usd_per_token(),
+            output_rate: config.cost.output_nano_usd_per_token(),
+            prompt_overhead: config.prompt_overhead_tokens,
             model,
         }
     }
@@ -314,6 +317,17 @@ async fn check_stream(gw: &Gateway, t: &Target) -> Option<Measured> {
     let billed = gw.settled_spend().await - before;
     assert_eq!(billed, cost, "{}: the ledger bills what the end event says", t.provider);
     let reserved = reserved(&headers);
+    // The catalogue's template allowance must cover what the vendor adds, or
+    // the reservation runs low whenever an answer uses its whole output cap.
+    let allowed = u64::from(estimated) + u64::from(t.prompt_overhead);
+    assert!(
+        prompt <= allowed,
+        "{}: the vendor counted {prompt} prompt tokens; the estimate ({estimated}) plus the catalogue's \
+         prompt_overhead_tokens ({}) allows {allowed}. Raise prompt_overhead_tokens for `{}`.",
+        t.provider,
+        t.prompt_overhead,
+        t.model
+    );
     assert!(
         billed <= reserved,
         "{}: billed {billed} nano-USD against a reservation of {reserved}: the pre-flight estimate \
@@ -493,9 +507,7 @@ async fn live(provider: &'static str, key_env: &str, default_model: &str) {
         "upstream_model": m.upstream_model,
         "estimated_prompt_tokens": m.estimated_prompt_tokens,
         "billed_prompt_tokens": m.billed_prompt_tokens,
-        // The vendor counted more prompt than the gateway estimated: the
-        // estimate is not the over-estimate it is meant to be for this model.
-        "estimate_undershot": m.billed_prompt_tokens > u64::from(m.estimated_prompt_tokens),
+        "prompt_overhead_tokens": target.prompt_overhead,
         "completion_tokens": m.completion_tokens,
         "finish_reason": m.finish_reason,
         "reserved_nano_usd": m.reserved_nano_usd,

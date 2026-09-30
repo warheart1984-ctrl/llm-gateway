@@ -451,7 +451,12 @@ daily_budget_nano_usd = 5000000000   # 1 USD = 1_000_000_000 nano-USD
 
 `config/models.yaml` is the only place a model, provider, or upstream URL is
 defined. A per-model `endpoint:` override is what makes a self-hosted NIM
-container work.
+container work. `prompt_overhead_tokens:` is what a vendor adds around every
+prompt (its chat template, a default system prompt), which the gateway's
+estimate cannot see: Groq's gpt-oss bills a short prompt at ~79 tokens
+against ~13 estimated. It is added to the reservation only, so the budget
+check covers it; the bill is still the vendor's reported usage. The live
+suite fails when a vendor's overhead outgrows the catalogue's number.
 
 `config/tenants.yaml` holds credentials, scopes, allow/deny lists, limits, and
 per-model policy. Keys are referenced by env var (`key_env`) or by file
@@ -504,7 +509,7 @@ What the gateway does itself, and what it expects of the deployment around it.
 ## Testing
 
 ```bash
-cargo test --locked --all-targets                  # 274 tests
+cargo test --locked --all-targets                  # 276 tests
 cargo clippy --locked --all-targets -- -D warnings
 cargo bench --bench framing                        # add `-- --quick` for a fast pass
 ```

@@ -23,6 +23,9 @@ models:
       temperature: 0.7
       max_tokens: 2048
       top_p: 0.95
+    # gpt-oss's chat template and default system prompt: a short prompt is
+    # billed ~79 tokens against ~13 estimated (live suite, 2026-09-30).
+    prompt_overhead_tokens: 96
     cost:
       input_per_mtok_usd: 0.15
       output_per_mtok_usd: 0.60
@@ -38,6 +41,8 @@ models:
     default_params:
       temperature: 0.7
       max_tokens: 2048
+    # As gpt-oss-120b: the same template.
+    prompt_overhead_tokens: 96
     cost:
       input_per_mtok_usd: 0.075
       output_per_mtok_usd: 0.30
@@ -56,6 +61,8 @@ models:
     default_params:
       temperature: 0.7
       max_tokens: 4096
+    # OpenAI's per-message framing: a few tokens.
+    prompt_overhead_tokens: 16
     cost:
       input_per_mtok_usd: 0.40
       output_per_mtok_usd: 1.60
@@ -71,6 +78,8 @@ models:
     default_params:
       temperature: 1.0
       max_tokens: 8192
+    # Not measured live; Anthropic's framing is small.
+    prompt_overhead_tokens: 16
     cost:
       input_per_mtok_usd: 3.00
       output_per_mtok_usd: 15.00
@@ -91,6 +100,8 @@ models:
     default_params:
       temperature: 0.7
       max_tokens: 2048
+    # ~11 tokens over the estimate for a short prompt (live suite, 2026-09-30).
+    prompt_overhead_tokens: 32
     cost:
       input_per_mtok_usd: 0.00
       output_per_mtok_usd: 0.00
