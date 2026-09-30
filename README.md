@@ -544,6 +544,9 @@ content:
   received;
 - a model the vendor does not know is a clean 502 that costs nothing.
 
+A refusal the vendor marks retryable (overloaded, rate limited) is retried
+twice after a pause; anything else fails at once.
+
 It spends money, so it is opt-in: nothing runs unless `LLM_GATEWAY_LIVE`
 names the providers, and a named provider without its key fails rather than
 skips. Each test's tenant has a 5-cent daily budget, so a runaway test is

@@ -17,6 +17,8 @@
 //! * a model the vendor does not know is a clean 502 that costs nothing.
 //!
 //! Content is never asserted, only shape and money.
+//! A refusal the vendor marks retryable (overloaded, rate limited) is
+//! retried twice after a pause; anything else fails at once.
 //!
 //! **Opt-in, because it spends money.** Nothing runs unless
 //! `LLM_GATEWAY_LIVE` names the providers (`groq,openrouter,nvidia` or
@@ -249,13 +251,39 @@ struct Measured {
     ttft_ms: u64,
 }
 
-async fn check_stream(gw: &Gateway, t: &Target) -> Measured {
+/// A refusal the vendor marked as worth retrying (overloaded, rate limited),
+/// before the answer or in-band.
+fn transient(status: StatusCode, body: &str) -> bool {
+    body.contains("\"retryable\":true") && (status != StatusCode::OK || body.contains("event: error"))
+}
+
+/// Run a check; if the vendor refused it as transient, pause and run it
+/// again, three attempts in all. Anything else is a finding at once.
+async fn retrying<T, F, Fut>(provider: &str, what: &str, mut once: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    for attempt in 1..=3u64 {
+        if let Some(done) = once().await {
+            return done;
+        }
+        eprintln!("{provider}: {what}: the vendor refused as transient (attempt {attempt}); retrying");
+        tokio::time::sleep(Duration::from_secs(5 * attempt)).await;
+    }
+    panic!("{provider}: {what}: refused as transient three times; the vendor is not serving");
+}
+
+async fn check_stream(gw: &Gateway, t: &Target) -> Option<Measured> {
     let request = t.request("Reply with exactly one word: ready.", 256);
     let before = gw.settled_spend().await;
     let reply = gw.post("/v1/chat/stream", &request).send().await.unwrap();
     let status = reply.status();
     let headers = reply.headers().clone();
     let body = reply.text().await.unwrap();
+    if transient(status, &body) {
+        return None;
+    }
     assert_eq!(status, StatusCode::OK, "{}: {body}", t.provider);
     assert!(headers[header::CONTENT_TYPE].to_str().unwrap().starts_with("text/event-stream"));
 
@@ -292,7 +320,7 @@ async fn check_stream(gw: &Gateway, t: &Target) -> Measured {
          ({estimated} prompt tokens) did not cover the {prompt} billed",
         t.provider
     );
-    Measured {
+    Some(Measured {
         upstream_model: headers["x-upstream-model"].to_str().unwrap().to_string(),
         estimated_prompt_tokens: estimated,
         billed_prompt_tokens: prompt,
@@ -301,17 +329,22 @@ async fn check_stream(gw: &Gateway, t: &Target) -> Measured {
         reserved_nano_usd: reserved,
         billed_nano_usd: billed,
         ttft_ms: end["ttft_ms"].as_u64().unwrap_or(0),
-    }
+    })
 }
 
-async fn check_completion(gw: &Gateway, t: &Target) {
+async fn check_completion(gw: &Gateway, t: &Target) -> Option<()> {
     let request = t.request("Reply with exactly one word: ready.", 256);
     let before = gw.settled_spend().await;
     let reply = gw.post("/v1/chat/complete", &request).send().await.unwrap();
     let status = reply.status();
-    let reserved = reserved(reply.headers());
-    let body: Value = reply.json().await.unwrap();
-    assert_eq!(status, StatusCode::OK, "{}: {body}", t.provider);
+    let headers = reply.headers().clone();
+    let text = reply.text().await.unwrap();
+    if transient(status, &text) {
+        return None;
+    }
+    assert_eq!(status, StatusCode::OK, "{}: {text}", t.provider);
+    let reserved = reserved(&headers);
+    let body: Value = serde_json::from_str(&text).unwrap();
     let answered = ["content", "reasoning"].iter().any(|f| body[f].as_str().is_some_and(|s| !s.is_empty()));
     assert!(answered, "{}: an empty answer: {body}", t.provider);
     assert!(body["usage"]["prompt_tokens"].as_u64().unwrap_or(0) > 0, "{}: {body}", t.provider);
@@ -319,36 +352,54 @@ async fn check_completion(gw: &Gateway, t: &Target) {
     let billed = gw.settled_spend().await - before;
     assert_eq!(billed, cost, "{}: the ledger bills what the answer says", t.provider);
     assert!(billed <= reserved, "{}: billed {billed} against a reservation of {reserved}", t.provider);
+    Some(())
 }
 
-async fn check_passthrough(gw: &Gateway, t: &Target) {
+async fn check_passthrough(gw: &Gateway, t: &Target) -> Option<()> {
     let request = t.request("Reply with exactly one word: ready.", 64);
     let before = gw.settled_spend().await;
     let reply = gw.post("/v1/chat/stream", &request).header("x-gateway-framing", "passthrough").send().await.unwrap();
     let status = reply.status();
-    let reserved = reserved(reply.headers());
+    let headers = reply.headers().clone();
     let body = reply.text().await.unwrap();
+    if transient(status, &body) {
+        return None;
+    }
     assert_eq!(status, StatusCode::OK, "{}: {body}", t.provider);
+    let reserved = reserved(&headers);
     assert!(body.contains("data:") && body.contains("[DONE]"), "{}: not the vendor's stream: {body}", t.provider);
     assert!(!body.contains("event: start"), "{}: passthrough must not re-frame", t.provider);
     let billed = gw.settled_spend().await - before;
     assert_eq!(billed, reserved, "{}: passthrough bills the reservation", t.provider);
+    Some(())
 }
 
-async fn check_hang_up(gw: &Gateway, t: &Target) {
+async fn check_hang_up(gw: &Gateway, t: &Target) -> Option<()> {
     let request = t.request("Count from 1 to 400, one number per line, nothing else.", 1024);
     let before = gw.settled_spend().await;
     let reply = gw.post("/v1/chat/stream", &request).send().await.unwrap();
-    assert_eq!(reply.status(), StatusCode::OK, "{}", t.provider);
+    let status = reply.status();
+    if status != StatusCode::OK {
+        let body = reply.text().await.unwrap();
+        if transient(status, &body) {
+            return None;
+        }
+        panic!("{}: {status} {body}", t.provider);
+    }
     let reserved = reserved(reply.headers());
     let mut stream = reply.bytes_stream();
     let mut seen = String::new();
     while !(seen.contains("{\"token\"") || seen.contains("event: reasoning")) {
-        let chunk = tokio::time::timeout(Duration::from_secs(60), stream.next())
+        let next = tokio::time::timeout(Duration::from_secs(60), stream.next())
             .await
-            .unwrap_or_else(|_| panic!("{}: no output within a minute", t.provider))
-            .unwrap_or_else(|| panic!("{}: the stream ended before any output: {seen}", t.provider))
-            .unwrap();
+            .unwrap_or_else(|_| panic!("{}: no output within a minute", t.provider));
+        let Some(chunk) = next else {
+            if transient(StatusCode::OK, &seen) {
+                return None;
+            }
+            panic!("{}: the stream ended before any output: {seen}", t.provider);
+        };
+        let chunk = chunk.unwrap();
         seen.push_str(&String::from_utf8_lossy(&chunk));
     }
     drop(stream);
@@ -359,6 +410,7 @@ async fn check_hang_up(gw: &Gateway, t: &Target) {
         assert!(billed > 0, "{}: the prompt and what was delivered are owed", t.provider);
         assert!(billed < reserved, "{}: billed {billed}, the whole reservation {reserved}", t.provider);
     }
+    Some(())
 }
 
 async fn check_unknown_model(gw: &Gateway, t: &Target) -> String {
@@ -382,10 +434,11 @@ async fn check_unknown_model(gw: &Gateway, t: &Target) -> String {
 
 /// Every check, in order, against one gateway.
 async fn check_all(gw: &Gateway, t: &Target) -> (Measured, String) {
-    let measured = check_stream(gw, t).await;
-    check_completion(gw, t).await;
-    check_passthrough(gw, t).await;
-    check_hang_up(gw, t).await;
+    let p = t.provider;
+    let measured = retrying(p, "stream", || check_stream(gw, t)).await;
+    retrying(p, "completion", || check_completion(gw, t)).await;
+    retrying(p, "passthrough", || check_passthrough(gw, t)).await;
+    retrying(p, "hang-up", || check_hang_up(gw, t)).await;
     let refusal = check_unknown_model(gw, t).await;
     (measured, refusal)
 }
