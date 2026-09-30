@@ -155,7 +155,7 @@ impl PostgresLedger {
             .execute(&pool)
             .await
             .map_err(|e| format!("cannot create ledger schema: {e}"))?;
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations/postgres")
             .run(&pool)
             .await
             .map_err(|e| format!("ledger migration failed: {e}"))?;

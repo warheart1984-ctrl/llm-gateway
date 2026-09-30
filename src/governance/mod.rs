@@ -18,7 +18,7 @@ pub use auth::{
     ApiKeyAuthenticator, AuthError, Authenticator, JwtAuthenticator, KeyRecord, Principal, Scope,
     SCOPE_ADMIN, SCOPE_CHAT_STREAM, SCOPE_MODELS_READ,
 };
-pub use limits::{AdmitRequest, BudgetSnapshot, CostEstimate, LimitEngine, LimitError, Reservation, TenantUsage};
+pub use limits::{AdmitRequest, QuotaSplit, BudgetSnapshot, CostEstimate, LimitEngine, LimitError, Reservation, TenantUsage};
 pub use policy::{AuthorizeError, Decision, PolicyEngine, Tenant, TenantRegistry};
 
 use crate::config::LimitProfile;

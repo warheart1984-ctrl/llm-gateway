@@ -83,12 +83,16 @@ request_usage = true
 # postgres: one durable ledger shared by every replica. Survives restarts;
 #           replicas draw on one budget; a repeated Idempotency-Key is
 #           answered from the ledger instead of running again.
+# sqlite: a durable ledger in a local file. Survives restarts with no
+#         database server. Not shared: for several replicas, pair it with
+#         quota_split_replicas below.
 backend = "memory"
 url_env = "LLM_GATEWAY_DATABASE_URL"   # env var NAME; the URL stays in env
 schema = "public"
 max_connections = 16
 # Ledger unreachable or slower than this: the request is refused with 503.
-# There is deliberately no option to admit without the ledger.
+# There is deliberately no option to admit without the ledger. On the sqlite
+# backend with a slow or busy disk, raise it rather than see spurious 503s.
 timeout_ms = 1000
 # An open reservation older than this was orphaned by a crash and is billed
 # in full. Keep it well above the longest stream.
@@ -99,6 +103,14 @@ idempotency_retention_secs = 86400
 # `kid:base64-of-32-bytes[,kid:...]`, first key seals, all keys open.
 # Unset: answers are not stored and repeated completions get 409.
 response_keys_env = "LLM_GATEWAY_RESPONSE_KEYS"
+# sqlite backend: the database file, relative to this config directory.
+sqlite_path = "ledger.sqlite3"
+# Quota split, for N replicas without a shared database (sqlite backend):
+# each replica enforces budget * margin% / N of every tenant's budget, so
+# together they never exceed it. 0 = off. Same N on every replica; change it
+# only at the UTC day boundary.
+quota_split_replicas = 0
+quota_split_margin_percent = 100
 
 [telemetry]
 service_name = "llm-gateway"

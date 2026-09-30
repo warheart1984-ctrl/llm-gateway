@@ -23,6 +23,7 @@
 mod memory;
 pub mod postgres;
 pub mod sealed;
+pub mod sqlite;
 
 use std::{sync::Arc, time::SystemTime};
 
@@ -32,6 +33,7 @@ pub use memory::MemoryLedger;
 #[cfg(test)]
 pub(crate) use memory::SpendLedger;
 pub use postgres::PostgresLedger;
+pub use sqlite::SqliteLedger;
 
 /// A request to put money on hold for one gateway request.
 #[derive(Debug, Clone)]

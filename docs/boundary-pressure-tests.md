@@ -124,7 +124,21 @@ there instead of skipping them.
 | No sealing key configured | no answer stored at all; a repeat is recognised and billed once, with 409 instead of a replay | `shared_ledger_without_a_key_stores_no_answer` | HOLDS |
 | Copy one request's sealed answer into another request's row | the copy does not open; 409, never the wrong answer; nothing re-executed | `shared_ledger_an_answer_moved_to_another_row_is_not_served` | HOLDS |
 
-## 10. Known gaps
+## 10. The local ledger (SQLite) and quota-split replicas
+
+No database server, so these run on every platform, Windows included.
+
+| Pressure | Must happen | Test | Result |
+|---|---|---|---|
+| Crash and restart on the SQLite ledger | spend survives; an exhausted tenant stays refused | `local_ledger_a_restart_keeps_todays_spend` | HOLDS |
+| Same `Idempotency-Key` after a restart | recognised; executed once across the restart | `local_ledger_a_repeated_key_is_recognised_after_a_restart` | HOLDS |
+| SQLite ledger cannot be opened | the gateway refuses to start | `local_ledger_a_gateway_will_not_start_without_its_ledger` | HOLDS |
+| 20 simultaneous requests across two split replicas, no shared database, room for 3 | exactly one share per replica reaches the provider: 2, where unsplit replicas would admit 6 | `quota_split_a_burst_across_replicas_admits_exactly_the_shares` | HOLDS |
+| A split replica restarts | its spent share survives; `/v1/usage` reports the share and the tenant budget | `quota_split_a_restarted_replica_keeps_its_spent_share` | HOLDS |
+| A split configured on a ledger that would fail open, or with a 0% margin | the gateway refuses to start | `quota_split_refuses_to_boot_where_it_would_fail_open` | HOLDS |
+| A tenant budget whose share rounds down to zero | refused, never treated as "no ceiling" | `a_share_that_rounds_to_zero_refuses_instead_of_unlimiting` (unit) | HOLDS |
+
+## 11. Known gaps
 
 | Pressure | What happens | Test | Result |
 |---|---|---|---|
@@ -151,7 +165,17 @@ requests are recorded as structured log lines only.
 - **Answer sealing:** removing the row binding fails exactly the
   moved-answer test (the copied answer is served); storing answers in the
   clear fails three tests, including the at-rest check.
-- **Flakiness:** on the shared ledger, a first batch of 10 runs had 2 runs
-  with a failure. The output was not captured and the cause is not yet
-  identified. 40 consecutive runs since then were clean, 46/46 each time.
-  Treat the suite as not yet proven flake-free.
+- **SQLite budget condition removed from the SQL:** the exact-budget and
+  two-processes-on-one-file ledger tests fail, and so does the restart
+  pressure test.
+- **Quota split ignored:** both split pressure tests fail, and the unit test
+  for each replica's share.
+- **Flakiness, diagnosed:** the intermittent failures (about 1 run in 5)
+  were ledger requests exceeding their deadline under the suite's own load,
+  with dozens of gateways syncing every commit to one disk in parallel.
+  They surfaced as a 503 on the SQLite ledger and as an uncounted refusal in
+  the Postgres burst test. Fixed by opening every SQLite connection at boot,
+  and by giving the tests a loaded machine's deadline, since they assert
+  admission outcomes, not latency. The burst test now names any refusal
+  that is not a budget refusal. After the fix: 25 consecutive full-suite
+  runs on Postgres, 55/55 each time.
