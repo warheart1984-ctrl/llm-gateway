@@ -354,6 +354,71 @@ fn tenants_yaml(include_rotating_key: bool) -> String {
     allowed_models: ["mock/*"]
     limits:
 {roomy}      daily_budget_nano_usd: 100000000000
+  # HOLD: `mock/other` always waits for approval, and so does anything whose
+  # worst case is above 1,000,000 nano-USD (a standard request, ~1.03M).
+  - tenant_id: guarded
+    enabled: true
+    credentials:
+      - key_id: ak_guarded
+        key: key-guarded
+        scopes: [chat:stream]
+      # Can approve holds, but never its own.
+      - key_id: ak_guarded_lead
+        key: key-guarded-lead
+        scopes: [chat:stream, approve:holds]
+    allowed_models: ["mock/*"]
+    limits:
+{roomy}      daily_budget_nano_usd: 100000000000
+    holds:
+      models: ["mock/other"]
+      above_nano_usd: 1000000
+  # Holds that lapse after three seconds, approvals after one.
+  - tenant_id: hasty
+    enabled: true
+    credentials:
+      - key_id: ak_hasty
+        key: key-hasty
+        scopes: [chat:stream]
+    allowed_models: ["mock/*"]
+    limits:
+{roomy}      daily_budget_nano_usd: 100000000000
+    holds:
+      models: ["mock/*"]
+      expiry_secs: 3
+      approval_valid_secs: 1
+  # At most two holds waiting at once.
+  - tenant_id: queued
+    enabled: true
+    credentials:
+      - key_id: ak_queued
+        key: key-queued
+        scopes: [chat:stream]
+    allowed_models: ["mock/*"]
+    limits:
+{roomy}      daily_budget_nano_usd: 100000000000
+    holds:
+      models: ["mock/*"]
+      max_pending: 2
+  # Everything is held, and the budget is too small for a standard request.
+  - tenant_id: thrifty
+    enabled: true
+    credentials:
+      - key_id: ak_thrifty
+        key: key-thrifty
+        scopes: [chat:stream]
+    allowed_models: ["mock/*"]
+    limits:
+{roomy}      daily_budget_nano_usd: 60000
+    holds:
+      models: ["mock/*"]
+  # The approvers: a key that can decide holds and do nothing else.
+  - tenant_id: ops
+    enabled: true
+    credentials:
+      - key_id: ak_approver
+        key: key-approver
+        scopes: [approve:holds]
+    allowed_models: ["mock/chat"]
 "#
     )
 }
@@ -2072,6 +2137,507 @@ async fn readiness_names_the_ledger_consistency_scope() {
             json!({ "backend": "postgres", "durability": "persistent", "replica_mode": "shared" })
         );
     }
+}
+
+// ===========================================================================
+// HOLD: requests that wait for a person
+// ===========================================================================
+//
+// A tenant's policy can hold a request instead of executing it. A held
+// request must never reach the provider until someone with `approve:holds`
+// approves it, and then only once, only as approved, and only if everything
+// else still admits it.
+
+/// Held because of its model, whatever it costs.
+fn held_request() -> Value {
+    json!({
+        "model": "mock/other",
+        "messages": [{ "role": "user", "content": "please approve me" }],
+        "params": { "max_tokens": 5 }
+    })
+}
+
+/// Ask for `body`, expect it held, and return the hold's id.
+async fn held(gw: &Gateway, key: &str, body: Value) -> String {
+    let reply = gw.chat(Some(key), body).await;
+    assert_eq!(reply.status, StatusCode::ACCEPTED, "{}", reply.body);
+    let json = reply.json();
+    assert_eq!(json["status"], "held");
+    assert_eq!(json["hold"]["state"], "pending");
+    let id = json["hold"]["id"].as_str().expect("hold id").to_string();
+    assert_eq!(reply.headers["hold-id"], id.as_str());
+    assert_eq!(reply.headers["location"], format!("/v1/holds/{id}").as_str());
+    id
+}
+
+async fn decide(gw: &Gateway, key: &str, id: &str, verdict: &str) -> Reply {
+    gw.send(
+        reqwest::Client::new()
+            .post(gw.url(&format!("/v1/admin/holds/{id}/{verdict}")))
+            .header("x-api-key", key)
+            .json(&json!({ "note": format!("{verdict} by the test") })),
+    )
+    .await
+}
+
+async fn approve(gw: &Gateway, id: &str) {
+    let reply = decide(gw, "key-approver", id, "approve").await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert_eq!(reply.json()["hold"]["state"], "approved");
+}
+
+/// Send `body` again, presenting the hold.
+async fn with_hold(gw: &Gateway, key: &str, id: &str, body: &Value) -> Reply {
+    gw.send(
+        reqwest::Client::new()
+            .post(gw.url("/v1/chat/stream"))
+            .header("x-api-key", key)
+            .header("hold-id", id)
+            .json(body),
+    )
+    .await
+}
+
+async fn hold_state(gw: &Gateway, key: &str, id: &str) -> String {
+    let reply = gw.get(&format!("/v1/holds/{id}"), key).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    reply.json()["hold"]["state"].as_str().unwrap_or_default().to_string()
+}
+
+#[tokio::test]
+async fn hold_a_held_request_never_reaches_the_provider() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let gw = Deployment::new(&provider).boot().await;
+
+    let id = held(&gw, "key-guarded", held_request()).await;
+    assert_eq!(provider.calls(), 0, "held, not executed");
+    assert_eq!(gw.spent("key-guarded").await, 0, "and not charged");
+    let reply = gw.get(&format!("/v1/holds/{id}"), "key-guarded").await;
+    let hold = &reply.json()["hold"];
+    assert_eq!(hold["state"], "pending");
+    assert_eq!(hold["model"], "mock/other");
+    assert_eq!(hold["requested_by"], "ak_guarded");
+    assert!(hold["reason"].as_str().unwrap().contains("mock/other"), "{hold}");
+    assert!(!reply.body.contains("please approve me"), "a hold never carries the prompt: {}", reply.body);
+    // Asking again is asking again: a second hold, still nothing executed.
+    let again = held(&gw, "key-guarded", held_request()).await;
+    assert_ne!(again, id);
+    assert_eq!(provider.calls(), 0);
+}
+
+#[tokio::test]
+async fn hold_the_cost_rule_holds_only_what_is_above_the_threshold() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let gw = Deployment::new(&provider).boot().await;
+
+    // 46,000 nano-USD at worst: under the threshold, so it runs.
+    assert_eq!(gw.chat(Some("key-guarded"), small_request()).await.status, StatusCode::OK);
+    assert_eq!(provider.calls(), 1);
+    // ~1.03M at worst, the same model: above it, so it waits.
+    let id = held(&gw, "key-guarded", standard_request()).await;
+    let reply = gw.get(&format!("/v1/holds/{id}"), "key-guarded").await;
+    assert!(reply.json()["hold"]["reason"].as_str().unwrap().contains("above the approval threshold"));
+    assert_eq!(provider.calls(), 1, "the expensive request was held");
+}
+
+#[tokio::test]
+async fn hold_an_approved_request_executes_exactly_once() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let gw = Deployment::new(&provider).boot().await;
+    let id = held(&gw, "key-guarded", held_request()).await;
+    approve(&gw, &id).await;
+    assert_eq!(provider.calls(), 0, "approving executes nothing by itself");
+
+    // Ten copies of the approved request at once: one runs.
+    let body = held_request();
+    let replies = futures_util::future::join_all((0..10).map(|_| with_hold(&gw, "key-guarded", &id, &body))).await;
+    let ran = replies.iter().filter(|r| r.status == StatusCode::OK).count();
+    assert_eq!(ran, 1, "{:?}", replies.iter().map(|r| (r.status, r.body.clone())).collect::<Vec<_>>());
+    for refused in replies.iter().filter(|r| r.status != StatusCode::OK) {
+        assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.body);
+        assert_eq!(refused.code(), "hold_consumed");
+    }
+    eventually("the answer settles", || provider.calls() == 1).await;
+    assert_eq!(provider.calls(), 1, "executed exactly once");
+    let reply = gw.get(&format!("/v1/holds/{id}"), "key-guarded").await;
+    let hold = &reply.json()["hold"];
+    assert_eq!(hold["state"], "consumed");
+    assert!(hold["reservation_id"].is_string(), "{hold}");
+    assert_eq!(hold["decided_by"], "ops/ak_approver");
+}
+
+#[tokio::test]
+async fn hold_a_pending_hold_cannot_be_used() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let gw = Deployment::new(&provider).boot().await;
+    let id = held(&gw, "key-guarded", held_request()).await;
+
+    let reply = with_hold(&gw, "key-guarded", &id, &held_request()).await;
+    assert_eq!(reply.status, StatusCode::CONFLICT, "{}", reply.body);
+    assert_eq!(reply.code(), "hold_pending");
+    assert_eq!(reply.headers["retry-after"], "5");
+    assert_eq!(provider.calls(), 0);
+    assert_eq!(hold_state(&gw, "key-guarded", &id).await, "pending");
+}
+
+#[tokio::test]
+async fn hold_a_denied_or_revoked_hold_never_executes() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let gw = Deployment::new(&provider).boot().await;
+
+    let denied = held(&gw, "key-guarded", held_request()).await;
+    let reply = decide(&gw, "key-approver", &denied, "deny").await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert_eq!(reply.json()["hold"]["note"], "deny by the test");
+    let reply = with_hold(&gw, "key-guarded", &denied, &held_request()).await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN, "{}", reply.body);
+    assert_eq!(reply.code(), "hold_denied");
+    let late = decide(&gw, "key-approver", &denied, "approve").await;
+    assert_eq!(late.status, StatusCode::CONFLICT, "a denial is final: {}", late.body);
+    assert_eq!(late.code(), "hold_not_decidable");
+
+    // An approval can be taken back until it is used.
+    let revoked = held(&gw, "key-guarded", held_request()).await;
+    approve(&gw, &revoked).await;
+    assert_eq!(decide(&gw, "key-approver", &revoked, "deny").await.status, StatusCode::OK);
+    let reply = with_hold(&gw, "key-guarded", &revoked, &held_request()).await;
+    assert_eq!(reply.code(), "hold_denied");
+    assert_eq!(provider.calls(), 0);
+}
+
+#[tokio::test]
+async fn hold_nobody_decides_their_own_request() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let gw = Deployment::new(&provider).boot().await;
+    // The lead may approve holds, but this one is the lead's own request.
+    let id = held(&gw, "key-guarded-lead", held_request()).await;
+
+    for verdict in ["approve", "deny"] {
+        let reply = decide(&gw, "key-guarded-lead", &id, verdict).await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN, "{}", reply.body);
+        assert_eq!(reply.code(), "self_approval");
+    }
+    assert_eq!(hold_state(&gw, "key-guarded-lead", &id).await, "pending");
+    // The same lead may decide a colleague's.
+    let other = held(&gw, "key-guarded", held_request()).await;
+    assert_eq!(decide(&gw, "key-guarded-lead", &other, "approve").await.status, StatusCode::OK);
+    assert_eq!(provider.calls(), 0);
+}
+
+#[tokio::test]
+async fn hold_deciding_needs_the_dedicated_scope() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let gw = Deployment::new(&provider).boot().await;
+    let id = held(&gw, "key-guarded", held_request()).await;
+
+    // `admin` can look at the queue, but not decide: approval is its own grant.
+    for key in ["key-admin", "key-app", "key-guarded"] {
+        let reply = decide(&gw, key, &id, "approve").await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN, "{key}: {}", reply.body);
+    }
+    let queue = gw.get("/v1/admin/holds?state=pending", "key-admin").await;
+    assert_eq!(queue.status, StatusCode::OK, "{}", queue.body);
+    assert_eq!(queue.json()["holds"][0]["id"], id.as_str());
+    assert_eq!(gw.get("/v1/admin/holds", "key-guarded").await.status, StatusCode::FORBIDDEN);
+    let unauthenticated = decide(&gw, "not-a-key", &id, "approve").await;
+    assert_eq!(unauthenticated.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(hold_state(&gw, "key-guarded", &id).await, "pending");
+    assert_eq!(provider.calls(), 0);
+}
+
+#[tokio::test]
+async fn hold_an_approval_covers_only_the_request_approved() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let gw = Deployment::new(&provider).boot().await;
+    let id = held(&gw, "key-guarded", held_request()).await;
+    approve(&gw, &id).await;
+
+    // Another prompt, a bigger output cap, the other endpoint: none of them
+    // is the request that was approved.
+    let mut other_prompt = held_request();
+    other_prompt["messages"][0]["content"] = json!("something else entirely");
+    let mut bigger = held_request();
+    bigger["params"]["max_tokens"] = json!(6);
+    for body in [&other_prompt, &bigger] {
+        let reply = with_hold(&gw, "key-guarded", &id, body).await;
+        assert_eq!(reply.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", reply.body);
+        assert_eq!(reply.code(), "hold_mismatch");
+    }
+    let second_door = gw
+        .send(
+            reqwest::Client::new()
+                .post(gw.url("/v1/chat/complete"))
+                .header("x-api-key", "key-guarded")
+                .header("hold-id", &id)
+                .json(&held_request()),
+        )
+        .await;
+    assert_eq!(second_door.code(), "hold_mismatch", "{}", second_door.body);
+    assert_eq!(provider.calls(), 0);
+
+    // The failed attempts did not use the approval up.
+    assert_eq!(with_hold(&gw, "key-guarded", &id, &held_request()).await.status, StatusCode::OK);
+    assert_eq!(provider.calls(), 1);
+}
+
+#[tokio::test]
+async fn hold_a_hold_is_its_tenants_alone() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let gw = Deployment::new(&provider).boot().await;
+    let id = held(&gw, "key-guarded", held_request()).await;
+    approve(&gw, &id).await;
+
+    let peek = gw.get(&format!("/v1/holds/{id}"), "key-app").await;
+    assert_eq!(peek.status, StatusCode::NOT_FOUND, "another tenant's hold does not exist for acme");
+    let reply = with_hold(&gw, "key-app", &id, &held_request()).await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND, "{}", reply.body);
+    assert_eq!(reply.code(), "hold_not_found");
+    let forged = with_hold(&gw, "key-guarded", "not-a-uuid", &held_request()).await;
+    assert_eq!(forged.code(), "invalid_hold_id");
+    assert_eq!(provider.calls(), 0);
+    assert_eq!(hold_state(&gw, "key-guarded", &id).await, "approved");
+}
+
+#[tokio::test]
+async fn hold_undecided_holds_and_unused_approvals_expire() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let gw = Deployment::new(&provider).boot().await;
+
+    let waiting = held(&gw, "key-hasty", small_request()).await;
+    let approved = held(&gw, "key-hasty", small_request()).await;
+    approve(&gw, &approved).await;
+    tokio::time::sleep(Duration::from_millis(4_200)).await;
+
+    assert_eq!(hold_state(&gw, "key-hasty", &waiting).await, "expired");
+    assert_eq!(hold_state(&gw, "key-hasty", &approved).await, "expired");
+    let late = decide(&gw, "key-approver", &waiting, "approve").await;
+    assert_eq!(late.status, StatusCode::CONFLICT, "{}", late.body);
+    for id in [&waiting, &approved] {
+        let reply = with_hold(&gw, "key-hasty", id, &small_request()).await;
+        assert_eq!(reply.status, StatusCode::GONE, "{}", reply.body);
+        assert_eq!(reply.code(), "hold_expired");
+    }
+    assert_eq!(provider.calls(), 0);
+}
+
+#[tokio::test]
+async fn hold_execution_rechecks_the_tenant_and_the_budget() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let deployment = Deployment::new(&provider);
+    let gw = deployment.boot().await;
+
+    // Approved, but the budget cannot cover it: refused when it would run,
+    // and the approval is not used up by the refusal.
+    let id = held(&gw, "key-thrifty", standard_request()).await;
+    approve(&gw, &id).await;
+    let reply = with_hold(&gw, "key-thrifty", &id, &standard_request()).await;
+    assert_eq!(reply.status, StatusCode::PAYMENT_REQUIRED, "{}", reply.body);
+    assert_eq!(hold_state(&gw, "key-thrifty", &id).await, "approved");
+
+    // Approved, then the tenant is switched off: nothing runs.
+    let id = held(&gw, "key-guarded", held_request()).await;
+    approve(&gw, &id).await;
+    deployment.rewrite_tenants(
+        &tenants_yaml(true).replace("tenant_id: guarded\n    enabled: true", "tenant_id: guarded\n    enabled: false"),
+    );
+    let reload = gw
+        .send(reqwest::Client::new().post(gw.url("/v1/admin/registry/reload")).header("x-api-key", "key-admin"))
+        .await;
+    assert_eq!(reload.status, StatusCode::OK, "{}", reload.body);
+    let reply = with_hold(&gw, "key-guarded", &id, &held_request()).await;
+    assert!(
+        matches!(reply.status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN),
+        "{} {}",
+        reply.status,
+        reply.body
+    );
+    assert_eq!(provider.calls(), 0);
+}
+
+#[tokio::test]
+async fn hold_a_provider_refusal_gives_the_approval_back() {
+    let provider = MockProvider::start(Provider::Refusing).await;
+    let gw = Deployment::new(&provider).boot().await;
+    let id = held(&gw, "key-guarded", held_request()).await;
+    approve(&gw, &id).await;
+
+    // The provider refused before accepting anything: nothing was executed,
+    // so the approval is restored, as an idempotency key would be.
+    let reply = with_hold(&gw, "key-guarded", &id, &held_request()).await;
+    assert_eq!(reply.status, StatusCode::BAD_GATEWAY, "{}", reply.body);
+    eventually_async("the approval is restored", || {
+        let gw = &gw;
+        let id = &id;
+        async move { hold_state(gw, "key-guarded", id).await == "approved" }
+    })
+    .await;
+    assert_eq!(with_hold(&gw, "key-guarded", &id, &held_request()).await.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(provider.calls(), 2, "usable again after the refusal");
+}
+
+#[tokio::test]
+async fn hold_too_many_waiting_are_refused() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let gw = Deployment::new(&provider).boot().await;
+    let first = held(&gw, "key-queued", small_request()).await;
+    held(&gw, "key-queued", small_request()).await;
+
+    let reply = gw.chat(Some("key-queued"), small_request()).await;
+    assert_eq!(reply.status, StatusCode::TOO_MANY_REQUESTS, "{}", reply.body);
+    assert_eq!(reply.code(), "holds_pending_limit");
+    // A decided hold no longer waits, and makes room.
+    assert_eq!(decide(&gw, "key-approver", &first, "deny").await.status, StatusCode::OK);
+    held(&gw, "key-queued", small_request()).await;
+    assert_eq!(provider.calls(), 0);
+}
+
+#[tokio::test]
+async fn hold_every_transition_is_on_the_decision_record() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let gw = Deployment::new(&provider).boot().await;
+    let id = held(&gw, "key-guarded", held_request()).await;
+    approve(&gw, &id).await;
+    assert_eq!(with_hold(&gw, "key-guarded", &id, &held_request()).await.status, StatusCode::OK);
+
+    let reply = gw.get("/v1/admin/decisions?tenant=guarded", "key-admin").await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let trail: Vec<(String, String)> = reply.json()["decisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["request_id"] == id.as_str())
+        .map(|d| (d["code"].as_str().unwrap().to_string(), d["key_id"].as_str().unwrap().to_string()))
+        .collect();
+    let expect = |code: &str, key: &str| assert!(trail.contains(&(code.into(), key.into())), "{code} by {key}: {trail:?}");
+    expect("hold_requested", "ak_guarded");
+    expect("hold_approved", "ak_approver");
+    expect("hold_consumed", "ak_guarded");
+    assert!(reply.json()["decisions"].as_array().unwrap().iter().all(|d| d["kind"] == "hold"));
+    assert!(!reply.body.contains("please approve me"), "no prompt on the record: {}", reply.body);
+}
+
+#[tokio::test]
+async fn hold_the_second_door_holds_too() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let gw = Deployment::new(&provider).boot().await;
+
+    let reply = gw.complete(Some("key-guarded"), held_request()).await;
+    assert_eq!(reply.status, StatusCode::ACCEPTED, "{}", reply.body);
+    let id = reply.json()["hold"]["id"].as_str().unwrap().to_string();
+    assert_eq!(reply.json()["hold"]["endpoint"], "complete");
+    assert_eq!(provider.calls(), 0);
+    approve(&gw, &id).await;
+    let done = gw
+        .send(
+            reqwest::Client::new()
+                .post(gw.url("/v1/chat/complete"))
+                .header("x-api-key", "key-guarded")
+                .header("hold-id", &id)
+                .json(&held_request()),
+        )
+        .await;
+    assert_eq!(done.status, StatusCode::OK, "{}", done.body);
+    assert_eq!(provider.calls(), 1);
+}
+
+#[tokio::test]
+async fn local_ledger_a_hold_survives_a_restart() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let deployment = Deployment::new(&provider);
+    let id = {
+        let gw = deployment.boot_with(deployment.local_ledger("ledger.sqlite3", None)).await;
+        let id = held(&gw, "key-guarded", held_request()).await;
+        approve(&gw, &id).await;
+        id
+    };
+    let gw = deployment.boot_with(deployment.local_ledger("ledger.sqlite3", None)).await;
+    assert_eq!(hold_state(&gw, "key-guarded", &id).await, "approved", "the approval survived the restart");
+    assert_eq!(with_hold(&gw, "key-guarded", &id, &held_request()).await.status, StatusCode::OK);
+    assert_eq!(with_hold(&gw, "key-guarded", &id, &held_request()).await.code(), "hold_consumed");
+    assert_eq!(provider.calls(), 1);
+}
+
+#[tokio::test]
+async fn shared_ledger_a_hold_is_one_hold_across_replicas() {
+    let Some(url) = test_database_url() else { return };
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let deployment = Deployment::shared(&provider, &url);
+    let (a, b) = (deployment.boot().await, deployment.boot().await);
+
+    // Held on one replica, approved on the other, visible on both.
+    let id = held(&a, "key-guarded", held_request()).await;
+    let queue = b.get("/v1/admin/holds?state=pending&tenant=guarded", "key-approver").await;
+    assert_eq!(queue.json()["holds"][0]["id"], id.as_str(), "{}", queue.body);
+    approve(&b, &id).await;
+    assert_eq!(hold_state(&a, "key-guarded", &id).await, "approved");
+
+    // Twenty copies across both replicas at once: one runs.
+    let body = held_request();
+    let replies = futures_util::future::join_all(
+        (0..20).map(|i| with_hold(if i % 2 == 0 { &a } else { &b }, "key-guarded", &id, &body)),
+    )
+    .await;
+    let ran = replies.iter().filter(|r| r.status == StatusCode::OK).count();
+    assert_eq!(ran, 1, "{:?}", replies.iter().map(|r| (r.status, r.body.clone())).collect::<Vec<_>>());
+    assert!(replies.iter().filter(|r| r.status != StatusCode::OK).all(|r| r.code() == "hold_consumed"));
+    assert_eq!(provider.calls(), 1, "executed once across both replicas");
+}
+
+#[tokio::test]
+async fn shared_ledger_lapsed_holds_are_expired_and_recorded() {
+    let Some(url) = test_database_url() else { return };
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let deployment = Deployment::shared(&provider, &url);
+    let gw = deployment.boot().await;
+    let waiting = held(&gw, "key-hasty", small_request()).await;
+    let unused = held(&gw, "key-hasty", small_request()).await;
+    approve(&gw, &unused).await;
+    tokio::time::sleep(Duration::from_millis(4_200)).await;
+
+    let LedgerChoice::Shared { schema, .. } = &deployment.ledger else { unreachable!() };
+    let ledger = postgres_ledger(&url, schema, false).await.expect("connect ledger");
+    assert_eq!(ledger.expire_holds().await.unwrap(), 2);
+    assert_eq!(ledger.expire_holds().await.unwrap(), 0, "each hold expires once");
+    let record = gw.get("/v1/admin/decisions?tenant=hasty", "key-admin").await.json();
+    let reason = |id: &str| {
+        record["decisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["request_id"] == id && d["code"] == "hold_expired")
+            .map(|d| d["reason"].as_str().unwrap().to_string())
+    };
+    assert_eq!(reason(&waiting).as_deref(), Some("nobody decided before the hold expired"));
+    assert_eq!(reason(&unused).as_deref(), Some("approved, but not used before the approval lapsed"));
+    assert_eq!(provider.calls(), 0);
+}
+
+#[tokio::test]
+async fn shared_ledger_a_hold_decision_that_cannot_be_recorded_does_not_happen() {
+    let Some(url) = test_database_url() else { return };
+    let relay = relay::Relay::start(&url).await;
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let deployment = Deployment::shared(&provider, &relay.url);
+    let gw = deployment.boot().await;
+    let id = held(&gw, "key-guarded", held_request()).await;
+
+    relay.cut();
+    let reply = decide(&gw, "key-approver", &id, "approve").await;
+    assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE, "{}", reply.body);
+    // And a request the policy would hold is not let through either.
+    let held = gw.chat(Some("key-guarded"), held_request()).await;
+    assert_eq!(held.status, StatusCode::SERVICE_UNAVAILABLE, "{}", held.body);
+    assert_eq!(provider.calls(), 0);
+
+    // Read through a connection of its own: the gateway's is cut.
+    let LedgerChoice::Shared { schema, .. } = &deployment.ledger else { unreachable!() };
+    let pool = postgres_ledger(&url, schema, false).await.expect("connect ledger").pool().clone();
+    let state: String = sqlx::query_scalar("SELECT state FROM holds WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(&id).unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "pending", "the unrecorded approval did not happen");
 }
 
 // ===========================================================================

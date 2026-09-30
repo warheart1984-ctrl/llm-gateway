@@ -33,6 +33,7 @@ use super::budget_bucket_label;
 use super::ledger::{
     Closing, Fingerprinter, IdempotencyClaim, Ledger, LedgerRefusal, MemoryLedger, NewReservation, Outcome,
     SharedLimits,
+    holds::{HoldClaim, HoldProblem, HoldState},
 };
 use crate::{config::LimitProfile, providers::Usage, router::CostModel};
 
@@ -66,6 +67,27 @@ pub enum LimitError {
         billed_nano_usd: u64,
         response: Option<String>,
     },
+    #[error("{}", hold_problem_message(*.0))]
+    Hold(HoldProblem),
+    #[error("{limit} requests from this tenant are already waiting for approval")]
+    TooManyHolds { limit: u32 },
+    #[error("this hold is {} and can no longer be decided", .state.as_str())]
+    HoldNotDecidable { state: HoldState },
+    #[error("the key that made a request cannot approve or deny it")]
+    SelfApproval,
+}
+
+fn hold_problem_message(problem: HoldProblem) -> &'static str {
+    match problem {
+        HoldProblem::NotFound => "no such hold for this tenant",
+        HoldProblem::Pending => "this hold is still waiting for approval; poll it and retry once approved",
+        HoldProblem::Denied => "this hold was denied; the request will not be executed",
+        HoldProblem::Expired => "this hold expired; send the request again without `Hold-Id` to ask again",
+        HoldProblem::Consumed => "this hold's approval was already used",
+        HoldProblem::Mismatch => {
+            "this request is not the one that was approved, or would now cost more than the approved amount"
+        }
+    }
 }
 
 impl From<LedgerRefusal> for LimitError {
@@ -86,6 +108,10 @@ impl From<LedgerRefusal> for LimitError {
                 LimitError::TokenRateLimited { done, requested, limit }
             }
             LedgerRefusal::ConcurrencyLimited { limit } => LimitError::ConcurrencyLimited { limit },
+            LedgerRefusal::Hold(problem) => LimitError::Hold(problem),
+            LedgerRefusal::TooManyHolds { limit } => LimitError::TooManyHolds { limit },
+            LedgerRefusal::HoldNotDecidable { state } => LimitError::HoldNotDecidable { state },
+            LedgerRefusal::SelfApproval => LimitError::SelfApproval,
         }
     }
 }
@@ -398,6 +424,8 @@ pub struct AdmitRequest<'a> {
     pub max_output_tokens: u32,
     pub estimate: CostEstimate,
     pub idempotency: Option<IdempotencyClaim<'a>>,
+    /// An approved hold this request presents.
+    pub hold: Option<HoldClaim>,
 }
 
 pub struct LimitEngine {
@@ -495,6 +523,7 @@ impl LimitEngine {
             max_output_tokens,
             estimate,
             idempotency: None,
+            hold: None,
         })
         .await
     }
@@ -586,7 +615,8 @@ impl LimitEngine {
         // back out of the window: a request that was never admitted does not
         // consume rate limit.
         let tracked = self.cost_tracking;
-        let recorded = tracked || req.idempotency.is_some() || shared;
+        // A presented hold is consumed in the ledger, so it needs a record.
+        let recorded = tracked || req.idempotency.is_some() || shared || req.hold.is_some();
         let budget = self.enforced_budget(limits.daily_budget_nano_usd);
         // A real budget whose share rounds down to zero must refuse, not
         // reach the ledger as `0`, which means "no ceiling": that would turn
@@ -609,6 +639,7 @@ impl LimitEngine {
                     prompt_nano_usd: if tracked { req.estimate.prompt_nano_usd } else { 0 },
                     budget_nano_usd: if tracked { budget } else { 0 },
                     idempotency: req.idempotency.clone(),
+                    hold: req.hold.clone(),
                     limits: SharedLimits {
                         // The local slot treats 0 as 1; the ledger must agree.
                         max_concurrent: concurrent.max(1),

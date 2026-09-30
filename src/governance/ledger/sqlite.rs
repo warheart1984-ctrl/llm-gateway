@@ -48,8 +48,9 @@ use tokio::{
 use uuid::Uuid;
 
 use super::{
-    Closing, Ledger, LedgerRefusal, NewReservation,
+    Closing, Ledger, LedgerRefusal, NewReservation, Outcome,
     decisions::{DECISION_QUEUE, Decision, DecisionKind, DecisionQuery, DecisionRecord},
+    holds::{self, HoldClaim, HoldDecision, HoldProblem, HoldQuery, HoldRecord, HoldState, NewHold, Transition},
     sealed::{ResponseSealer, binding},
 };
 
@@ -204,6 +205,12 @@ impl SqliteLedger {
         sweep(&self.pool).await.map_err(|e| e.to_string())
     }
 
+    /// Mark every hold whose time ran out as expired, recording each. The
+    /// sweeper does this on its interval. Returns how many.
+    pub async fn expire_holds(&self) -> Result<u64, String> {
+        expire_holds(&self.pool).await.map_err(|e| e.to_string())
+    }
+
     fn open_response(&self, tenant_id: &str, id: Uuid, stored: Option<String>) -> Option<String> {
         let stored = stored?;
         let opened = self.sealer.as_ref().and_then(|s| s.open(&binding(tenant_id, id), &stored));
@@ -262,6 +269,13 @@ impl SqliteLedger {
                     .execute(&mut *tx)
                     .await?;
             }
+        }
+        // After the key, so a repeat of an executed request is answered as a
+        // repeat; before the money, and rolled back with it on any refusal.
+        if let Some(claim) = &r.hold
+            && let Some(problem) = consume_hold(&mut tx, r, claim).await?
+        {
+            return Ok(Err(LedgerRefusal::Hold(problem)));
         }
 
         sqlx::query("INSERT INTO spend_days (tenant_id, day) VALUES (?1, ?2) ON CONFLICT DO NOTHING")
@@ -349,6 +363,120 @@ impl SqliteLedger {
     }
 }
 
+/// Mark an approved hold used by this reservation, or say why it cannot be.
+async fn consume_hold(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    r: &NewReservation<'_>,
+    claim: &HoldClaim,
+) -> Result<Option<HoldProblem>, sqlx::Error> {
+    let row = sqlx::query(&format!(
+        "SELECT state, fingerprint, model, endpoint, exposure_nano_usd, (expires_at <= {NOW}) AS lapsed
+           FROM holds WHERE id = ?1 AND tenant_id = ?2"
+    ))
+    .bind(claim.id.to_string())
+    .bind(r.tenant_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(Some(HoldProblem::NotFound));
+    };
+    let state = HoldState::parse(&row.get::<String, _>("state"))
+        .unwrap_or(HoldState::Expired)
+        .effective(row.get::<i64, _>("lapsed") != 0);
+    let fingerprint: Vec<u8> = row.get("fingerprint");
+    let model: String = row.get("model");
+    let approved: i64 = row.get("exposure_nano_usd");
+    if let Err(problem) = claim.check(state, &fingerprint, &model, approved.max(0) as u64) {
+        return Ok(Some(problem));
+    }
+    sqlx::query("UPDATE holds SET state = 'consumed', reservation_id = ?2 WHERE id = ?1")
+        .bind(claim.id.to_string())
+        .bind(r.id.to_string())
+        .execute(&mut **tx)
+        .await?;
+    let used = Decision {
+        request_id: claim.id,
+        tenant_id: r.tenant_id.to_string(),
+        key_id: claim.key_id.clone(),
+        kind: DecisionKind::Hold,
+        endpoint: row.get("endpoint"),
+        model: Some(model),
+        code: holds::CODE_CONSUMED.to_string(),
+        reason: String::new(),
+    }
+    .with_reason(&format!("executed as request {}", r.id));
+    insert_decision(&mut **tx, &used).await?;
+    Ok(None)
+}
+
+const HOLD_COLUMNS: &str = "id, tenant_id, requested_by, endpoint, model, max_output_tokens, exposure_nano_usd,
+    reason, state, created_at, expires_at, decided_by, decided_at, note, reservation_id";
+
+/// A hold's state as callers see it, in SQL.
+const HOLD_EFFECTIVE: &str =
+    "(CASE WHEN state IN ('pending', 'approved') AND expires_at <= CAST(strftime('%s', 'now') AS INTEGER)
+           THEN 'expired' ELSE state END)";
+
+fn hold_from_row(row: &sqlx::sqlite::SqliteRow) -> Option<HoldRecord> {
+    Some(HoldRecord {
+        id: Uuid::parse_str(&row.get::<String, _>("id")).ok()?,
+        tenant_id: row.get("tenant_id"),
+        requested_by: row.get("requested_by"),
+        endpoint: row.get("endpoint"),
+        model: row.get("model"),
+        max_output_tokens: row.get::<i64, _>("max_output_tokens").clamp(0, i64::from(u32::MAX)) as u32,
+        exposure_nano_usd: row.get::<i64, _>("exposure_nano_usd").max(0) as u64,
+        reason: row.get("reason"),
+        state: HoldState::parse(&row.get::<String, _>("state"))?.effective(row.get::<i64, _>("lapsed") != 0),
+        created_at: row.get("created_at"),
+        expires_at: row.get("expires_at"),
+        decided_by: row.get("decided_by"),
+        decided_at: row.get("decided_at"),
+        note: row.get("note"),
+        reservation_id: row
+            .get::<Option<String>, _>("reservation_id")
+            .and_then(|id| Uuid::parse_str(&id).ok()),
+    })
+}
+
+async fn select_hold<'e, E>(ex: E, id: Uuid) -> Result<Option<HoldRecord>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let row = sqlx::query(&format!(
+        "SELECT {HOLD_COLUMNS}, (expires_at <= {NOW}) AS lapsed FROM holds WHERE id = ?1"
+    ))
+    .bind(id.to_string())
+    .fetch_optional(ex)
+    .await?;
+    Ok(row.as_ref().and_then(hold_from_row))
+}
+
+/// Mark every hold whose time ran out as expired, and record each, as one
+/// step. The time is read once, so the record and the transition agree.
+async fn expire_holds(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let now: i64 = sqlx::query_scalar(&format!("SELECT {NOW}")).fetch_one(&mut *tx).await?;
+    sqlx::query(
+        "INSERT INTO decisions (request_id, tenant_id, key_id, kind, endpoint, model, code, reason, created_at)
+         SELECT id, tenant_id, requested_by, 'hold', endpoint, model, ?2,
+                CASE state WHEN 'pending' THEN ?3 ELSE ?4 END, ?1
+           FROM holds WHERE state IN ('pending', 'approved') AND expires_at <= ?1",
+    )
+    .bind(now)
+    .bind(holds::CODE_EXPIRED)
+    .bind(holds::EXPIRED_UNDECIDED)
+    .bind(holds::EXPIRED_UNUSED)
+    .execute(&mut *tx)
+    .await?;
+    let expired = sqlx::query("UPDATE holds SET state = 'expired' WHERE state IN ('pending', 'approved') AND expires_at <= ?1")
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(expired.rows_affected())
+}
+
 /// Whole seconds, at least one: SQLite times here are Unix seconds.
 fn lease_secs(lease: Duration) -> i64 {
     lease.as_secs().max(1) as i64
@@ -423,6 +551,14 @@ async fn apply_close(pool: &SqlitePool, c: &Closing, sealed_response: Option<&st
     let tenant: String = row.get("tenant_id");
     let day: i64 = row.get("day");
     let today: i64 = sqlx::query_scalar(&format!("SELECT {TODAY}")).fetch_one(&mut *tx).await?;
+    // Released: nothing was executed, so an approval it used can be used
+    // again. Lock order: reservation, hold, day row, rate counters.
+    if c.outcome == Outcome::Released {
+        sqlx::query("UPDATE holds SET state = 'approved', reservation_id = NULL WHERE reservation_id = ?1 AND state = 'consumed'")
+            .bind(c.id.to_string())
+            .execute(&mut *tx)
+            .await?;
+    }
 
     // The rollover rule, identical to the other backends.
     if delta < 0 && day == today {
@@ -544,7 +680,10 @@ async fn sweep(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
     Ok(swept.rows_affected())
 }
 
-async fn insert_decision(pool: &SqlitePool, d: &Decision) -> Result<(), sqlx::Error> {
+async fn insert_decision<'e, E>(ex: E, d: &Decision) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     sqlx::query(&format!(
         "INSERT INTO decisions (request_id, tenant_id, key_id, kind, endpoint, model, code, reason, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, {NOW})"
@@ -557,7 +696,7 @@ async fn insert_decision(pool: &SqlitePool, d: &Decision) -> Result<(), sqlx::Er
     .bind(d.model.as_deref())
     .bind(&d.code)
     .bind(&d.reason)
-    .execute(pool)
+    .execute(ex)
     .await
     .map(|_| ())
 }
@@ -583,6 +722,19 @@ async fn run_sweeper(pool: SqlitePool, interval: Duration, decision_retention: D
             .await
         {
             tracing::warn!(%error, "decision retention sweep failed; will retry");
+        }
+        if let Err(error) = expire_holds(&pool).await {
+            tracing::warn!(%error, "hold expiry failed; will retry");
+        }
+        // Holds that can never change again go with the decisions about them.
+        if let Err(error) = sqlx::query(&format!(
+            "DELETE FROM holds WHERE state IN ('denied', 'expired', 'consumed') AND created_at < {NOW} - ?1"
+        ))
+        .bind(decision_retention.as_secs() as i64)
+        .execute(&pool)
+        .await
+        {
+            tracing::warn!(%error, "hold retention sweep failed; will retry");
         }
         match sweep(&pool).await {
             Ok(0) => {}
@@ -700,6 +852,140 @@ impl Ledger for SqliteLedger {
     fn decisions_dropped(&self) -> u64 {
         self.decisions_dropped.load(Ordering::Relaxed)
     }
+
+    async fn create_hold(&self, h: NewHold) -> Result<HoldRecord, LedgerRefusal> {
+        bounded(self.timeout, "create hold", self.create_hold_tx(&h)).await?
+    }
+
+    async fn hold(&self, id: Uuid) -> Result<Option<HoldRecord>, LedgerRefusal> {
+        bounded(self.timeout, "hold", select_hold(&self.pool, id)).await
+    }
+
+    async fn holds(&self, q: HoldQuery) -> Result<Vec<HoldRecord>, LedgerRefusal> {
+        let sql = format!(
+            "SELECT {HOLD_COLUMNS}, (expires_at <= {NOW}) AS lapsed FROM holds
+              WHERE (?1 IS NULL OR tenant_id = ?1) AND (?2 IS NULL OR {HOLD_EFFECTIVE} = ?2)
+           ORDER BY created_at DESC, id DESC
+              LIMIT ?3"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(q.tenant_id.as_deref())
+            .bind(q.state.map(HoldState::as_str))
+            .bind(i64::from(q.limit))
+            .fetch_all(&self.pool);
+        let rows = bounded(self.timeout, "holds", rows).await?;
+        Ok(rows.iter().filter_map(hold_from_row).collect())
+    }
+
+    async fn decide_hold(&self, d: HoldDecision) -> Result<HoldRecord, LedgerRefusal> {
+        bounded(self.timeout, "decide hold", self.decide_hold_tx(&d)).await?
+    }
+}
+
+/// Run one ledger operation under the deadline. A failure or a timeout is
+/// `Unavailable`: the caller refuses rather than guesses.
+async fn bounded<T>(
+    timeout: Duration,
+    op: &str,
+    work: impl std::future::Future<Output = Result<T, sqlx::Error>>,
+) -> Result<T, LedgerRefusal> {
+    match tokio::time::timeout(timeout, work).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(unavailable(op, error)),
+        Err(_) => Err(unavailable(op, "timed out")),
+    }
+}
+
+impl SqliteLedger {
+    async fn create_hold_tx(&self, h: &NewHold) -> Result<Result<HoldRecord, LedgerRefusal>, sqlx::Error> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let pending: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM holds WHERE tenant_id = ?1 AND state = 'pending' AND expires_at > {NOW}"
+        ))
+        .bind(&h.tenant_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if pending >= i64::from(h.max_pending) {
+            return Ok(Err(LedgerRefusal::TooManyHolds { limit: h.max_pending }));
+        }
+        sqlx::query(&format!(
+            "INSERT INTO holds (id, tenant_id, requested_by, endpoint, model, max_output_tokens, exposure_nano_usd,
+                                reason, fingerprint, approval_valid_secs, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, {NOW}, {NOW} + ?11)"
+        ))
+        .bind(h.id.to_string())
+        .bind(&h.tenant_id)
+        .bind(&h.requested_by)
+        .bind(&h.endpoint)
+        .bind(&h.model)
+        .bind(i64::from(h.max_output_tokens))
+        .bind(to_i64(h.exposure_nano_usd))
+        .bind(&h.reason)
+        .bind(&h.fingerprint)
+        .bind(lease_secs(h.approval_valid_for))
+        .bind(lease_secs(h.expires_in))
+        .execute(&mut *tx)
+        .await?;
+        let requested = Decision {
+            request_id: h.id,
+            tenant_id: h.tenant_id.clone(),
+            key_id: h.requested_by.clone(),
+            kind: DecisionKind::Hold,
+            endpoint: h.endpoint.clone(),
+            model: Some(h.model.clone()),
+            code: holds::CODE_REQUESTED.to_string(),
+            reason: String::new(),
+        }
+        .with_reason(&h.reason);
+        insert_decision(&mut *tx, &requested).await?;
+        let record = select_hold(&mut *tx, h.id)
+            .await?
+            .ok_or_else(|| sqlx::Error::RowNotFound)?;
+        tx.commit().await?;
+        Ok(Ok(record))
+    }
+
+    async fn decide_hold_tx(&self, d: &HoldDecision) -> Result<Result<HoldRecord, LedgerRefusal>, sqlx::Error> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let Some(current) = select_hold(&mut *tx, d.id).await? else {
+            return Ok(Err(LedgerRefusal::Hold(HoldProblem::NotFound)));
+        };
+        let state = match holds::transition(&current, d) {
+            Err(refusal) => return Ok(Err(refusal)),
+            Ok(Transition::Unchanged) => return Ok(Ok(current)),
+            Ok(Transition::To(state)) => state,
+        };
+        // An approval starts the approval's own clock; a denial keeps the
+        // hold's expiry, which no longer matters.
+        sqlx::query(&format!(
+            "UPDATE holds SET state = ?2, decided_by = ?3, decided_at = {NOW}, note = ?4,
+                    expires_at = CASE WHEN ?2 = 'approved' THEN {NOW} + approval_valid_secs ELSE expires_at END
+              WHERE id = ?1"
+        ))
+        .bind(d.id.to_string())
+        .bind(state.as_str())
+        .bind(d.decided_by())
+        .bind((!d.note.is_empty()).then_some(d.note.as_str()))
+        .execute(&mut *tx)
+        .await?;
+        let decided = Decision {
+            request_id: d.id,
+            tenant_id: current.tenant_id.clone(),
+            key_id: d.approver_key.clone(),
+            kind: DecisionKind::Hold,
+            endpoint: holds::DECIDE_ENDPOINT.to_string(),
+            model: Some(current.model.clone()),
+            code: d.code().to_string(),
+            reason: String::new(),
+        }
+        .with_reason(&d.reason());
+        insert_decision(&mut *tx, &decided).await?;
+        let record = select_hold(&mut *tx, d.id)
+            .await?
+            .ok_or_else(|| sqlx::Error::RowNotFound)?;
+        tx.commit().await?;
+        Ok(Ok(record))
+    }
 }
 
 #[cfg(test)]
@@ -750,6 +1036,7 @@ mod tests {
             prompt_nano_usd: amount / 4,
             budget_nano_usd: budget,
             idempotency: None,
+            hold: None,
             limits: crate::governance::ledger::SharedLimits::default(),
         }
     }
@@ -1105,5 +1392,150 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
+    }
+
+    fn new_hold(tenant: &str, fingerprint: &[u8]) -> NewHold {
+        NewHold {
+            id: Uuid::new_v4(),
+            tenant_id: tenant.into(),
+            requested_by: "ak_app".into(),
+            endpoint: "stream".into(),
+            model: "m".into(),
+            max_output_tokens: 10,
+            exposure_nano_usd: 1_000,
+            reason: "model `m` requires approval".into(),
+            fingerprint: fingerprint.to_vec(),
+            expires_in: Duration::from_secs(900),
+            approval_valid_for: Duration::from_secs(300),
+            max_pending: 20,
+        }
+    }
+
+    fn verdict(id: Uuid, verdict: holds::Verdict) -> HoldDecision {
+        HoldDecision {
+            id,
+            approver_tenant: "ops".into(),
+            approver_key: "ak_approver".into(),
+            verdict,
+            note: String::new(),
+        }
+    }
+
+    fn claim(id: Uuid, fingerprint: &[u8]) -> HoldClaim {
+        HoldClaim {
+            id,
+            fingerprints: vec![fingerprint.to_vec()],
+            model: "m".into(),
+            exposure_nano_usd: 1_000,
+            key_id: "ak_app".into(),
+        }
+    }
+
+    async fn codes_for(ledger: &SqliteLedger, id: Uuid) -> Vec<(String, String)> {
+        sqlx::query_as("SELECT code, reason FROM decisions WHERE request_id = ?1 ORDER BY id")
+            .bind(id.to_string())
+            .fetch_all(ledger.pool())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_approval_is_used_once_and_not_by_a_refused_admission() {
+        let file = TempFile::new();
+        let ledger = open(&file).await;
+        let hold = ledger.create_hold(new_hold("t", b"fp")).await.unwrap();
+        assert_eq!(hold.state, HoldState::Pending);
+        let early = NewReservation { hold: Some(claim(hold.id, b"fp")), ..reservation("t", 1_000, 0) };
+        assert_eq!(ledger.try_reserve(early).await, Err(LedgerRefusal::Hold(HoldProblem::Pending)));
+        ledger.decide_hold(verdict(hold.id, holds::Verdict::Approve)).await.unwrap();
+
+        // Refused for budget: rolled back, approval and all.
+        let poor = NewReservation { hold: Some(claim(hold.id, b"fp")), ..reservation("t", 1_000, 500) };
+        assert!(matches!(ledger.try_reserve(poor).await, Err(LedgerRefusal::BudgetWouldBeExceeded { .. })));
+        assert_eq!(ledger.hold(hold.id).await.unwrap().unwrap().state, HoldState::Approved);
+        // Another request presenting it: refused, approval untouched.
+        let other = NewReservation { hold: Some(claim(hold.id, b"other")), ..reservation("t", 1_000, 0) };
+        assert_eq!(ledger.try_reserve(other).await, Err(LedgerRefusal::Hold(HoldProblem::Mismatch)));
+
+        let used = NewReservation { hold: Some(claim(hold.id, b"fp")), ..reservation("t", 1_000, 0) };
+        let used_id = used.id;
+        ledger.try_reserve(used).await.unwrap();
+        let after = ledger.hold(hold.id).await.unwrap().unwrap();
+        assert_eq!(after.state, HoldState::Consumed);
+        assert_eq!(after.reservation_id, Some(used_id));
+        let again = NewReservation { hold: Some(claim(hold.id, b"fp")), ..reservation("t", 1_000, 0) };
+        assert_eq!(ledger.try_reserve(again).await, Err(LedgerRefusal::Hold(HoldProblem::Consumed)));
+        // Another tenant cannot even see it.
+        let stranger = NewReservation { hold: Some(claim(hold.id, b"fp")), ..reservation("u", 1_000, 0) };
+        assert_eq!(ledger.try_reserve(stranger).await, Err(LedgerRefusal::Hold(HoldProblem::NotFound)));
+
+        let codes: Vec<String> = codes_for(&ledger, hold.id).await.into_iter().map(|(c, _)| c).collect();
+        assert_eq!(codes, ["hold_requested", "hold_approved", "hold_consumed"]);
+    }
+
+    #[tokio::test]
+    async fn a_released_request_gives_its_approval_back_and_a_settled_one_does_not() {
+        let file = TempFile::new();
+        let ledger = open(&file).await;
+        let hold = ledger.create_hold(new_hold("t", b"fp")).await.unwrap();
+        ledger.decide_hold(verdict(hold.id, holds::Verdict::Approve)).await.unwrap();
+
+        let first = NewReservation { hold: Some(claim(hold.id, b"fp")), ..reservation("t", 1_000, 0) };
+        let bucket = ledger.try_reserve(first.clone()).await.unwrap();
+        ledger.close(closing(first.id, "t", bucket, -1_000, Outcome::Released));
+        ledger.flush().await;
+        assert_eq!(ledger.hold(hold.id).await.unwrap().unwrap().state, HoldState::Approved);
+
+        let second = NewReservation { hold: Some(claim(hold.id, b"fp")), ..reservation("t", 1_000, 0) };
+        let bucket = ledger.try_reserve(second.clone()).await.unwrap();
+        ledger.close(closing(second.id, "t", bucket, 0, Outcome::Settled));
+        ledger.flush().await;
+        let after = ledger.hold(hold.id).await.unwrap().unwrap();
+        assert_eq!(after.state, HoldState::Consumed, "executed: it stays used");
+        assert_eq!(after.reservation_id, Some(second.id));
+    }
+
+    #[tokio::test]
+    async fn lapsed_holds_are_expired_and_recorded_with_why() {
+        let file = TempFile::new();
+        let ledger = open(&file).await;
+        let waiting = ledger.create_hold(new_hold("t", b"a")).await.unwrap();
+        let approved = ledger.create_hold(new_hold("t", b"b")).await.unwrap();
+        ledger.decide_hold(verdict(approved.id, holds::Verdict::Approve)).await.unwrap();
+        let denied = ledger.create_hold(new_hold("t", b"c")).await.unwrap();
+        ledger.decide_hold(verdict(denied.id, holds::Verdict::Deny)).await.unwrap();
+        sqlx::query(&format!("UPDATE holds SET expires_at = {NOW} - 1"))
+            .execute(ledger.pool())
+            .await
+            .unwrap();
+
+        // Expired to every reader at once, before the sweeper runs.
+        assert_eq!(ledger.hold(waiting.id).await.unwrap().unwrap().state, HoldState::Expired);
+        assert_eq!(ledger.expire_holds().await.unwrap(), 2, "the denial is final and stays a denial");
+        assert_eq!(ledger.hold(denied.id).await.unwrap().unwrap().state, HoldState::Denied);
+        let reason = |codes: Vec<(String, String)>| codes.into_iter().find(|(c, _)| c == "hold_expired").unwrap().1;
+        assert_eq!(reason(codes_for(&ledger, waiting.id).await), holds::EXPIRED_UNDECIDED);
+        assert_eq!(reason(codes_for(&ledger, approved.id).await), holds::EXPIRED_UNUSED);
+        assert_eq!(ledger.expire_holds().await.unwrap(), 0, "and only once");
+        let late = ledger.decide_hold(verdict(waiting.id, holds::Verdict::Approve)).await;
+        assert_eq!(late, Err(LedgerRefusal::HoldNotDecidable { state: HoldState::Expired }));
+    }
+
+    #[tokio::test]
+    async fn the_pending_limit_holds_across_processes_sharing_the_file() {
+        let file = TempFile::new();
+        let (a, b) = (open(&file).await, open(&file).await);
+        let limited = |fp: u8| NewHold { max_pending: 3, ..new_hold("t", &[fp]) };
+        let attempts = futures_util::future::join_all(
+            (0..10u8).map(|i| if i % 2 == 0 { a.create_hold(limited(i)) } else { b.create_hold(limited(i)) }),
+        )
+        .await;
+        assert_eq!(attempts.iter().filter(|r| r.is_ok()).count(), 3);
+        assert!(attempts.iter().filter_map(|r| r.as_ref().err()).all(|e| *e == LedgerRefusal::TooManyHolds { limit: 3 }));
+        let listed = a
+            .holds(HoldQuery { tenant_id: Some("t".into()), state: Some(HoldState::Pending), limit: 100 })
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 3);
     }
 }

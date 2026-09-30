@@ -25,6 +25,9 @@ use crate::config::{AuthConfig, AuthMode};
 pub const SCOPE_CHAT_STREAM: &str = "chat:stream";
 pub const SCOPE_MODELS_READ: &str = "models:read";
 pub const SCOPE_ADMIN: &str = "admin";
+/// Approve or deny held requests. Granted only by name: see
+/// [`Principal::has_explicit_scope`].
+pub const SCOPE_APPROVE_HOLDS: &str = "approve:holds";
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
@@ -73,6 +76,13 @@ impl Principal {
 
     pub fn has_scope(&self, scope: &str) -> bool {
         self.scopes.iter().any(|s| s.name == scope || s.wildcard)
+    }
+
+    /// Whether this scope was granted by name. A wildcard grant, made for
+    /// credentials older than scopes, does not count: approving a hold is a
+    /// decision someone must have been given explicitly.
+    pub fn has_explicit_scope(&self, scope: &str) -> bool {
+        self.scopes.iter().any(|s| s.name == scope)
     }
 
     /// Tenants created before scopes existed have a wildcard. Represented as a
@@ -669,5 +679,24 @@ mod tests {
             a.authenticate(&headers_with(&[("authorization", &format!("Bearer {token}"))])).await,
             Err(AuthError::WrongAudience)
         ));
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    #[test]
+    fn a_wildcard_grant_does_not_approve_holds() {
+        let principal = |scopes: Vec<Scope>| Principal {
+            tenant_id: "t".into(),
+            key_id: "k".into(),
+            scopes: Arc::new(scopes),
+            scheme: "api_key".into(),
+        };
+        let legacy = principal(vec![Scope { name: "*".into(), wildcard: true }]);
+        assert!(legacy.has_scope(SCOPE_ADMIN), "a wildcard is every ordinary scope");
+        assert!(!legacy.has_explicit_scope(SCOPE_APPROVE_HOLDS), "but never approval");
+        assert!(principal(vec![Scope::exact(SCOPE_APPROVE_HOLDS)]).has_explicit_scope(SCOPE_APPROVE_HOLDS));
     }
 }

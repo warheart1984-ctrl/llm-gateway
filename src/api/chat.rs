@@ -51,7 +51,14 @@ use uuid::Uuid;
 use crate::{
     config::OverflowMode,
     governance::{
-        auth::Principal, ledger, limits::AdmitRequest, limits::CostEstimate, limits::Reservation,
+        auth::Principal,
+        ledger::{
+            self,
+            holds::{HoldClaim, HoldProblem, HoldRecord, NewHold},
+        },
+        limits::AdmitRequest,
+        limits::CostEstimate,
+        limits::Reservation,
         AuthorizeError, LimitError,
     },
     observability::{logging, metrics::RejectionKind, RequestSpan, StreamSummary},
@@ -127,6 +134,11 @@ enum RequestError {
     InvalidIdempotencyKey,
     #[error("this tenant requires an `Idempotency-Key` header on every request")]
     IdempotencyKeyRequired,
+    #[error("`Hold-Id` must be a hold's id, as returned when the request was held")]
+    InvalidHoldId,
+    /// Not a refusal: the request waits for approval. Answered with `202`.
+    #[error("this request is held for approval: {}", .0.reason)]
+    Held(Box<HoldRecord>),
     /// Body exceeded `server.request_body_limit_bytes`.
     #[error("request body is too large")]
     PayloadTooLarge,
@@ -155,7 +167,19 @@ impl RequestError {
             | RequestError::BadJson(_)
             | RequestError::InvalidIdempotencyKey
             | RequestError::IdempotencyKeyRequired
+            | RequestError::InvalidHoldId
             | RequestError::Param(_) => StatusCode::BAD_REQUEST,
+            RequestError::Held(_) => StatusCode::ACCEPTED,
+            RequestError::Limit(LimitError::Hold(problem)) => match problem {
+                HoldProblem::NotFound => StatusCode::NOT_FOUND,
+                HoldProblem::Pending | HoldProblem::Consumed => StatusCode::CONFLICT,
+                HoldProblem::Denied => StatusCode::FORBIDDEN,
+                HoldProblem::Expired => StatusCode::GONE,
+                HoldProblem::Mismatch => StatusCode::UNPROCESSABLE_ENTITY,
+            },
+            RequestError::Limit(LimitError::TooManyHolds { .. }) => StatusCode::TOO_MANY_REQUESTS,
+            RequestError::Limit(LimitError::HoldNotDecidable { .. }) => StatusCode::CONFLICT,
+            RequestError::Limit(LimitError::SelfApproval) => StatusCode::FORBIDDEN,
             RequestError::Limit(LimitError::LedgerUnavailable) => StatusCode::SERVICE_UNAVAILABLE,
             RequestError::Limit(LimitError::IdempotencyKeyReused) => StatusCode::UNPROCESSABLE_ENTITY,
             RequestError::Limit(LimitError::RequestInProgress { .. } | LimitError::DuplicateRequest { .. }) => {
@@ -191,6 +215,19 @@ impl RequestError {
             RequestError::BadJson(_) => "invalid_json",
             RequestError::InvalidIdempotencyKey => "invalid_idempotency_key",
             RequestError::IdempotencyKeyRequired => "idempotency_key_required",
+            RequestError::InvalidHoldId => "invalid_hold_id",
+            RequestError::Held(_) => "held",
+            RequestError::Limit(LimitError::Hold(problem)) => match problem {
+                HoldProblem::NotFound => "hold_not_found",
+                HoldProblem::Pending => "hold_pending",
+                HoldProblem::Denied => "hold_denied",
+                HoldProblem::Expired => "hold_expired",
+                HoldProblem::Consumed => "hold_consumed",
+                HoldProblem::Mismatch => "hold_mismatch",
+            },
+            RequestError::Limit(LimitError::TooManyHolds { .. }) => "holds_pending_limit",
+            RequestError::Limit(LimitError::HoldNotDecidable { .. }) => "hold_not_decidable",
+            RequestError::Limit(LimitError::SelfApproval) => "self_approval",
             RequestError::Limit(LimitError::LedgerUnavailable) => "ledger_unavailable",
             RequestError::Limit(LimitError::IdempotencyKeyReused) => "idempotency_key_reused",
             RequestError::Limit(LimitError::RequestInProgress { .. }) => "request_in_progress",
@@ -235,7 +272,11 @@ impl RequestError {
     fn retryable(&self) -> bool {
         match self {
             RequestError::Provider(e) => e.retryable(),
-            RequestError::Limit(LimitError::LedgerUnavailable | LimitError::RequestInProgress { .. }) => true,
+            RequestError::Limit(
+                LimitError::LedgerUnavailable
+                | LimitError::RequestInProgress { .. }
+                | LimitError::Hold(HoldProblem::Pending),
+            ) => true,
             _ => false,
         }
     }
@@ -247,6 +288,7 @@ impl RequestError {
             RequestError::Limit(LimitError::RateLimited { .. } | LimitError::TokenRateLimited { .. }) => Some("60"),
             RequestError::Limit(LimitError::LedgerUnavailable) => Some("5"),
             RequestError::Limit(LimitError::RequestInProgress { .. }) => Some("1"),
+            RequestError::Limit(LimitError::Hold(HoldProblem::Pending)) => Some("5"),
             _ => None,
         }
     }
@@ -260,7 +302,7 @@ impl RequestError {
             StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
             StatusCode::PAYMENT_REQUIRED => "billing_error",
             StatusCode::CONFLICT => "conflict_error",
-            StatusCode::UNPROCESSABLE_ENTITY => "invalid_request_error",
+            StatusCode::UNPROCESSABLE_ENTITY | StatusCode::GONE => "invalid_request_error",
             _ => "api_error",
         }
     }
@@ -335,6 +377,34 @@ async fn handle(state: Arc<AppState>, headers: HeaderMap, body: Bytes, mode: Mod
             h.insert("x-request-id", header_value(&request_id));
             h.insert("idempotent-replayed", HeaderValue::from_static("true"));
             h.insert("x-original-request-id", header_value(&original.to_string()));
+            response
+        }
+        // Held for approval. Not a refusal, so neither a rejection metric nor
+        // a routine decision: the hold was recorded when it was made.
+        Err(RequestError::Held(hold)) => {
+            tracing::info!(
+                request_id = %request_id,
+                tenant = %span.tenant_id,
+                hold = %hold.id,
+                model = %hold.model,
+                reason = %hold.reason,
+                "request held for approval"
+            );
+            let location = format!("/v1/holds/{}", hold.id);
+            let message = format!(
+                "this request needs approval before it runs ({}). Poll `GET {location}`; once it is approved, send \
+                 the same request again with the header `Hold-Id: {}`.",
+                hold.reason, hold.id
+            );
+            let mut response = (
+                StatusCode::ACCEPTED,
+                Json(json!({ "status": "held", "hold": hold, "message": message, "request_id": request_id })),
+            )
+                .into_response();
+            let h = response.headers_mut();
+            h.insert("x-request-id", header_value(&request_id));
+            h.insert("hold-id", header_value(&hold.id.to_string()));
+            h.insert(axum::http::header::LOCATION, header_value(&location));
             response
         }
         Err(err) => {
@@ -428,6 +498,18 @@ fn idempotency_key(headers: &HeaderMap) -> Result<Option<&str>, RequestError> {
     Ok(Some(key))
 }
 
+/// The request's `Hold-Id`, if it presents an approved hold.
+fn hold_id(headers: &HeaderMap) -> Result<Option<Uuid>, RequestError> {
+    let Some(raw) = headers.get("hold-id") else {
+        return Ok(None);
+    };
+    raw.to_str()
+        .ok()
+        .and_then(|v| Uuid::parse_str(v.trim()).ok())
+        .map(Some)
+        .ok_or(RequestError::InvalidHoldId)
+}
+
 /// Everything the stream needs after governance has admitted the request.
 struct Admitted {
     principal: Principal,
@@ -480,6 +562,7 @@ async fn admit(
         _ => {}
     }
     let idempotency_key = idempotency_key(headers)?;
+    let hold_id = hold_id(headers)?;
 
     // 3. Authorize: may this tenant call this model, at this size?
     let prompt_chars: usize = req.messages.iter().map(ChatMessage::approx_chars).sum();
@@ -563,15 +646,57 @@ async fn admit(
     if decision.tenant.require_idempotency_key && idempotency_key.is_none() {
         return Err(RequestError::IdempotencyKeyRequired);
     }
-    let idempotency = idempotency_key.map(|key| {
-        let scope = match mode {
-            Mode::Stream => "stream",
-            Mode::Complete => "complete",
-        };
-        // The body already parsed as a `ChatRequest`, so it is valid JSON.
-        let value: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-        state.limits.fingerprinter().claim(key, scope, &value)
+    let scope = match mode {
+        Mode::Stream => "stream",
+        Mode::Complete => "complete",
+    };
+    //    HOLD comes before admission. A request the tenant's policy says must
+    //    wait is recorded as a hold instead: no reservation, no charge, no
+    //    provider call. A request presenting an approved hold is admitted
+    //    below, and the ledger consumes the approval with the budget.
+    let hold_reason = match (&decision.tenant.holds, hold_id) {
+        (Some(policy), None) => policy.trigger(&resolved.registry_id, cost.total()),
+        _ => None,
+    };
+    // Parsed once, only if something fingerprints it. The body already
+    // parsed as a `ChatRequest`, so it is valid JSON.
+    let value: Value = if idempotency_key.is_some() || hold_id.is_some() || hold_reason.is_some() {
+        serde_json::from_slice(body).unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+    if let (Some(reason), Some(policy)) = (hold_reason, &decision.tenant.holds) {
+        let fingerprint = state.limits.fingerprinter().encodings(scope, &value).remove(0);
+        let hold = state
+            .limits
+            .ledger()
+            .create_hold(NewHold {
+                // The held request's id is the hold's id.
+                id: Uuid::parse_str(request_id).unwrap_or_else(|_| Uuid::new_v4()),
+                tenant_id: principal.tenant_id.to_string(),
+                requested_by: principal.key_id.to_string(),
+                endpoint: scope.to_string(),
+                model: resolved.registry_id.clone(),
+                max_output_tokens,
+                exposure_nano_usd: cost.total(),
+                reason,
+                fingerprint,
+                expires_in: std::time::Duration::from_secs(policy.expiry_secs),
+                approval_valid_for: std::time::Duration::from_secs(policy.approval_valid_secs),
+                max_pending: policy.max_pending,
+            })
+            .await
+            .map_err(LimitError::from)?;
+        return Err(RequestError::Held(Box::new(hold)));
+    }
+    let hold = hold_id.map(|id| HoldClaim {
+        id,
+        fingerprints: state.limits.fingerprinter().encodings(scope, &value),
+        model: resolved.registry_id.clone(),
+        exposure_nano_usd: cost.total(),
+        key_id: principal.key_id.to_string(),
     });
+    let idempotency = idempotency_key.map(|key| state.limits.fingerprinter().claim(key, scope, &value));
     let reservation = state
         .limits
         .admit_request(AdmitRequest {
@@ -582,6 +707,7 @@ async fn admit(
             max_output_tokens,
             estimate: cost,
             idempotency,
+            hold,
         })
         .await?;
 
