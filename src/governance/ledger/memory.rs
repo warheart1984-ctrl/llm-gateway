@@ -9,7 +9,10 @@ use std::{
 use dashmap::{DashMap, mapref::entry::Entry};
 use uuid::Uuid;
 
-use super::{Closing, Ledger, LedgerRefusal, NewReservation, Outcome};
+use super::{
+    Closing, Ledger, LedgerRefusal, NewReservation, Outcome,
+    decisions::{Decision, DecisionQuery, DecisionRecord, DecisionRing},
+};
 use crate::governance::budget_bucket;
 
 /// Day-bucketed spend in nano-USD, guarded by one mutex so the bucket and the
@@ -116,7 +119,7 @@ enum KeyState {
 #[derive(Debug)]
 struct KeyRecord {
     id: Uuid,
-    fingerprint: [u8; 32],
+    fingerprint: Vec<u8>,
     state: KeyState,
     reserved: u64,
     billed: u64,
@@ -136,6 +139,7 @@ pub struct MemoryLedger {
     /// guard before it locks `keys`, so the two cannot deadlock.
     by_id: DashMap<Uuid, (String, String)>,
     retention: Duration,
+    decisions: DecisionRing,
 }
 
 impl Default for MemoryLedger {
@@ -151,6 +155,7 @@ impl MemoryLedger {
             keys: DashMap::new(),
             by_id: DashMap::new(),
             retention: idempotency_retention,
+            decisions: DecisionRing::default(),
         }
     }
 
@@ -181,7 +186,7 @@ impl Ledger for MemoryLedger {
         let key = (r.tenant_id.to_string(), claim.key.to_string());
         let fresh = |id| KeyRecord {
             id,
-            fingerprint: claim.fingerprint,
+            fingerprint: claim.fingerprint.clone(),
             state: KeyState::Open,
             reserved: r.amount_nano_usd,
             billed: 0,
@@ -203,7 +208,7 @@ impl Ledger for MemoryLedger {
                 // bound to its first request for good: a different request
                 // under it is refused whatever state the first one is in.
                 if !self.expired(record, r.now) {
-                    if record.fingerprint != claim.fingerprint {
+                    if !claim.matches(&record.fingerprint) {
                         return Err(LedgerRefusal::IdempotencyKeyReused);
                     }
                     match record.state {
@@ -268,5 +273,22 @@ impl Ledger for MemoryLedger {
 
     fn backend(&self) -> &'static str {
         "memory"
+    }
+
+    fn record_decision(&self, decision: Decision) {
+        self.decisions.push(decision);
+    }
+
+    async fn record_decision_durably(&self, decision: Decision) -> Result<(), LedgerRefusal> {
+        self.decisions.push(decision);
+        Ok(())
+    }
+
+    async fn decisions(&self, query: DecisionQuery) -> Result<Vec<DecisionRecord>, LedgerRefusal> {
+        Ok(self.decisions.query(&query))
+    }
+
+    fn decisions_dropped(&self) -> u64 {
+        self.decisions.dropped()
     }
 }

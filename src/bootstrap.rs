@@ -129,16 +129,25 @@ pub async fn build_with_ledger(
         settings.governance.default_limits.clone(),
     );
     let quota_split = quota_split(&settings.ledger, ledger.backend())?;
+    if ledger.backend() == "memory" {
+        tracing::warn!(
+            "THE IN-MEMORY LEDGER IS IN USE: a restart forgets all spend, idempotency keys and decisions, \
+             and each replica enforces the full budget. For tests and development only; \
+             use backend = \"sqlite\" or \"postgres\" in production"
+        );
+    }
     tracing::info!(
         backend = ledger.backend(),
         quota_split_replicas = quota_split.map(|s| s.replicas).unwrap_or(0),
         "spend ledger ready"
     );
+    let fingerprinter = fingerprinter(&settings.ledger.fingerprint_keys_env, ledger.backend())?;
     let limits = LimitEngine::with_ledger_split(
         settings.server.max_concurrent_streams_global,
         settings.governance.cost_tracking_enabled,
         ledger,
         quota_split,
+        fingerprinter,
     );
 
     // Report which catalogue entries cannot currently be served. Not fatal:
@@ -188,6 +197,7 @@ async fn build_ledger(
     use std::time::Duration;
 
     let retention = Duration::from_secs(cfg.idempotency_retention_secs);
+    let decision_retention = Duration::from_secs(u64::from(cfg.decision_retention_days) * 86_400);
     match cfg.backend {
         LedgerBackend::Memory => Ok(Arc::new(MemoryLedger::new(retention))),
         LedgerBackend::Sqlite => {
@@ -199,6 +209,7 @@ async fn build_ledger(
                     sweep_interval: Duration::from_secs(cfg.sweep_interval_secs),
                     idempotency_retention: retention,
                     sealer: response_sealer(&cfg.response_keys_env)?,
+                    decision_retention,
                 },
             )
             .await
@@ -219,6 +230,7 @@ async fn build_ledger(
                 sweep_interval: Duration::from_secs(cfg.sweep_interval_secs),
                 idempotency_retention: retention,
                 sealer,
+                decision_retention,
             })
             .await
             .map_err(BootError::Ledger)?;
@@ -276,4 +288,26 @@ fn quota_split(
         replicas: cfg.quota_split_replicas,
         margin_percent: cfg.quota_split_margin_percent,
     }))
+}
+
+/// The keys that fingerprint idempotent requests. Set but malformed: fatal.
+/// Unset: plain SHA-256, with a warning when the ledger keeps them on disk.
+fn fingerprinter(
+    env_name: &str,
+    backend: &str,
+) -> Result<crate::governance::ledger::Fingerprinter, BootError> {
+    use crate::governance::ledger::Fingerprinter;
+    match std::env::var(env_name) {
+        Ok(spec) if !spec.trim().is_empty() => {
+            Fingerprinter::from_keys(&spec).map_err(|e| BootError::Ledger(format!("`{env_name}`: {e}")))
+        }
+        _ => {
+            if backend != "memory" {
+                tracing::warn!(
+                    "`{env_name}` is not set: request fingerprints are stored unkeyed, so anyone who can read the ledger can test a guessed prompt against them"
+                );
+            }
+            Ok(Fingerprinter::unkeyed())
+        }
+    }
 }

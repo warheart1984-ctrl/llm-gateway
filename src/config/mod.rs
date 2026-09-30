@@ -45,15 +45,16 @@ pub struct Settings {
 #[serde(rename_all = "snake_case")]
 pub enum LedgerBackend {
     /// Process memory: exact, but a restart forgets it and replicas do not
-    /// share it. Right for a single instance.
-    #[default]
+    /// share it. For tests and development; choose it explicitly.
     Memory,
     /// A shared, durable Postgres ledger: survives restarts, and every
     /// replica draws on one budget.
     Postgres,
     /// A durable ledger in a local SQLite file: survives restarts, no
     /// database server. One file per gateway; replicas do not share it, so
-    /// several replicas need `quota_split_replicas`.
+    /// several replicas need `quota_split_replicas`. The default: a fresh
+    /// install keeps its spend across restarts with no setup.
+    #[default]
     Sqlite,
 }
 
@@ -79,6 +80,14 @@ pub struct LedgerConfig {
     /// replay: `kid:base64key[,kid:base64key...]`, first key seals. Unset
     /// means answers are not stored, so completions are not replayed.
     pub response_keys_env: String,
+    /// Name of the env var holding the keys that fingerprint requests for
+    /// idempotency: `kid:base64key[,kid:...]`, each at least 32 bytes. Unset
+    /// means plain SHA-256 fingerprints, which anyone reading the ledger can
+    /// test a guessed prompt against.
+    pub fingerprint_keys_env: String,
+    /// How long decision records (refusals, failures, operator actions) are
+    /// kept before the sweeper deletes them.
+    pub decision_retention_days: u32,
     /// The SQLite database file. Relative paths resolve against the config
     /// directory. Must be on a local disk; its directory must exist.
     pub sqlite_path: PathBuf,
@@ -97,7 +106,7 @@ pub struct LedgerConfig {
 impl Default for LedgerConfig {
     fn default() -> Self {
         Self {
-            backend: LedgerBackend::Memory,
+            backend: LedgerBackend::Sqlite,
             url_env: "LLM_GATEWAY_DATABASE_URL".to_string(),
             schema: "public".to_string(),
             max_connections: 16,
@@ -106,6 +115,8 @@ impl Default for LedgerConfig {
             sweep_interval_secs: 60,
             idempotency_retention_secs: 86_400,
             response_keys_env: "LLM_GATEWAY_RESPONSE_KEYS".to_string(),
+            fingerprint_keys_env: "LLM_GATEWAY_FINGERPRINT_KEYS".to_string(),
+            decision_retention_days: 30,
             sqlite_path: PathBuf::from("ledger.sqlite3"),
             quota_split_replicas: 0,
             quota_split_margin_percent: 100,
@@ -622,5 +633,16 @@ log_filter = "info"
             rendered.contains("request_timeout_ms"),
             "expected the stale key to be named in the error, got: {rendered}"
         );
+    }
+
+    /// Durable by default: a fresh install, and the shipped config, keep
+    /// spend across restarts. The in-memory ledger must be asked for.
+    #[test]
+    fn the_default_ledger_is_durable() {
+        assert_eq!(Settings::default().ledger.backend, LedgerBackend::Sqlite);
+        let shipped = Settings::load_file(Path::new("config/default.toml"), Path::new("config"))
+            .expect("the shipped config loads");
+        assert_eq!(shipped.ledger.backend, LedgerBackend::Sqlite);
+        assert_eq!(shipped.ledger.sqlite_path, Path::new("config").join("ledger.sqlite3"));
     }
 }

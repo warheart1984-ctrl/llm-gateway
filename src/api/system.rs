@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::{header::CONTENT_TYPE, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -195,14 +195,51 @@ pub async fn reload_registry(
         return Err(ApiError::Forbidden("this operation requires the `admin` scope"));
     }
 
-    let models = state
-        .models
-        .reload()
+    // An operator action is recorded before it takes effect. If the record
+    // cannot be written, the action does not happen.
+    let action = |code: &str, kind, reason: &str| {
+        crate::governance::ledger::decisions::Decision {
+            request_id: uuid::Uuid::new_v4(),
+            tenant_id: principal.tenant_id.to_string(),
+            key_id: principal.key_id.to_string(),
+            kind,
+            endpoint: "admin/registry/reload".to_string(),
+            model: None,
+            code: code.to_string(),
+            reason: String::new(),
+        }
+        .with_reason(reason)
+    };
+    use crate::governance::ledger::decisions::DecisionKind;
+    state
+        .limits
+        .ledger()
+        .record_decision_durably(action("registry_reload", DecisionKind::AdminAction, "requested"))
         .await
-        .map_err(|e| ApiError::ReloadFailed(format!("model registry reload failed: {e}")))?;
-    let tenants = state
-        .reload_tenants()
-        .map_err(|e| ApiError::ReloadFailed(format!("tenant registry reload failed: {e}")))?;
+        .map_err(|_| ApiError::LedgerUnavailable)?;
+
+    let reloaded = async {
+        let models = state
+            .models
+            .reload()
+            .await
+            .map_err(|e| format!("model registry reload failed: {e}"))?;
+        let tenants = state
+            .reload_tenants()
+            .map_err(|e| format!("tenant registry reload failed: {e}"))?;
+        Ok::<_, String>((models, tenants))
+    }
+    .await;
+    let (models, tenants) = match reloaded {
+        Ok(counts) => counts,
+        Err(message) => {
+            state
+                .limits
+                .ledger()
+                .record_decision(action("registry_reload_failed", DecisionKind::Failed, &message));
+            return Err(ApiError::ReloadFailed(message));
+        }
+    };
 
     tracing::info!(
         actor = %principal.key_id,
@@ -228,6 +265,26 @@ pub async fn live() -> impl IntoResponse {
 /// registry, live providers, and a resolvable default model. A gateway that
 /// cannot route should be pulled from the load balancer, not left to fail
 /// requests.
+/// What the ledger guarantees, spelled out: a bare backend name invites
+/// mistaking a per-instance ledger for a shared one.
+fn ledger_scope(state: &AppState) -> serde_json::Value {
+    let ledger = state.limits.ledger();
+    let (durability, replica_mode) = match ledger.backend() {
+        "memory" => ("ephemeral", json!("single_process")),
+        "postgres" => ("persistent", json!("shared")),
+        _ => (
+            "persistent",
+            match state.limits.quota_split() {
+                Some(split) => json!({
+                    "quota_split": { "replicas": split.replicas, "margin_percent": split.margin_percent }
+                }),
+                None => json!("single_instance_only"),
+            },
+        ),
+    };
+    json!({ "backend": ledger.backend(), "durability": durability, "replica_mode": replica_mode })
+}
+
 pub async fn ready(State(state): State<Arc<AppState>>) -> Response {
     let snapshot = state.models.snapshot().await;
     let mut issues: Vec<String> = Vec::new();
@@ -260,13 +317,14 @@ pub async fn ready(State(state): State<Arc<AppState>>) -> Response {
                 "models": snapshot.len(),
                 "providers": state.providers.names().len(),
                 "registry_generation": snapshot.generation,
+                "ledger": ledger_scope(&state),
             })),
         )
             .into_response()
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "status": "not_ready", "issues": issues })),
+            Json(json!({ "status": "not_ready", "issues": issues, "ledger": ledger_scope(&state) })),
         )
             .into_response()
     }
@@ -289,13 +347,60 @@ pub async fn metrics_for_admins(
 /// Prometheus text exposition. Refreshes the uptime gauge, then renders.
 pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     state.metrics.refresh_uptime(state.started_at);
-    let body = state.metrics.render();
+    let mut body = state.metrics.render();
+    use std::fmt::Write as _;
+    let _ = writeln!(
+        body,
+        "# HELP gw_decisions_dropped_total Routine decision records dropped because they could not be kept.\n# TYPE gw_decisions_dropped_total counter\ngw_decisions_dropped_total {}",
+        state.limits.ledger().decisions_dropped()
+    );
     let mut response = body.into_response();
     response.headers_mut().insert(
         CONTENT_TYPE,
         HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
     );
     response
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct DecisionParams {
+    tenant: Option<String>,
+    /// Unix seconds. Defaults to the last 24 hours.
+    since: Option<i64>,
+    /// Default 100, at most 1000.
+    limit: Option<u32>,
+}
+
+/// `GET /v1/admin/decisions` — the decision record, newest first: refusals,
+/// failures and operator actions for authenticated callers. Admin scope,
+/// like `/metrics`: it spans tenants. Served on the ops listener when one is
+/// configured.
+pub async fn list_decisions(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(params): Query<DecisionParams>,
+) -> Result<Response, ApiError> {
+    let principal = caller(&state, &headers).await?;
+    if !principal.has_scope(crate::governance::auth::SCOPE_ADMIN) {
+        return Err(ApiError::Forbidden("this operation requires the `admin` scope"));
+    }
+    let ledger = state.limits.ledger();
+    let records = ledger
+        .decisions(crate::governance::ledger::decisions::DecisionQuery {
+            tenant_id: params.tenant,
+            since: params
+                .since
+                .unwrap_or_else(|| crate::governance::ledger::decisions::unix_now() - 86_400),
+            limit: params.limit.unwrap_or(100).clamp(1, 1_000),
+        })
+        .await
+        .map_err(|_| ApiError::LedgerUnavailable)?;
+    Ok(Json(json!({
+        "decisions": records,
+        "dropped_since_start": ledger.decisions_dropped(),
+        "ledger": ledger.backend(),
+    }))
+    .into_response())
 }
 
 pub async fn not_found() -> Response {

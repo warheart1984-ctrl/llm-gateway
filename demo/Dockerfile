@@ -11,7 +11,8 @@ FROM debian:bookworm-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/* \
- && useradd --system --uid 10001 gateway
+ && useradd --system --uid 10001 gateway \
+ && mkdir -p /var/lib/llm-gateway && chown gateway /var/lib/llm-gateway
 COPY --from=build /usr/local/bin/llm-gateway /usr/local/bin/mock_upstream /usr/local/bin/
 USER gateway
 EXPOSE 8080 9090

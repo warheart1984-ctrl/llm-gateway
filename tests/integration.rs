@@ -455,6 +455,12 @@ tenants:
                 allow_anonymous: false,
                 ..Default::default()
             },
+            // Explicitly the in-memory ledger: the default is a SQLite file,
+            // and parallel tests must not share one.
+            ledger: llm_gateway::config::LedgerConfig {
+                backend: llm_gateway::config::LedgerBackend::Memory,
+                ..Default::default()
+            },
             ..Default::default()
         };
 

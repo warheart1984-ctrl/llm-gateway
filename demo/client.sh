@@ -11,8 +11,10 @@ set -eu
 
 GATEWAY="${GATEWAY:-http://gateway:8080}"
 OPS="${OPS:-http://gateway:9090}"
-DEMO_KEY="${DEMO_KEY:-$(cat "${DEMO_KEY_FILE:-/run/secrets/demo_key}")}"
-SHOESTRING_KEY="${SHOESTRING_KEY:-$(cat "${SHOESTRING_KEY_FILE:-/run/secrets/shoestring_key}")}"
+# `tr` drops any trailing newline or carriage return: a key file saved with
+# Windows line endings must not put a stray carriage return into a header.
+DEMO_KEY="${DEMO_KEY:-$(tr -d '\r\n' < "${DEMO_KEY_FILE:-/run/secrets/demo_key}")}"
+SHOESTRING_KEY="${SHOESTRING_KEY:-$(tr -d '\r\n' < "${SHOESTRING_KEY_FILE:-/run/secrets/shoestring_key}")}"
 TMP="$(mktemp -d)"
 
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }

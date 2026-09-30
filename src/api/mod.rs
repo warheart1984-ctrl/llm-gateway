@@ -23,6 +23,7 @@ pub const ROUTE_CHAT_COMPLETE: &str = "/v1/chat/complete";
 pub const ROUTE_MODELS: &str = "/v1/models";
 pub const ROUTE_USAGE: &str = "/v1/usage";
 pub const ROUTE_RELOAD: &str = "/v1/admin/registry/reload";
+pub const ROUTE_DECISIONS: &str = "/v1/admin/decisions";
 pub const ROUTE_LIVE: &str = "/health/live";
 pub const ROUTE_READY: &str = "/health/ready";
 pub const ROUTE_METRICS: &str = "/metrics";
@@ -43,7 +44,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(ROUTE_MODELS, get(system::list_models))
         .route(ROUTE_USAGE, get(system::get_usage));
     if !separate_ops {
-        api = api.route(ROUTE_RELOAD, post(system::reload_registry));
+        api = api
+            .route(ROUTE_RELOAD, post(system::reload_registry))
+            .route(ROUTE_DECISIONS, get(system::list_decisions));
     }
     // Body cap enforced by the extractor, so an oversized request is rejected
     // before a handler allocates a buffer for it.
@@ -62,7 +65,9 @@ pub fn router(state: Arc<AppState>) -> Router {
 /// still requires the `admin` scope). Network placement is the access control
 /// for the scrape, so bind it where tenants cannot reach.
 pub fn ops_router(state: Arc<AppState>) -> Router {
-    let mut ops = health_routes().route(ROUTE_RELOAD, post(system::reload_registry));
+    let mut ops = health_routes()
+        .route(ROUTE_RELOAD, post(system::reload_registry))
+        .route(ROUTE_DECISIONS, get(system::list_decisions));
     if state.settings.server.metrics_enabled {
         ops = ops.route(ROUTE_METRICS, get(system::metrics));
     }

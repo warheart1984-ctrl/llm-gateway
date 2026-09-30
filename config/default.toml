@@ -78,15 +78,17 @@ user_agent = "llm-gateway/0.1.0"
 request_usage = true
 
 [ledger]
+# sqlite (default): a durable ledger in a local file (`sqlite_path` below).
+#         Survives restarts with no database server. The file's directory
+#         must exist and be writable; the gateway will not start otherwise.
 # memory: spend lives in this process. A restart forgets it, and replicas
-#         each enforce the full budget. Right for a single instance.
+#         each enforce the full budget. For tests and development only.
 # postgres: one durable ledger shared by every replica. Survives restarts;
 #           replicas draw on one budget; a repeated Idempotency-Key is
 #           answered from the ledger instead of running again.
-# sqlite: a durable ledger in a local file. Survives restarts with no
-#         database server. Not shared: for several replicas, pair it with
-#         quota_split_replicas below.
-backend = "memory"
+# sqlite is not shared: for several replicas, use postgres, or pair sqlite
+# with quota_split_replicas below.
+backend = "sqlite"
 url_env = "LLM_GATEWAY_DATABASE_URL"   # env var NAME; the URL stays in env
 schema = "public"
 max_connections = 16
@@ -103,6 +105,10 @@ idempotency_retention_secs = 86400
 # `kid:base64-of-32-bytes[,kid:...]`, first key seals, all keys open.
 # Unset: answers are not stored and repeated completions get 409.
 response_keys_env = "LLM_GATEWAY_RESPONSE_KEYS"
+# Env var NAME holding the keys that fingerprint idempotent requests:
+# `kid:base64-of-32+-bytes[,kid:...]`. Unset: plain SHA-256, which lets anyone
+# reading the ledger test a guessed prompt. First key fingerprints, all match.
+fingerprint_keys_env = "LLM_GATEWAY_FINGERPRINT_KEYS"
 # sqlite backend: the database file, relative to this config directory.
 sqlite_path = "ledger.sqlite3"
 # Quota split, for N replicas without a shared database (sqlite backend):

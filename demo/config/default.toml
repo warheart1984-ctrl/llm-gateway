@@ -50,6 +50,13 @@ pool_idle_timeout_ms = 90000
 user_agent = "llm-gateway-demo"
 request_usage = true
 
+[ledger]
+# The default durable ledger, in a directory the image makes writable. It
+# lives in the container: `docker compose restart gateway` keeps the spend,
+# and recreating the container starts the demo fresh.
+backend = "sqlite"
+sqlite_path = "/var/lib/llm-gateway/ledger.sqlite3"
+
 [telemetry]
 service_name = "llm-gateway-demo"
 service_version = "0.1.0"

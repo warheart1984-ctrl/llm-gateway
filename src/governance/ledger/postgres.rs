@@ -40,6 +40,7 @@ use tokio::{
 
 use super::{
     Closing, Ledger, LedgerRefusal, NewReservation,
+    decisions::{DECISION_QUEUE, Decision, DecisionKind, DecisionQuery, DecisionRecord},
     sealed::{ResponseSealer, binding},
 };
 
@@ -66,6 +67,8 @@ pub struct PostgresOptions {
     /// stored at all, and a repeated completion gets `duplicate_request`
     /// rather than a replay: nothing leaves the process in the clear.
     pub sealer: Option<Arc<ResponseSealer>>,
+    /// Decision records older than this are deleted by the sweeper.
+    pub decision_retention: Duration,
 }
 
 enum WriterMsg {
@@ -82,6 +85,8 @@ pub struct PostgresLedger {
     retention: Duration,
     sealer: Option<Arc<ResponseSealer>>,
     sweeper: JoinHandle<()>,
+    decision_queue: mpsc::Sender<Decision>,
+    decisions_dropped: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for WriterMsg {
@@ -163,7 +168,15 @@ impl PostgresLedger {
         let (writer, inbox) = mpsc::unbounded_channel();
         let pending = Arc::new(AtomicU64::new(0));
         tokio::spawn(run_writer(pool.clone(), inbox, Arc::clone(&pending), opts.sealer.clone()));
-        let sweeper = tokio::spawn(run_sweeper(pool.clone(), opts.sweep_after, opts.sweep_interval));
+        let sweeper = tokio::spawn(run_sweeper(
+            pool.clone(),
+            opts.sweep_after,
+            opts.sweep_interval,
+            opts.decision_retention,
+        ));
+        let (decision_queue, decision_inbox) = mpsc::channel(DECISION_QUEUE);
+        let decisions_dropped = Arc::new(AtomicU64::new(0));
+        tokio::spawn(run_decision_writer(pool.clone(), decision_inbox, Arc::clone(&decisions_dropped)));
 
         Ok(Arc::new(Self {
             pool,
@@ -173,6 +186,8 @@ impl PostgresLedger {
             retention: opts.idempotency_retention,
             sealer: opts.sealer,
             sweeper,
+            decision_queue,
+            decisions_dropped,
         }))
     }
 
@@ -234,7 +249,7 @@ impl PostgresLedger {
                 let expired: bool = row.get("expired");
                 if !expired {
                     let fingerprint: Option<Vec<u8>> = row.get("fingerprint");
-                    if fingerprint.as_deref() != Some(&claim.fingerprint[..]) {
+                    if !fingerprint.as_deref().is_some_and(|stored| claim.matches(stored)) {
                         return Ok(Err(LedgerRefusal::IdempotencyKeyReused));
                     }
                     match row.get::<String, _>("state").as_str() {
@@ -311,7 +326,7 @@ impl PostgresLedger {
         .bind(amount)
         .bind(to_i64(r.prompt_nano_usd))
         .bind(r.idempotency.as_ref().map(|c| c.key))
-        .bind(r.idempotency.as_ref().map(|c| c.fingerprint.to_vec()))
+        .bind(r.idempotency.as_ref().map(|c| c.fingerprint.clone()))
         .execute(&mut *tx)
         .await;
         match inserted {
@@ -434,10 +449,46 @@ async fn sweep(pool: &PgPool, older_than: Duration) -> Result<u64, sqlx::Error> 
     Ok(swept.rows_affected())
 }
 
-async fn run_sweeper(pool: PgPool, sweep_after: Duration, interval: Duration) {
+async fn insert_decision(pool: &PgPool, d: &Decision) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO decisions (request_id, tenant_id, key_id, kind, endpoint, model, code, reason)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(d.request_id)
+    .bind(&d.tenant_id)
+    .bind(&d.key_id)
+    .bind(d.kind.as_str())
+    .bind(&d.endpoint)
+    .bind(d.model.as_deref())
+    .bind(&d.code)
+    .bind(&d.reason)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// Routine records: one attempt each. A failure drops and counts the record
+/// instead of retrying, so a struggling database never grows a backlog.
+async fn run_decision_writer(pool: PgPool, mut inbox: mpsc::Receiver<Decision>, dropped: Arc<AtomicU64>) {
+    while let Some(decision) = inbox.recv().await {
+        if let Err(error) = insert_decision(&pool, &decision).await {
+            dropped.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(%error, "a decision record was dropped");
+        }
+    }
+}
+
+async fn run_sweeper(pool: PgPool, sweep_after: Duration, interval: Duration, decision_retention: Duration) {
     let mut ticker = tokio::time::interval(interval.max(Duration::from_secs(1)));
     loop {
         ticker.tick().await;
+        if let Err(error) = sqlx::query("DELETE FROM decisions WHERE created_at < now() - make_interval(secs => $1)")
+            .bind(decision_retention.as_secs_f64())
+            .execute(&pool)
+            .await
+        {
+            tracing::warn!(%error, "decision retention sweep failed; will retry");
+        }
         match sweep(&pool, sweep_after).await {
             Ok(0) => {}
             Ok(n) => tracing::warn!(
@@ -496,6 +547,62 @@ impl Ledger for PostgresLedger {
 
     fn backend(&self) -> &'static str {
         "postgres"
+    }
+
+    fn record_decision(&self, decision: Decision) {
+        if self.decision_queue.try_send(decision).is_err() {
+            self.decisions_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    async fn record_decision_durably(&self, decision: Decision) -> Result<(), LedgerRefusal> {
+        match tokio::time::timeout(self.timeout, insert_decision(&self.pool, &decision)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(unavailable("record decision", error)),
+            Err(_) => Err(unavailable("record decision", "timed out")),
+        }
+    }
+
+    async fn decisions(&self, q: DecisionQuery) -> Result<Vec<DecisionRecord>, LedgerRefusal> {
+        let rows = sqlx::query(
+            "SELECT request_id, tenant_id, key_id, kind, endpoint, model, code, reason,
+                    extract(epoch from created_at)::bigint AS at
+               FROM decisions
+              WHERE ($1::text IS NULL OR tenant_id = $1) AND created_at >= to_timestamp($2)
+           ORDER BY created_at DESC, id DESC
+              LIMIT $3",
+        )
+        .bind(q.tenant_id.as_deref())
+        .bind(q.since as f64)
+        .bind(i64::from(q.limit))
+        .fetch_all(&self.pool);
+        let rows = match tokio::time::timeout(self.timeout, rows).await {
+            Ok(Ok(rows)) => rows,
+            Ok(Err(error)) => return Err(unavailable("decisions", error)),
+            Err(_) => return Err(unavailable("decisions", "timed out")),
+        };
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                Some(DecisionRecord {
+                    decision: Decision {
+                        request_id: row.get("request_id"),
+                        tenant_id: row.get("tenant_id"),
+                        key_id: row.get("key_id"),
+                        kind: DecisionKind::parse(row.get::<String, _>("kind").as_str())?,
+                        endpoint: row.get("endpoint"),
+                        model: row.get("model"),
+                        code: row.get("code"),
+                        reason: row.get("reason"),
+                    },
+                    at: row.get("at"),
+                })
+            })
+            .collect())
+    }
+
+    fn decisions_dropped(&self) -> u64 {
+        self.decisions_dropped.load(Ordering::Relaxed)
     }
 }
 

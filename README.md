@@ -256,15 +256,45 @@ isolation, rollover) and end to end in `tests/integration.rs`.
 
 ## State and restarts
 
-Where spend lives is a choice, `[ledger] backend`:
+Where spend lives is a choice, `[ledger] backend`. It is durable by default:
 
-| | `memory` (default) | `sqlite` | `postgres` |
+| | `sqlite` (default) | `postgres` | `memory` |
+|---|---|---|---|
+| Survives a restart | yes | yes | no: spend resets to zero |
+| Replicas share one budget | no: use quota split (below) | yes | no: each enforces the full budget |
+| Repeated `Idempotency-Key` recognised | across restarts, on one host | across all replicas | within one process |
+| Needs a database server | no: one local file | yes | no |
+| Ledger unreachable | 503; the gateway will not start without it | 503 `ledger_unavailable`; readiness fails; no request executes | cannot happen |
+
+`memory` is for tests and development. Choose it explicitly; the gateway
+logs a warning at boot whenever it is in use. `GET /health/ready` states
+what the ledger in use guarantees, so nobody has to infer it from a name:
+
+```json
+"ledger": { "backend": "sqlite", "durability": "persistent", "replica_mode": "single_instance_only" }
+```
+
+`replica_mode` is `single_instance_only`, `shared` (Postgres),
+`single_process` (memory), or the quota split's replica count and margin.
+
+> **Upgrading from an earlier release.** A config with no `[ledger]`
+> section used the in-memory ledger; it now uses `sqlite`, writing
+> `ledger.sqlite3` next to the config (`sqlite_path` changes where). That
+> directory must be writable. If it is not, for example a read-only config
+> mount, the gateway refuses to start and says why. Point `sqlite_path` at a
+> writable volume, or set `backend = "memory"` to keep the old behaviour.
+
+<details><summary>The same table, as it was before this release</summary>
+
+| | `memory` (old default) | `sqlite` | `postgres` |
 |---|---|---|---|
 | Survives a restart | no: spend resets to zero | yes | yes |
 | Replicas share one budget | no: each enforces the full budget | no: use quota split (below) | yes |
 | Repeated `Idempotency-Key` recognised | within one process | across restarts, on one host | across all replicas |
 | Needs a database server | no | no: one local file | yes |
 | Ledger unreachable | cannot happen | 503; the gateway will not start without it | 503 `ledger_unavailable`; readiness fails; no request executes |
+
+</details>
 
 `sqlite` is the Postgres design on a local file (`[ledger] sqlite_path`,
 relative to the config directory). WAL journal with `synchronous = FULL`,
@@ -311,7 +341,7 @@ database decides, not any gateway process:
 
 Put `sslmode=require` in the database URL outside a trusted network.
 
-**Idempotency** works on both backends. Send `Idempotency-Key` (1 to 255
+**Idempotency** works on every backend. Send `Idempotency-Key` (1 to 255
 visible ASCII characters). A repeat of a finished request is not executed
 again: a completion returns the stored answer (`idempotent-replayed: true`),
 and a stream gets 409 `duplicate_request` naming the original request and
@@ -321,7 +351,17 @@ whose attempt the provider refused may be used again, since nothing was
 executed or billed. Set `require_idempotency_key: true` on a tenant whose
 clients retry automatically.
 
-**Stored answers are sealed.** On the Postgres ledger, the answer kept for
+**Request fingerprints are keyed.** An idempotency record keeps a
+fingerprint of its request, to tell a retry from a reused key. A plain hash
+of a prompt would let anyone who can read the ledger confirm a guess at it,
+so the fingerprint is an HMAC-SHA256 keyed from the env var named by
+`[ledger] fingerprint_keys_env` (default `LLM_GATEWAY_FINGERPRINT_KEYS`),
+as `kid:base64-of-32+-bytes[,kid:...]`. The first key fingerprints new
+records and every key matches old ones, so keys rotate like the sealing keys.
+Records made before keys were configured still match until they expire.
+Without keys, fingerprints stay plain SHA-256, with a warning at boot.
+
+**Stored answers are sealed.** On the durable ledgers, the answer kept for
 replay is encrypted with AES-256-GCM before it reaches the database. It is
 bound to its tenant and request, so a copy moved into another row does not
 open, and anything that fails to open is never served (the caller gets 409
@@ -333,8 +373,32 @@ so a key rotates by putting the new one first. Generate one with
 and a repeated completion gets 409 instead of a replay. A malformed key
 setting stops the gateway starting.
 
-**Still per process on both backends:** rate-limit windows and concurrency
+**Still per process on every backend:** rate-limit windows and concurrency
 caps. Behind N replicas, divide them by N.
+
+### The decision record
+
+Reservations record admitted, billable work. The decision record covers the
+rest: every refusal (4xx) and failure (5xx) a known caller received, and
+every operator action. `GET /v1/admin/decisions?tenant=&since=&limit=`
+(admin scope, and on the ops listener when one is configured) returns
+request id, tenant, key id, kind, endpoint, model, code, reason and time,
+newest first.
+
+- **Only authenticated callers.** Anonymous 401s stay in logs and metrics;
+  persisting them would let anyone write to the database.
+- **No prompts or answers.** A reason is a code and a short sentence. For a
+  malformed body it is a fixed sentence, because a parser's error can quote
+  the offending value.
+- **Routine records never cost availability.** Refusals and failures go
+  through a bounded queue. If it is full or the store fails, the record is
+  dropped and counted in `gw_decisions_dropped_total`; the caller still gets
+  the refusal.
+- **Operator actions are recorded before they happen.** A registry reload is
+  written synchronously first. If that write fails, the reload does not
+  happen and the operator gets 503.
+- Kept `decision_retention_days` (default 30), then deleted by the sweeper.
+  Durable on `sqlite` and `postgres`; the last 10,000 in memory on `memory`.
 
 ## Configuration
 
@@ -418,7 +482,7 @@ What the gateway does itself, and what it expects of the deployment around it.
 ## Testing
 
 ```bash
-cargo test --locked --all-targets                  # 245 tests
+cargo test --locked --all-targets                  # 260 tests
 cargo clippy --locked --all-targets -- -D warnings
 cargo bench --bench framing                        # add `-- --quick` for a fast pass
 ```
@@ -443,6 +507,13 @@ LLM_GATEWAY_TEST_DATABASE_URL="postgres://postgres:gatewaytest@127.0.0.1:55432/g
 ```
 
 The SQLite ledger and quota-split tests need no server and always run.
+
+`tests/crash.rs` starts the real `llm-gateway` binary as a separate
+process, kills it outright (no destructors, no graceful shutdown) at each
+critical point of a request, restarts it on the same SQLite ledger, and
+reads the ledger file directly. It covers a kill mid-upload before
+admission, after reserving but before any answer, mid-stream, and a retry
+with the same idempotency key across the crash.
 
 `tests/pressure.rs` is the boundary pressure suite: one test per attack on
 the claim that an unauthorised or financially inadmissible request never

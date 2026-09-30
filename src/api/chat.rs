@@ -342,6 +342,7 @@ async fn handle(state: Arc<AppState>, headers: HeaderMap, body: Bytes, mode: Mod
                 state.metrics.rejection(kind);
             }
             logging::log_rejected(&request_id, &span.tenant_id, err.code(), &err.to_string());
+            record_decision(&state, &span, &request_id, mode, &err);
 
             let status = err.status();
             let mut body = json!({
@@ -377,6 +378,42 @@ async fn handle(state: Arc<AppState>, headers: HeaderMap, body: Bytes, mode: Mod
             response
         }
     }
+}
+
+/// Keep a record of why this known caller's request did not happen. Only
+/// after authentication: `span.tenant_id` is empty until then, and anonymous
+/// refusals are never persisted.
+fn record_decision(state: &AppState, span: &RequestSpan, request_id: &str, mode: Mode, err: &RequestError) {
+    use crate::governance::ledger::decisions::{Decision, DecisionKind};
+    if span.tenant_id.is_empty() || matches!(err, RequestError::Auth(_)) {
+        return;
+    }
+    // A parser's message can quote the offending value, which may be prompt
+    // text; the record keeps a fixed sentence instead.
+    let reason = match err {
+        RequestError::BadJson(_) => "request body is not valid JSON".to_string(),
+        other => other.to_string(),
+    };
+    let decision = Decision {
+        request_id: Uuid::parse_str(request_id).unwrap_or_else(|_| Uuid::nil()),
+        tenant_id: span.tenant_id.clone(),
+        key_id: span.key_id.clone(),
+        kind: if err.status().is_client_error() {
+            DecisionKind::Refused
+        } else {
+            DecisionKind::Failed
+        },
+        endpoint: match mode {
+            Mode::Stream => "stream",
+            Mode::Complete => "complete",
+        }
+        .to_string(),
+        model: (!span.model.is_empty()).then(|| span.model.clone()),
+        code: err.code().to_string(),
+        reason: String::new(),
+    }
+    .with_reason(&reason);
+    state.limits.ledger().record_decision(decision);
 }
 
 /// The request's `Idempotency-Key`, if it sent one.
@@ -526,14 +563,14 @@ async fn admit(
     if decision.tenant.require_idempotency_key && idempotency_key.is_none() {
         return Err(RequestError::IdempotencyKeyRequired);
     }
-    let fingerprint = idempotency_key.map(|_| {
+    let idempotency = idempotency_key.map(|key| {
         let scope = match mode {
             Mode::Stream => "stream",
             Mode::Complete => "complete",
         };
         // The body already parsed as a `ChatRequest`, so it is valid JSON.
         let value: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-        ledger::fingerprint(scope, &value)
+        state.limits.fingerprinter().claim(key, scope, &value)
     });
     let reservation = state
         .limits
@@ -544,10 +581,7 @@ async fn admit(
             prompt_tokens,
             max_output_tokens,
             estimate: cost,
-            idempotency: idempotency_key.zip(fingerprint).map(|(key, fingerprint)| ledger::IdempotencyClaim {
-                key,
-                fingerprint,
-            }),
+            idempotency,
         })
         .await?;
 

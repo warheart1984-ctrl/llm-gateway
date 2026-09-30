@@ -1,0 +1,5 @@
+# Files read inside Linux containers: always LF, whatever the checkout
+# platform. With CRLF, `sh` reads `set -eu` plus a carriage return and fails,
+# and a key file carries a stray carriage return into the header it is sent in.
+*.sh text eol=lf
+demo/secrets/* text eol=lf
