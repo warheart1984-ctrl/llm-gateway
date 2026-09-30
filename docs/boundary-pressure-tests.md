@@ -91,20 +91,51 @@ cannot be used to get around the boundary.
 | Provider dies mid-answer | 502; prompt billed, output reservation refunded | `second_door_a_provider_dying_mid_answer_bills_the_prompt_only` | HOLDS |
 | 20 clients give up while waiting | no slot leaks; each billed its reservation, because the provider finishes unseen | `second_door_a_disconnect_storm_leaks_no_slots_and_bills_each_reservation` | HOLDS |
 
-## 8. Known gaps
+## 8. Replays: one execution and one charge per `Idempotency-Key`
 
-| Pressure | What happens today | Test | Result |
+Both ledger backends. The key and the charge are claimed in one atomic
+step, together with a fingerprint of the request.
+
+| Pressure | Must happen | Test | Result |
 |---|---|---|---|
-| Crash or restart | the ledger dies with the process; an exhausted tenant spends again | `gap_a_restart_forgets_todays_spend` | **GAP: fails open** |
-| Two replicas | each enforces the full budget; N replicas admit N budgets | `gap_replicas_each_enforce_the_full_budget` | **GAP: fails open** |
-| Replayed request (same request id and idempotency key) | executed and billed twice | `gap_a_replayed_request_is_executed_and_billed_again` | **GAP: not detected** |
-| Replayed completion, as when a client times out and retries | executed and billed twice | `gap_a_replayed_completion_is_executed_and_billed_again` | **GAP: not detected** |
-| HOLD (neither GO nor NO-GO: wait for approval) | no such decision exists; the gate is GO / NO-GO only | none | NOT BUILT |
+| Same key, same streamed request, sent twice | 409 `duplicate_request` naming the original and its bill; provider called once, billed once | `replay_a_repeated_stream_is_recognised_not_executed` | HOLDS |
+| Same key, same completion, sent twice | the stored answer returned byte for byte; provider called once, billed once | `replay_a_repeated_completion_is_served_from_the_ledger` | HOLDS |
+| Same key, different request | 422 `idempotency_key_reused` | `replay_the_same_key_for_a_different_request_is_refused` | HOLDS |
+| Retry while the first attempt is still running | 409 `request_in_progress`, `retry-after: 1` | `replay_a_retry_while_the_first_is_running_is_told_to_wait` | HOLDS |
+| Retry after the provider refused (nothing executed, nothing billed) | executed again, not refused as a duplicate | `replay_a_refused_attempt_can_be_retried_under_its_key` | HOLDS |
+| Tenant configured to require the key, request without one | 400 `idempotency_key_required`; provider receives nothing | `replay_a_tenant_can_require_the_key` | HOLDS |
+| Two identical requests with no key | both executed: they may be two real requests | `replay_without_a_key_cannot_be_recognised` | LIMIT (by design) |
 
-The first two gaps are the subject of `docs/plans/durable-ledger.md`. That
-plan's reservation table becomes the durable decision record once rejected
-decisions are written to it as well. Replay protection needs an idempotency
-key stored with the reservation.
+## 9. The shared ledger: restarts, replicas, a dead database
+
+`[ledger] backend = "postgres"`, tested against a real Postgres. CI sets
+`LLM_GATEWAY_REQUIRE_TEST_DATABASE`, so a missing database fails these tests
+there instead of skipping them.
+
+| Pressure | Must happen | Test | Result |
+|---|---|---|---|
+| Crash and restart | spend survives; an exhausted tenant stays refused | `shared_ledger_a_restart_keeps_todays_spend` | HOLDS |
+| Two replicas, sequential | the second sees the first one's spend and refuses | `shared_ledger_replicas_draw_on_one_budget` | HOLDS |
+| 20 simultaneous requests across two replicas, room for 3 | exactly 3 reach the provider | `shared_ledger_a_burst_across_replicas_admits_exactly_what_fits` | HOLDS |
+| Same key sent to two different replicas | executed once, the second served from the ledger | `shared_ledger_a_repeated_key_is_recognised_across_replicas` | HOLDS |
+| Database connection cut mid-run | 503 `ledger_unavailable`; provider receives nothing; readiness fails | `shared_ledger_a_dead_ledger_fails_closed` | HOLDS |
+| Ledger unreachable at startup | the gateway refuses to start; the error does not echo credentials | `shared_ledger_a_gateway_will_not_start_without_its_ledger` | HOLDS |
+| Read the stored answers straight from the database | ciphertext only (AES-256-GCM); the replay still returns the real answer | `shared_ledger_stored_answers_are_sealed` | HOLDS |
+| No sealing key configured | no answer stored at all; a repeat is recognised and billed once, with 409 instead of a replay | `shared_ledger_without_a_key_stores_no_answer` | HOLDS |
+| Copy one request's sealed answer into another request's row | the copy does not open; 409, never the wrong answer; nothing re-executed | `shared_ledger_an_answer_moved_to_another_row_is_not_served` | HOLDS |
+
+## 10. Known gaps
+
+| Pressure | What happens | Test | Result |
+|---|---|---|---|
+| Restart, on the in-memory ledger | spend is forgotten | `gap_memory_ledger_a_restart_forgets_todays_spend` | **GAP by design:** use the shared ledger |
+| Two replicas, on the in-memory ledger | each enforces the full budget | `gap_memory_ledger_replicas_each_enforce_the_full_budget` | **GAP by design:** use the shared ledger |
+| Rate limits and concurrency caps across replicas | enforced per process, on both backends | none | NOT BUILT |
+| HOLD (neither GO nor NO-GO: wait for approval) | no such decision exists | none | NOT BUILT |
+
+The in-memory ledger is the default and is exact within one process. The
+reservation table is the durable record of every *admitted* request; refused
+requests are recorded as structured log lines only.
 
 ## Evidence that the suite can fail
 
@@ -114,4 +145,13 @@ key stored with the reservation.
 - **Mid-answer failure misclassified as "never accepted":** exactly
   `second_door_a_provider_dying_mid_answer…` fails, billing 0 where the
   prompt is owed.
-- **Flakiness:** 10 consecutive runs, 35/35 each time.
+- **Shared ledger's budget condition removed from the SQL:** exactly the
+  three shared-ledger budget tests fail (restart, replicas, burst across
+  replicas), which shows the database's check, not luck, holds the line.
+- **Answer sealing:** removing the row binding fails exactly the
+  moved-answer test (the copied answer is served); storing answers in the
+  clear fails three tests, including the at-rest check.
+- **Flakiness:** on the shared ledger, a first batch of 10 runs had 2 runs
+  with a failure. The output was not captured and the cause is not yet
+  identified. 40 consecutive runs since then were clean, 46/46 each time.
+  Treat the suite as not yet proven flake-free.

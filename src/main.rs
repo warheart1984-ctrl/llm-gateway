@@ -124,6 +124,14 @@ async fn run(state: std::sync::Arc<AppState>) -> anyhow::Result<()> {
         }
     }
 
+    // Make every settlement the drained streams produced durable before the
+    // process exits. Anything still queued after `grace` stays `open` in the
+    // ledger, and the sweeper bills it in full: never undercharged.
+    match tokio::time::timeout(grace, state.limits.ledger().flush()).await {
+        Ok(()) => tracing::info!("ledger flushed"),
+        Err(_) => tracing::warn!("ledger flush timed out; open reservations will be swept"),
+    }
+
     Ok(())
 }
 
