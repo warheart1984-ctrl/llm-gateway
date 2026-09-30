@@ -504,7 +504,7 @@ What the gateway does itself, and what it expects of the deployment around it.
 ## Testing
 
 ```bash
-cargo test --locked --all-targets                  # 270 tests
+cargo test --locked --all-targets                  # 274 tests
 cargo clippy --locked --all-targets -- -D warnings
 cargo bench --bench framing                        # add `-- --quick` for a fast pass
 ```
@@ -531,6 +531,34 @@ LLM_GATEWAY_TEST_DATABASE_URL="postgres://postgres:gatewaytest@127.0.0.1:55432/g
 The SQLite ledger, lease and quota-split tests need no server and always
 run. Tests that count within one rate window wait until at least 15 s of the
 current minute remain, so they cannot straddle a boundary.
+
+`tests/live.rs` calls the real Groq, OpenRouter and NVIDIA APIs with the
+model the shipped catalogue names for each. It checks shape and money, never
+content:
+- a streamed answer follows the v1 contract and is billed exactly what its
+  reported usage costs at catalogue prices;
+- **the reservation made before the call covered the bill**;
+- a completion is one well-formed document, billed the same way;
+- passthrough relays the vendor's stream and bills the reservation;
+- a client hanging up mid-stream frees its slot and is billed for what it
+  received;
+- a model the vendor does not know is a clean 502 that costs nothing.
+
+It spends money, so it is opt-in: nothing runs unless `LLM_GATEWAY_LIVE`
+names the providers, and a named provider without its key fails rather than
+skips. Each test's tenant has a 5-cent daily budget, so a runaway test is
+refused by the gateway itself; a full run costs well under a cent.
+
+```bash
+LLM_GATEWAY_LIVE=all cargo test --test live -- --nocapture
+```
+
+Each run appends estimated vs billed prompt tokens and reserved vs billed
+cost to `target/live-report.jsonl`. The `live` workflow runs it nightly and
+on demand from repository secrets (`GROQ_API_KEY`, `OPENROUTER_API_KEY`,
+`NVIDIA_API_KEY`), outside the gate: it depends on three vendors being up.
+Its checks are themselves tested on every normal run, against a local server
+that speaks the vendors' wire format, with no key and no cost.
 
 `tests/crash.rs` starts the real `llm-gateway` binary as a separate
 process, kills it outright (no destructors, no graceful shutdown) at each
