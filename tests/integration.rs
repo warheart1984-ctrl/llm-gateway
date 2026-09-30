@@ -134,6 +134,7 @@ fn sse_stream(items: Vec<String>, tail_delay: Option<Duration>) -> impl Stream<I
 
 async fn handle(State(state): State<MockState>, Json(body): Json<Value>) -> Response {
     state.calls.fetch_add(1, Ordering::SeqCst);
+    let streaming = body["stream"] != json!(false);
     *state.last_body.lock().unwrap() = Some(body);
 
     let scenario = match state.scenario {
@@ -143,6 +144,10 @@ async fn handle(State(state): State<MockState>, Json(body): Json<Value>) -> Resp
         }
         other => other,
     };
+
+    if !streaming && scenario != Scenario::UpstreamReject {
+        return completion_answer(scenario).await;
+    }
 
     match scenario {
         Scenario::Gated => unreachable!("rewritten to Happy above"),
@@ -238,6 +243,49 @@ async fn handle(State(state): State<MockState>, Json(body): Json<Value>) -> Resp
             "data: [DONE]\n\n".to_string(),
         ]),
     }
+}
+
+/// The non-streaming counterpart of each scenario: one JSON document.
+async fn completion_answer(scenario: Scenario) -> Response {
+    let message = |message: Value, finish: &str| {
+        json!({ "id": "cc1", "model": "mock-model",
+                "choices": [{ "index": 0, "message": message, "finish_reason": finish }] })
+    };
+    let with_usage = |mut v: Value, prompt: u32, completion: u32| {
+        v["usage"] = json!({ "prompt_tokens": prompt, "completion_tokens": completion,
+                             "total_tokens": prompt + completion });
+        v
+    };
+    let body = match scenario {
+        Scenario::Happy | Scenario::CommentKeepalive => {
+            with_usage(message(json!({ "role": "assistant", "content": "Hello, world" }), "stop"), 12, 3)
+        }
+        Scenario::Reasoning => with_usage(
+            message(json!({ "content": "answer", "reasoning_content": "let me think" }), "stop"),
+            12,
+            5,
+        ),
+        Scenario::NoUsage => message(
+            json!({ "content": "one two three four five six seven eight" }),
+            "stop",
+        ),
+        Scenario::ToolCalls => with_usage(
+            message(
+                json!({ "content": null, "tool_calls": [{ "id": "call_1", "type": "function",
+                        "function": { "name": "get_weather", "arguments": "{\"city\":\"NYC\"}" } }] }),
+                "tool_calls",
+            ),
+            12,
+            9,
+        ),
+        Scenario::MidStreamError => json!({ "error": { "message": "upstream exploded", "code": "internal" } }),
+        Scenario::SlowFirstToken => {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            with_usage(message(json!({ "content": "eventual" }), "stop"), 12, 1)
+        }
+        Scenario::UpstreamReject | Scenario::Gated => unreachable!("handled by the caller"),
+    };
+    Json(body).into_response()
 }
 
 fn sse_response(frames: Vec<String>) -> Response {
@@ -441,6 +489,19 @@ tenants:
         let headers = resp.headers().clone();
         let text = resp.text().await.unwrap_or_default();
         (status, headers, text)
+    }
+
+    async fn post_complete(&self, key: &str, body: Value) -> (StatusCode, HeaderMap, String) {
+        let resp = reqwest::Client::new()
+            .post(self.url("/v1/chat/complete"))
+            .header("x-api-key", key)
+            .json(&body)
+            .send()
+            .await
+            .expect("post complete");
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        (status, headers, resp.text().await.unwrap_or_default())
     }
 
     async fn get(&self, path: &str, key: &str) -> (StatusCode, String) {
@@ -1381,6 +1442,212 @@ async fn public_metrics_need_an_admin_key() {
     assert_eq!(gw.get("/metrics", "").await.0, StatusCode::UNAUTHORIZED);
     assert_eq!(gw.get("/metrics", "test-key-throttled").await.0, StatusCode::FORBIDDEN);
     assert_eq!(gw.get("/metrics", TEST_KEY).await.0, StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// Non-streaming completions: POST /v1/chat/complete
+// ---------------------------------------------------------------------------
+
+fn complete_body() -> Value {
+    json!({
+        "model": "mock/chat",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "params": { "max_tokens": 128 },
+        "metadata": { "trace": "abc" }
+    })
+}
+
+fn reserved_of(headers: &HeaderMap) -> u64 {
+    headers["x-reserved-nano-usd"].to_str().unwrap().parse().unwrap()
+}
+
+#[tokio::test]
+async fn a_completion_is_one_json_answer_billed_from_reported_usage() {
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let gw = Gateway::start(&upstream).await;
+
+    let (status, headers, text) = gw.post_complete(TEST_KEY, complete_body()).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(headers[header::CONTENT_TYPE], "application/json");
+    assert!(headers.get("x-accel-buffering").is_none());
+    let answer: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(answer["content"], "Hello, world");
+    assert_eq!(answer["finish_reason"], "stop");
+    assert_eq!(answer["model"], "mock/chat");
+    assert_eq!(answer["tenant"], "acme");
+    assert_eq!(answer["upstream_id"], "cc1");
+    assert_eq!(answer["metadata"]["trace"], "abc");
+    assert_eq!(answer["usage"]["prompt_tokens"], 12);
+    assert_eq!(answer["usage"]["completion_tokens"], 3);
+    // 12 x 2,000 + 3 x 8,000.
+    assert_eq!(answer["cost_nano_usd"], 48_000);
+    assert_eq!(spent(&gw, TEST_KEY).await, 48_000, "the answer and the ledger agree");
+
+    // The upstream was asked for a completion, not a stream.
+    let sent = upstream.last_body().unwrap();
+    assert_eq!(sent["stream"], false);
+    assert!(sent.get("stream_options").is_none(), "{sent}");
+    assert_eq!(sent["max_tokens"], 128);
+}
+
+#[tokio::test]
+async fn each_endpoint_refuses_the_other_ones_stream_flag() {
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let gw = Gateway::start(&upstream).await;
+
+    let mut body = complete_body();
+    body["stream"] = json!(true);
+    let (status, _, text) = gw.post_complete(TEST_KEY, body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(text.contains("stream_not_allowed"), "{text}");
+
+    let mut body = chat_body();
+    body["stream"] = json!(false);
+    let (status, _, text) = gw.post_chat(TEST_KEY, body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(text.contains("stream_required"), "{text}");
+    assert_eq!(upstream.calls(), 0);
+
+    // `stream: false` explicitly is fine on the completion endpoint.
+    let mut body = complete_body();
+    body["stream"] = json!(false);
+    assert_eq!(gw.post_complete(TEST_KEY, body).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_caller_cannot_turn_a_completion_into_a_stream_through_params() {
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let gw = Gateway::start(&upstream).await;
+    let mut body = complete_body();
+    body["params"] = json!({ "max_tokens": 32, "stream": true, "stream_options": { "include_usage": true } });
+    let (status, _, text) = gw.post_complete(TEST_KEY, body).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let sent = upstream.last_body().unwrap();
+    assert_eq!(sent["stream"], false);
+    assert!(sent.get("stream_options").is_none(), "{sent}");
+}
+
+#[tokio::test]
+async fn a_refused_completion_costs_nothing() {
+    let upstream = MockUpstream::start(Scenario::UpstreamReject).await;
+    let gw = Gateway::start(&upstream).await;
+    let (status, headers, text) = gw.post_complete(TEST_KEY, complete_body()).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{text}");
+    assert!(text.contains("upstream_rate_limited"), "{text}");
+    assert_eq!(headers["x-error-retryable"], "true");
+    assert_eq!(spent(&gw, TEST_KEY).await, 0);
+}
+
+#[tokio::test]
+async fn an_in_band_error_in_a_completion_costs_nothing() {
+    // A 200 whose body is `{"error": ...}` is a refusal delivered in-band:
+    // retryable, and nothing was processed.
+    let upstream = MockUpstream::start(Scenario::MidStreamError).await;
+    let gw = Gateway::start(&upstream).await;
+    let (status, _, text) = gw.post_complete(TEST_KEY, complete_body()).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{text}");
+    let err: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(err["error"]["retryable"], true);
+    assert_eq!(spent(&gw, TEST_KEY).await, 0);
+}
+
+#[tokio::test]
+async fn a_completion_without_usage_bills_what_it_returned() {
+    let upstream = MockUpstream::start(Scenario::NoUsage).await;
+    let gw = Gateway::start(&upstream).await;
+    let (status, headers, text) = gw.post_complete(TEST_KEY, complete_body()).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let answer: Value = serde_json::from_str(&text).unwrap();
+    let completion = answer["usage"]["completion_tokens"].as_u64().unwrap();
+    assert!(completion >= 2, "estimated from the returned text: {answer}");
+    let billed = spent(&gw, TEST_KEY).await;
+    assert_eq!(billed, answer["cost_nano_usd"].as_u64().unwrap());
+    assert!(billed < reserved_of(&headers), "the unused ceiling is refunded");
+}
+
+#[tokio::test]
+async fn a_completion_forwards_tool_calls_and_keeps_reasoning_separate() {
+    let upstream = MockUpstream::start(Scenario::ToolCalls).await;
+    let gw = Gateway::start(&upstream).await;
+    let (_, _, text) = gw.post_complete(TEST_KEY, complete_body()).await;
+    let answer: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(answer["content"], "");
+    assert_eq!(answer["finish_reason"], "tool_calls");
+    let call = &answer["tool_calls"][0];
+    assert_eq!(call["id"], "call_1");
+    assert_eq!(call["type"], "function");
+    assert_eq!(call["function"]["name"], "get_weather");
+    assert_eq!(call["function"]["arguments"], "{\"city\":\"NYC\"}");
+
+    let upstream = MockUpstream::start(Scenario::Reasoning).await;
+    let gw = Gateway::start(&upstream).await;
+    let (_, _, text) = gw.post_complete(TEST_KEY, complete_body()).await;
+    let answer: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(answer["content"], "answer");
+    assert_eq!(answer["reasoning"], "let me think");
+}
+
+#[tokio::test]
+async fn a_client_that_leaves_mid_completion_is_billed_the_reservation() {
+    // The upstream is still answering when the client gives up. A
+    // non-streaming vendor finishes and bills the whole answer regardless,
+    // and the gateway will never see its usage, so the reservation is the
+    // bill, exactly as for passthrough.
+    let upstream = MockUpstream::start(Scenario::SlowFirstToken).await;
+    let gw = Gateway::start(&upstream).await;
+
+    // Same body, so the same reservation; this one is allowed to finish.
+    let (status, headers, _) = gw.post_complete(TEST_KEY, complete_body()).await;
+    assert_eq!(status, StatusCode::OK);
+    let reserved = reserved_of(&headers);
+    let before = spent(&gw, TEST_KEY).await;
+
+    let impatient = reqwest::Client::builder()
+        .timeout(Duration::from_millis(100))
+        .build()
+        .unwrap();
+    let result = impatient
+        .post(gw.url("/v1/chat/complete"))
+        .header("x-api-key", TEST_KEY)
+        .json(&complete_body())
+        .send()
+        .await;
+    assert!(result.is_err(), "the client must time out before the answer");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    assert_eq!(spent(&gw, TEST_KEY).await - before, reserved);
+    let (_, usage) = gw.get("/v1/usage", TEST_KEY).await;
+    assert!(usage.contains("\"streams_in_flight\":0"), "{usage}");
+    let (_, metrics) = gw.get("/metrics", TEST_KEY).await;
+    assert!(metrics.contains("gw_streams_client_aborted_total 1"), "{metrics}");
+}
+
+#[tokio::test]
+async fn completions_are_governed_like_streams() {
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let gw = Gateway::start(&upstream).await;
+
+    let (status, _, text) = gw.post_complete("test-key-broke", complete_body()).await;
+    assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{text}");
+    let (status, _, _) = gw.post_complete("wrong-key", complete_body()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _, _) = gw.post_complete("test-key-locked", complete_body()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let mut body = complete_body();
+    body["model"] = json!("mock/uncapped");
+    body["params"] = json!({});
+    let (status, _, text) = gw.post_complete(TEST_KEY, body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(text.contains("max_tokens_required"), "{text}");
+    for _ in 0..2 {
+        assert_eq!(gw.post_complete("test-key-throttled", complete_body()).await.0, StatusCode::OK);
+    }
+    assert_eq!(
+        gw.post_complete("test-key-throttled", complete_body()).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "completions and streams share one rate limit"
+    );
+    assert_eq!(upstream.calls(), 2, "no refused request reached the provider");
 }
 
 // ---------------------------------------------------------------------------

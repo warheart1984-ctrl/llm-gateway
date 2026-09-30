@@ -20,9 +20,9 @@ cargo test --test pressure
   can't change silently.
 - **NOT BUILT:** no mechanism exists, so there is nothing to test yet.
 
-Scope: the SSE endpoint `POST /v1/chat/stream` on `master`. The non-streaming
-endpoint (`/v1/chat/complete`, PR #3) shares the same governance code, and
-its rows will be added once it merges.
+Scope: both entry points. Sections 1–6 exercise `POST /v1/chat/stream`.
+Section 7 checks that the second entry point, `POST /v1/chat/complete`,
+cannot be used to get around the boundary.
 
 ## 1. Identity: who is asking?
 
@@ -79,13 +79,26 @@ its rows will be added once it merges.
 | A refused request | structured record with request id, tenant, reason | `ledger_every_refusal_is_recorded_with_request_tenant_and_reason` | HOLDS as a log line only |
 | Durable record of every decision (authorised, spent, refused) | queryable after the fact | none | NOT BUILT |
 
-## 7. Known gaps
+## 7. The second door: `POST /v1/chat/complete`
+
+| Pressure | Must happen | Test | Result |
+|---|---|---|---|
+| No key, forged key, switched-off key, key without the spend scope, disabled tenant | 401/403; provider receives nothing | `second_door_identity_and_authority_hold` | HOLDS |
+| Off-allowlist, denied or unknown model; model or `stream: true` smuggled through `params` | refused; provider receives the registry model and `stream: false` | `second_door_model_access_holds` | HOLDS |
+| Worst case over budget; no output cap | 402 / 400 before execution | `second_door_worst_case_exposure_is_refused_up_front` | HOLDS |
+| 20 simultaneous requests alternating between both doors, room for 3 | exactly 3 reach the provider: one budget, not two | `second_door_both_doors_draw_on_one_budget` | HOLDS |
+| Provider accepts and never answers | released within the read timeout; costs nothing; slot freed | `second_door_a_hung_provider_cannot_pin_budget_or_slots` | HOLDS |
+| Provider dies mid-answer | 502; prompt billed, output reservation refunded | `second_door_a_provider_dying_mid_answer_bills_the_prompt_only` | HOLDS |
+| 20 clients give up while waiting | no slot leaks; each billed its reservation, because the provider finishes unseen | `second_door_a_disconnect_storm_leaks_no_slots_and_bills_each_reservation` | HOLDS |
+
+## 8. Known gaps
 
 | Pressure | What happens today | Test | Result |
 |---|---|---|---|
 | Crash or restart | the ledger dies with the process; an exhausted tenant spends again | `gap_a_restart_forgets_todays_spend` | **GAP: fails open** |
 | Two replicas | each enforces the full budget; N replicas admit N budgets | `gap_replicas_each_enforce_the_full_budget` | **GAP: fails open** |
 | Replayed request (same request id and idempotency key) | executed and billed twice | `gap_a_replayed_request_is_executed_and_billed_again` | **GAP: not detected** |
+| Replayed completion, as when a client times out and retries | executed and billed twice | `gap_a_replayed_completion_is_executed_and_billed_again` | **GAP: not detected** |
 | HOLD (neither GO nor NO-GO: wait for approval) | no such decision exists; the gate is GO / NO-GO only | none | NOT BUILT |
 
 The first two gaps are the subject of `docs/plans/durable-ledger.md`. That
@@ -98,4 +111,7 @@ key stored with the reservation.
 - **Budget check removed from the gateway:** 6 tests fail, including both
   `gap_*` budget tests, which shows they exercise the real budget.
 - **Deny-list ignored:** exactly `model_denied_under_a_wildcard…` fails.
-- **Flakiness:** 10 consecutive runs, 27/27 each time.
+- **Mid-answer failure misclassified as "never accepted":** exactly
+  `second_door_a_provider_dying_mid_answer…` fails, billing 0 where the
+  prompt is owed.
+- **Flakiness:** 10 consecutive runs, 35/35 each time.

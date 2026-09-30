@@ -14,7 +14,7 @@ use std::{convert::Infallible, net::SocketAddr, time::Duration};
 use axum::{
     Json, Router,
     body::Body,
-    http::{StatusCode, header},
+    http::header,
     response::{IntoResponse, Response},
     routing::post,
 };
@@ -55,10 +55,6 @@ async fn completions(Json(body): Json<Value>, delay: Duration) -> Response {
         .map(|m| m.iter().map(|m| m["content"].as_str().unwrap_or("").len() / 4 + 4).sum())
         .unwrap_or(8);
 
-    if body["stream"] != json!(true) {
-        return (StatusCode::BAD_REQUEST, "this mock only streams").into_response();
-    }
-
     let words: Vec<String> = ANSWER
         .split_inclusive(' ')
         .take(max_tokens)
@@ -66,6 +62,24 @@ async fn completions(Json(body): Json<Value>, delay: Duration) -> Response {
         .collect();
     let completion_tokens = words.len();
     let finish = if completion_tokens < ANSWER.split(' ').count() { "length" } else { "stop" };
+    let usage = json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens
+    });
+
+    // `stream: false`: the whole answer as one JSON document, after the time
+    // the stream would have taken, so a client can see it waits.
+    if body["stream"] != json!(true) {
+        tokio::time::sleep(delay * completion_tokens as u32).await;
+        return Json(json!({
+            "id": "mock-1", "object": "chat.completion", "model": model,
+            "choices": [{ "index": 0, "finish_reason": finish,
+                          "message": { "role": "assistant", "content": words.concat() } }],
+            "usage": usage
+        }))
+        .into_response();
+    }
 
     let mut frames: Vec<String> = words
         .into_iter()
@@ -78,14 +92,7 @@ async fn completions(Json(body): Json<Value>, delay: Duration) -> Response {
         "id": "mock-1", "model": model,
         "choices": [{ "index": 0, "delta": {}, "finish_reason": finish }]
     })));
-    frames.push(frame(json!({
-        "id": "mock-1", "model": model, "choices": [],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens
-        }
-    })));
+    frames.push(frame(json!({ "id": "mock-1", "model": model, "choices": [], "usage": usage })));
     frames.push("data: [DONE]\n\n".to_string());
 
     let stream = futures_util::stream::unfold(frames.into_iter(), move |mut frames| async move {

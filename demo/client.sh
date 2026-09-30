@@ -106,4 +106,14 @@ grep 'gw_tenant_cost_nano_usd_total' "$TMP/metrics"
 grep -q 'gw_tenant_cost_nano_usd_total{tenant="shoestring"}' "$TMP/metrics" || fail "no per-tenant cost series"
 ok "per-tenant spend is visible to the operator"
 
+step "7. The same request, answered as one JSON document"
+complete_body='{"model":"mock/chat","messages":[{"role":"user","content":"Explain the gateway in one breath."}],"params":{"max_tokens":64}}'
+code=$(status "$DEMO_KEY" /v1/chat/complete -H 'content-type: application/json' -d "$complete_body")
+cat "$TMP/body"; echo
+[ "$code" = 200 ] || fail "/v1/chat/complete returned $code"
+grep -q '"content":"The gateway' "$TMP/body" || fail "no content in the completion"
+cost=$(field cost_nano_usd "$TMP/body")
+[ "${cost:-0}" -gt 0 ] || fail "the completion reported no cost"
+ok "one answer, billed $cost nano-USD from the usage it returned"
+
 printf '\n\033[32mAll demo checks passed.\033[0m\n'
