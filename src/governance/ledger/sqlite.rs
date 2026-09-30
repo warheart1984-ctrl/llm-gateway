@@ -851,8 +851,8 @@ mod tests {
         ledger.try_reserve(reservation("t", 500, 0)).await.unwrap();
         for (id, _) in [(Uuid::new_v4(), ()), (Uuid::new_v4(), ())] {
             sqlx::query(&format!(
-                "INSERT INTO reservations (id, tenant_id, day, reserved_nano_usd, prompt_nano_usd, created_at)
-                 VALUES (?1, 't', ?2, 1000, 100, {NOW})"
+                "INSERT INTO reservations (id, tenant_id, day, reserved_nano_usd, prompt_nano_usd, created_at, lease_expires_at)
+                 VALUES (?1, 't', ?2, 1000, 100, {NOW}, {NOW} + 3600)"
             ))
             .bind(id.to_string())
             .bind(today - 1)
@@ -867,8 +867,8 @@ mod tests {
 
         let late = Uuid::new_v4();
         sqlx::query(&format!(
-            "INSERT INTO reservations (id, tenant_id, day, reserved_nano_usd, prompt_nano_usd, created_at)
-             VALUES (?1, 't', ?2, 1000, 100, {NOW})"
+            "INSERT INTO reservations (id, tenant_id, day, reserved_nano_usd, prompt_nano_usd, created_at, lease_expires_at)
+             VALUES (?1, 't', ?2, 1000, 100, {NOW}, {NOW} + 3600)"
         ))
         .bind(late.to_string())
         .bind(today - 1)
