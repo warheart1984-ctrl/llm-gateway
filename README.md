@@ -426,13 +426,31 @@ cargo bench --bench framing                        # add `-- --quick` for a fast
 CI (`.github/workflows/ci.yml`) runs that gate from a clean checkout on Linux
 and Windows: the full suite three times over, the money tests five more times,
 clippy with warnings as errors, a build on the declared `rust-version`, the
-benchmark in quick mode, and the docker compose demo end to end.
+benchmark in quick mode, and the docker compose demo end to end. A separate
+`shared-ledger` job runs the pressure suite three times against a real
+Postgres, with the database made mandatory so those tests fail rather than
+skip if it is missing.
+
+The Postgres tests skip unless `LLM_GATEWAY_TEST_DATABASE_URL` is set. To run
+them locally:
+
+```bash
+docker run -d --name llmgw-pg -e POSTGRES_PASSWORD=gatewaytest -e POSTGRES_DB=gateway -p 127.0.0.1:55432:5432 postgres:16
+```
+
+```bash
+LLM_GATEWAY_TEST_DATABASE_URL="postgres://postgres:gatewaytest@127.0.0.1:55432/gateway?sslmode=disable" cargo test --test pressure
+```
+
+The SQLite ledger and quota-split tests need no server and always run.
 
 `tests/pressure.rs` is the boundary pressure suite: one test per attack on
 the claim that an unauthorised or financially inadmissible request never
 reaches the provider, checked by counting what the provider actually
-received. It includes tests that pin today's known gaps (restart, replicas,
-replay) as failing open. The claim → test → result table is
+received. It covers restarts, replicas and replays on each ledger backend,
+and a database cut mid-run. Tests named `gap_*` pin what still fails open by
+design: restarts and replicas on the in-memory ledger, which is per-process.
+The claim → test → result table is
 [docs/boundary-pressure-tests.md](docs/boundary-pressure-tests.md).
 
 `tests/integration.rs` drives the real router over real HTTP against a mock
@@ -451,9 +469,11 @@ src/
   providers/       per-vendor adapters hiding their quirks
     openai_compat.rs   shared SSE engine; adapters are a spec
   governance/      auth (API key, JWT) → policy → limits
-  api/             HTTP surface and SSE framing
+    ledger/        spend ledger: memory, sqlite, postgres; answer sealing
+  api/             HTTP surface: SSE stream and JSON completion
   observability/   structured logging, Prometheus metrics
   bootstrap.rs     startup wiring
+migrations/        ledger schema, one folder per database
 examples/
   mock_upstream.rs a stand-in provider for the demo
 demo/              docker compose demo: config, secrets, scripted client

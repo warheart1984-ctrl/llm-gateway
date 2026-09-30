@@ -20,9 +20,12 @@ cargo test --test pressure
   can't change silently.
 - **NOT BUILT:** no mechanism exists, so there is nothing to test yet.
 
-Scope: both entry points. Sections 1–6 exercise `POST /v1/chat/stream`.
-Section 7 checks that the second entry point, `POST /v1/chat/complete`,
-cannot be used to get around the boundary.
+Scope: both entry points and every ledger backend. Sections 1–6 exercise
+`POST /v1/chat/stream`. Section 7 checks that the second entry point,
+`POST /v1/chat/complete`, cannot be used to get around the boundary.
+Section 8 covers replays, section 9 the shared Postgres ledger (restarts,
+replicas, a dead database, answers at rest), section 10 the local SQLite
+ledger and quota-split replicas, and section 11 what still fails open.
 
 ## 1. Identity: who is asking?
 
@@ -142,8 +145,8 @@ No database server, so these run on every platform, Windows included.
 
 | Pressure | What happens | Test | Result |
 |---|---|---|---|
-| Restart, on the in-memory ledger | spend is forgotten | `gap_memory_ledger_a_restart_forgets_todays_spend` | **GAP by design:** use the shared ledger |
-| Two replicas, on the in-memory ledger | each enforces the full budget | `gap_memory_ledger_replicas_each_enforce_the_full_budget` | **GAP by design:** use the shared ledger |
+| Restart, on the in-memory ledger | spend is forgotten | `gap_memory_ledger_a_restart_forgets_todays_spend` | **GAP by design:** use `sqlite` or `postgres` |
+| Two replicas, on the in-memory ledger | each enforces the full budget | `gap_memory_ledger_replicas_each_enforce_the_full_budget` | **GAP by design:** use `postgres`, or `sqlite` with quota split |
 | Rate limits and concurrency caps across replicas | enforced per process, on both backends | none | NOT BUILT |
 | HOLD (neither GO nor NO-GO: wait for approval) | no such decision exists | none | NOT BUILT |
 
