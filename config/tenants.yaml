@@ -97,3 +97,28 @@ tenants:
     model_params:
       groq/gpt-oss-20b:
         temperature: 0.2
+
+  # HOLD: requests that wait for a person. Acme's expensive model, and anything
+  # whose worst case is above 5 USD, are held instead of executed; the caller
+  # gets 202 and a hold id, and sends the same request again with `Hold-Id`
+  # once someone approves it. To turn it on, move this block under a tenant:
+  #
+  #   holds:
+  #     models: ["openrouter/gpt-4.1-mini"]
+  #     above_nano_usd: 5000000000
+  #     expiry_secs: 900          # how long a hold waits for a decision (max 3600)
+  #     approval_valid_secs: 300  # how long an approval stays usable (max 3600)
+  #     max_pending: 20           # held requests waiting at once
+  #
+  # Approvers hold the `approve:holds` scope, granted by name: `admin` does not
+  # imply it, and no key can decide its own request. A tenant of approvers:
+  #
+  # - tenant_id: approvers
+  #   enabled: true
+  #   credentials:
+  #     - key_id: ak_finance_lead
+  #       key_env: GATEWAY_KEY_FINANCE_LEAD
+  #       scopes: [approve:holds]
+  #   # Required by the allowlist rule; without `chat:stream` these keys
+  #   # cannot call it anyway.
+  #   allowed_models: ["groq/gpt-oss-20b"]

@@ -22,6 +22,8 @@
 //! * **Operator actions** ([`Ledger::record_decision_durably`]) are written
 //!   before the action takes effect. If that write fails, the action does not
 //!   happen: here the record is part of the authorization.
+//! * **Hold transitions** (see [`super::holds`]) are written in the same
+//!   transaction as the transition, for the same reason.
 //!
 //! [`Ledger::record_decision`]: super::Ledger::record_decision
 //! [`Ledger::record_decision_durably`]: super::Ledger::record_decision_durably
@@ -54,6 +56,8 @@ pub enum DecisionKind {
     Failed,
     /// An operator changed something.
     AdminAction,
+    /// A hold was requested, approved, denied, expired or used.
+    Hold,
 }
 
 impl DecisionKind {
@@ -62,6 +66,7 @@ impl DecisionKind {
             DecisionKind::Refused => "refused",
             DecisionKind::Failed => "failed",
             DecisionKind::AdminAction => "admin_action",
+            DecisionKind::Hold => "hold",
         }
     }
 
@@ -70,6 +75,7 @@ impl DecisionKind {
             "refused" => Some(DecisionKind::Refused),
             "failed" => Some(DecisionKind::Failed),
             "admin_action" => Some(DecisionKind::AdminAction),
+            "hold" => Some(DecisionKind::Hold),
             _ => None,
         }
     }

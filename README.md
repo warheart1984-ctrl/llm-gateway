@@ -94,13 +94,19 @@ data: [DONE]
 | `POST` | `/v1/chat/complete` | The same request, answered as one JSON document |
 | `GET` | `/v1/models` | Catalogue, filtered to the caller's allowlist |
 | `GET` | `/v1/usage` | Caller's own quota and spend |
+| `GET` | `/v1/holds/{id}` | A held request's state, for the tenant that made it |
 | `POST` | `/v1/admin/registry/reload` | Re-read `models.yaml` / `tenants.yaml` (admin scope) |
+| `GET` | `/v1/admin/decisions` | The decision record (admin scope) |
+| `GET` | `/v1/admin/holds` | Held requests; `?state=pending` is the approval queue (`approve:holds` or admin) |
+| `POST` | `/v1/admin/holds/{id}/approve` | Approve a held request (`approve:holds`) |
+| `POST` | `/v1/admin/holds/{id}/deny` | Deny it, or revoke an approval not yet used (`approve:holds`) |
 | `GET` | `/health/live` | Liveness |
 | `GET` | `/health/ready` | Readiness; 503 if routing cannot work |
 | `GET` | `/metrics` | Prometheus text exposition (admin scope) |
 
-With `server.ops_port` set, `/metrics` (unauthenticated) and the admin reload
-move to that listener and no longer exist on the public port. See
+With `server.ops_port` set, `/metrics` (unauthenticated) and every
+`/v1/admin/*` route move to that listener and no longer exist on the public
+port. See
 [Security posture](#security-posture).
 
 ## Non-streaming: `/v1/chat/complete`
@@ -212,6 +218,13 @@ Rejections are real HTTP statuses, not errors hidden inside a 200:
 | RPM or TPM exceeded | 429 + `retry-after` | `rate_limited` |
 | Concurrency cap reached | 429 | `concurrency_limited` |
 | Daily budget exhausted | 402 | `budget_exhausted` |
+| Held for approval (not a refusal) | 202 | `status: "held"` |
+| Presented hold still pending | 409 + `retry-after` | `hold_pending` |
+| Presented hold denied | 403 | `hold_denied` |
+| Presented hold expired | 410 | `hold_expired` |
+| Presented hold already used | 409 | `hold_consumed` |
+| Not the request that was approved | 422 | `hold_mismatch` |
+| Too many holds waiting | 429 | `holds_pending_limit` |
 | No `max_tokens` anywhere | 400 | `max_tokens_required` |
 | Body over the limit | 413 | `payload_too_large` |
 | Upstream 4xx/5xx before streaming | 502 | `upstream_*` |
@@ -422,6 +435,68 @@ newest first.
 - Kept `decision_retention_days` (default 30), then deleted by the sweeper.
   Durable on `sqlite` and `postgres`; the last 10,000 in memory on `memory`.
 
+## HOLD: requests that wait for approval
+
+Between GO and NO-GO there is a third decision. A tenant's policy can say
+that some requests wait for a person: requests for certain models, or whose
+worst-case cost is above a threshold.
+
+```yaml
+# tenants.yaml, under a tenant
+holds:
+  models: ["openrouter/gpt-4.1-mini"]   # registry model ids, globs
+  above_nano_usd: 5000000000            # worst case above 5 USD
+  expiry_secs: 900                      # how long a hold waits (max 3600)
+  approval_valid_secs: 300              # how long an approval stays usable (max 3600)
+  max_pending: 20                       # held requests waiting at once
+```
+
+1. **Held.** A matching request is not executed and not charged. The caller
+   gets `202` with `{"status": "held", "hold": {...}}`, a `Hold-Id` header
+   and `Location: /v1/holds/{id}`. The hold records who asked, the model, the
+   output cap, the worst-case cost and which rule matched. It never records
+   the prompt: the client keeps its request.
+2. **Decided.** A key with the `approve:holds` scope approves or denies it
+   (`POST /v1/admin/holds/{id}/approve` or `/deny`, optionally with
+   `{"note": "..."}`). The scope must be granted by name. `admin` does not
+   imply it, a legacy wildcard grant does not, and **no key can decide its
+   own request**. `GET /v1/admin/holds?state=pending` is the queue.
+3. **Executed once.** The client polls `GET /v1/holds/{id}` and, once it is
+   `approved`, sends **the same request** again with `Hold-Id: <id>`.
+
+What the approval covers, and what it does not:
+
+- **Exactly the request approved.** The hold stores the request's keyed
+  fingerprint, and the approval is bound to it, to the model, and to the
+  approved worst-case cost. Another prompt, a bigger `max_tokens`, the other
+  endpoint, or a price rise since approval is `422 hold_mismatch`.
+- **Once.** The approval is consumed in the admission transaction, with the
+  budget: twenty copies sent at once across two replicas execute one (tested).
+  A refused admission (budget, rate, concurrency) does not use it up. If the
+  provider refuses before accepting anything, the approval is given back,
+  like an idempotency key. Once anything was executed, it stays used.
+- **Nothing else is waived.** At execution the key, the tenant, the model
+  policy, the budget and the limits are all checked again. An approved
+  request from a tenant switched off since is refused.
+- **No money is held while waiting.** Charging a pending hold would let a
+  flood of requests nobody approved exhaust a tenant's budget. The cost: an
+  approved request can still be refused for budget (`402`).
+- **Every transition is recorded.** Requested, approved, denied, expired and
+  used each go on the decision record (kind `hold`) in the same transaction
+  as the transition. If the record cannot be written, the transition does
+  not happen: an approval with the ledger down is a `503`, and the hold stays
+  pending.
+- **Time limits.** A pending hold expires after `expiry_secs`; an approval
+  after `approval_valid_secs`. Both read as `expired` the moment they lapse,
+  and the sweeper records the expiry.
+- **Where holds live.** In the ledger: durable on `sqlite` and `postgres`,
+  shared across replicas on `postgres`. Under quota split each replica has
+  its own holds, so a tenant's requests, polls, approvals and resubmissions
+  must reach one replica; the gateway warns at boot. A hold presented to the
+  wrong replica is not found and nothing runs.
+
+Approvers are notified by polling the queue. Signed webhooks are not built.
+
 ## Configuration
 
 `config/default.toml`, overridable by `LLM_GATEWAY__SECTION__FIELD` env vars.
@@ -458,8 +533,8 @@ against ~13 estimated. It is added to the reservation only, so the budget
 check covers it; the bill is still the vendor's reported usage. The live
 suite fails when a vendor's overhead outgrows the catalogue's number.
 
-`config/tenants.yaml` holds credentials, scopes, allow/deny lists, limits, and
-per-model policy. Keys are referenced by env var (`key_env`) or by file
+`config/tenants.yaml` holds credentials, scopes, allow/deny lists, limits,
+per-model policy, and approval holds. Keys are referenced by env var (`key_env`) or by file
 (`key_file`, e.g. a mounted secret), hashed at load, and only the digest is
 retained — a memory dump yields digests, not credentials.
 
@@ -500,7 +575,7 @@ What the gateway does itself, and what it expects of the deployment around it.
 | **TLS** | Speaks plain HTTP only. | Terminate TLS in front (ingress, nginx, Envoy, a cloud LB). Upstream calls to vendors are HTTPS via rustls. |
 | **Client IP / trusted proxies** | Never reads `X-Forwarded-For` or the peer address. Every limit is keyed by the authenticated tenant, so there is no IP-based decision a spoofed header could influence, and no trusted-proxy list to configure. | IP allow-listing or per-IP flood control, if wanted, belongs in the proxy. |
 | **Request size** | Bodies over `request_body_limit_bytes` get a 413 on the declared `content-length` alone, before any byte is read. Headers use hyper's defaults: more than 100 headers is a 431 (tested); the header block is capped at hyper's ~400 KB read buffer. | Set tighter header limits at the proxy (e.g. nginx `large_client_header_buffers`) if you need them. |
-| **Operator endpoints** | `/metrics` names every tenant's spend, so on the public port it requires the `admin` scope. Set `server.ops_port` to move `/metrics` and `/v1/admin/*` to a separate listener (loopback by default); they then return 404 on the public port. The reload still requires `admin` there. | Bind the ops listener to a private interface or network and scrape it from inside. |
+| **Operator endpoints** | `/metrics` names every tenant's spend, so on the public port it requires the `admin` scope. Set `server.ops_port` to move `/metrics` and `/v1/admin/*` to a separate listener (loopback by default); they then return 404 on the public port. The reload and the decision record still require `admin` there, and hold decisions `approve:holds`. | Bind the ops listener to a private interface or network and scrape it from inside. |
 | **Log redaction** | Logs carry one structured summary per stream: ids and counts, never credentials or message content. An integration test captures every log line from the whole suite at `llm_gateway=trace`, including refused and malformed requests and bearer auth, and fails if a key or a prompt marker appears. | Keep the gateway's filter at `debug` or above for other crates; hyper/reqwest `trace` output is not covered by that test. |
 | **Secret rotation** | `key_file` credentials are re-read on every tenant reload, so replacing the file and reloading rotates a key with no restart; the old key stops working the moment the reload lands (tested). `key_env` values, provider API keys and the JWT secret are read once at boot, and rotating them means a restart. There is no dual-secret window for JWTs. | Rotate tenant keys without a gap by adding the new credential alongside the old, moving clients, then removing the old one. |
 | **Metric cardinality** | Every label value comes from configuration — provider, registry model id, tenant id from `tenants.yaml` — never from request input. A series is created only after authentication and routing succeed. Labels with delimiter characters or over 128 bytes become `invalid`. Tested with unknown models, unknown keys and junk metadata. | Cardinality is bounded by the size of the model and tenant files; size scrape limits accordingly. |
@@ -509,7 +584,7 @@ What the gateway does itself, and what it expects of the deployment around it.
 ## Testing
 
 ```bash
-cargo test --locked --all-targets                  # 276 tests
+cargo test --locked --all-targets                  # 300 tests
 cargo clippy --locked --all-targets -- -D warnings
 cargo bench --bench framing                        # add `-- --quick` for a fast pass
 ```
@@ -579,7 +654,7 @@ with the same idempotency key across the crash.
 the claim that an unauthorised or financially inadmissible request never
 reaches the provider, checked by counting what the provider actually
 received. It covers restarts, replicas and replays on each ledger backend,
-and a database cut mid-run. Tests named `gap_*` pin what still fails open by
+a database cut mid-run, and approval holds. Tests named `gap_*` pin what still fails open by
 design: restarts and replicas on the in-memory ledger, which is per-process.
 The claim → test → result table is
 [docs/boundary-pressure-tests.md](docs/boundary-pressure-tests.md).
