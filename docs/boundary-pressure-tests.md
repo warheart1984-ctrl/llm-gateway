@@ -25,8 +25,8 @@ Scope: both entry points and every ledger backend. Sections 1–6 exercise
 `POST /v1/chat/complete`, cannot be used to get around the boundary.
 Section 8 covers replays, section 9 the shared Postgres ledger (restarts,
 replicas, a dead database, answers at rest), section 10 the local SQLite
-ledger and quota-split replicas, section 11 real process kills, and section
-12 what still fails open.
+ledger and quota-split replicas, section 11 real process kills, section 12
+approval holds, and section 13 what still fails open.
 
 ## 1. Identity: who is asking?
 
@@ -169,13 +169,44 @@ code path as the kills below.
 | Killed, then the client retries with the same idempotency key | 409 in progress, then duplicate; executed exactly once across the crash | `a_retry_across_a_kill_is_never_executed_twice` | HOLDS |
 | Any deployment asks what its ledger guarantees | readiness names backend, durability and replica mode | `readiness_names_the_ledger_consistency_scope` | HOLDS |
 
-## 12. Known gaps
+## 12. HOLD: requests that wait for a person
+
+A tenant's policy can hold a request instead of executing it: by model, or
+by worst-case cost. Each test checks the claim at the provider: a held
+request must never reach it until someone with `approve:holds` approves it,
+and then only once, only as approved, and only if everything else still
+admits it. Memory ledger unless the test name says otherwise.
+
+| Pressure | Must happen | Test | Result |
+|---|---|---|---|
+| A request for a held model | 202 with a hold id; provider receives nothing; nothing charged; the hold carries no prompt | `hold_a_held_request_never_reaches_the_provider` | HOLDS |
+| A request over the cost threshold, and one under it, on the same model | the expensive one is held, the cheap one runs | `hold_the_cost_rule_holds_only_what_is_above_the_threshold` | HOLDS |
+| The approved request sent 10 times at once | exactly one reaches the provider; the other nine 409 `hold_consumed` | `hold_an_approved_request_executes_exactly_once` | HOLDS |
+| The same, 20 times across two replicas on Postgres | exactly one reaches the provider | `shared_ledger_a_hold_is_one_hold_across_replicas` | HOLDS |
+| The request sent with its hold before anyone decided | 409 `hold_pending`, `retry-after: 5`; provider receives nothing | `hold_a_pending_hold_cannot_be_used` | HOLDS |
+| A denied hold, and an approval revoked before use | 403 `hold_denied`; a denial cannot then be approved | `hold_a_denied_or_revoked_hold_never_executes` | HOLDS |
+| An approver deciding their own request | 403 `self_approval`; the hold stays pending | `hold_nobody_decides_their_own_request` | HOLDS |
+| An `admin` key, a tenant key, a bad key trying to approve | 403, 403, 401: approving needs `approve:holds`, granted by name | `hold_deciding_needs_the_dedicated_scope` | HOLDS |
+| A wildcard (legacy) grant trying to approve | refused: a wildcard is never an approval grant | `a_wildcard_grant_does_not_approve_holds` (unit) | HOLDS |
+| An approval presented with another prompt, a bigger `max_tokens`, or at the other endpoint | 422 `hold_mismatch`; provider receives nothing; the approval still works for the real request | `hold_an_approval_covers_only_the_request_approved` | HOLDS |
+| Another tenant reading or presenting the hold | 404, as if it did not exist | `hold_a_hold_is_its_tenants_alone` | HOLDS |
+| A hold nobody decided, and an approval nobody used, past their time | both `expired`; 410 `hold_expired`; too late to approve | `hold_undecided_holds_and_unused_approvals_expire` | HOLDS |
+| Expiry on Postgres | the sweeper marks each once, and records why | `shared_ledger_lapsed_holds_are_expired_and_recorded` | HOLDS |
+| An approved request the budget cannot cover, and one from a tenant switched off after approval | 402, then 401/403; provider receives nothing; the budget refusal does not use the approval | `hold_execution_rechecks_the_tenant_and_the_budget` | HOLDS |
+| The provider refuses the approved request before accepting it | the approval is given back and can be used again | `hold_a_provider_refusal_gives_the_approval_back` | HOLDS |
+| More holds than the tenant allows waiting | 429 `holds_pending_limit`; a decision makes room | `hold_too_many_waiting_are_refused` | HOLDS |
+| The pending limit, with two processes on one SQLite file | exactly the limit, never more | `the_pending_limit_holds_across_processes_sharing_the_file` (unit) | HOLDS |
+| The trail | `hold_requested`, `hold_approved`, `hold_consumed` on the decision record, with who did each; no prompt | `hold_every_transition_is_on_the_decision_record` | HOLDS |
+| `/v1/chat/complete` | held and executed exactly like the stream endpoint | `hold_the_second_door_holds_too` | HOLDS |
+| A restart on the SQLite ledger | the approval survives, and is still used only once | `local_ledger_a_hold_survives_a_restart` | HOLDS |
+| The database cut before an approval | 503; the hold stays pending; a request the policy would hold is refused, not let through | `shared_ledger_a_hold_decision_that_cannot_be_recorded_does_not_happen` | HOLDS |
+
+## 13. Known gaps
 
 | Pressure | What happens | Test | Result |
 |---|---|---|---|
 | Restart, on the in-memory ledger | spend is forgotten | `gap_memory_ledger_a_restart_forgets_todays_spend` | **GAP by design:** memory is opt-in; the default is `sqlite` |
 | Two replicas, on the in-memory ledger | each enforces the full budget | `gap_memory_ledger_replicas_each_enforce_the_full_budget` | **GAP by design:** use `postgres`, or `sqlite` with quota split |
-| HOLD (neither GO nor NO-GO: wait for approval) | no such decision exists | none | NOT BUILT |
 
 The in-memory ledger is for tests and development, chosen explicitly, and
 exact within one process. The reservation table records every admitted
@@ -204,6 +235,12 @@ request, and the decision table every refusal, failure and operator action.
   4-second stream test fail; the live reservation is swept.
 - **Shared concurrency count or rate condition removed from the Postgres
   SQL:** the cross-replica cap and window tests each fail.
+- **HOLD:** never holding a request fails every hold pressure test. Not marking an
+  approval used lets the ten concurrent copies run more than once. Dropping
+  the Postgres row lock on the hold lets 16 of 20 copies across two replicas
+  run. Ignoring the fingerprint fails exactly the mismatch test; dropping
+  the self-approval rule fails exactly that test; not giving an approval
+  back after a provider refusal fails exactly that test.
 - **Closing's lock order reversed** (rate counters before the day row, as
   first written in this change): the racing-settlements test fails 5 runs
   in 5 with deadlock-aborted 503s; restored, it passes 5 in 5.

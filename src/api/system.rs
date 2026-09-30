@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{header::CONTENT_TYPE, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -35,6 +35,12 @@ pub enum ApiError {
     ReloadFailed(String),
     /// The spend ledger could not be read.
     LedgerUnavailable,
+    /// Any other refusal, with its own status and stable code.
+    Refused {
+        status: StatusCode,
+        code: &'static str,
+        message: String,
+    },
 }
 
 impl IntoResponse for ApiError {
@@ -69,6 +75,17 @@ impl IntoResponse for ApiError {
                 "ledger_unavailable",
                 "api_error",
                 "the spend ledger is unavailable; retry shortly".to_string(),
+            ),
+            ApiError::Refused { status, code, message } => (
+                *status,
+                *code,
+                match *status {
+                    StatusCode::FORBIDDEN => "permission_error",
+                    StatusCode::NOT_FOUND => "not_found_error",
+                    StatusCode::CONFLICT => "conflict_error",
+                    _ => "invalid_request_error",
+                },
+                message.clone(),
             ),
         };
         (
@@ -401,6 +418,185 @@ pub async fn list_decisions(
         "ledger": ledger.backend(),
     }))
     .into_response())
+}
+
+fn hold_not_found() -> ApiError {
+    ApiError::Refused {
+        status: StatusCode::NOT_FOUND,
+        code: "hold_not_found",
+        message: "no such hold".to_string(),
+    }
+}
+
+/// `GET /v1/holds/{id}`: a held request's state, for the tenant that made
+/// it. Poll this until the hold is approved, then send the request again with
+/// `Hold-Id`. Another tenant's hold is not found, not forbidden: its
+/// existence is not this caller's business.
+pub async fn get_hold(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let principal = caller(&state, &headers).await?;
+    let id = uuid::Uuid::parse_str(&id).map_err(|_| hold_not_found())?;
+    let hold = state
+        .limits
+        .ledger()
+        .hold(id)
+        .await
+        .map_err(|_| ApiError::LedgerUnavailable)?
+        .filter(|h| h.tenant_id == *principal.tenant_id)
+        .ok_or_else(hold_not_found)?;
+    Ok(Json(json!({ "hold": hold })).into_response())
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct HoldParams {
+    tenant: Option<String>,
+    /// `pending`, `approved`, `denied`, `expired` or `consumed`.
+    state: Option<String>,
+    /// Default 100, at most 1000.
+    limit: Option<u32>,
+}
+
+/// `GET /v1/admin/holds`: holds across tenants, newest first, for whoever
+/// decides them. `?state=pending` is the approval queue. Needs
+/// `approve:holds`, or `admin` to look without deciding.
+pub async fn list_holds(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(params): Query<HoldParams>,
+) -> Result<Response, ApiError> {
+    use crate::governance::{
+        auth::{SCOPE_ADMIN, SCOPE_APPROVE_HOLDS},
+        ledger::holds::{HoldQuery, HoldState},
+    };
+    let principal = caller(&state, &headers).await?;
+    if !principal.has_explicit_scope(SCOPE_APPROVE_HOLDS) && !principal.has_scope(SCOPE_ADMIN) {
+        return Err(ApiError::Forbidden("listing holds requires the `approve:holds` or `admin` scope"));
+    }
+    let wanted = match params.state.as_deref() {
+        None => None,
+        Some(name) => Some(HoldState::parse(name).ok_or_else(|| ApiError::Refused {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_parameter",
+            message: "`state` must be pending, approved, denied, expired or consumed".to_string(),
+        })?),
+    };
+    let holds = state
+        .limits
+        .ledger()
+        .holds(HoldQuery {
+            tenant_id: params.tenant,
+            state: wanted,
+            limit: params.limit.unwrap_or(100).clamp(1, 1_000),
+        })
+        .await
+        .map_err(|_| ApiError::LedgerUnavailable)?;
+    Ok(Json(json!({ "holds": holds })).into_response())
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecideBody {
+    /// Kept on the hold and the decision record.
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// Longest approver note kept.
+const NOTE_MAX: usize = 300;
+
+/// `POST /v1/admin/holds/{id}/approve`, optionally with `{"note": "..."}`.
+pub async fn approve_hold(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    body: bytes::Bytes,
+) -> Result<Response, ApiError> {
+    decide_hold(state, headers, id, body, crate::governance::ledger::holds::Verdict::Approve).await
+}
+
+/// `POST /v1/admin/holds/{id}/deny`. Also revokes an approval not yet used.
+pub async fn deny_hold(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    body: bytes::Bytes,
+) -> Result<Response, ApiError> {
+    decide_hold(state, headers, id, body, crate::governance::ledger::holds::Verdict::Deny).await
+}
+
+/// Approve or deny. Needs `approve:holds`, granted by name: `admin` does not
+/// imply it, and neither does a wildcard grant. The decision is recorded in
+/// the same step as the transition; if it cannot be recorded, nothing
+/// changes and the approver gets `503`.
+async fn decide_hold(
+    state: Arc<AppState>,
+    headers: axum::http::HeaderMap,
+    id: String,
+    body: bytes::Bytes,
+    verdict: crate::governance::ledger::holds::Verdict,
+) -> Result<Response, ApiError> {
+    use crate::governance::{
+        auth::SCOPE_APPROVE_HOLDS,
+        ledger::{
+            LedgerRefusal,
+            holds::{HoldDecision, HoldProblem},
+        },
+    };
+    let principal = caller(&state, &headers).await?;
+    if !principal.has_explicit_scope(SCOPE_APPROVE_HOLDS) {
+        return Err(ApiError::Forbidden(
+            "deciding a hold requires the `approve:holds` scope, granted by name; `admin` does not imply it",
+        ));
+    }
+    let id = uuid::Uuid::parse_str(&id).map_err(|_| hold_not_found())?;
+    let note = if body.iter().all(u8::is_ascii_whitespace) {
+        String::new()
+    } else {
+        let parsed: DecideBody = serde_json::from_slice(&body).map_err(|_| ApiError::Refused {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_json",
+            message: "the body must be empty or `{\"note\": \"...\"}`".to_string(),
+        })?;
+        parsed.note.unwrap_or_default().trim().chars().take(NOTE_MAX).collect()
+    };
+    let decision = HoldDecision {
+        id,
+        approver_tenant: principal.tenant_id.to_string(),
+        approver_key: principal.key_id.to_string(),
+        verdict,
+        note,
+    };
+    let hold = match state.limits.ledger().decide_hold(decision).await {
+        Ok(hold) => hold,
+        Err(LedgerRefusal::Hold(HoldProblem::NotFound)) => return Err(hold_not_found()),
+        Err(LedgerRefusal::HoldNotDecidable { state }) => {
+            return Err(ApiError::Refused {
+                status: StatusCode::CONFLICT,
+                code: "hold_not_decidable",
+                message: format!("this hold is {} and can no longer be decided", state.as_str()),
+            });
+        }
+        Err(LedgerRefusal::SelfApproval) => {
+            return Err(ApiError::Refused {
+                status: StatusCode::FORBIDDEN,
+                code: "self_approval",
+                message: "the key that made a request cannot approve or deny it".to_string(),
+            });
+        }
+        Err(_) => return Err(ApiError::LedgerUnavailable),
+    };
+    tracing::info!(
+        hold = %hold.id,
+        tenant = %hold.tenant_id,
+        actor = %principal.key_id,
+        actor_tenant = %principal.tenant_id,
+        state = hold.state.as_str(),
+        "hold decided"
+    );
+    Ok(Json(json!({ "hold": hold })).into_response())
 }
 
 pub async fn not_found() -> Response {

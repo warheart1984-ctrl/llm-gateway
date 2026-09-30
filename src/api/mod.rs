@@ -24,6 +24,10 @@ pub const ROUTE_MODELS: &str = "/v1/models";
 pub const ROUTE_USAGE: &str = "/v1/usage";
 pub const ROUTE_RELOAD: &str = "/v1/admin/registry/reload";
 pub const ROUTE_DECISIONS: &str = "/v1/admin/decisions";
+pub const ROUTE_HOLD: &str = "/v1/holds/{id}";
+pub const ROUTE_HOLDS: &str = "/v1/admin/holds";
+pub const ROUTE_HOLD_APPROVE: &str = "/v1/admin/holds/{id}/approve";
+pub const ROUTE_HOLD_DENY: &str = "/v1/admin/holds/{id}/deny";
 pub const ROUTE_LIVE: &str = "/health/live";
 pub const ROUTE_READY: &str = "/health/ready";
 pub const ROUTE_METRICS: &str = "/metrics";
@@ -42,11 +46,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(ROUTE_CHAT_STREAM, post(chat::chat_stream))
         .route(ROUTE_CHAT_COMPLETE, post(chat::chat_complete))
         .route(ROUTE_MODELS, get(system::list_models))
-        .route(ROUTE_USAGE, get(system::get_usage));
+        .route(ROUTE_USAGE, get(system::get_usage))
+        .route(ROUTE_HOLD, get(system::get_hold));
     if !separate_ops {
-        api = api
-            .route(ROUTE_RELOAD, post(system::reload_registry))
-            .route(ROUTE_DECISIONS, get(system::list_decisions));
+        api = operator_routes(api);
     }
     // Body cap enforced by the extractor, so an oversized request is rejected
     // before a handler allocates a buffer for it.
@@ -65,13 +68,22 @@ pub fn router(state: Arc<AppState>) -> Router {
 /// still requires the `admin` scope). Network placement is the access control
 /// for the scrape, so bind it where tenants cannot reach.
 pub fn ops_router(state: Arc<AppState>) -> Router {
-    let mut ops = health_routes()
-        .route(ROUTE_RELOAD, post(system::reload_registry))
-        .route(ROUTE_DECISIONS, get(system::list_decisions));
+    let mut ops = operator_routes(health_routes());
     if state.settings.server.metrics_enabled {
         ops = ops.route(ROUTE_METRICS, get(system::metrics));
     }
     finish(ops, state)
+}
+
+/// Operator actions, each checking its own scope: reload, the decision
+/// record, and the hold approval queue.
+fn operator_routes(routes: Router<Arc<AppState>>) -> Router<Arc<AppState>> {
+    routes
+        .route(ROUTE_RELOAD, post(system::reload_registry))
+        .route(ROUTE_DECISIONS, get(system::list_decisions))
+        .route(ROUTE_HOLDS, get(system::list_holds))
+        .route(ROUTE_HOLD_APPROVE, post(system::approve_hold))
+        .route(ROUTE_HOLD_DENY, post(system::deny_hold))
 }
 
 fn health_routes() -> Router<Arc<AppState>> {

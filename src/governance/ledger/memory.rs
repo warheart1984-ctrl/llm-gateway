@@ -2,6 +2,7 @@
 //! process, and each replica has its own. Right for a single instance.
 
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
@@ -11,7 +12,8 @@ use uuid::Uuid;
 
 use super::{
     Closing, Ledger, LedgerRefusal, NewReservation, Outcome,
-    decisions::{Decision, DecisionQuery, DecisionRecord, DecisionRing},
+    decisions::{Decision, DecisionKind, DecisionQuery, DecisionRecord, DecisionRing, unix_now},
+    holds::{self, HoldDecision, HoldProblem, HoldQuery, HoldRecord, HoldState, NewHold, Transition},
 };
 use crate::governance::budget_bucket;
 
@@ -127,6 +129,23 @@ struct KeyRecord {
     closed_at: Option<SystemTime>,
 }
 
+/// A hold as the memory ledger keeps it: the record, with its stored (not
+/// effective) state, plus what is never shown.
+#[derive(Debug)]
+struct HeldRequest {
+    record: HoldRecord,
+    fingerprint: Vec<u8>,
+    approval_valid_secs: i64,
+}
+
+impl HeldRequest {
+    fn effective(&self, now: i64) -> HoldRecord {
+        let mut record = self.record.clone();
+        record.state = record.state.effective(now >= record.expires_at);
+        record
+    }
+}
+
 #[derive(Debug)]
 pub struct MemoryLedger {
     spend: DashMap<String, Arc<SpendLedger>>,
@@ -140,6 +159,11 @@ pub struct MemoryLedger {
     by_id: DashMap<Uuid, (String, String)>,
     retention: Duration,
     decisions: DecisionRing,
+    /// Lock order: `holds` may be held while reserving (which touches `keys`
+    /// and `by_id`), never the other way round.
+    holds: Mutex<HashMap<Uuid, HeldRequest>>,
+    /// Reservation id -> the hold it consumed, to restore a released one.
+    consumed: DashMap<Uuid, Uuid>,
 }
 
 impl Default for MemoryLedger {
@@ -156,6 +180,36 @@ impl MemoryLedger {
             by_id: DashMap::new(),
             retention: idempotency_retention,
             decisions: DecisionRing::default(),
+            holds: Mutex::new(HashMap::new()),
+            consumed: DashMap::new(),
+        }
+    }
+
+    fn held(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, HeldRequest>> {
+        self.holds.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// What the ledger would answer for this request's idempotency key
+    /// without reserving anything: the refusal a repeat gets, if any. Lets a
+    /// repeat of an executed request be answered as a repeat before its
+    /// (consumed) hold is looked at, as the SQL ledgers do.
+    fn repeat_answer(&self, r: &NewReservation<'_>) -> Option<LedgerRefusal> {
+        let claim = r.idempotency.as_ref()?;
+        let record = self.keys.get(&(r.tenant_id.to_string(), claim.key.to_string()))?;
+        if self.expired(&record, r.now) {
+            return None;
+        }
+        if !claim.matches(&record.fingerprint) {
+            return Some(LedgerRefusal::IdempotencyKeyReused);
+        }
+        match record.state {
+            KeyState::Open => Some(LedgerRefusal::InProgress { original: Some(record.id) }),
+            KeyState::Billed => Some(LedgerRefusal::Duplicate {
+                original: record.id,
+                billed_nano_usd: record.billed,
+                response: record.response.clone(),
+            }),
+            KeyState::Released => None,
         }
     }
 
@@ -175,11 +229,11 @@ impl MemoryLedger {
     }
 }
 
-#[async_trait::async_trait]
-impl Ledger for MemoryLedger {
-    async fn try_reserve(&self, r: NewReservation<'_>) -> Result<u64, LedgerRefusal> {
+impl MemoryLedger {
+    /// Budget and idempotency key, as one step.
+    fn reserve(&self, r: &NewReservation<'_>) -> Result<u64, LedgerRefusal> {
         let spend = self.spend_for(r.tenant_id);
-        let Some(claim) = r.idempotency else {
+        let Some(claim) = &r.idempotency else {
             return spend.try_reserve(r.now, r.amount_nano_usd, r.budget_nano_usd);
         };
 
@@ -234,8 +288,59 @@ impl Ledger for MemoryLedger {
             }
         }
     }
+}
+
+#[async_trait::async_trait]
+impl Ledger for MemoryLedger {
+    async fn try_reserve(&self, r: NewReservation<'_>) -> Result<u64, LedgerRefusal> {
+        let Some(claim) = &r.hold else {
+            return self.reserve(&r);
+        };
+        if let Some(refusal) = self.repeat_answer(&r) {
+            return Err(refusal);
+        }
+        // The holds lock is kept for the whole admission, so two requests
+        // presenting one approval are decided one after the other.
+        let now = unix_now();
+        let mut held = self.held();
+        let hold = held
+            .get_mut(&claim.id)
+            .filter(|h| h.record.tenant_id == r.tenant_id)
+            .ok_or(LedgerRefusal::Hold(HoldProblem::NotFound))?;
+        let current = hold.effective(now);
+        claim
+            .check(current.state, &hold.fingerprint, &current.model, current.exposure_nano_usd)
+            .map_err(LedgerRefusal::Hold)?;
+        let bucket = self.reserve(&r)?;
+        hold.record.state = HoldState::Consumed;
+        hold.record.reservation_id = Some(r.id);
+        self.consumed.insert(r.id, claim.id);
+        self.decisions.push(
+            Decision {
+                request_id: claim.id,
+                tenant_id: r.tenant_id.to_string(),
+                key_id: claim.key_id.clone(),
+                kind: DecisionKind::Hold,
+                endpoint: hold.record.endpoint.clone(),
+                model: Some(hold.record.model.clone()),
+                code: holds::CODE_CONSUMED.to_string(),
+                reason: String::new(),
+            }
+            .with_reason(&format!("executed as request {}", r.id)),
+        );
+        Ok(bucket)
+    }
 
     fn close(&self, c: Closing) {
+        // Nothing was executed: the approval can be used again.
+        if c.outcome == Outcome::Released
+            && let Some((_, hold_id)) = self.consumed.remove(&c.id)
+            && let Some(hold) = self.held().get_mut(&hold_id)
+            && hold.record.state == HoldState::Consumed
+        {
+            hold.record.state = HoldState::Approved;
+            hold.record.reservation_id = None;
+        }
         if c.delta_nano_usd != 0 {
             self.spend_for(&c.tenant_id).correct(c.at, c.bucket, c.delta_nano_usd);
         }
@@ -290,5 +395,105 @@ impl Ledger for MemoryLedger {
 
     fn decisions_dropped(&self) -> u64 {
         self.decisions.dropped()
+    }
+
+    async fn create_hold(&self, h: NewHold) -> Result<HoldRecord, LedgerRefusal> {
+        let now = unix_now();
+        let mut held = self.held();
+        let pending = held
+            .values()
+            .filter(|x| x.record.tenant_id == h.tenant_id && x.effective(now).state == HoldState::Pending)
+            .count();
+        if pending >= h.max_pending as usize {
+            return Err(LedgerRefusal::TooManyHolds { limit: h.max_pending });
+        }
+        let record = HoldRecord {
+            id: h.id,
+            tenant_id: h.tenant_id,
+            requested_by: h.requested_by,
+            endpoint: h.endpoint,
+            model: h.model,
+            max_output_tokens: h.max_output_tokens,
+            exposure_nano_usd: h.exposure_nano_usd,
+            reason: h.reason,
+            state: HoldState::Pending,
+            created_at: now,
+            expires_at: now + h.expires_in.as_secs() as i64,
+            decided_by: None,
+            decided_at: None,
+            note: None,
+            reservation_id: None,
+        };
+        self.decisions.push(
+            Decision {
+                request_id: record.id,
+                tenant_id: record.tenant_id.clone(),
+                key_id: record.requested_by.clone(),
+                kind: DecisionKind::Hold,
+                endpoint: record.endpoint.clone(),
+                model: Some(record.model.clone()),
+                code: holds::CODE_REQUESTED.to_string(),
+                reason: String::new(),
+            }
+            .with_reason(&record.reason),
+        );
+        held.insert(
+            record.id,
+            HeldRequest {
+                record: record.clone(),
+                fingerprint: h.fingerprint,
+                approval_valid_secs: h.approval_valid_for.as_secs().max(1) as i64,
+            },
+        );
+        Ok(record)
+    }
+
+    async fn hold(&self, id: Uuid) -> Result<Option<HoldRecord>, LedgerRefusal> {
+        Ok(self.held().get(&id).map(|h| h.effective(unix_now())))
+    }
+
+    async fn holds(&self, q: HoldQuery) -> Result<Vec<HoldRecord>, LedgerRefusal> {
+        let now = unix_now();
+        let mut found: Vec<HoldRecord> = self
+            .held()
+            .values()
+            .map(|h| h.effective(now))
+            .filter(|h| q.tenant_id.as_deref().is_none_or(|t| h.tenant_id == t))
+            .filter(|h| q.state.is_none_or(|s| h.state == s))
+            .collect();
+        found.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
+        found.truncate(q.limit as usize);
+        Ok(found)
+    }
+
+    async fn decide_hold(&self, d: HoldDecision) -> Result<HoldRecord, LedgerRefusal> {
+        let now = unix_now();
+        let mut held = self.held();
+        let hold = held.get_mut(&d.id).ok_or(LedgerRefusal::Hold(HoldProblem::NotFound))?;
+        let current = hold.effective(now);
+        let Transition::To(state) = holds::transition(&current, &d)? else {
+            return Ok(current);
+        };
+        hold.record.state = state;
+        hold.record.decided_by = Some(d.decided_by());
+        hold.record.decided_at = Some(now);
+        hold.record.note = (!d.note.is_empty()).then(|| d.note.clone());
+        if state == HoldState::Approved {
+            hold.record.expires_at = now + hold.approval_valid_secs;
+        }
+        self.decisions.push(
+            Decision {
+                request_id: d.id,
+                tenant_id: hold.record.tenant_id.clone(),
+                key_id: d.approver_key.clone(),
+                kind: DecisionKind::Hold,
+                endpoint: holds::DECIDE_ENDPOINT.to_string(),
+                model: Some(hold.record.model.clone()),
+                code: d.code().to_string(),
+                reason: String::new(),
+            }
+            .with_reason(&d.reason()),
+        );
+        Ok(hold.effective(now))
     }
 }

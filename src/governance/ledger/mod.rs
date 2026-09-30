@@ -21,6 +21,7 @@
 //! after the reservation is durable. "Called but unrecorded" cannot happen.
 
 pub mod decisions;
+pub mod holds;
 mod memory;
 pub mod postgres;
 pub mod sealed;
@@ -54,6 +55,10 @@ pub struct NewReservation<'a> {
     /// Rate and concurrency limits, for ledgers that enforce them across
     /// processes ([`Ledger::enforces_limits`]). Ignored by the others.
     pub limits: SharedLimits,
+    /// An approved hold this request presents. Consumed in the same step as
+    /// the budget, so an approval is used at most once, and not at all if the
+    /// request is refused.
+    pub hold: Option<holds::HoldClaim>,
 }
 
 /// The per-tenant limits a shared ledger enforces in the admission
@@ -156,6 +161,14 @@ pub enum LedgerRefusal {
     RateLimited { done: u32, limit: u32 },
     TokenRateLimited { done: u32, requested: u32, limit: u32 },
     ConcurrencyLimited { limit: u32 },
+    /// The presented hold cannot be used by this request.
+    Hold(holds::HoldProblem),
+    /// Too many holds already wait for this tenant.
+    TooManyHolds { limit: u32 },
+    /// A decision on a hold that is past deciding.
+    HoldNotDecidable { state: holds::HoldState },
+    /// The key that made a request cannot decide its hold.
+    SelfApproval,
 }
 
 #[async_trait::async_trait]
@@ -202,6 +215,20 @@ pub trait Ledger: Send + Sync + std::fmt::Debug {
 
     /// Routine records dropped since the process started.
     fn decisions_dropped(&self) -> u64;
+
+    /// Hold a request for approval, recording it as one step. Refused when
+    /// the tenant already has `max_pending` holds waiting.
+    async fn create_hold(&self, h: holds::NewHold) -> Result<holds::HoldRecord, LedgerRefusal>;
+
+    /// One hold, with its effective state.
+    async fn hold(&self, id: Uuid) -> Result<Option<holds::HoldRecord>, LedgerRefusal>;
+
+    /// Holds, newest first.
+    async fn holds(&self, q: holds::HoldQuery) -> Result<Vec<holds::HoldRecord>, LedgerRefusal>;
+
+    /// Approve or deny, recording the decision in the same step. Returns the
+    /// hold as it now is.
+    async fn decide_hold(&self, d: holds::HoldDecision) -> Result<holds::HoldRecord, LedgerRefusal>;
 }
 
 /// The request, rendered canonically: object keys sorted at every level, so
@@ -305,13 +332,19 @@ impl Fingerprinter {
     /// The claim for this request: fingerprinted with the current key, and
     /// matching every encoding a stored record of the same request may carry.
     pub fn claim<'a>(&self, key: &'a str, scope: &str, request: &serde_json::Value) -> IdempotencyClaim<'a> {
-        let canonical = canonical(scope, request);
-        let plain = fingerprint(scope, request).to_vec();
-        let mut encodings: Vec<Vec<u8>> =
-            self.keys.iter().map(|(id, k)| Self::keyed(id, k, &canonical)).collect();
-        encodings.push(plain);
+        let mut encodings = self.encodings(scope, request);
         let fingerprint = encodings.remove(0);
         IdempotencyClaim { key, fingerprint, also_matches: encodings }
+    }
+
+    /// Every encoding of this request's fingerprint, the one to store first:
+    /// under each key, current first, then unkeyed.
+    pub fn encodings(&self, scope: &str, request: &serde_json::Value) -> Vec<Vec<u8>> {
+        let canonical = canonical(scope, request);
+        let mut encodings: Vec<Vec<u8>> =
+            self.keys.iter().map(|(id, k)| Self::keyed(id, k, &canonical)).collect();
+        encodings.push(fingerprint(scope, request).to_vec());
+        encodings
     }
 }
 

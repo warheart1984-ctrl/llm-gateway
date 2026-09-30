@@ -129,6 +129,23 @@ pub async fn build_with_ledger(
         settings.governance.default_limits.clone(),
     );
     let quota_split = quota_split(&settings.ledger, ledger.backend())?;
+    // Holds live in the ledger, and under quota split each replica has its
+    // own: a hold made on one replica is unknown to the others. That fails
+    // closed (an unknown hold is refused), but approvals only work if a
+    // tenant's requests, polls and approvals reach the same replica.
+    if quota_split.is_some() {
+        let held: Vec<&str> = tenants
+            .tenant_ids()
+            .into_iter()
+            .filter(|id| tenants.get(id).is_some_and(|t| t.holds.is_some()))
+            .collect();
+        if !held.is_empty() {
+            tracing::warn!(
+                tenants = ?held,
+                "these tenants hold requests for approval, and under quota split each replica keeps its own holds:                  route each tenant's requests, hold polls, approvals and resubmissions to one replica, or use postgres"
+            );
+        }
+    }
     if ledger.backend() == "memory" {
         tracing::warn!(
             "THE IN-MEMORY LEDGER IS IN USE: a restart forgets all spend, idempotency keys and decisions, \

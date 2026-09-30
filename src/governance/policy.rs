@@ -31,6 +31,8 @@ pub enum PolicyError {
     DuplicateTenant(String),
     #[error("tenant `{tenant}` has no credentials")]
     TenantHasNoKeys { tenant: String },
+    #[error("tenant `{tenant}`: {message}")]
+    InvalidHolds { tenant: String, message: String },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -75,6 +77,78 @@ pub struct Tenant {
     /// executed and billed again.
     #[serde(default)]
     pub require_idempotency_key: bool,
+    /// Requests that wait for a person to approve them. See
+    /// `governance::ledger::holds`.
+    #[serde(default)]
+    pub holds: Option<HoldPolicy>,
+}
+
+/// When a tenant's requests are held for approval instead of executed.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HoldPolicy {
+    /// Registry model ids (globs) whose requests always wait for approval.
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// Requests whose worst-case cost is above this wait for approval.
+    /// `0` means no cost rule.
+    #[serde(default)]
+    pub above_nano_usd: u64,
+    /// How long a held request waits for a decision. 1 to 3,600 seconds.
+    #[serde(default = "default_hold_expiry_secs")]
+    pub expiry_secs: u64,
+    /// How long an approval stays usable. 1 to 3,600 seconds.
+    #[serde(default = "default_approval_valid_secs")]
+    pub approval_valid_secs: u64,
+    /// Held requests waiting at once, at most; more are refused.
+    #[serde(default = "default_max_pending_holds")]
+    pub max_pending: u32,
+}
+
+/// The longest a hold or an approval may last.
+pub const HOLD_MAX_SECS: u64 = 3_600;
+
+fn default_hold_expiry_secs() -> u64 {
+    900
+}
+
+fn default_approval_valid_secs() -> u64 {
+    300
+}
+
+fn default_max_pending_holds() -> u32 {
+    20
+}
+
+impl HoldPolicy {
+    /// Why this request must wait, or `None` if it may run now.
+    pub fn trigger(&self, model: &str, exposure_nano_usd: u64) -> Option<String> {
+        if glob_any(&self.models, model) {
+            return Some(format!("model `{model}` requires approval"));
+        }
+        if self.above_nano_usd > 0 && exposure_nano_usd > self.above_nano_usd {
+            return Some(format!(
+                "worst-case cost of {exposure_nano_usd} nano-USD is above the approval threshold of {} nano-USD",
+                self.above_nano_usd
+            ));
+        }
+        None
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.models.is_empty() && self.above_nano_usd == 0 {
+            return Err("`holds` needs `models`, `above_nano_usd`, or both: as written it holds nothing".into());
+        }
+        for (name, secs) in [("expiry_secs", self.expiry_secs), ("approval_valid_secs", self.approval_valid_secs)] {
+            if secs == 0 || secs > HOLD_MAX_SECS {
+                return Err(format!("`holds.{name}` must be 1 to {HOLD_MAX_SECS} seconds, got {secs}"));
+            }
+        }
+        if self.max_pending == 0 {
+            return Err("`holds.max_pending` must be at least 1".into());
+        }
+        Ok(())
+    }
 }
 
 impl Tenant {
@@ -201,6 +275,12 @@ impl TenantRegistry {
             }
             for cred in &tenant.credentials {
                 key_records.push(cred.to_record(&tenant.tenant_id)?);
+            }
+            if let Some(holds) = &tenant.holds {
+                holds.validate().map_err(|message| PolicyError::InvalidHolds {
+                    tenant: tenant.tenant_id.clone(),
+                    message,
+                })?;
             }
             by_id.insert(tenant.tenant_id.clone(), Arc::new(tenant));
         }
@@ -545,6 +625,46 @@ mod tests {
     use crate::governance::auth::Principal;
     use std::sync::Arc as StdArc;
 
+    fn holds(models: &[&str], above: u64) -> HoldPolicy {
+        HoldPolicy {
+            models: models.iter().map(|m| (*m).to_string()).collect(),
+            above_nano_usd: above,
+            expiry_secs: 900,
+            approval_valid_secs: 300,
+            max_pending: 20,
+        }
+    }
+
+    #[test]
+    fn a_hold_policy_triggers_on_its_models_or_above_its_threshold() {
+        let policy = holds(&["openrouter/*"], 1_000);
+        assert!(policy.trigger("openrouter/gpt-4.1", 1).unwrap().contains("requires approval"));
+        assert!(policy.trigger("groq/small", 1_001).unwrap().contains("above the approval threshold"));
+        assert_eq!(policy.trigger("groq/small", 1_000), None, "at the threshold is not above it");
+        assert_eq!(holds(&[], 0).trigger("anything", u64::MAX), None);
+    }
+
+    #[test]
+    fn a_hold_policy_that_holds_nothing_or_waits_too_long_is_refused_at_load() {
+        assert!(holds(&[], 0).validate().unwrap_err().contains("holds nothing"));
+        for (expiry, approval) in [(0, 300), (3_601, 300), (900, 0), (900, 3_601)] {
+            let policy = HoldPolicy { expiry_secs: expiry, approval_valid_secs: approval, ..holds(&["m"], 0) };
+            assert!(policy.validate().is_err(), "{expiry}/{approval}");
+        }
+        assert!(HoldPolicy { max_pending: 0, ..holds(&["m"], 0) }.validate().is_err());
+        assert!(holds(&["m"], 0).validate().is_ok());
+        assert!(holds(&[], 1).validate().is_ok());
+
+        let mut file: TenantFile = serde_yaml::from_str(
+            "tenants:\n  - tenant_id: t\n    credentials: [{ key_id: k, key: x }]\n    holds: { models: [] }\n",
+        )
+        .unwrap();
+        let err = TenantRegistry::from_file(file.clone(), PathBuf::from("t.yaml")).err().unwrap();
+        assert!(err.to_string().contains("tenant `t`"), "{err}");
+        file.tenants[0].holds = Some(holds(&["m"], 0));
+        assert!(TenantRegistry::from_file(file, PathBuf::from("t.yaml")).is_ok());
+    }
+
     fn tenant(allowed: &[&str], denied: &[&str]) -> Tenant {
         Tenant {
             tenant_id: "acme".into(),
@@ -565,6 +685,7 @@ mod tests {
             limits: None,
             model_params: HashMap::new(),
             require_idempotency_key: false,
+            holds: None,
         }
     }
 

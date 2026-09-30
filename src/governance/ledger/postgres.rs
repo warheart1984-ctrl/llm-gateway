@@ -50,8 +50,9 @@ use tokio::{
 };
 
 use super::{
-    Closing, Ledger, LedgerRefusal, NewReservation,
+    Closing, Ledger, LedgerRefusal, NewReservation, Outcome,
     decisions::{DECISION_QUEUE, Decision, DecisionKind, DecisionQuery, DecisionRecord},
+    holds::{self, HoldClaim, HoldDecision, HoldProblem, HoldQuery, HoldRecord, HoldState, NewHold, Transition},
     sealed::{ResponseSealer, binding},
 };
 
@@ -229,6 +230,12 @@ impl PostgresLedger {
         sweep(&self.pool).await.map_err(|e| e.to_string())
     }
 
+    /// Mark every hold whose time ran out as expired, recording each. The
+    /// sweeper does this on its interval. Returns how many.
+    pub async fn expire_holds(&self) -> Result<u64, String> {
+        expire_holds(&self.pool).await.map_err(|e| e.to_string())
+    }
+
     /// A stored answer, if it opens for this exact row. Anything that does
     /// not verify is withheld: the caller gets `duplicate_request`.
     fn open_response(&self, tenant_id: &str, id: uuid::Uuid, stored: Option<String>) -> Option<String> {
@@ -295,6 +302,15 @@ impl PostgresLedger {
                     .execute(&mut *tx)
                     .await?;
             }
+        }
+        // After the key, so a repeat of an executed request is answered as a
+        // repeat; before the day row, keeping one lock order everywhere:
+        // reservation, hold, day row, rate counters. A refusal anywhere below
+        // rolls the consumption back with the charge.
+        if let Some(claim) = &r.hold
+            && let Some(problem) = consume_hold(&mut tx, r, claim).await?
+        {
+            return Ok(Err(LedgerRefusal::Hold(problem)));
         }
 
         sqlx::query("INSERT INTO spend_days (tenant_id, day) VALUES ($1, $2) ON CONFLICT DO NOTHING")
@@ -390,6 +406,244 @@ impl PostgresLedger {
     }
 }
 
+/// Mark an approved hold used by this reservation, or say why it cannot be.
+/// The row lock makes two requests presenting one approval go one at a time,
+/// on every replica: the second sees it consumed.
+async fn consume_hold(
+    tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+    r: &NewReservation<'_>,
+    claim: &HoldClaim,
+) -> Result<Option<HoldProblem>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT state, fingerprint, model, endpoint, exposure_nano_usd, (expires_at <= now()) AS lapsed
+           FROM holds WHERE id = $1 AND tenant_id = $2
+            FOR UPDATE",
+    )
+    .bind(claim.id)
+    .bind(r.tenant_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(Some(HoldProblem::NotFound));
+    };
+    let state = HoldState::parse(&row.get::<String, _>("state"))
+        .unwrap_or(HoldState::Expired)
+        .effective(row.get("lapsed"));
+    let fingerprint: Vec<u8> = row.get("fingerprint");
+    let model: String = row.get("model");
+    let approved: i64 = row.get("exposure_nano_usd");
+    if let Err(problem) = claim.check(state, &fingerprint, &model, approved.max(0) as u64) {
+        return Ok(Some(problem));
+    }
+    sqlx::query("UPDATE holds SET state = 'consumed', reservation_id = $2 WHERE id = $1")
+        .bind(claim.id)
+        .bind(r.id)
+        .execute(&mut **tx)
+        .await?;
+    let used = Decision {
+        request_id: claim.id,
+        tenant_id: r.tenant_id.to_string(),
+        key_id: claim.key_id.clone(),
+        kind: DecisionKind::Hold,
+        endpoint: row.get("endpoint"),
+        model: Some(model),
+        code: holds::CODE_CONSUMED.to_string(),
+        reason: String::new(),
+    }
+    .with_reason(&format!("executed as request {}", r.id));
+    insert_decision(&mut **tx, &used).await?;
+    Ok(None)
+}
+
+const HOLD_COLUMNS: &str = "id, tenant_id, requested_by, endpoint, model, max_output_tokens, exposure_nano_usd,
+    reason, state, extract(epoch from created_at)::bigint AS created_at,
+    extract(epoch from expires_at)::bigint AS expires_at, decided_by,
+    extract(epoch from decided_at)::bigint AS decided_at, note, reservation_id,
+    (expires_at <= now()) AS lapsed";
+
+/// A hold's state as callers see it, in SQL.
+const HOLD_EFFECTIVE: &str =
+    "(CASE WHEN state IN ('pending', 'approved') AND expires_at <= now() THEN 'expired' ELSE state END)";
+
+fn hold_from_row(row: &sqlx::postgres::PgRow) -> Option<HoldRecord> {
+    Some(HoldRecord {
+        id: row.get("id"),
+        tenant_id: row.get("tenant_id"),
+        requested_by: row.get("requested_by"),
+        endpoint: row.get("endpoint"),
+        model: row.get("model"),
+        max_output_tokens: row.get::<i64, _>("max_output_tokens").clamp(0, i64::from(u32::MAX)) as u32,
+        exposure_nano_usd: row.get::<i64, _>("exposure_nano_usd").max(0) as u64,
+        reason: row.get("reason"),
+        state: HoldState::parse(&row.get::<String, _>("state"))?.effective(row.get("lapsed")),
+        created_at: row.get("created_at"),
+        expires_at: row.get("expires_at"),
+        decided_by: row.get("decided_by"),
+        decided_at: row.get("decided_at"),
+        note: row.get("note"),
+        reservation_id: row.get("reservation_id"),
+    })
+}
+
+async fn select_hold<'e, E>(ex: E, id: uuid::Uuid, for_update: bool) -> Result<Option<HoldRecord>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let lock = if for_update { " FOR UPDATE" } else { "" };
+    let row = sqlx::query(&format!("SELECT {HOLD_COLUMNS} FROM holds WHERE id = $1{lock}"))
+        .bind(id)
+        .fetch_optional(ex)
+        .await?;
+    Ok(row.as_ref().and_then(hold_from_row))
+}
+
+/// Mark every hold whose time ran out as expired, and record each, in one
+/// statement.
+async fn expire_holds(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let expired = sqlx::query(
+        "WITH lapsed AS (
+             SELECT id, state FROM holds
+              WHERE state IN ('pending', 'approved') AND expires_at <= now()
+                FOR UPDATE SKIP LOCKED
+         ), marked AS (
+             UPDATE holds SET state = 'expired' FROM lapsed WHERE holds.id = lapsed.id
+          RETURNING holds.id, holds.tenant_id, holds.requested_by, holds.endpoint, holds.model, lapsed.state AS was
+         )
+         INSERT INTO decisions (request_id, tenant_id, key_id, kind, endpoint, model, code, reason)
+         SELECT id, tenant_id, requested_by, 'hold', endpoint, model, $1,
+                CASE was WHEN 'pending' THEN $2 ELSE $3 END
+           FROM marked",
+    )
+    .bind(holds::CODE_EXPIRED)
+    .bind(holds::EXPIRED_UNDECIDED)
+    .bind(holds::EXPIRED_UNUSED)
+    .execute(pool)
+    .await?;
+    Ok(expired.rows_affected())
+}
+
+/// Run one ledger operation under the deadline. A failure or a timeout is
+/// `Unavailable`: the caller refuses rather than guesses.
+async fn bounded<T>(
+    timeout: Duration,
+    op: &str,
+    work: impl std::future::Future<Output = Result<T, sqlx::Error>>,
+) -> Result<T, LedgerRefusal> {
+    match tokio::time::timeout(timeout, work).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(unavailable(op, error)),
+        Err(_) => Err(unavailable(op, "timed out")),
+    }
+}
+
+impl PostgresLedger {
+    async fn begin_bounded(&self) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(&format!("SET LOCAL statement_timeout = {}", self.timeout.as_millis().max(1)))
+            .execute(&mut *tx)
+            .await?;
+        Ok(tx)
+    }
+
+    async fn create_hold_tx(&self, h: &NewHold) -> Result<Result<HoldRecord, LedgerRefusal>, sqlx::Error> {
+        let mut tx = self.begin_bounded().await?;
+        // One tenant's hold requests go one at a time, on every replica, so
+        // the pending count cannot be raced past its limit.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('holds:' || $1, 0))")
+            .bind(&h.tenant_id)
+            .execute(&mut *tx)
+            .await?;
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM holds WHERE tenant_id = $1 AND state = 'pending' AND expires_at > now()",
+        )
+        .bind(&h.tenant_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if pending >= i64::from(h.max_pending) {
+            return Ok(Err(LedgerRefusal::TooManyHolds { limit: h.max_pending }));
+        }
+        sqlx::query(
+            "INSERT INTO holds (id, tenant_id, requested_by, endpoint, model, max_output_tokens, exposure_nano_usd,
+                                reason, fingerprint, approval_valid_secs, expires_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now() + make_interval(secs => $11))",
+        )
+        .bind(h.id)
+        .bind(&h.tenant_id)
+        .bind(&h.requested_by)
+        .bind(&h.endpoint)
+        .bind(&h.model)
+        .bind(i64::from(h.max_output_tokens))
+        .bind(to_i64(h.exposure_nano_usd))
+        .bind(&h.reason)
+        .bind(&h.fingerprint)
+        .bind(h.approval_valid_for.as_secs().max(1) as i64)
+        .bind(h.expires_in.as_secs_f64().max(1.0))
+        .execute(&mut *tx)
+        .await?;
+        let requested = Decision {
+            request_id: h.id,
+            tenant_id: h.tenant_id.clone(),
+            key_id: h.requested_by.clone(),
+            kind: DecisionKind::Hold,
+            endpoint: h.endpoint.clone(),
+            model: Some(h.model.clone()),
+            code: holds::CODE_REQUESTED.to_string(),
+            reason: String::new(),
+        }
+        .with_reason(&h.reason);
+        insert_decision(&mut *tx, &requested).await?;
+        let record = select_hold(&mut *tx, h.id, false)
+            .await?
+            .ok_or(sqlx::Error::RowNotFound)?;
+        tx.commit().await?;
+        Ok(Ok(record))
+    }
+
+    async fn decide_hold_tx(&self, d: &HoldDecision) -> Result<Result<HoldRecord, LedgerRefusal>, sqlx::Error> {
+        let mut tx = self.begin_bounded().await?;
+        let Some(current) = select_hold(&mut *tx, d.id, true).await? else {
+            return Ok(Err(LedgerRefusal::Hold(HoldProblem::NotFound)));
+        };
+        let state = match holds::transition(&current, d) {
+            Err(refusal) => return Ok(Err(refusal)),
+            Ok(Transition::Unchanged) => return Ok(Ok(current)),
+            Ok(Transition::To(state)) => state,
+        };
+        // An approval starts the approval's own clock; a denial keeps the
+        // hold's expiry, which no longer matters.
+        sqlx::query(
+            "UPDATE holds SET state = $2, decided_by = $3, decided_at = now(), note = $4,
+                    expires_at = CASE WHEN $2 = 'approved'
+                                      THEN now() + make_interval(secs => approval_valid_secs)
+                                      ELSE expires_at END
+              WHERE id = $1",
+        )
+        .bind(d.id)
+        .bind(state.as_str())
+        .bind(d.decided_by())
+        .bind((!d.note.is_empty()).then_some(d.note.as_str()))
+        .execute(&mut *tx)
+        .await?;
+        let decided = Decision {
+            request_id: d.id,
+            tenant_id: current.tenant_id.clone(),
+            key_id: d.approver_key.clone(),
+            kind: DecisionKind::Hold,
+            endpoint: holds::DECIDE_ENDPOINT.to_string(),
+            model: Some(current.model.clone()),
+            code: d.code().to_string(),
+            reason: String::new(),
+        }
+        .with_reason(&d.reason());
+        insert_decision(&mut *tx, &decided).await?;
+        let record = select_hold(&mut *tx, d.id, false)
+            .await?
+            .ok_or(sqlx::Error::RowNotFound)?;
+        tx.commit().await?;
+        Ok(Ok(record))
+    }
+}
+
 /// Minutes since the Unix epoch, by the database clock: the rate window.
 const MINUTE: &str = "(floor(extract(epoch from now()) / 60))::bigint";
 
@@ -462,6 +716,15 @@ async fn apply_close(pool: &PgPool, c: &Closing, sealed_response: Option<&str>) 
     let tenant: String = row.get("tenant_id");
     let day: i64 = row.get("day");
     let today: i64 = sqlx::query_scalar(&format!("SELECT {TODAY}")).fetch_one(&mut *tx).await?;
+    // Released: nothing was executed, so an approval it used can be used
+    // again. Lock order, as in admission: reservation, hold, day row, rate
+    // counters.
+    if c.outcome == Outcome::Released {
+        sqlx::query("UPDATE holds SET state = 'approved', reservation_id = NULL WHERE reservation_id = $1 AND state = 'consumed'")
+            .bind(c.id)
+            .execute(&mut *tx)
+            .await?;
+    }
 
     // The rollover rule, identical to the memory backend: a refund reaches
     // only the day it was reserved in, and is dropped once that day has
@@ -593,7 +856,10 @@ async fn sweep(pool: &PgPool) -> Result<u64, sqlx::Error> {
     Ok(swept.rows_affected())
 }
 
-async fn insert_decision(pool: &PgPool, d: &Decision) -> Result<(), sqlx::Error> {
+async fn insert_decision<'e, E>(ex: E, d: &Decision) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query(
         "INSERT INTO decisions (request_id, tenant_id, key_id, kind, endpoint, model, code, reason)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
@@ -606,7 +872,7 @@ async fn insert_decision(pool: &PgPool, d: &Decision) -> Result<(), sqlx::Error>
     .bind(d.model.as_deref())
     .bind(&d.code)
     .bind(&d.reason)
-    .execute(pool)
+    .execute(ex)
     .await
     .map(|_| ())
 }
@@ -632,6 +898,20 @@ async fn run_sweeper(pool: PgPool, interval: Duration, decision_retention: Durat
             .await
         {
             tracing::warn!(%error, "decision retention sweep failed; will retry");
+        }
+        if let Err(error) = expire_holds(&pool).await {
+            tracing::warn!(%error, "hold expiry failed; will retry");
+        }
+        // Holds that can never change again go with the decisions about them.
+        if let Err(error) = sqlx::query(
+            "DELETE FROM holds WHERE state IN ('denied', 'expired', 'consumed')
+                AND created_at < now() - make_interval(secs => $1)",
+        )
+        .bind(decision_retention.as_secs_f64())
+        .execute(&pool)
+        .await
+        {
+            tracing::warn!(%error, "hold retention sweep failed; will retry");
         }
         match sweep(&pool).await {
             Ok(0) => {}
@@ -751,6 +1031,34 @@ impl Ledger for PostgresLedger {
 
     fn decisions_dropped(&self) -> u64 {
         self.decisions_dropped.load(Ordering::Relaxed)
+    }
+
+    async fn create_hold(&self, h: NewHold) -> Result<HoldRecord, LedgerRefusal> {
+        bounded(self.timeout, "create hold", self.create_hold_tx(&h)).await?
+    }
+
+    async fn hold(&self, id: uuid::Uuid) -> Result<Option<HoldRecord>, LedgerRefusal> {
+        bounded(self.timeout, "hold", select_hold(&self.pool, id, false)).await
+    }
+
+    async fn holds(&self, q: HoldQuery) -> Result<Vec<HoldRecord>, LedgerRefusal> {
+        let sql = format!(
+            "SELECT {HOLD_COLUMNS} FROM holds
+              WHERE ($1::text IS NULL OR tenant_id = $1) AND ($2::text IS NULL OR {HOLD_EFFECTIVE} = $2)
+           ORDER BY created_at DESC, id DESC
+              LIMIT $3"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(q.tenant_id.as_deref())
+            .bind(q.state.map(HoldState::as_str))
+            .bind(i64::from(q.limit))
+            .fetch_all(&self.pool);
+        let rows = bounded(self.timeout, "holds", rows).await?;
+        Ok(rows.iter().filter_map(hold_from_row).collect())
+    }
+
+    async fn decide_hold(&self, d: HoldDecision) -> Result<HoldRecord, LedgerRefusal> {
+        bounded(self.timeout, "decide hold", self.decide_hold_tx(&d)).await?
     }
 }
 
