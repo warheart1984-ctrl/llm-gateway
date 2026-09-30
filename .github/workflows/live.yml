@@ -2,9 +2,9 @@
 #
 # Not part of the gate on purpose: it spends real money, depends on three
 # vendors being up, and needs secrets that pull requests from forks never
-# get. It runs nightly, on demand, and whenever the live suite itself
-# changes, so a vendor changing its wire format or retiring a catalogue model
-# shows up within a day.
+# get. It runs nightly, on demand, and whenever the adapters, the catalogue
+# or the suite change, so a vendor changing its wire format or retiring a
+# catalogue model shows up within a day.
 #
 # Set the three repository secrets once: GROQ_API_KEY, OPENROUTER_API_KEY and
 # NVIDIA_API_KEY. A missing one fails that provider's test rather than
@@ -14,10 +14,13 @@
 name: live
 
 on:
-  # A change to the live suite itself is run for real, on any branch of this
+  # A change to what the live suite verifies (the provider adapters, the
+  # catalogue) or to the suite itself is run for real, on any branch of this
   # repository (pushes never come from forks, so the secrets are there).
   push:
     paths:
+      - src/providers/**
+      - config/models.yaml
       - tests/live.rs
       - .github/workflows/live.yml
   schedule:
