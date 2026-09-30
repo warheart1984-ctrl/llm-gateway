@@ -295,6 +295,18 @@ whose attempt the provider refused may be used again, since nothing was
 executed or billed. Set `require_idempotency_key: true` on a tenant whose
 clients retry automatically.
 
+**Stored answers are sealed.** On the Postgres ledger, the answer kept for
+replay is encrypted with AES-256-GCM before it reaches the database. It is
+bound to its tenant and request, so a copy moved into another row does not
+open, and anything that fails to open is never served (the caller gets 409
+`duplicate_request`). Keys come from the env var named by
+`[ledger] response_keys_env` (default `LLM_GATEWAY_RESPONSE_KEYS`), as
+`kid:base64-of-32-bytes[,kid:...]`: the first key seals and every key opens,
+so a key rotates by putting the new one first. Generate one with
+`openssl rand -base64 32`. With no keys set, answers are not stored at all,
+and a repeated completion gets 409 instead of a replay. A malformed key
+setting stops the gateway starting.
+
 **Still per process on both backends:** rate-limit windows and concurrency
 caps. Behind N replicas, divide them by N.
 
@@ -380,7 +392,7 @@ What the gateway does itself, and what it expects of the deployment around it.
 ## Testing
 
 ```bash
-cargo test --locked --all-targets                  # 218 tests
+cargo test --locked --all-targets                  # 228 tests
 cargo clippy --locked --all-targets -- -D warnings
 cargo bench --bench framing                        # add `-- --quick` for a fast pass
 ```

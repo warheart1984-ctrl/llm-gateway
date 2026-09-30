@@ -309,8 +309,9 @@ enum LedgerChoice {
     /// Each gateway process has its own, in memory.
     Memory,
     /// Every gateway process shares one Postgres ledger: a schema of its own
-    /// per deployment, so parallel tests never share rows.
-    Shared { url: String, schema: String },
+    /// per deployment, so parallel tests never share rows. `sealed` says
+    /// whether stored answers are encrypted (and therefore stored at all).
+    Shared { url: String, schema: String, sealed: bool },
 }
 
 /// The test database, or `None` to skip. CI sets
@@ -328,7 +329,17 @@ fn test_database_url() -> Option<String> {
     }
 }
 
-async fn postgres_ledger(url: &str, schema: &str) -> Result<Arc<llm_gateway::governance::ledger::PostgresLedger>, String> {
+/// Test-only answer-sealing key: 32 bytes, base64.
+const TEST_RESPONSE_KEYS: &str = "test-1:AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
+
+async fn postgres_ledger(
+    url: &str,
+    schema: &str,
+    sealed: bool,
+) -> Result<Arc<llm_gateway::governance::ledger::PostgresLedger>, String> {
+    let sealer = sealed.then(|| {
+        Arc::new(llm_gateway::governance::ledger::sealed::ResponseSealer::from_keys(TEST_RESPONSE_KEYS).unwrap())
+    });
     llm_gateway::governance::ledger::PostgresLedger::connect(
         llm_gateway::governance::ledger::postgres::PostgresOptions {
             url: url.to_string(),
@@ -338,6 +349,7 @@ async fn postgres_ledger(url: &str, schema: &str) -> Result<Arc<llm_gateway::gov
             sweep_after: Duration::from_secs(3_600),
             sweep_interval: Duration::from_secs(3_600),
             idempotency_retention: Duration::from_secs(86_400),
+            sealer,
         },
     )
     .await
@@ -361,11 +373,24 @@ impl Deployment {
 
     /// A deployment whose gateways share one Postgres ledger at `url`.
     fn shared(provider: &MockProvider, url: &str) -> Self {
+        Self::shared_with(provider, url, true)
+    }
+
+    fn shared_with(provider: &MockProvider, url: &str, sealed: bool) -> Self {
         let schema = format!("pressure_{}", uuid::Uuid::new_v4().simple());
         Self {
-            ledger: LedgerChoice::Shared { url: url.to_string(), schema },
+            ledger: LedgerChoice::Shared { url: url.to_string(), schema, sealed },
             ..Self::new(provider)
         }
+    }
+
+    /// Direct access to the shared ledger's tables, for inspecting what is
+    /// actually at rest.
+    async fn ledger_pool(&self) -> sqlx::PgPool {
+        let LedgerChoice::Shared { url, schema, .. } = &self.ledger else {
+            panic!("not a shared-ledger deployment");
+        };
+        postgres_ledger(url, schema, false).await.expect("connect ledger").pool().clone()
     }
 
     fn rewrite_tenants(&self, yaml: &str) {
@@ -404,8 +429,8 @@ impl Deployment {
             LedgerChoice::Memory => llm_gateway::bootstrap::build(settings).await.expect("boot gateway"),
             // A fresh ledger client per boot, exactly as a separate process
             // would have: nothing is shared but the database.
-            LedgerChoice::Shared { url, schema } => {
-                let ledger = postgres_ledger(url, schema).await.expect("connect ledger");
+            LedgerChoice::Shared { url, schema, sealed } => {
+                let ledger = postgres_ledger(url, schema, *sealed).await.expect("connect ledger");
                 llm_gateway::bootstrap::build_with_ledger(settings, ledger)
                     .await
                     .expect("boot gateway")
@@ -1380,8 +1405,100 @@ async fn shared_ledger_a_gateway_will_not_start_without_its_ledger() {
     let Some(url) = test_database_url() else { return };
     let relay = relay::Relay::start(&url).await;
     relay.cut();
-    let err = postgres_ledger(&relay.url, "pressure_unreachable").await.unwrap_err();
+    let err = postgres_ledger(&relay.url, "pressure_unreachable", true).await.unwrap_err();
     assert!(!err.contains("gatewaytest"), "the error must not echo credentials: {err}");
+}
+
+// ---------------------------------------------------------------------------
+// Answers at rest
+// ---------------------------------------------------------------------------
+
+async fn complete_with_key(gw: &Gateway, key: &str) -> Reply {
+    gw.send(with_key(reqwest::Client::new().post(gw.url("/v1/chat/complete")), key).json(&standard_request()))
+        .await
+}
+
+/// Replay `key` until the first attempt's settlement is durable, as a client
+/// told `request_in_progress` would.
+async fn settled_replay(gw: &Gateway, key: &str) -> Reply {
+    let mut reply = complete_with_key(gw, key).await;
+    for _ in 0..100 {
+        if !(reply.status == StatusCode::CONFLICT && reply.code() == "request_in_progress") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        reply = complete_with_key(gw, key).await;
+    }
+    reply
+}
+
+async fn stored_answer(deployment: &Deployment, key: &str) -> Option<String> {
+    sqlx::query_scalar("SELECT response FROM reservations WHERE idempotency_key = $1")
+        .bind(key)
+        .fetch_one(&deployment.ledger_pool().await)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn shared_ledger_stored_answers_are_sealed() {
+    let Some(url) = test_database_url() else { return };
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let deployment = Deployment::shared(&provider, &url);
+    let gw = deployment.boot().await;
+
+    assert_eq!(complete_with_key(&gw, "sealed-1").await.status, StatusCode::OK);
+    let replay = settled_replay(&gw, "sealed-1").await;
+    assert_eq!(replay.status, StatusCode::OK, "{}", replay.body);
+    assert!(replay.body.contains("Hello, world"), "the replay is the real answer");
+
+    let stored = stored_answer(&deployment, "sealed-1").await.expect("the answer is stored for replay");
+    assert!(stored.starts_with("v1:test-1:"), "{stored}");
+    assert!(!stored.contains("Hello"), "the answer must not be at rest in the clear: {stored}");
+}
+
+#[tokio::test]
+async fn shared_ledger_without_a_key_stores_no_answer() {
+    let Some(url) = test_database_url() else { return };
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let deployment = Deployment::shared_with(&provider, &url, false);
+    let gw = deployment.boot().await;
+
+    assert_eq!(complete_with_key(&gw, "unsealed-1").await.status, StatusCode::OK);
+    let replay = settled_replay(&gw, "unsealed-1").await;
+    assert_eq!(replay.status, StatusCode::CONFLICT, "{}", replay.body);
+    assert_eq!(replay.code(), "duplicate_request", "recognised and billed once, but not replayed");
+    assert_eq!(provider.calls(), 1);
+    assert!(stored_answer(&deployment, "unsealed-1").await.is_none(), "no key, no stored answer");
+}
+
+#[tokio::test]
+async fn shared_ledger_an_answer_moved_to_another_row_is_not_served() {
+    // Someone with write access to the table copies one request's sealed
+    // answer into another's row. The seal is bound to its row, so the copy
+    // does not open, and the gateway refuses to replay rather than serve it.
+    let Some(url) = test_database_url() else { return };
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let deployment = Deployment::shared(&provider, &url);
+    let gw = deployment.boot().await;
+
+    assert_eq!(complete_with_key(&gw, "moved-a").await.status, StatusCode::OK);
+    assert_eq!(complete_with_key(&gw, "moved-b").await.status, StatusCode::OK);
+    assert_eq!(settled_replay(&gw, "moved-a").await.status, StatusCode::OK);
+    assert_eq!(settled_replay(&gw, "moved-b").await.status, StatusCode::OK);
+
+    sqlx::query(
+        "UPDATE reservations SET response = (SELECT response FROM reservations WHERE idempotency_key = 'moved-a')
+          WHERE idempotency_key = 'moved-b'",
+    )
+    .execute(&deployment.ledger_pool().await)
+    .await
+    .unwrap();
+
+    let replay = complete_with_key(&gw, "moved-b").await;
+    assert_eq!(replay.status, StatusCode::CONFLICT, "{}", replay.body);
+    assert_eq!(replay.code(), "duplicate_request");
+    assert_eq!(provider.calls(), 2, "nothing was re-executed either");
 }
 
 // ===========================================================================

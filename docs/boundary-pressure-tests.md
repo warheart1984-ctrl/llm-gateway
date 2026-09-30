@@ -120,6 +120,9 @@ there instead of skipping them.
 | Same key sent to two different replicas | executed once, the second served from the ledger | `shared_ledger_a_repeated_key_is_recognised_across_replicas` | HOLDS |
 | Database connection cut mid-run | 503 `ledger_unavailable`; provider receives nothing; readiness fails | `shared_ledger_a_dead_ledger_fails_closed` | HOLDS |
 | Ledger unreachable at startup | the gateway refuses to start; the error does not echo credentials | `shared_ledger_a_gateway_will_not_start_without_its_ledger` | HOLDS |
+| Read the stored answers straight from the database | ciphertext only (AES-256-GCM); the replay still returns the real answer | `shared_ledger_stored_answers_are_sealed` | HOLDS |
+| No sealing key configured | no answer stored at all; a repeat is recognised and billed once, with 409 instead of a replay | `shared_ledger_without_a_key_stores_no_answer` | HOLDS |
+| Copy one request's sealed answer into another request's row | the copy does not open; 409, never the wrong answer; nothing re-executed | `shared_ledger_an_answer_moved_to_another_row_is_not_served` | HOLDS |
 
 ## 10. Known gaps
 
@@ -145,6 +148,9 @@ requests are recorded as structured log lines only.
 - **Shared ledger's budget condition removed from the SQL:** exactly the
   three shared-ledger budget tests fail (restart, replicas, burst across
   replicas), which shows the database's check, not luck, holds the line.
+- **Answer sealing:** removing the row binding fails exactly the
+  moved-answer test (the copied answer is served); storing answers in the
+  clear fails three tests, including the at-rest check.
 - **Flakiness:** on the shared ledger, a first batch of 10 runs had 2 runs
   with a failure. The output was not captured and the cause is not yet
   identified. 40 consecutive runs since then were clean, 46/46 each time.

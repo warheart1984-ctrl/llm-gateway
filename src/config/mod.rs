@@ -71,6 +71,10 @@ pub struct LedgerConfig {
     pub sweep_interval_secs: u64,
     /// How long a completed request's Idempotency-Key is remembered.
     pub idempotency_retention_secs: u64,
+    /// Name of the env var holding the keys that seal answers kept for
+    /// replay: `kid:base64key[,kid:base64key...]`, first key seals. Unset
+    /// means answers are not stored, so completions are not replayed.
+    pub response_keys_env: String,
 }
 
 impl Default for LedgerConfig {
@@ -84,6 +88,7 @@ impl Default for LedgerConfig {
             sweep_after_secs: 3_600,
             sweep_interval_secs: 60,
             idempotency_retention_secs: 86_400,
+            response_keys_env: "LLM_GATEWAY_RESPONSE_KEYS".to_string(),
         }
     }
 }

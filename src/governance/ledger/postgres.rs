@@ -38,7 +38,10 @@ use tokio::{
     task::JoinHandle,
 };
 
-use super::{Closing, Ledger, LedgerRefusal, NewReservation};
+use super::{
+    Closing, Ledger, LedgerRefusal, NewReservation,
+    sealed::{ResponseSealer, binding},
+};
 
 /// Days since the Unix epoch, by the database clock. One definition, used by
 /// every statement, so "today" means the same thing on every replica.
@@ -59,6 +62,10 @@ pub struct PostgresOptions {
     pub sweep_after: Duration,
     pub sweep_interval: Duration,
     pub idempotency_retention: Duration,
+    /// Seals answers kept for idempotent replay. Without it no answer is
+    /// stored at all, and a repeated completion gets `duplicate_request`
+    /// rather than a replay: nothing leaves the process in the clear.
+    pub sealer: Option<Arc<ResponseSealer>>,
 }
 
 enum WriterMsg {
@@ -73,6 +80,7 @@ pub struct PostgresLedger {
     pending: Arc<AtomicU64>,
     timeout: Duration,
     retention: Duration,
+    sealer: Option<Arc<ResponseSealer>>,
     sweeper: JoinHandle<()>,
 }
 
@@ -154,7 +162,7 @@ impl PostgresLedger {
 
         let (writer, inbox) = mpsc::unbounded_channel();
         let pending = Arc::new(AtomicU64::new(0));
-        tokio::spawn(run_writer(pool.clone(), inbox, Arc::clone(&pending)));
+        tokio::spawn(run_writer(pool.clone(), inbox, Arc::clone(&pending), opts.sealer.clone()));
         let sweeper = tokio::spawn(run_sweeper(pool.clone(), opts.sweep_after, opts.sweep_interval));
 
         Ok(Arc::new(Self {
@@ -163,6 +171,7 @@ impl PostgresLedger {
             pending,
             timeout: opts.timeout,
             retention: opts.idempotency_retention,
+            sealer: opts.sealer,
             sweeper,
         }))
     }
@@ -181,6 +190,20 @@ impl PostgresLedger {
     /// `swept`, keeping its full reservation as the bill. Returns how many.
     pub async fn sweep(&self, older_than: Duration) -> Result<u64, String> {
         sweep(&self.pool, older_than).await.map_err(|e| e.to_string())
+    }
+
+    /// A stored answer, if it opens for this exact row. Anything that does
+    /// not verify is withheld: the caller gets `duplicate_request`.
+    fn open_response(&self, tenant_id: &str, id: uuid::Uuid, stored: Option<String>) -> Option<String> {
+        let stored = stored?;
+        let opened = self.sealer.as_ref().and_then(|s| s.open(&binding(tenant_id, id), &stored));
+        if opened.is_none() {
+            tracing::warn!(
+                reservation = %id,
+                "a stored answer did not open (unknown key id, tampered, or no key configured); not replaying it"
+            );
+        }
+        opened
     }
 
     async fn reserve_tx(&self, r: &NewReservation<'_>) -> Result<Result<u64, LedgerRefusal>, sqlx::Error> {
@@ -223,7 +246,7 @@ impl PostgresLedger {
                             return Ok(Err(LedgerRefusal::Duplicate {
                                 original: id,
                                 billed_nano_usd: (reserved + delta.unwrap_or(0)).max(0) as u64,
-                                response: row.get("response"),
+                                response: self.open_response(r.tenant_id, id, row.get("response")),
                             }));
                         }
                     }
@@ -305,7 +328,7 @@ impl PostgresLedger {
     }
 }
 
-async fn apply_close(pool: &PgPool, c: &Closing) -> Result<(), sqlx::Error> {
+async fn apply_close(pool: &PgPool, c: &Closing, sealed_response: Option<&str>) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
     let delta = clamp_delta(c.delta_nano_usd);
     let closed = sqlx::query(
@@ -317,7 +340,7 @@ async fn apply_close(pool: &PgPool, c: &Closing) -> Result<(), sqlx::Error> {
     .bind(c.id)
     .bind(c.outcome.as_str())
     .bind(delta)
-    .bind(c.response.as_deref())
+    .bind(sealed_response)
     .fetch_optional(&mut *tx)
     .await?;
     let Some(row) = closed else {
@@ -360,16 +383,27 @@ async fn apply_close(pool: &PgPool, c: &Closing) -> Result<(), sqlx::Error> {
 /// Applies closings one at a time, in the order they were made, retrying each
 /// until it is durable. Order matters only within a reservation, and each
 /// reservation is closed exactly once, so a strict queue is simple and safe.
-async fn run_writer(pool: PgPool, mut inbox: mpsc::UnboundedReceiver<WriterMsg>, pending: Arc<AtomicU64>) {
+async fn run_writer(
+    pool: PgPool,
+    mut inbox: mpsc::UnboundedReceiver<WriterMsg>,
+    pending: Arc<AtomicU64>,
+    sealer: Option<Arc<ResponseSealer>>,
+) {
     while let Some(msg) = inbox.recv().await {
         match msg {
             WriterMsg::Flush(done) => {
                 let _ = done.send(());
             }
             WriterMsg::Close(closing) => {
+                // Sealed once, before any retry, so a retried write stores
+                // the same bytes. No sealer: the answer is not stored.
+                let sealed = match (&sealer, &closing.response) {
+                    (Some(s), Some(answer)) => Some(s.seal(&binding(&closing.tenant_id, closing.id), answer)),
+                    _ => None,
+                };
                 let mut backoff = Duration::from_millis(100);
                 loop {
-                    match apply_close(&pool, &closing).await {
+                    match apply_close(&pool, &closing, sealed.as_deref()).await {
                         Ok(()) => break,
                         Err(error) => {
                             tracing::warn!(

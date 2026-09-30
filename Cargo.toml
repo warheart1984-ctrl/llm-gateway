@@ -91,6 +91,10 @@ sqlx = { version = "0.8", default-features = false, features = [
   "migrate",
 ] }
 
+# Encrypts answers kept in the ledger for idempotent replay. RustCrypto's
+# audited AEAD; random nonces from the OS via `getrandom`.
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc", "getrandom"] }
+
 # ---- util ----------------------------------------------------------------
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }

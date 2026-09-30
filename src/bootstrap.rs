@@ -188,6 +188,7 @@ async fn build_ledger(
             let url = std::env::var(&cfg.url_env).map_err(|_| {
                 BootError::Ledger(format!("backend is postgres but `{}` is not set", cfg.url_env))
             })?;
+            let sealer = response_sealer(&cfg.response_keys_env)?;
             let ledger = PostgresLedger::connect(PostgresOptions {
                 url,
                 schema: cfg.schema.clone(),
@@ -196,10 +197,33 @@ async fn build_ledger(
                 sweep_after: Duration::from_secs(cfg.sweep_after_secs),
                 sweep_interval: Duration::from_secs(cfg.sweep_interval_secs),
                 idempotency_retention: retention,
+                sealer,
             })
             .await
             .map_err(BootError::Ledger)?;
             Ok(ledger)
+        }
+    }
+}
+
+/// The keys that seal stored answers. Absent: answers are not stored. Set
+/// but malformed: fatal, because a typo must not silently turn encryption
+/// off, and the error never repeats the key material.
+fn response_sealer(
+    env_name: &str,
+) -> Result<Option<Arc<crate::governance::ledger::sealed::ResponseSealer>>, BootError> {
+    match std::env::var(env_name) {
+        Ok(spec) if !spec.trim().is_empty() => {
+            let sealer = crate::governance::ledger::sealed::ResponseSealer::from_keys(&spec)
+                .map_err(|e| BootError::Ledger(format!("`{env_name}`: {e}")))?;
+            tracing::info!(key_id = sealer.current_key_id(), "stored answers are sealed with AES-256-GCM");
+            Ok(Some(Arc::new(sealer)))
+        }
+        _ => {
+            tracing::warn!(
+                "`{env_name}` is not set: completions are not stored, so a repeated Idempotency-Key gets 409 rather than a replay"
+            );
+            Ok(None)
         }
     }
 }
