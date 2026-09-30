@@ -33,6 +33,8 @@ pub enum ApiError {
     TenantUnknown,
     /// A control-plane operation failed.
     ReloadFailed(String),
+    /// The spend ledger could not be read.
+    LedgerUnavailable,
 }
 
 impl IntoResponse for ApiError {
@@ -61,6 +63,12 @@ impl IntoResponse for ApiError {
                 "reload_failed",
                 "api_error",
                 message.clone(),
+            ),
+            ApiError::LedgerUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ledger_unavailable",
+                "api_error",
+                "the spend ledger is unavailable; retry shortly".to_string(),
             ),
         };
         (
@@ -138,7 +146,11 @@ pub async fn get_usage(
         .get(&principal.tenant_id)
         .ok_or(ApiError::TenantUnknown)?;
     let limits = state.policy.limits_for(&tenant);
-    let snapshot = state.limits.snapshot(&principal.tenant_id, &limits);
+    let snapshot = state
+        .limits
+        .snapshot(&principal.tenant_id, &limits)
+        .await
+        .map_err(|_| ApiError::LedgerUnavailable)?;
 
     Ok(Json(json!({
         "tenant_id": snapshot.tenant_id,
@@ -213,6 +225,11 @@ pub async fn ready(State(state): State<Arc<AppState>>) -> Response {
     }
     if state.providers.is_empty() {
         issues.push("no providers are configured".into());
+    }
+    // Every admission goes through the ledger, and an unreachable ledger
+    // refuses them all. Pull this replica from the load balancer instead.
+    if !state.limits.ledger().healthy().await {
+        issues.push(format!("the {} spend ledger is unreachable", state.limits.ledger().backend()));
     }
     for id in snapshot.ids() {
         if let Some(cfg) = snapshot.by_id.get(id)

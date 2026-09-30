@@ -51,7 +51,8 @@ use uuid::Uuid;
 use crate::{
     config::OverflowMode,
     governance::{
-        auth::Principal, limits::CostEstimate, limits::Reservation, AuthorizeError, LimitError,
+        auth::Principal, ledger, limits::AdmitRequest, limits::CostEstimate, limits::Reservation,
+        AuthorizeError, LimitError,
     },
     observability::{logging, metrics::RejectionKind, RequestSpan, StreamSummary},
     providers::{
@@ -122,6 +123,10 @@ enum RequestError {
     MaxTokensRequired,
     #[error("request body is not valid JSON: {0}")]
     BadJson(String),
+    #[error("`Idempotency-Key` must be 1 to 255 visible ASCII characters")]
+    InvalidIdempotencyKey,
+    #[error("this tenant requires an `Idempotency-Key` header on every request")]
+    IdempotencyKeyRequired,
     /// Body exceeded `server.request_body_limit_bytes`.
     #[error("request body is too large")]
     PayloadTooLarge,
@@ -148,7 +153,14 @@ impl RequestError {
             | RequestError::StreamNotAllowed
             | RequestError::MaxTokensRequired
             | RequestError::BadJson(_)
+            | RequestError::InvalidIdempotencyKey
+            | RequestError::IdempotencyKeyRequired
             | RequestError::Param(_) => StatusCode::BAD_REQUEST,
+            RequestError::Limit(LimitError::LedgerUnavailable) => StatusCode::SERVICE_UNAVAILABLE,
+            RequestError::Limit(LimitError::IdempotencyKeyReused) => StatusCode::UNPROCESSABLE_ENTITY,
+            RequestError::Limit(LimitError::RequestInProgress { .. } | LimitError::DuplicateRequest { .. }) => {
+                StatusCode::CONFLICT
+            }
             RequestError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             RequestError::Auth(_) => StatusCode::UNAUTHORIZED,
             RequestError::Policy(_) => StatusCode::FORBIDDEN,
@@ -177,6 +189,12 @@ impl RequestError {
             RequestError::StreamNotAllowed => "stream_not_allowed",
             RequestError::MaxTokensRequired => "max_tokens_required",
             RequestError::BadJson(_) => "invalid_json",
+            RequestError::InvalidIdempotencyKey => "invalid_idempotency_key",
+            RequestError::IdempotencyKeyRequired => "idempotency_key_required",
+            RequestError::Limit(LimitError::LedgerUnavailable) => "ledger_unavailable",
+            RequestError::Limit(LimitError::IdempotencyKeyReused) => "idempotency_key_reused",
+            RequestError::Limit(LimitError::RequestInProgress { .. }) => "request_in_progress",
+            RequestError::Limit(LimitError::DuplicateRequest { .. }) => "duplicate_request",
             RequestError::PayloadTooLarge => "payload_too_large",
             RequestError::Auth(_) => "unauthorized",
             RequestError::Policy(
@@ -217,7 +235,19 @@ impl RequestError {
     fn retryable(&self) -> bool {
         match self {
             RequestError::Provider(e) => e.retryable(),
+            RequestError::Limit(LimitError::LedgerUnavailable | LimitError::RequestInProgress { .. }) => true,
             _ => false,
+        }
+    }
+
+    /// Seconds a client should wait before retrying, when there is a known
+    /// answer.
+    fn retry_after(&self) -> Option<&'static str> {
+        match self {
+            RequestError::Limit(LimitError::RateLimited { .. } | LimitError::TokenRateLimited { .. }) => Some("60"),
+            RequestError::Limit(LimitError::LedgerUnavailable) => Some("5"),
+            RequestError::Limit(LimitError::RequestInProgress { .. }) => Some("1"),
+            _ => None,
         }
     }
 
@@ -229,6 +259,8 @@ impl RequestError {
             StatusCode::NOT_FOUND => "not_found_error",
             StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
             StatusCode::PAYMENT_REQUIRED => "billing_error",
+            StatusCode::CONFLICT => "conflict_error",
+            StatusCode::UNPROCESSABLE_ENTITY => "invalid_request_error",
             _ => "api_error",
         }
     }
@@ -284,6 +316,27 @@ async fn handle(state: Arc<AppState>, headers: HeaderMap, body: Bytes, mode: Mod
     };
     match outcome {
         Ok(response) => response,
+        // A repeat of a completed completion is answered from the ledger:
+        // the stored answer, with no provider call and no new charge.
+        Err(RequestError::Limit(LimitError::DuplicateRequest {
+            original,
+            response: Some(stored),
+            ..
+        })) if mode == Mode::Complete => {
+            tracing::info!(
+                request_id = %request_id,
+                tenant = %span.tenant_id,
+                original = %original,
+                "idempotent replay served from the ledger"
+            );
+            let mut response = (StatusCode::OK, stored).into_response();
+            let h = response.headers_mut();
+            h.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            h.insert("x-request-id", header_value(&request_id));
+            h.insert("idempotent-replayed", HeaderValue::from_static("true"));
+            h.insert("x-original-request-id", header_value(&original.to_string()));
+            response
+        }
         Err(err) => {
             if let Some(kind) = err.rejection_kind() {
                 state.metrics.rejection(kind);
@@ -291,34 +344,51 @@ async fn handle(state: Arc<AppState>, headers: HeaderMap, body: Bytes, mode: Mod
             logging::log_rejected(&request_id, &span.tenant_id, err.code(), &err.to_string());
 
             let status = err.status();
-            let mut response = (
-                status,
-                Json(json!({
-                    "error": {
-                        "code": err.code(),
-                        "type": err.error_type(),
-                        "message": err.to_string(),
-                        "retryable": err.retryable(),
-                    },
-                    "request_id": request_id,
-                })),
-            )
-                .into_response();
+            let mut body = json!({
+                "error": {
+                    "code": err.code(),
+                    "type": err.error_type(),
+                    "message": err.to_string(),
+                    "retryable": err.retryable(),
+                },
+                "request_id": request_id,
+            });
+            // Point a client at the attempt that holds its idempotency key.
+            match &err {
+                RequestError::Limit(LimitError::DuplicateRequest { original, billed_nano_usd, .. }) => {
+                    body["original_request_id"] = json!(original.to_string());
+                    body["billed_nano_usd"] = json!(billed_nano_usd);
+                }
+                RequestError::Limit(LimitError::RequestInProgress { original: Some(original) }) => {
+                    body["original_request_id"] = json!(original.to_string());
+                }
+                _ => {}
+            }
+            let mut response = (status, Json(body)).into_response();
             let h = response.headers_mut();
             h.insert("x-request-id", header_value(&request_id));
             h.insert(
                 "x-error-retryable",
                 HeaderValue::from_static(if err.retryable() { "true" } else { "false" }),
             );
-            if matches!(
-                err,
-                RequestError::Limit(LimitError::RateLimited { .. } | LimitError::TokenRateLimited { .. })
-            ) {
-                h.insert("retry-after", HeaderValue::from_static("60"));
+            if let Some(seconds) = err.retry_after() {
+                h.insert("retry-after", HeaderValue::from_static(seconds));
             }
             response
         }
     }
+}
+
+/// The request's `Idempotency-Key`, if it sent one.
+fn idempotency_key(headers: &HeaderMap) -> Result<Option<&str>, RequestError> {
+    let Some(raw) = headers.get("idempotency-key") else {
+        return Ok(None);
+    };
+    let key = raw.to_str().map_err(|_| RequestError::InvalidIdempotencyKey)?;
+    if !ledger::valid_idempotency_key(key) {
+        return Err(RequestError::InvalidIdempotencyKey);
+    }
+    Ok(Some(key))
 }
 
 /// Everything the stream needs after governance has admitted the request.
@@ -372,6 +442,7 @@ async fn admit(
         (Mode::Complete, Some(true)) => return Err(RequestError::StreamNotAllowed),
         _ => {}
     }
+    let idempotency_key = idempotency_key(headers)?;
 
     // 3. Authorize: may this tenant call this model, at this size?
     let prompt_chars: usize = req.messages.iter().map(ChatMessage::approx_chars).sum();
@@ -450,15 +521,34 @@ async fn admit(
         prompt_nano_usd: estimate_cost_nano_usd(&resolved.config.cost, prompt_tokens, 0),
         completion_nano_usd: estimate_cost_nano_usd(&resolved.config.cost, 0, max_output_tokens),
     };
+    //    A repeated Idempotency-Key is decided here too, by the ledger, in the
+    //    same step as the budget: a duplicate never reaches the provider.
+    if decision.tenant.require_idempotency_key && idempotency_key.is_none() {
+        return Err(RequestError::IdempotencyKeyRequired);
+    }
+    let fingerprint = idempotency_key.map(|_| {
+        let scope = match mode {
+            Mode::Stream => "stream",
+            Mode::Complete => "complete",
+        };
+        // The body already parsed as a `ChatRequest`, so it is valid JSON.
+        let value: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+        ledger::fingerprint(scope, &value)
+    });
     let reservation = state
         .limits
-        .admit(
-            &principal.tenant_id,
-            &decision.limits,
+        .admit_request(AdmitRequest {
+            id: Uuid::parse_str(request_id).unwrap_or_else(|_| Uuid::new_v4()),
+            tenant_id: &principal.tenant_id,
+            limits: &decision.limits,
             prompt_tokens,
             max_output_tokens,
-            cost,
-        )
+            estimate: cost,
+            idempotency: idempotency_key.zip(fingerprint).map(|(key, fingerprint)| ledger::IdempotencyClaim {
+                key,
+                fingerprint,
+            }),
+        })
         .await?;
 
     let framing = match &req.framing {
@@ -1091,7 +1181,6 @@ async fn complete_response(
 
     guard.closed = true;
     let usage = billable_usage(&completion, guard.summary.prompt_tokens, guard.max_output_tokens);
-    guard.reservation.settle(usage, &guard.cost_model);
     let cost = estimate_cost_nano_usd(&guard.cost_model, usage.prompt_tokens, usage.completion_tokens);
 
     let s = &mut guard.summary;
@@ -1104,6 +1193,10 @@ async fn complete_response(
     s.upstream_model.clone_from(&completion.upstream_model);
     s.events = 1;
     let payload = completion_payload(&completion, &usage, cost, &guard, admitted.metadata.as_ref());
+    // The answer goes into the ledger with the settlement, so a repeat under
+    // the same Idempotency-Key is served from there.
+    guard.reservation.keep_response(payload.clone());
+    guard.reservation.settle(usage, &guard.cost_model);
     guard.summary.bytes_out = payload.len() as u64;
     state.metrics.bytes_to_client(payload.len() as u64);
     guard.record(true);

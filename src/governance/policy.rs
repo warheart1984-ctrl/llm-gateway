@@ -70,6 +70,11 @@ pub struct Tenant {
     /// caller's own params, so a tenant policy can force `temperature: 0`.
     #[serde(default)]
     pub model_params: HashMap<String, serde_json::Map<String, serde_json::Value>>,
+    /// Refuse any request without an `Idempotency-Key`. For tenants whose
+    /// clients retry automatically, where a retry without a key would be
+    /// executed and billed again.
+    #[serde(default)]
+    pub require_idempotency_key: bool,
 }
 
 impl Tenant {
@@ -559,6 +564,7 @@ mod tests {
             default_model: None,
             limits: None,
             model_params: HashMap::new(),
+            require_idempotency_key: false,
         }
     }
 

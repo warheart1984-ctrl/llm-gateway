@@ -32,12 +32,28 @@ pub enum BootError {
     NoProviders(String),
     #[error("registry validation failed:\n{}", .0.join("\n"))]
     InvalidRegistry(Vec<String>),
+    /// A configured Postgres ledger that cannot be reached is fatal: falling
+    /// back to process memory would silently drop the guarantees it exists
+    /// to give (durability across restarts, one budget across replicas).
+    #[error("ledger: {0}")]
+    Ledger(String),
     #[error("could not build an upstream HTTP client: {0}")]
     Provider(String),
 }
 
-/// Build the full object graph.
+/// Build the full object graph, with the ledger `settings.ledger` names.
 pub async fn build(settings: Settings) -> Result<Arc<AppState>, BootError> {
+    let ledger = build_ledger(&settings.ledger).await?;
+    build_with_ledger(settings, ledger).await
+}
+
+/// Build the full object graph on a ledger the caller already has: how two
+/// gateway processes are pointed at one shared ledger in tests, and how an
+/// embedder supplies its own.
+pub async fn build_with_ledger(
+    settings: Settings,
+    ledger: Arc<dyn crate::governance::ledger::Ledger>,
+) -> Result<Arc<AppState>, BootError> {
     let settings = Arc::new(settings);
 
     // Registries first: everything else is validated against them.
@@ -112,9 +128,11 @@ pub async fn build(settings: Settings) -> Result<Arc<AppState>, BootError> {
         settings.governance.require_model_allowlist,
         settings.governance.default_limits.clone(),
     );
-    let limits = LimitEngine::new(
+    tracing::info!(backend = ledger.backend(), "spend ledger ready");
+    let limits = LimitEngine::with_ledger(
         settings.server.max_concurrent_streams_global,
         settings.governance.cost_tracking_enabled,
+        ledger,
     );
 
     // Report which catalogue entries cannot currently be served. Not fatal:
@@ -152,4 +170,36 @@ pub async fn build(settings: Settings) -> Result<Arc<AppState>, BootError> {
         started_at: std::time::Instant::now(),
         inflight: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     }))
+}
+
+async fn build_ledger(
+    cfg: &crate::config::LedgerConfig,
+) -> Result<Arc<dyn crate::governance::ledger::Ledger>, BootError> {
+    use crate::{
+        config::LedgerBackend,
+        governance::ledger::{MemoryLedger, PostgresLedger, postgres::PostgresOptions},
+    };
+    use std::time::Duration;
+
+    let retention = Duration::from_secs(cfg.idempotency_retention_secs);
+    match cfg.backend {
+        LedgerBackend::Memory => Ok(Arc::new(MemoryLedger::new(retention))),
+        LedgerBackend::Postgres => {
+            let url = std::env::var(&cfg.url_env).map_err(|_| {
+                BootError::Ledger(format!("backend is postgres but `{}` is not set", cfg.url_env))
+            })?;
+            let ledger = PostgresLedger::connect(PostgresOptions {
+                url,
+                schema: cfg.schema.clone(),
+                max_connections: cfg.max_connections,
+                timeout: Duration::from_millis(cfg.timeout_ms),
+                sweep_after: Duration::from_secs(cfg.sweep_after_secs),
+                sweep_interval: Duration::from_secs(cfg.sweep_interval_secs),
+                idempotency_retention: retention,
+            })
+            .await
+            .map_err(BootError::Ledger)?;
+            Ok(ledger)
+        }
+    }
 }

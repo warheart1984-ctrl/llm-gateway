@@ -77,6 +77,25 @@ user_agent = "llm-gateway/0.1.0"
 # Ask providers for usage in the terminal chunk so billing is exact.
 request_usage = true
 
+[ledger]
+# memory: spend lives in this process. A restart forgets it, and replicas
+#         each enforce the full budget. Right for a single instance.
+# postgres: one durable ledger shared by every replica. Survives restarts;
+#           replicas draw on one budget; a repeated Idempotency-Key is
+#           answered from the ledger instead of running again.
+backend = "memory"
+url_env = "LLM_GATEWAY_DATABASE_URL"   # env var NAME; the URL stays in env
+schema = "public"
+max_connections = 16
+# Ledger unreachable or slower than this: the request is refused with 503.
+# There is deliberately no option to admit without the ledger.
+timeout_ms = 1000
+# An open reservation older than this was orphaned by a crash and is billed
+# in full. Keep it well above the longest stream.
+sweep_after_secs = 3600
+sweep_interval_secs = 60
+idempotency_retention_secs = 86400
+
 [telemetry]
 service_name = "llm-gateway"
 service_version = "0.1.0"

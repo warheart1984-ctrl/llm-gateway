@@ -256,26 +256,47 @@ isolation, rollover) and end to end in `tests/integration.rs`.
 
 ## State and restarts
 
-**All governance state is in process memory**: the daily spend ledger, open
-reservations, the per-minute request and token windows, and the concurrency
-counters. There is no database. Plainly:
+Where spend lives is a choice, `[ledger] backend`:
 
-- **A restart resets it.** Daily spend goes back to zero, so a tenant can
-  spend its full budget again on the same UTC day. N restarts in a day allow
-  up to N+1 budgets. Rate-limit windows start empty.
-- **Replicas do not share it.** Behind a load balancer, each replica enforces
-  the full budget and rate limits independently, so the effective ceiling is
-  the per-tenant limit times the replica count. Run a single replica, or
-  divide the configured limits by the replica count.
-- **Graceful shutdown settles in-flight streams** (up to `shutdown_grace_ms`)
-  into a ledger that is then discarded.
+| | `memory` (default) | `postgres` |
+|---|---|---|
+| Survives a restart | no: spend resets to zero | yes |
+| Replicas share one budget | no: each enforces the full budget | yes |
+| Repeated `Idempotency-Key` recognised | within one process | across all replicas |
+| Ledger unreachable | cannot happen | 503 `ledger_unavailable`; readiness fails; no request executes |
 
-This fits a single-instance gateway with budgets as a guardrail against
-runaway spend within a process lifetime. It does not fit billing, or hard
-budget guarantees across restarts or replicas. For those the next step is a
-durable, transactional store (Postgres, or Redis with Lua scripts for the
-check-and-reserve) behind the same reserve/settle interface — a deliberate
-architectural change, not a config flag.
+With `postgres`, every change to money is one conditional statement, so the
+database decides, not any gateway process:
+
+- **Admission** charges the tenant's row for the day with
+  `UPDATE … WHERE spent < budget AND spent + amount <= budget`. The row lock
+  serializes admissions across replicas. The day comes from the database
+  clock, so replicas with skewed clocks agree on midnight.
+- **The reservation is committed before the provider is called.** A crash
+  can leave a reservation open, but never a provider call without a record.
+  A sweeper closes reservations left open longer than `sweep_after_secs`,
+  billing the full reservation, because after a crash the usage is unknowable.
+- **Closing** is `UPDATE … WHERE state = 'open'`, so a duplicate close from
+  any process changes nothing. Closings are queued to one writer that
+  retries until each one is durable, and graceful shutdown flushes the queue.
+- **There is no fail-open setting.** A ledger that is unreachable at startup
+  stops the gateway starting. One that is unreachable at runtime refuses
+  requests with 503.
+
+Put `sslmode=require` in the database URL outside a trusted network.
+
+**Idempotency** works on both backends. Send `Idempotency-Key` (1 to 255
+visible ASCII characters). A repeat of a finished request is not executed
+again: a completion returns the stored answer (`idempotent-replayed: true`),
+and a stream gets 409 `duplicate_request` naming the original request and
+its bill. A repeat while the first attempt is still running gets 409
+`request_in_progress`. The same key with a different request gets 422. A key
+whose attempt the provider refused may be used again, since nothing was
+executed or billed. Set `require_idempotency_key: true` on a tenant whose
+clients retry automatically.
+
+**Still per process on both backends:** rate-limit windows and concurrency
+caps. Behind N replicas, divide them by N.
 
 ## Configuration
 
@@ -359,7 +380,7 @@ What the gateway does itself, and what it expects of the deployment around it.
 ## Testing
 
 ```bash
-cargo test --locked --all-targets                  # 204 tests
+cargo test --locked --all-targets                  # 218 tests
 cargo clippy --locked --all-targets -- -D warnings
 cargo bench --bench framing                        # add `-- --quick` for a fast pass
 ```

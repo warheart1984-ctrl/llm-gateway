@@ -6,9 +6,15 @@
 //! dies at 20% still pays for the prompt it already sent, and the over-reserve
 //! is released on settle.
 //!
-//! Locking discipline: window counters and the spend ledger live behind
-//! `std::sync::Mutex`s that are never held across an `await`, so `settle()`
-//! can stay synchronous and be called straight from a stream `Drop`.
+//! Spend lives in a [`Ledger`]: in process memory by default, or in Postgres,
+//! shared by every replica and surviving restarts. Rate windows and
+//! concurrency counters are always per process.
+//!
+//! Locking discipline: window counters live behind `std::sync::Mutex`s that
+//! are never held across an `await`, so `settle()` can stay synchronous and be
+//! called straight from a stream `Drop`. Admission records the attempt in the
+//! window, releases the lock, asks the ledger, and takes the attempt back out
+//! if the ledger refuses.
 
 use std::{
     collections::VecDeque,
@@ -21,8 +27,10 @@ use std::{
 
 use dashmap::DashMap;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use uuid::Uuid;
 
-use super::{budget_bucket, budget_bucket_label};
+use super::budget_bucket_label;
+use super::ledger::{Closing, IdempotencyClaim, Ledger, LedgerRefusal, MemoryLedger, NewReservation, Outcome};
 use crate::{config::LimitProfile, providers::Usage, router::CostModel};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -43,6 +51,35 @@ pub enum LimitError {
     BudgetWouldBeExceeded { estimate: u64, remaining: u64 },
     #[error("output token limit exceeded: requested {requested}, tenant allows at most {limit}")]
     OutputTokensExceeded { requested: u32, limit: u32 },
+    #[error("the spend ledger is unavailable, so the request was not executed; retry shortly")]
+    LedgerUnavailable,
+    #[error("this Idempotency-Key was already used for a different request")]
+    IdempotencyKeyReused,
+    #[error("a request with this Idempotency-Key is still in progress; retry shortly")]
+    RequestInProgress { original: Option<Uuid> },
+    #[error("a request with this Idempotency-Key already completed (request {original}, billed {billed_nano_usd} nano-USD)")]
+    DuplicateRequest {
+        original: Uuid,
+        billed_nano_usd: u64,
+        response: Option<String>,
+    },
+}
+
+impl From<LedgerRefusal> for LimitError {
+    fn from(refusal: LedgerRefusal) -> Self {
+        match refusal {
+            LedgerRefusal::BudgetExhausted { spent, budget } => LimitError::BudgetExhausted { spent, budget },
+            LedgerRefusal::BudgetWouldBeExceeded { estimate, remaining } => {
+                LimitError::BudgetWouldBeExceeded { estimate, remaining }
+            }
+            LedgerRefusal::IdempotencyKeyReused => LimitError::IdempotencyKeyReused,
+            LedgerRefusal::InProgress { original } => LimitError::RequestInProgress { original },
+            LedgerRefusal::Duplicate { original, billed_nano_usd, response } => {
+                LimitError::DuplicateRequest { original, billed_nano_usd, response }
+            }
+            LedgerRefusal::Unavailable(_) => LimitError::LedgerUnavailable,
+        }
+    }
 }
 
 const WINDOW: Duration = Duration::from_secs(60);
@@ -80,108 +117,38 @@ impl Window {
     fn tokens(&self) -> u32 {
         self.token_events.iter().map(|(_, t)| *t).sum()
     }
-}
 
-/// Day-bucketed spend in nano-USD, guarded by one mutex so the bucket and the
-/// counter flip together. Integer only: money is not a float.
-#[derive(Debug, Default)]
-struct SpendLedger {
-    inner: Mutex<(u64, u64)>,
-}
-
-impl SpendLedger {
-    /// Roll over at the UTC day boundary and run `f` on the pair. Called on
-    /// every read/write, so the first request after midnight resets the
-    /// counter without a timer. The pair must flip under one lock: two
-    /// separate atomics let a write sneak between the bucket's CAS and the
-    /// `spent` reset, and that write is silently lost — a reservation made one
-    /// microsecond after the boundary vanishes from the budget graph.
-    fn with_day<F, R>(&self, now: SystemTime, f: F) -> R
-    where
-        F: FnOnce(&mut (u64, u64)) -> R,
-    {
-        let today = budget_bucket(now);
-        let mut pair = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if pair.0 != today {
-            pair.0 = today;
-            pair.1 = 0;
+    /// Take back one attempt recorded at `at` whose admission was refused.
+    /// Entries recorded at the same instant are interchangeable, so removing
+    /// any one of them restores the counts exactly.
+    fn withdraw(&mut self, at: Instant, prompt_tokens: u32) {
+        if let Some(i) = self.request_times.iter().rposition(|t| *t == at) {
+            self.request_times.remove(i);
         }
-        f(&mut pair)
-    }
-
-    fn snapshot(&self, now: SystemTime) -> (u64, u64) {
-        self.with_day(now, |pair| *pair)
-    }
-
-    #[cfg(test)]
-    fn reserve(&self, now: SystemTime, amount: u64) -> u64 {
-        self.with_day(now, |pair| {
-            pair.1 = pair.1.saturating_add(amount);
-            pair.1
-        })
-    }
-
-    /// Check the budget and place the reservation under one lock. Checking in
-    /// one critical section and reserving in another lets a concurrent
-    /// settle overage land in between, and the reservation then overshoots
-    /// the budget it was just checked against. `budget == 0` means no
-    /// ceiling: spend is still recorded, so `/v1/usage` stays truthful.
-    fn try_reserve(&self, now: SystemTime, amount: u64, budget: u64) -> Result<u64, LimitError> {
-        self.with_day(now, |pair| {
-            if budget > 0 {
-                if pair.1 >= budget {
-                    return Err(LimitError::BudgetExhausted {
-                        spent: pair.1,
-                        budget,
-                    });
-                }
-                let remaining = budget - pair.1;
-                if amount > remaining {
-                    return Err(LimitError::BudgetWouldBeExceeded {
-                        estimate: amount,
-                        remaining,
-                    });
-                }
-            }
-            pair.1 = pair.1.saturating_add(amount);
-            Ok(pair.0)
-        })
-    }
-
-    /// Correct a reservation made in day `bucket` once real usage or
-    /// abandonment is known. Clamps at zero so a refund larger than the
-    /// reservation cannot wrap the counter.
-    ///
-    /// A stream reserved at 23:59 UTC and settled at 00:01 belongs to a day
-    /// that has already rolled over. Its refund is dropped: the reservation
-    /// was never on today's ledger, and refunding it there would hand today's
-    /// budget yesterday's money. An overage is still charged, to today, since
-    /// that spend is real and today is the only budget still open.
-    fn correct(&self, now: SystemTime, bucket: u64, delta: i128) {
-        self.with_day(now, |pair| {
-            if delta < 0 {
-                if pair.0 == bucket {
-                    pair.1 = pair.1.saturating_sub(delta.unsigned_abs().min(u64::MAX as u128) as u64);
-                }
-            } else {
-                pair.1 = pair.1.saturating_add(delta.min(u64::MAX as i128) as u64);
-            }
-        });
+        if let Some(i) = self
+            .token_events
+            .iter()
+            .rposition(|(t, n)| *t == at && *n == prompt_tokens)
+        {
+            self.token_events.remove(i);
+        }
     }
 }
 
 #[derive(Debug, Default)]
 struct TenantState {
     window: Mutex<Window>,
-    spend: SpendLedger,
     /// Streams in flight, which is also the concurrency cap's counter. A
     /// semaphore sized at first sight would pin the cap to whatever the
     /// tenant file said when the tenant first connected; comparing against
     /// the limit on every admission lets a reload raise or lower it live.
     inflight: AtomicU64,
+}
+
+impl TenantState {
+    fn window(&self) -> std::sync::MutexGuard<'_, Window> {
+        self.window.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 /// One held concurrency slot. Releasing on `Drop` means every early return in
@@ -228,6 +195,9 @@ impl Drop for Slot {
 #[derive(Debug)]
 pub struct Reservation {
     state: Arc<TenantState>,
+    ledger: Arc<dyn Ledger>,
+    id: Uuid,
+    tenant_id: Arc<str>,
     _global_permit: Option<OwnedSemaphorePermit>,
     _slot: Option<Slot>,
     /// What admission put on the ledger: 0 when cost tracking is off, so a
@@ -236,9 +206,15 @@ pub struct Reservation {
     /// The prompt half of the reservation. Kept so an abandoned stream refunds
     /// only the completion half without needing the cost model at drop time.
     reserved_prompt_nano_usd: u64,
-    /// The UTC day the reservation was charged to. See [`SpendLedger::correct`].
+    /// The UTC day the reservation was charged to.
     bucket: u64,
+    /// Whether money moves on this reservation (cost tracking on).
     tracked: bool,
+    /// Whether the ledger holds a record of it: always when tracked, and
+    /// also when untracked but carrying an idempotency key.
+    recorded: bool,
+    /// The answer, stored with the closing for idempotent replay.
+    response: Option<String>,
     prompt_tokens: u32,
     max_output_tokens: u32,
     settled: bool,
@@ -253,7 +229,7 @@ impl Reservation {
         let prompt = usage.prompt_tokens.max(self.prompt_tokens);
         let completion = usage.completion_tokens;
         let actual = nano_usd_for(prompt, usage.cached_prompt_tokens, completion, cost);
-        self.correct(actual as i128 - self.reserved_nano_usd as i128);
+        self.finish(Outcome::Settled, actual as i128 - self.reserved_nano_usd as i128);
         self.count_completion_tokens(completion);
     }
 
@@ -268,18 +244,19 @@ impl Reservation {
         if !self.close() {
             return;
         }
-        self.refund_completion_half();
+        self.finish(Outcome::Abandoned, self.completion_refund());
     }
 
     /// Refund everything: the upstream refused the request or could not be
     /// reached, so no prompt was processed and nothing is owed. The request
     /// still counts against the per-minute request window — a rate limit
-    /// counts attempts, not successes.
+    /// counts attempts, not successes — and its idempotency key may be used
+    /// again, since nothing was executed.
     pub fn release(&mut self) {
         if !self.close() {
             return;
         }
-        self.correct(-(self.reserved_nano_usd as i128));
+        self.finish(Outcome::Released, -(self.reserved_nano_usd as i128));
     }
 
     /// Keep the whole reservation as the bill. For a stream whose usage the
@@ -291,7 +268,19 @@ impl Reservation {
         if !self.close() {
             return;
         }
+        self.finish(Outcome::Committed, 0);
         self.count_completion_tokens(self.max_output_tokens);
+    }
+
+    /// Keep this answer with the closing, so a repeat under the same
+    /// idempotency key can be served without calling the provider again.
+    /// Must be called before the closing call.
+    pub fn keep_response(&mut self, response: String) {
+        self.response = Some(response);
+    }
+
+    pub fn id(&self) -> Uuid {
+        self.id
     }
 
     pub fn reserved_nano_usd(&self) -> u64 {
@@ -307,28 +296,30 @@ impl Reservation {
         !std::mem::replace(&mut self.settled, true)
     }
 
-    fn refund_completion_half(&self) {
-        let refund = self.reserved_nano_usd as i128 - self.reserved_prompt_nano_usd as i128;
-        if refund > 0 {
-            self.correct(-refund);
-        }
+    fn completion_refund(&self) -> i128 {
+        (self.reserved_prompt_nano_usd as i128 - self.reserved_nano_usd as i128).min(0)
     }
 
-    fn correct(&self, delta: i128) {
-        if self.tracked && delta != 0 {
-            self.state.spend.correct(SystemTime::now(), self.bucket, delta);
+    fn finish(&mut self, outcome: Outcome, delta: i128) {
+        if !self.recorded {
+            return;
         }
+        self.ledger.close(Closing {
+            id: self.id,
+            tenant_id: Arc::clone(&self.tenant_id),
+            bucket: self.bucket,
+            delta_nano_usd: if self.tracked { delta } else { 0 },
+            outcome,
+            at: SystemTime::now(),
+            response: self.response.take(),
+        });
     }
 
     fn count_completion_tokens(&self, completion: u32) {
         if completion == 0 {
             return;
         }
-        let mut window = self
-            .state
-            .window
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut window = self.state.window();
         let now = Instant::now();
         window.evict(now);
         window.token_events.push_back((now, completion));
@@ -342,7 +333,7 @@ impl Drop for Reservation {
         // slot and permit fields drop after this body, so the ledger is
         // corrected before the concurrency slot frees up.
         if self.close() {
-            self.refund_completion_half();
+            self.finish(Outcome::Abandoned, self.completion_refund());
         }
     }
 }
@@ -368,19 +359,43 @@ fn nano_usd_for(
 // Engine
 // ---------------------------------------------------------------------------
 
+/// Everything admission needs to know about one request.
+#[derive(Debug, Clone)]
+pub struct AdmitRequest<'a> {
+    /// The request id, which becomes the reservation's id in the ledger.
+    pub id: Uuid,
+    pub tenant_id: &'a str,
+    pub limits: &'a LimitProfile,
+    pub prompt_tokens: u32,
+    pub max_output_tokens: u32,
+    pub estimate: CostEstimate,
+    pub idempotency: Option<IdempotencyClaim<'a>>,
+}
+
 pub struct LimitEngine {
     tenants: DashMap<String, Arc<TenantState>>,
     global: Arc<Semaphore>,
     cost_tracking: bool,
+    ledger: Arc<dyn Ledger>,
 }
 
 impl LimitEngine {
+    /// An engine on the in-memory ledger.
     pub fn new(max_concurrent_global: usize, cost_tracking: bool) -> Arc<Self> {
+        Self::with_ledger(max_concurrent_global, cost_tracking, Arc::new(MemoryLedger::default()))
+    }
+
+    pub fn with_ledger(max_concurrent_global: usize, cost_tracking: bool, ledger: Arc<dyn Ledger>) -> Arc<Self> {
         Arc::new(Self {
             tenants: DashMap::new(),
             global: Arc::new(Semaphore::new(max_concurrent_global.max(1))),
             cost_tracking,
+            ledger,
         })
+    }
+
+    pub fn ledger(&self) -> &Arc<dyn Ledger> {
+        &self.ledger
     }
 
     fn state(&self, tenant_id: &str) -> Arc<TenantState> {
@@ -391,8 +406,7 @@ impl LimitEngine {
         Arc::clone(entry.value())
     }
 
-    /// Pre-flight gate. Every rejection names the ceiling that was hit, so a
-    /// tenant can tell "slow down" apart from "you cannot afford this".
+    /// [`LimitEngine::admit_request`] with a fresh id and no idempotency key.
     pub async fn admit(
         self: &Arc<Self>,
         tenant_id: &str,
@@ -401,11 +415,27 @@ impl LimitEngine {
         max_output_tokens: u32,
         estimate: CostEstimate,
     ) -> Result<Reservation, LimitError> {
-        let estimated_cost_nano_usd = estimate.total();
+        self.admit_request(AdmitRequest {
+            id: Uuid::new_v4(),
+            tenant_id,
+            limits,
+            prompt_tokens,
+            max_output_tokens,
+            estimate,
+            idempotency: None,
+        })
+        .await
+    }
+
+    /// Pre-flight gate. Every rejection names the ceiling that was hit, so a
+    /// tenant can tell "slow down" apart from "you cannot afford this".
+    pub async fn admit_request(self: &Arc<Self>, req: AdmitRequest<'_>) -> Result<Reservation, LimitError> {
+        let limits = req.limits;
+        let estimated_cost_nano_usd = req.estimate.total();
         // `0` means "no ceiling", matching the rest of `LimitProfile`.
-        if limits.max_output_tokens > 0 && max_output_tokens > limits.max_output_tokens {
+        if limits.max_output_tokens > 0 && req.max_output_tokens > limits.max_output_tokens {
             return Err(LimitError::OutputTokensExceeded {
-                requested: max_output_tokens,
+                requested: req.max_output_tokens,
                 limit: limits.max_output_tokens,
             });
         }
@@ -418,75 +448,99 @@ impl LimitEngine {
             }
         })?;
 
-        let state = self.state(tenant_id);
+        let state = self.state(req.tenant_id);
         let slot = Slot::try_acquire(&state, limits.max_concurrent_streams).ok_or(
             LimitError::ConcurrencyLimited {
                 limit: limits.max_concurrent_streams,
             },
         )?;
 
+        // Phase 1, under the window lock: check the rate limits and record
+        // this attempt, so concurrent admissions see it.
         let now = Instant::now();
-        let system_now = SystemTime::now();
-        let mut window = state
-            .window
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        window.evict(now);
-
-        if limits.requests_per_minute > 0 && window.request_times.len() as u32 >= limits.requests_per_minute {
-            return Err(LimitError::RateLimited {
-                done: window.request_times.len() as u32,
-                limit: limits.requests_per_minute,
-            });
+        {
+            let mut window = state.window();
+            window.evict(now);
+            if limits.requests_per_minute > 0 && window.request_times.len() as u32 >= limits.requests_per_minute {
+                return Err(LimitError::RateLimited {
+                    done: window.request_times.len() as u32,
+                    limit: limits.requests_per_minute,
+                });
+            }
+            let used_tokens = window.tokens();
+            if limits.tokens_per_minute > 0
+                && used_tokens.saturating_add(req.prompt_tokens) > limits.tokens_per_minute
+            {
+                return Err(LimitError::TokenRateLimited {
+                    done: used_tokens,
+                    requested: req.prompt_tokens,
+                    limit: limits.tokens_per_minute,
+                });
+            }
+            window.request_times.push_back(now);
+            window.token_events.push_back((now, req.prompt_tokens));
+            if window.token_events.len() > 8_192 {
+                let drop_to = window.token_events.len() - 4_096;
+                window.token_events.drain(..drop_to);
+            }
         }
-        let used_tokens = window.tokens();
-        if limits.tokens_per_minute > 0 && used_tokens.saturating_add(prompt_tokens) > limits.tokens_per_minute {
-            return Err(LimitError::TokenRateLimited {
-                done: used_tokens,
-                requested: prompt_tokens,
-                limit: limits.tokens_per_minute,
-            });
-        }
 
-        // Check-and-reserve is one ledger operation; the window lock held
-        // here serializes this tenant's admissions, but not its settlements.
-        let (bucket, reserved) = if self.cost_tracking {
-            let bucket = state.spend.try_reserve(
-                system_now,
-                estimated_cost_nano_usd,
-                limits.daily_budget_nano_usd,
-            )?;
-            (bucket, estimated_cost_nano_usd)
+        // Phase 2, no lock held: the ledger decides, atomically, whether the
+        // money and the idempotency key are available. A refusal takes the
+        // attempt back out of the window: a request that was never admitted
+        // does not consume rate limit.
+        let tracked = self.cost_tracking;
+        let recorded = tracked || req.idempotency.is_some();
+        let bucket = if recorded {
+            let decision = self
+                .ledger
+                .try_reserve(NewReservation {
+                    id: req.id,
+                    tenant_id: req.tenant_id,
+                    now: SystemTime::now(),
+                    amount_nano_usd: if tracked { estimated_cost_nano_usd } else { 0 },
+                    prompt_nano_usd: if tracked { req.estimate.prompt_nano_usd } else { 0 },
+                    budget_nano_usd: if tracked { limits.daily_budget_nano_usd } else { 0 },
+                    idempotency: req.idempotency.clone(),
+                })
+                .await;
+            match decision {
+                Ok(bucket) => bucket,
+                Err(refusal) => {
+                    state.window().withdraw(now, req.prompt_tokens);
+                    return Err(refusal.into());
+                }
+            }
         } else {
-            (budget_bucket(system_now), 0)
+            super::budget_bucket(SystemTime::now())
         };
-
-        window.request_times.push_back(now);
-        window.token_events.push_back((now, prompt_tokens));
-        if window.token_events.len() > 8_192 {
-            let drop_to = window.token_events.len() - 4_096;
-            window.token_events.drain(..drop_to);
-        }
-        drop(window);
+        let reserved = if tracked { estimated_cost_nano_usd } else { 0 };
 
         tracing::debug!(
-            tenant = tenant_id,
-            prompt_tokens,
-            max_output_tokens,
+            tenant = req.tenant_id,
+            reservation = %req.id,
+            prompt_tokens = req.prompt_tokens,
+            max_output_tokens = req.max_output_tokens,
             reserved_nano_usd = reserved,
+            ledger = self.ledger.backend(),
             "admitted"
         );
 
         Ok(Reservation {
             state: Arc::clone(&state),
+            ledger: Arc::clone(&self.ledger),
+            id: req.id,
+            tenant_id: Arc::from(req.tenant_id),
             _global_permit: Some(global_permit),
             _slot: Some(slot),
             reserved_nano_usd: reserved,
-            reserved_prompt_nano_usd: if self.cost_tracking { estimate.prompt_nano_usd } else { 0 },
+            reserved_prompt_nano_usd: if tracked { req.estimate.prompt_nano_usd } else { 0 },
             bucket,
-            tracked: self.cost_tracking,
-            prompt_tokens,
-            max_output_tokens,
+            tracked,
+            recorded,
+            response: None,
+            prompt_tokens: req.prompt_tokens,
+            max_output_tokens: req.max_output_tokens,
             settled: false,
         })
     }
@@ -496,10 +550,7 @@ impl LimitEngine {
         let Some(state) = self.tenants.get(tenant_id) else {
             return TenantUsage::default();
         };
-        let mut window = state
-            .window
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut window = state.window();
         window.evict(Instant::now());
         TenantUsage {
             requests_last_minute: window.request_times.len() as u32,
@@ -508,16 +559,11 @@ impl LimitEngine {
         }
     }
 
-    /// Point-in-time budget view. Day-bucketed like the ledger itself.
-    pub fn snapshot(&self, tenant_id: &str, limits: &LimitProfile) -> BudgetSnapshot {
-        let system_now = std::time::SystemTime::now();
-        let (bucket, spent) = self
-            .tenants
-            .get(tenant_id)
-            .map(|state| state.spend.snapshot(system_now))
-            .unwrap_or((budget_bucket(system_now), 0));
+    /// Point-in-time budget view, read from the ledger.
+    pub async fn snapshot(&self, tenant_id: &str, limits: &LimitProfile) -> Result<BudgetSnapshot, LimitError> {
+        let (bucket, spent) = self.ledger.snapshot(tenant_id, SystemTime::now()).await?;
         let usage = self.usage(tenant_id);
-        BudgetSnapshot {
+        Ok(BudgetSnapshot {
             tenant_id: tenant_id.to_string(),
             requests_last_minute: usage.requests_last_minute,
             tokens_last_minute: usage.tokens_last_minute,
@@ -526,7 +572,7 @@ impl LimitEngine {
             budget_nano_usd: limits.daily_budget_nano_usd,
             budget_bucket: bucket,
             budget_label: budget_bucket_label(bucket),
-        }
+        })
     }
 
     pub fn tracked_tenants(&self) -> usize {
@@ -587,6 +633,18 @@ pub struct UsageDelta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::governance::ledger::SpendLedger;
+    use futures_util::FutureExt as _;
+
+    /// The in-memory ledger answers immediately, so its snapshot future is
+    /// ready on first poll. Lets sync tests and threads read spend.
+    fn snap(engine: &LimitEngine, tenant: &str, limits: &LimitProfile) -> BudgetSnapshot {
+        engine
+            .snapshot(tenant, limits)
+            .now_or_never()
+            .expect("the memory ledger answers immediately")
+            .expect("the memory ledger never refuses a snapshot")
+    }
 
     fn limits(requests: u32, tokens: u32, concurrent: u32, budget: u64) -> LimitProfile {
         LimitProfile {
@@ -674,14 +732,14 @@ mod tests {
             completion_nano_usd: nano_usd_for(0, None, 100, &c),
         };
         let mut r = engine.admit("t", &l, 10, 100, estimate).await.unwrap();
-        assert_eq!(engine.snapshot("t", &l).spent_nano_usd, 820_000);
+        assert_eq!(snap(&engine, "t", &l).spent_nano_usd, 820_000);
         r.settle(
             Usage { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, ..Default::default() },
             &c,
         );
         // Actual: 10 * 2,000 + 5 * 8,000 = 60,000. The 760,000 over-reserve is
         // refunded.
-        assert_eq!(engine.snapshot("t", &l).spent_nano_usd, 60_000);
+        assert_eq!(snap(&engine, "t", &l).spent_nano_usd, 60_000);
     }
 
 #[tokio::test]
@@ -698,14 +756,14 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(engine.snapshot("t", &l).spent_nano_usd, 820);
+        assert_eq!(snap(&engine, "t", &l).spent_nano_usd, 820);
         r.abandon();
         // The completion reservation is refunded immediately, not deferred to
         // `Drop`; only the prompt half stands.
-        assert_eq!(engine.snapshot("t", &l).spent_nano_usd, 20);
+        assert_eq!(snap(&engine, "t", &l).spent_nano_usd, 20);
         drop(r);
         // Dropping an already-abandoned reservation refunds nothing twice.
-        assert_eq!(engine.snapshot("t", &l).spent_nano_usd, 20);
+        assert_eq!(snap(&engine, "t", &l).spent_nano_usd, 20);
     }
 
     #[tokio::test]
@@ -721,12 +779,12 @@ mod tests {
             Usage { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, ..Default::default() },
             &c,
         );
-        let billed = engine.snapshot("t", &l).spent_nano_usd;
+        let billed = snap(&engine, "t", &l).spent_nano_usd;
         assert_eq!(billed, 60_000);
         r.abandon();
         // Real usage was already charged; abandoning afterwards must not refund
         // the completion half a second time.
-        assert_eq!(engine.snapshot("t", &l).spent_nano_usd, billed);
+        assert_eq!(snap(&engine, "t", &l).spent_nano_usd, billed);
     }
 
     #[test]
@@ -786,7 +844,7 @@ mod tests {
             .admit("t", &l, 1, 1, CostEstimate { prompt_nano_usd: 500, completion_nano_usd: 500 })
             .await
             .unwrap();
-        assert_eq!(engine.snapshot("t", &l).spent_nano_usd, 1_000);
+        assert_eq!(snap(&engine, "t", &l).spent_nano_usd, 1_000);
         // Settling at the reserved amount leaves the budget exactly exhausted.
         // $0.001/MTok is 1 nano-USD per token, so 500 + 500 tokens bills
         // exactly the 1,000 nano-USD that was reserved.
@@ -910,7 +968,7 @@ mod tests {
                         step.apply(&mut r);
                     }
                     drop(r);
-                    let snap = engine.snapshot("t", &l);
+                    let snap = snap(&engine, "t", &l);
                     assert_eq!(snap.spent_nano_usd, a.owed(), "sequence {a:?} -> {b:?} -> {c:?}");
                     assert_eq!(snap.in_flight, 0, "sequence {a:?} -> {b:?} -> {c:?} leaked a slot");
                     cases += 1;
@@ -1009,7 +1067,7 @@ mod tests {
             owed += o;
             admitted += a;
         }
-        let snap = engine.snapshot("t", &l);
+        let snap = snap(&engine, "t", &l);
         assert!(admitted > 0, "the property is vacuous if nothing was admitted");
         assert_eq!(snap.spent_nano_usd, owed, "{admitted} admitted");
         assert_eq!(snap.in_flight, 0);
@@ -1046,7 +1104,7 @@ mod tests {
                 )),
                 "round {round}: every refusal is a budget refusal"
             );
-            assert_eq!(engine.snapshot("t", &l).spent_nano_usd, per_request * 10);
+            assert_eq!(snap(&engine, "t", &l).spent_nano_usd, per_request * 10);
         }
     }
 
@@ -1076,8 +1134,8 @@ mod tests {
             })
             .collect();
         let held: Vec<Reservation> = threads.into_iter().flat_map(|t| t.join().unwrap()).collect();
-        assert_eq!(engine.snapshot("noisy", &tight).spent_nano_usd, per_request * 3);
-        assert_eq!(engine.snapshot("quiet", &roomy).spent_nano_usd, per_request * 400);
+        assert_eq!(snap(&engine, "noisy", &tight).spent_nano_usd, per_request * 3);
+        assert_eq!(snap(&engine, "quiet", &roomy).spent_nano_usd, per_request * 400);
         assert_eq!(held.len(), 403);
     }
 
@@ -1087,7 +1145,7 @@ mod tests {
         let l = limits(0, 0, 8, 10_000_000_000);
         let mut r = engine.admit("t", &l, 10, 100, estimate_for(10, 100)).await.unwrap();
         r.release();
-        let snap = engine.snapshot("t", &l);
+        let snap = snap(&engine, "t", &l);
         assert_eq!(snap.spent_nano_usd, 0, "a refused upstream costs nothing");
         assert_eq!(snap.requests_last_minute, 1, "but it was an attempt");
     }
@@ -1098,7 +1156,7 @@ mod tests {
         let l = limits(0, 0, 8, 10_000_000_000);
         let mut r = engine.admit("t", &l, 10, 100, estimate_for(10, 100)).await.unwrap();
         r.commit_reserved();
-        let snap = engine.snapshot("t", &l);
+        let snap = snap(&engine, "t", &l);
         assert_eq!(snap.spent_nano_usd, estimate_for(10, 100).total());
         assert_eq!(snap.tokens_last_minute, 110, "prompt plus the whole output ceiling");
     }
@@ -1113,7 +1171,7 @@ mod tests {
             let mut r = Some(engine.admit("t", &l, 10, 100, estimate_for(10, 100)).await.unwrap());
             close.apply(&mut r);
         }
-        assert_eq!(engine.snapshot("t", &l).spent_nano_usd, 0);
+        assert_eq!(snap(&engine, "t", &l).spent_nano_usd, 0);
     }
 
     /// A zero budget means no ceiling, but spend is still recorded so a
@@ -1125,7 +1183,7 @@ mod tests {
         let l = limits(0, 0, 8, 0);
         let mut r = engine.admit("t", &l, 10, 100, estimate_for(10, 100)).await.unwrap();
         r.settle(usage(10, 5), &rates());
-        assert_eq!(engine.snapshot("t", &l).spent_nano_usd, nano_usd_for(10, None, 5, &rates()));
+        assert_eq!(snap(&engine, "t", &l).spent_nano_usd, nano_usd_for(10, None, 5, &rates()));
     }
 
     #[test]

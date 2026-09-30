@@ -78,6 +78,19 @@ hmac = "0.12"
 subtle = "2"
 base64 = "0.22"
 
+# ---- durable ledger --------------------------------------------------------
+# Runtime-checked `sqlx::query`, never the `query!` macros: those need a live
+# database or offline data at compile time. `macros` + `migrate` are for the
+# embedded `migrate!()` only.
+sqlx = { version = "0.8", default-features = false, features = [
+  "runtime-tokio",
+  "tls-rustls",
+  "postgres",
+  "uuid",
+  "macros",
+  "migrate",
+] }
+
 # ---- util ----------------------------------------------------------------
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }

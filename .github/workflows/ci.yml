@@ -53,6 +53,34 @@ jobs:
             cargo test --locked --lib governance::limits
           done
 
+  shared-ledger:
+    # The restart, replica, replay and dead-database tests, against a real
+    # Postgres. The database is mandatory here: a missing one fails the job
+    # instead of letting the tests skip.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: gatewaytest
+          POSTGRES_DB: gateway
+        ports: ["55432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      LLM_GATEWAY_TEST_DATABASE_URL: postgres://postgres:gatewaytest@127.0.0.1:55432/gateway?sslmode=disable
+      LLM_GATEWAY_REQUIRE_TEST_DATABASE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Pressure suite on the shared ledger, repeated
+        run: |
+          for run in 1 2 3; do
+            cargo test --locked --test pressure
+          done
+
   lint:
     runs-on: ubuntu-latest
     steps:

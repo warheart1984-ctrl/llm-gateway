@@ -35,6 +35,57 @@ pub struct Settings {
     pub governance: GovernanceConfig,
     pub upstream: UpstreamConfig,
     pub telemetry: TelemetryConfig,
+    /// Absent in older config files, which get the in-memory ledger.
+    #[serde(default)]
+    pub ledger: LedgerConfig,
+}
+
+/// Where spend and reservations live. See `governance::ledger`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LedgerBackend {
+    /// Process memory: exact, but a restart forgets it and replicas do not
+    /// share it. Right for a single instance.
+    #[default]
+    Memory,
+    /// A shared, durable Postgres ledger: survives restarts, and every
+    /// replica draws on one budget.
+    Postgres,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LedgerConfig {
+    pub backend: LedgerBackend,
+    /// Name of the env var holding the database URL. Never the URL itself.
+    pub url_env: String,
+    pub schema: String,
+    pub max_connections: u32,
+    /// Bound on each admission's ledger round trip. When it is exceeded, or
+    /// the database is down, requests are refused with 503: there is no
+    /// setting that admits without the ledger, because that fails open.
+    pub timeout_ms: u64,
+    /// An `open` reservation older than this is treated as orphaned by a
+    /// crash and billed in full. Keep it well above the longest request.
+    pub sweep_after_secs: u64,
+    pub sweep_interval_secs: u64,
+    /// How long a completed request's Idempotency-Key is remembered.
+    pub idempotency_retention_secs: u64,
+}
+
+impl Default for LedgerConfig {
+    fn default() -> Self {
+        Self {
+            backend: LedgerBackend::Memory,
+            url_env: "LLM_GATEWAY_DATABASE_URL".to_string(),
+            schema: "public".to_string(),
+            max_connections: 16,
+            timeout_ms: 1_000,
+            sweep_after_secs: 3_600,
+            sweep_interval_secs: 60,
+            idempotency_retention_secs: 86_400,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -453,6 +504,7 @@ pub fn redacted_settings(settings: &Settings) -> BTreeMap<&'static str, String> 
     out.insert("auth_mode", format!("{:?}", settings.auth.mode));
     out.insert("jwt_issuer", settings.auth.jwt.as_ref().map(|j| j.issuer.clone()).unwrap_or_else(|| "-".into()));
     out.insert("metrics_enabled", settings.server.metrics_enabled.to_string());
+    out.insert("ledger", format!("{:?}", settings.ledger.backend).to_ascii_lowercase());
     out.insert(
         "ops_bind",
         settings

@@ -289,14 +289,65 @@ fn tenants_yaml(include_rotating_key: bool) -> String {
         key: key-dormant
         scopes: [chat:stream]
     allowed_models: ["mock/*"]
+  - tenant_id: strict
+    enabled: true
+    require_idempotency_key: true
+    credentials:
+      - key_id: ak_strict
+        key: key-strict
+        scopes: [chat:stream]
+    allowed_models: ["mock/*"]
+    limits:
+{roomy}      daily_budget_nano_usd: 100000000000
 "#
     )
+}
+
+/// Which ledger a deployment's gateways use.
+#[derive(Clone)]
+enum LedgerChoice {
+    /// Each gateway process has its own, in memory.
+    Memory,
+    /// Every gateway process shares one Postgres ledger: a schema of its own
+    /// per deployment, so parallel tests never share rows.
+    Shared { url: String, schema: String },
+}
+
+/// The test database, or `None` to skip. CI sets
+/// `LLM_GATEWAY_REQUIRE_TEST_DATABASE`, which turns a missing database into a
+/// failure rather than a silent pass.
+fn test_database_url() -> Option<String> {
+    match std::env::var("LLM_GATEWAY_TEST_DATABASE_URL") {
+        Ok(url) if !url.is_empty() => Some(url),
+        _ => {
+            let required = std::env::var("LLM_GATEWAY_REQUIRE_TEST_DATABASE").is_ok_and(|v| !v.is_empty());
+            assert!(!required, "LLM_GATEWAY_TEST_DATABASE_URL is required but not set");
+            eprintln!("skipped: set LLM_GATEWAY_TEST_DATABASE_URL to run the shared-ledger tests");
+            None
+        }
+    }
+}
+
+async fn postgres_ledger(url: &str, schema: &str) -> Result<Arc<llm_gateway::governance::ledger::PostgresLedger>, String> {
+    llm_gateway::governance::ledger::PostgresLedger::connect(
+        llm_gateway::governance::ledger::postgres::PostgresOptions {
+            url: url.to_string(),
+            schema: schema.to_string(),
+            max_connections: 8,
+            timeout: Duration::from_millis(2000),
+            sweep_after: Duration::from_secs(3_600),
+            sweep_interval: Duration::from_secs(3_600),
+            idempotency_retention: Duration::from_secs(86_400),
+        },
+    )
+    .await
 }
 
 /// Config files on disk, shared by every gateway process booted from them,
 /// the way replicas share a config volume.
 struct Deployment {
     dir: Arc<tempdir::TempDir>,
+    ledger: LedgerChoice,
 }
 
 impl Deployment {
@@ -305,7 +356,16 @@ impl Deployment {
         let dir = Arc::new(tempdir::TempDir::new("llm-gateway-pressure"));
         std::fs::write(dir.path().join("models.yaml"), models_yaml(provider.addr)).unwrap();
         std::fs::write(dir.path().join("tenants.yaml"), tenants_yaml(true)).unwrap();
-        Self { dir }
+        Self { dir, ledger: LedgerChoice::Memory }
+    }
+
+    /// A deployment whose gateways share one Postgres ledger at `url`.
+    fn shared(provider: &MockProvider, url: &str) -> Self {
+        let schema = format!("pressure_{}", uuid::Uuid::new_v4().simple());
+        Self {
+            ledger: LedgerChoice::Shared { url: url.to_string(), schema },
+            ..Self::new(provider)
+        }
     }
 
     fn rewrite_tenants(&self, yaml: &str) {
@@ -340,7 +400,17 @@ impl Deployment {
             ..Default::default()
         };
         tweak(&mut settings);
-        let state = llm_gateway::bootstrap::build(settings).await.expect("boot gateway");
+        let state = match &self.ledger {
+            LedgerChoice::Memory => llm_gateway::bootstrap::build(settings).await.expect("boot gateway"),
+            // A fresh ledger client per boot, exactly as a separate process
+            // would have: nothing is shared but the database.
+            LedgerChoice::Shared { url, schema } => {
+                let ledger = postgres_ledger(url, schema).await.expect("connect ledger");
+                llm_gateway::bootstrap::build_with_ledger(settings, ledger)
+                    .await
+                    .expect("boot gateway")
+            }
+        };
         let app = llm_gateway::api::router(state);
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind gateway");
         let addr = listener.local_addr().unwrap();
@@ -1057,15 +1127,272 @@ async fn second_door_a_disconnect_storm_leaks_no_slots_and_bills_each_reservatio
 }
 
 // ===========================================================================
-// 8. Known gaps: where the boundary does NOT hold today
+// 8. Replays: one execution and one charge per Idempotency-Key
 // ===========================================================================
-//
-// Each of these asserts the current, fail-open behaviour. When the gap is
-// closed (see docs/plans/durable-ledger.md), the test fails and must be
-// rewritten to assert the closed boundary.
+
+fn with_key(request: reqwest::RequestBuilder, key: &str) -> reqwest::RequestBuilder {
+    request.header("x-api-key", "key-app").header("idempotency-key", key)
+}
 
 #[tokio::test]
-async fn gap_a_restart_forgets_todays_spend() {
+async fn replay_a_repeated_stream_is_recognised_not_executed() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let gw = Deployment::new(&provider).boot().await;
+    let send = || gw.send(with_key(reqwest::Client::new().post(gw.url("/v1/chat/stream")), "order-1").json(&standard_request()));
+
+    let first = send().await;
+    assert_eq!(first.status, StatusCode::OK);
+    let second = send().await;
+    assert_eq!(second.status, StatusCode::CONFLICT, "{}", second.body);
+    assert_eq!(second.code(), "duplicate_request");
+    assert_eq!(second.json()["billed_nano_usd"], HEALTHY_ANSWER_COST);
+    assert!(second.json()["original_request_id"].is_string());
+    assert_eq!(provider.calls(), 1, "executed once");
+    assert_eq!(gw.spent("key-app").await, HEALTHY_ANSWER_COST, "billed once");
+}
+
+#[tokio::test]
+async fn replay_a_repeated_completion_is_served_from_the_ledger() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let gw = Deployment::new(&provider).boot().await;
+    let send = || gw.send(with_key(reqwest::Client::new().post(gw.url("/v1/chat/complete")), "order-2").json(&standard_request()));
+
+    let first = send().await;
+    assert_eq!(first.status, StatusCode::OK);
+    let replay = send().await;
+    assert_eq!(replay.status, StatusCode::OK, "{}", replay.body);
+    assert_eq!(replay.headers["idempotent-replayed"], "true");
+    assert_eq!(replay.body, first.body, "the same answer, byte for byte");
+    assert_eq!(provider.calls(), 1, "executed once");
+    assert_eq!(gw.spent("key-app").await, HEALTHY_ANSWER_COST, "billed once");
+}
+
+#[tokio::test]
+async fn replay_the_same_key_for_a_different_request_is_refused() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let gw = Deployment::new(&provider).boot().await;
+    let send = |body: Value| gw.send(with_key(reqwest::Client::new().post(gw.url("/v1/chat/stream")), "order-3").json(&body));
+
+    assert_eq!(send(standard_request()).await.status, StatusCode::OK);
+    let mut other = standard_request();
+    other["messages"] = json!([{ "role": "user", "content": "something else" }]);
+    let reply = send(other).await;
+    assert_eq!(reply.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(reply.code(), "idempotency_key_reused");
+    assert_eq!(provider.calls(), 1);
+}
+
+#[tokio::test]
+async fn replay_a_retry_while_the_first_is_running_is_told_to_wait() {
+    let provider = MockProvider::start(Provider::Gated).await;
+    let gw = Arc::new(Deployment::new(&provider).boot().await);
+    let send = |gw: Arc<Gateway>| async move {
+        gw.send(with_key(reqwest::Client::new().post(gw.url("/v1/chat/stream")), "order-4").json(&standard_request()))
+            .await
+    };
+
+    let first = tokio::spawn(send(Arc::clone(&gw)));
+    eventually("the first attempt reaches the provider", || provider.calls() == 1).await;
+    let retry = send(Arc::clone(&gw)).await;
+    assert_eq!(retry.status, StatusCode::CONFLICT);
+    assert_eq!(retry.code(), "request_in_progress");
+    assert_eq!(retry.headers["retry-after"], "1");
+    provider.open_gate(1);
+    assert_eq!(first.await.unwrap().status, StatusCode::OK);
+    assert_eq!(provider.calls(), 1);
+}
+
+#[tokio::test]
+async fn replay_a_refused_attempt_can_be_retried_under_its_key() {
+    // Nothing was executed and nothing billed, so the key is free again: an
+    // honest retry after a provider refusal must reach the provider.
+    let provider = MockProvider::start(Provider::Refusing).await;
+    let gw = Deployment::new(&provider).boot().await;
+    let send = || gw.send(with_key(reqwest::Client::new().post(gw.url("/v1/chat/stream")), "order-5").json(&standard_request()));
+
+    assert_eq!(send().await.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(send().await.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(provider.calls(), 2, "the retry was executed, not refused as a duplicate");
+    assert_eq!(gw.spent("key-app").await, 0);
+}
+
+#[tokio::test]
+async fn replay_without_a_key_cannot_be_recognised() {
+    // A limit, not a gap: two identical requests with no key may be two
+    // legitimate requests. Tenants whose clients retry require the key.
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let gw = Deployment::new(&provider).boot().await;
+    assert_eq!(gw.chat(Some("key-app"), standard_request()).await.status, StatusCode::OK);
+    assert_eq!(gw.chat(Some("key-app"), standard_request()).await.status, StatusCode::OK);
+    assert_eq!(provider.calls(), 2);
+}
+
+#[tokio::test]
+async fn replay_a_tenant_can_require_the_key() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let gw = Deployment::new(&provider).boot().await;
+
+    let reply = gw.chat(Some("key-strict"), standard_request()).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(reply.code(), "idempotency_key_required");
+    assert_eq!(provider.calls(), 0);
+    let keyed = reqwest::Client::new()
+        .post(gw.url("/v1/chat/stream"))
+        .header("x-api-key", "key-strict")
+        .header("idempotency-key", "order-6")
+        .json(&standard_request());
+    assert_eq!(gw.send(keyed).await.status, StatusCode::OK);
+}
+
+// ===========================================================================
+// 9. The shared ledger: restarts, replicas, and a dead database
+// ===========================================================================
+//
+// Run against a real Postgres when LLM_GATEWAY_TEST_DATABASE_URL is set.
+
+#[tokio::test]
+async fn shared_ledger_a_restart_keeps_todays_spend() {
+    let Some(url) = test_database_url() else { return };
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let deployment = Deployment::shared(&provider, &url);
+
+    let first = deployment.boot().await;
+    assert_eq!(first.chat(Some("key-oneshot"), small_request()).await.status, StatusCode::OK);
+    eventually_async("the settlement is durable", || async { first.spent("key-oneshot").await == HEALTHY_ANSWER_COST }).await;
+    drop(first); // crash
+
+    let restarted = deployment.boot().await;
+    assert_eq!(restarted.spent("key-oneshot").await, HEALTHY_ANSWER_COST, "the ledger outlived the process");
+    assert_eq!(
+        restarted.chat(Some("key-oneshot"), small_request()).await.status,
+        StatusCode::PAYMENT_REQUIRED,
+        "an exhausted tenant stays exhausted after a restart"
+    );
+    assert_eq!(provider.calls(), 1);
+}
+
+#[tokio::test]
+async fn shared_ledger_replicas_draw_on_one_budget() {
+    let Some(url) = test_database_url() else { return };
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let deployment = Deployment::shared(&provider, &url);
+    let (a, b) = (deployment.boot().await, deployment.boot().await);
+
+    assert_eq!(a.chat(Some("key-oneshot"), small_request()).await.status, StatusCode::OK);
+    eventually_async("the settlement is durable", || async { b.spent("key-oneshot").await == HEALTHY_ANSWER_COST }).await;
+    assert_eq!(
+        b.chat(Some("key-oneshot"), small_request()).await.status,
+        StatusCode::PAYMENT_REQUIRED,
+        "the second replica sees the first one's spend"
+    );
+    assert_eq!(provider.calls(), 1);
+}
+
+#[tokio::test]
+async fn shared_ledger_a_burst_across_replicas_admits_exactly_what_fits() {
+    // Twenty simultaneous requests alternating between two gateway processes,
+    // against a budget with room for three. Separate books would admit six.
+    let Some(url) = test_database_url() else { return };
+    let provider = MockProvider::start(Provider::Gated).await;
+    let deployment = Deployment::shared(&provider, &url);
+    let replicas = [Arc::new(deployment.boot().await), Arc::new(deployment.boot().await)];
+
+    let refused = Arc::new(AtomicU64::new(0));
+    let burst: Vec<_> = (0..20)
+        .map(|i| {
+            let (gw, refused) = (Arc::clone(&replicas[i % 2]), Arc::clone(&refused));
+            tokio::spawn(async move {
+                let reply = gw.chat(Some("key-tight"), standard_request()).await;
+                if reply.status == StatusCode::PAYMENT_REQUIRED {
+                    refused.fetch_add(1, Ordering::SeqCst);
+                }
+                reply.status
+            })
+        })
+        .collect();
+    eventually("every request admitted or refused", || {
+        provider.calls() + refused.load(Ordering::SeqCst) == 20
+    })
+    .await;
+    assert_eq!(provider.calls(), 3, "one budget across both replicas");
+    provider.open_gate(20);
+    let statuses = futures_util::future::join_all(burst).await;
+    assert_eq!(statuses.into_iter().filter(|s| *s.as_ref().unwrap() == StatusCode::OK).count(), 3);
+}
+
+#[tokio::test]
+async fn shared_ledger_a_repeated_key_is_recognised_across_replicas() {
+    let Some(url) = test_database_url() else { return };
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let deployment = Deployment::shared(&provider, &url);
+    let (a, b) = (deployment.boot().await, deployment.boot().await);
+    async fn send(gw: &Gateway) -> Reply {
+        gw.send(with_key(reqwest::Client::new().post(gw.url("/v1/chat/complete")), "order-7").json(&standard_request()))
+            .await
+    }
+
+    let first = send(&a).await;
+    assert_eq!(first.status, StatusCode::OK);
+    // A client retrying on 409 `request_in_progress`, exactly as told to,
+    // until the first attempt's settlement is durable.
+    let mut replay = send(&b).await;
+    for _ in 0..100 {
+        if replay.status != StatusCode::CONFLICT {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        replay = send(&b).await;
+    }
+    assert_eq!(replay.status, StatusCode::OK, "{}", replay.body);
+    assert_eq!(replay.headers["idempotent-replayed"], "true");
+    assert_eq!(replay.body, first.body);
+    assert_eq!(provider.calls(), 1, "executed once across both replicas");
+    assert_eq!(b.spent("key-app").await, HEALTHY_ANSWER_COST, "billed once");
+}
+
+#[tokio::test]
+async fn shared_ledger_a_dead_ledger_fails_closed() {
+    // The gateway reaches Postgres through a relay the test can cut. With the
+    // ledger gone, nothing may reach the provider: 503, not a free pass.
+    let Some(url) = test_database_url() else { return };
+    let relay = relay::Relay::start(&url).await;
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let gw = Deployment::shared(&provider, &relay.url).boot().await;
+
+    assert_eq!(gw.chat(Some("key-app"), standard_request()).await.status, StatusCode::OK);
+    assert_eq!(provider.calls(), 1);
+
+    relay.cut();
+    let reply = gw.chat(Some("key-app"), standard_request()).await;
+    assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE, "{}", reply.body);
+    assert_eq!(reply.code(), "ledger_unavailable");
+    assert_eq!(reply.headers["retry-after"], "5");
+    assert_eq!(provider.calls(), 1, "the provider saw nothing while the ledger was down");
+    let ready = gw.send(reqwest::Client::new().get(gw.url("/health/ready"))).await;
+    assert_eq!(ready.status, StatusCode::SERVICE_UNAVAILABLE, "pulled from the load balancer");
+    assert!(ready.body.contains("ledger"), "{}", ready.body);
+}
+
+#[tokio::test]
+async fn shared_ledger_a_gateway_will_not_start_without_its_ledger() {
+    // A configured ledger that cannot be reached is fatal at boot. Falling
+    // back to memory would silently drop both guarantees.
+    let Some(url) = test_database_url() else { return };
+    let relay = relay::Relay::start(&url).await;
+    relay.cut();
+    let err = postgres_ledger(&relay.url, "pressure_unreachable").await.unwrap_err();
+    assert!(!err.contains("gatewaytest"), "the error must not echo credentials: {err}");
+}
+
+// ===========================================================================
+// 10. Known gaps of the in-memory ledger
+// ===========================================================================
+//
+// The in-memory ledger is per process by design. These pin what that means,
+// so nobody mistakes it for the shared ledger above.
+
+#[tokio::test]
+async fn gap_memory_ledger_a_restart_forgets_todays_spend() {
     let provider = MockProvider::start(Provider::Healthy).await;
     let deployment = Deployment::new(&provider);
 
@@ -1090,7 +1417,7 @@ async fn gap_a_restart_forgets_todays_spend() {
 }
 
 #[tokio::test]
-async fn gap_replicas_each_enforce_the_full_budget() {
+async fn gap_memory_ledger_replicas_each_enforce_the_full_budget() {
     let provider = MockProvider::start(Provider::Healthy).await;
     let deployment = Deployment::new(&provider);
     let (a, b) = (deployment.boot().await, deployment.boot().await);
@@ -1105,43 +1432,73 @@ async fn gap_replicas_each_enforce_the_full_budget() {
     assert_eq!(provider.calls(), 2, "N replicas admit N budgets");
 }
 
-#[tokio::test]
-async fn gap_a_replayed_request_is_executed_and_billed_again() {
-    let provider = MockProvider::start(Provider::Healthy).await;
-    let gw = Deployment::new(&provider).boot().await;
-
-    let replay = || {
-        reqwest::Client::new()
-            .post(gw.url("/v1/chat/stream"))
-            .header("x-api-key", "key-app")
-            .header("x-request-id", "client-request-0001")
-            .header("idempotency-key", "client-request-0001")
-            .json(&standard_request())
-    };
-    assert_eq!(gw.send(replay()).await.status, StatusCode::OK);
-    assert_eq!(gw.send(replay()).await.status, StatusCode::OK, "GAP: not recognised as a replay");
-    assert_eq!(provider.calls(), 2, "GAP: executed twice");
-    assert_eq!(gw.spent("key-app").await, 2 * HEALTHY_ANSWER_COST, "GAP: billed twice");
+/// Wait until an async `condition` holds, or fail with `what`.
+async fn eventually_async<F, Fut>(what: &str, mut condition: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !condition().await {
+        assert!(tokio::time::Instant::now() < deadline, "timed out waiting for: {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
-/// The same gap through the second door, where it matters more: a client
-/// that times out on a slow completion and retries pays twice.
-#[tokio::test]
-async fn gap_a_replayed_completion_is_executed_and_billed_again() {
-    let provider = MockProvider::start(Provider::Healthy).await;
-    let gw = Deployment::new(&provider).boot().await;
+// ---------------------------------------------------------------------------
+// A TCP relay to Postgres that a test can cut
+// ---------------------------------------------------------------------------
 
-    let replay = || {
-        reqwest::Client::new()
-            .post(gw.url("/v1/chat/complete"))
-            .header("x-api-key", "key-app")
-            .header("idempotency-key", "client-request-0002")
-            .json(&standard_request())
-    };
-    assert_eq!(gw.send(replay()).await.status, StatusCode::OK);
-    assert_eq!(gw.send(replay()).await.status, StatusCode::OK, "GAP: not recognised as a replay");
-    assert_eq!(provider.calls(), 2, "GAP: executed twice");
-    assert_eq!(gw.spent("key-app").await, 2 * HEALTHY_ANSWER_COST, "GAP: billed twice");
+mod relay {
+    use std::sync::{Arc, Mutex};
+
+    use tokio::{net::TcpListener, task::JoinHandle};
+
+    pub struct Relay {
+        /// The database URL, rewritten to go through the relay.
+        pub url: String,
+        tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    }
+
+    impl Relay {
+        pub async fn start(database_url: &str) -> Self {
+            let mut url = reqwest::Url::parse(database_url).expect("database URL");
+            let target = format!("{}:{}", url.host_str().unwrap(), url.port().unwrap_or(5432));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            url.set_host(Some("127.0.0.1")).unwrap();
+            url.set_port(Some(port)).unwrap();
+
+            let tasks: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::default();
+            let registry = Arc::clone(&tasks);
+            let accept = tokio::spawn(async move {
+                while let Ok((mut inbound, _)) = listener.accept().await {
+                    let target = target.clone();
+                    let pipe = tokio::spawn(async move {
+                        if let Ok(mut outbound) = tokio::net::TcpStream::connect(&target).await {
+                            let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                        }
+                    });
+                    registry.lock().unwrap().push(pipe);
+                }
+            });
+            tasks.lock().unwrap().push(accept);
+            Self { url: url.to_string(), tasks }
+        }
+
+        /// Kill every connection and stop accepting: the database is gone.
+        pub fn cut(&self) {
+            for task in self.tasks.lock().unwrap().drain(..) {
+                task.abort();
+            }
+        }
+    }
+
+    impl Drop for Relay {
+        fn drop(&mut self) {
+            self.cut();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
