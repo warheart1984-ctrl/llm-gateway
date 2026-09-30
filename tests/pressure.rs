@@ -351,6 +351,7 @@ async fn postgres_ledger(
             sweep_interval: Duration::from_secs(3_600),
             idempotency_retention: Duration::from_secs(86_400),
             sealer,
+            decision_retention: Duration::from_secs(30 * 86_400),
         },
     )
     .await
@@ -429,6 +430,12 @@ impl Deployment {
             },
             auth: llm_gateway::config::AuthConfig {
                 allow_anonymous: false,
+                ..Default::default()
+            },
+            // Explicitly the in-memory ledger: the default is a SQLite file,
+            // and parallel tests must not share one.
+            ledger: llm_gateway::config::LedgerConfig {
+                backend: llm_gateway::config::LedgerBackend::Memory,
                 ..Default::default()
             },
             ..Default::default()
@@ -1021,6 +1028,131 @@ async fn ledger_every_refusal_is_recorded_with_request_tenant_and_reason() {
     assert_eq!(entry["level"], "WARN");
 }
 
+/// The decision record for one request, as an admin reads it.
+async fn decision_for(gw: &Gateway, request_id: &str) -> Option<Value> {
+    let reply = gw.get("/v1/admin/decisions?limit=1000", "key-admin").await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    reply.json()["decisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["request_id"] == request_id)
+        .cloned()
+}
+
+/// A budget refusal from `tight`, returning its request id.
+async fn refuse_on_budget(gw: &Gateway, prompt: &str) -> String {
+    let mut body = standard_request();
+    body["messages"] = json!([{ "role": "user", "content": prompt }]);
+    body["params"] = json!({ "max_tokens": 4000 });
+    let reply = gw.chat(Some("key-tight"), body).await;
+    assert_eq!(reply.status, StatusCode::PAYMENT_REQUIRED);
+    reply.json()["request_id"].as_str().unwrap().to_string()
+}
+
+async fn eventually_recorded(gw: &Gateway, request_id: &str) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(record) = decision_for(gw, request_id).await {
+            return record;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{request_id} was never recorded");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn ledger_a_refusal_is_on_the_decision_record() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let deployment = Deployment::new(&provider);
+    for gw in [
+        deployment.boot().await,
+        deployment.boot_with(deployment.local_ledger("decisions.sqlite3", None)).await,
+    ] {
+        let request_id = refuse_on_budget(&gw, "hi").await;
+        let record = eventually_recorded(&gw, &request_id).await;
+        assert_eq!(record["tenant_id"], "tight");
+        assert_eq!(record["key_id"], "ak_tight");
+        assert_eq!(record["kind"], "refused");
+        assert_eq!(record["code"], "budget_exhausted");
+        assert_eq!(record["endpoint"], "stream");
+        assert_eq!(record["model"], "mock/chat");
+        assert!(record["reason"].as_str().unwrap().contains("nano-USD"));
+    }
+    assert_eq!(provider.calls(), 0);
+}
+
+#[tokio::test]
+async fn ledger_anonymous_refusals_are_never_recorded() {
+    // Persisting refusals of unauthenticated callers would let anyone write
+    // to the database.
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let gw = Deployment::new(&provider).boot().await;
+    let reply = gw.chat(Some("forged-key"), standard_request()).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    let request_id = reply.json()["request_id"].as_str().unwrap().to_string();
+    // A later, authenticated refusal is recorded, so the record is working.
+    let later = refuse_on_budget(&gw, "hi").await;
+    eventually_recorded(&gw, &later).await;
+    assert!(decision_for(&gw, &request_id).await.is_none(), "an anonymous refusal was persisted");
+}
+
+#[tokio::test]
+async fn ledger_the_decision_record_holds_no_prompt_text() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let gw = Deployment::new(&provider).boot().await;
+    let marker = format!("prompt-marker-{}", uuid::Uuid::new_v4().simple());
+
+    let refused = refuse_on_budget(&gw, &marker).await;
+    // A body the parser rejects while quoting the offending value.
+    let malformed = gw
+        .chat(Some("key-app"), json!({ "model": "mock/chat", "messages": marker, "params": { "max_tokens": 5 } }))
+        .await;
+    assert_eq!(malformed.status, StatusCode::BAD_REQUEST);
+    let malformed_id = malformed.json()["request_id"].as_str().unwrap().to_string();
+
+    eventually_recorded(&gw, &refused).await;
+    let record = eventually_recorded(&gw, &malformed_id).await;
+    assert_eq!(record["reason"], "request body is not valid JSON");
+    let everything = gw.get("/v1/admin/decisions?limit=1000", "key-admin").await.body;
+    assert!(!everything.contains(&marker), "prompt text reached the decision record");
+}
+
+#[tokio::test]
+async fn ledger_decisions_survive_a_restart() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let deployment = Deployment::new(&provider);
+    let first = deployment.boot_with(deployment.local_ledger("decisions.sqlite3", None)).await;
+    let request_id = refuse_on_budget(&first, "hi").await;
+    eventually_recorded(&first, &request_id).await;
+    drop(first);
+
+    let restarted = deployment.boot_with(deployment.local_ledger("decisions.sqlite3", None)).await;
+    assert!(decision_for(&restarted, &request_id).await.is_some(), "the record outlived the process");
+}
+
+#[tokio::test]
+async fn ledger_an_operator_action_is_recorded() {
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let gw = Deployment::new(&provider).boot().await;
+    let reload = gw
+        .send(reqwest::Client::new().post(gw.url("/v1/admin/registry/reload")).header("x-api-key", "key-admin"))
+        .await;
+    assert_eq!(reload.status, StatusCode::OK);
+    let all = gw.get("/v1/admin/decisions", "key-admin").await.json();
+    let action = all["decisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["code"] == "registry_reload")
+        .cloned()
+        .expect("the reload is on the record");
+    assert_eq!(action["kind"], "admin_action");
+    assert_eq!(action["key_id"], "ak_admin");
+    assert!(gw.get("/metrics", "key-admin").await.body.contains("gw_decisions_dropped_total 0"));
+    assert_eq!(gw.get("/v1/admin/decisions", "key-app").await.status, StatusCode::FORBIDDEN);
+}
+
 // ===========================================================================
 // 7. The second door: POST /v1/chat/complete
 // ===========================================================================
@@ -1434,6 +1566,30 @@ async fn shared_ledger_a_dead_ledger_fails_closed() {
 }
 
 #[tokio::test]
+async fn shared_ledger_an_operator_action_that_cannot_be_recorded_does_not_happen() {
+    // The reload would revoke `key-rotating`. With the ledger unreachable the
+    // action cannot be recorded, so it must not take effect at all.
+    let Some(url) = test_database_url() else { return };
+    let relay = relay::Relay::start(&url).await;
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let deployment = Deployment::shared(&provider, &relay.url);
+    let gw = deployment.boot().await;
+    assert_eq!(gw.get("/v1/models", "key-rotating").await.status, StatusCode::OK);
+
+    deployment.rewrite_tenants(&tenants_yaml(false));
+    relay.cut();
+    let reload = gw
+        .send(reqwest::Client::new().post(gw.url("/v1/admin/registry/reload")).header("x-api-key", "key-admin"))
+        .await;
+    assert_eq!(reload.status, StatusCode::SERVICE_UNAVAILABLE, "{}", reload.body);
+    assert_eq!(
+        gw.get("/v1/models", "key-rotating").await.status,
+        StatusCode::OK,
+        "the unrecorded reload was not applied"
+    );
+}
+
+#[tokio::test]
 async fn shared_ledger_a_gateway_will_not_start_without_its_ledger() {
     // A configured ledger that cannot be reached is fatal at boot. Falling
     // back to memory would silently drop both guarantees.
@@ -1672,6 +1828,46 @@ async fn local_ledger_a_gateway_will_not_start_without_its_ledger() {
         .err()
         .expect("an unopenable ledger must stop the gateway starting");
     assert!(err.contains("ledger"), "{err}");
+}
+
+#[tokio::test]
+async fn readiness_names_the_ledger_consistency_scope() {
+    // A bare backend name invites mistaking a per-instance ledger for a
+    // shared one; readiness spells out what the ledger guarantees.
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let deployment = Deployment::new(&provider);
+    let scope = |gw: &Gateway| {
+        let url = gw.url("/health/ready");
+        async move {
+            let reply = reqwest::get(url).await.unwrap();
+            assert_eq!(reply.status(), StatusCode::OK);
+            reply.json::<Value>().await.unwrap()["ledger"].clone()
+        }
+    };
+
+    let memory = deployment.boot().await;
+    assert_eq!(
+        scope(&memory).await,
+        json!({ "backend": "memory", "durability": "ephemeral", "replica_mode": "single_process" })
+    );
+    let local = deployment.boot_with(deployment.local_ledger("scope.sqlite3", None)).await;
+    assert_eq!(
+        scope(&local).await,
+        json!({ "backend": "sqlite", "durability": "persistent", "replica_mode": "single_instance_only" })
+    );
+    let split = deployment.boot_with(deployment.local_ledger("scope-split.sqlite3", Some(3))).await;
+    assert_eq!(
+        scope(&split).await,
+        json!({ "backend": "sqlite", "durability": "persistent",
+                "replica_mode": { "quota_split": { "replicas": 3, "margin_percent": 100 } } })
+    );
+    if let Some(url) = test_database_url() {
+        let shared = Deployment::shared(&provider, &url).boot().await;
+        assert_eq!(
+            scope(&shared).await,
+            json!({ "backend": "postgres", "durability": "persistent", "replica_mode": "shared" })
+        );
+    }
 }
 
 // ===========================================================================

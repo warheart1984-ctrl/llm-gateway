@@ -25,7 +25,8 @@ Scope: both entry points and every ledger backend. Sections 1–6 exercise
 `POST /v1/chat/complete`, cannot be used to get around the boundary.
 Section 8 covers replays, section 9 the shared Postgres ledger (restarts,
 replicas, a dead database, answers at rest), section 10 the local SQLite
-ledger and quota-split replicas, and section 11 what still fails open.
+ledger and quota-split replicas, section 11 real process kills, and section
+12 what still fails open.
 
 ## 1. Identity: who is asking?
 
@@ -80,7 +81,12 @@ ledger and quota-split replicas, and section 11 what still fails open.
 | Pressure | Must happen | Test | Result |
 |---|---|---|---|
 | A refused request | structured record with request id, tenant, reason | `ledger_every_refusal_is_recorded_with_request_tenant_and_reason` | HOLDS as a log line only |
-| Durable record of every decision (authorised, spent, refused) | queryable after the fact | none | NOT BUILT |
+| A known caller's refusal | on the decision record with request, tenant, key, code, endpoint and model; queryable by an admin | `ledger_a_refusal_is_on_the_decision_record` | HOLDS |
+| An anonymous (401) refusal | never persisted: it would let anyone write to the database | `ledger_anonymous_refusals_are_never_recorded` | HOLDS |
+| A prompt in a refused request, or quoted by a parser error | never on the decision record | `ledger_the_decision_record_holds_no_prompt_text` | HOLDS |
+| A restart, on the SQLite ledger | the decision record survives | `ledger_decisions_survive_a_restart` | HOLDS |
+| An operator reloads the registry | recorded as an admin action; decisions need the admin scope | `ledger_an_operator_action_is_recorded` | HOLDS |
+| An operator action whose record cannot be written (database cut) | the action does not happen: 503, and the key it would revoke still works | `shared_ledger_an_operator_action_that_cannot_be_recorded_does_not_happen` | HOLDS |
 
 ## 7. The second door: `POST /v1/chat/complete`
 
@@ -141,18 +147,35 @@ No database server, so these run on every platform, Windows included.
 | A split configured on a ledger that would fail open, or with a 0% margin | the gateway refuses to start | `quota_split_refuses_to_boot_where_it_would_fail_open` | HOLDS |
 | A tenant budget whose share rounds down to zero | refused, never treated as "no ceiling" | `a_share_that_rounds_to_zero_refuses_instead_of_unlimiting` (unit) | HOLDS |
 
-## 11. Known gaps
+## 11. Crashes: the real binary, killed
+
+`tests/crash.rs` starts the actual `llm-gateway` executable, kills it
+outright (no destructors, no graceful shutdown), restarts it on the same
+SQLite ledger, and reads the ledger file directly. Not covered: a kill after
+the answer completes but before its settlement is written, a window of
+milliseconds; its outcome (open, then swept and billed in full) is the same
+code path as the kills below.
+
+| Pressure | Must happen | Test | Result |
+|---|---|---|---|
+| Killed while the request body is still arriving | nothing reserved, nothing charged, provider untouched | `a_kill_before_admission_leaves_no_trace` | HOLDS |
+| Killed after reserving, with the provider called but silent | the reservation survives; swept and billed in full; never re-executed | `a_kill_after_reserving_before_any_answer_bills_the_reservation` | HOLDS |
+| Killed mid-stream, after the first token was delivered | same: swept and billed in full | `a_kill_mid_stream_bills_the_reservation` | HOLDS |
+| Killed, then the client retries with the same idempotency key | 409 in progress, then duplicate; executed exactly once across the crash | `a_retry_across_a_kill_is_never_executed_twice` | HOLDS |
+| Any deployment asks what its ledger guarantees | readiness names backend, durability and replica mode | `readiness_names_the_ledger_consistency_scope` | HOLDS |
+
+## 12. Known gaps
 
 | Pressure | What happens | Test | Result |
 |---|---|---|---|
-| Restart, on the in-memory ledger | spend is forgotten | `gap_memory_ledger_a_restart_forgets_todays_spend` | **GAP by design:** use `sqlite` or `postgres` |
+| Restart, on the in-memory ledger | spend is forgotten | `gap_memory_ledger_a_restart_forgets_todays_spend` | **GAP by design:** memory is opt-in; the default is `sqlite` |
 | Two replicas, on the in-memory ledger | each enforces the full budget | `gap_memory_ledger_replicas_each_enforce_the_full_budget` | **GAP by design:** use `postgres`, or `sqlite` with quota split |
 | Rate limits and concurrency caps across replicas | enforced per process, on every ledger backend | none | NOT BUILT |
 | HOLD (neither GO nor NO-GO: wait for approval) | no such decision exists | none | NOT BUILT |
 
-The in-memory ledger is the default and is exact within one process. The
-reservation table is the durable record of every *admitted* request; refused
-requests are recorded as structured log lines only.
+The in-memory ledger is for tests and development, chosen explicitly, and
+exact within one process. The reservation table records every admitted
+request, and the decision table every refusal, failure and operator action.
 
 ## Evidence that the suite can fail
 
@@ -173,6 +196,12 @@ requests are recorded as structured log lines only.
   pressure test.
 - **Quota split ignored:** both split pressure tests fail, and the unit test
   for each replica's share.
+- **Crash tests:** switching idempotency off makes the retry across a kill
+  execute twice; disabling the sweeper leaves the orphaned reservation open
+  and unbilled. Both caught.
+- **Decision record:** recording anonymous refusals fails exactly the
+  anonymous test; letting a reload proceed when its record fails fails
+  exactly the fail-closed reload test.
 - **Flakiness, diagnosed:** the intermittent failures (about 1 run in 5)
   were ledger requests exceeding their deadline under the suite's own load,
   with dozens of gateways syncing every commit to one disk in parallel.

@@ -30,7 +30,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 use super::budget_bucket_label;
-use super::ledger::{Closing, IdempotencyClaim, Ledger, LedgerRefusal, MemoryLedger, NewReservation, Outcome};
+use super::ledger::{
+    Closing, Fingerprinter, IdempotencyClaim, Ledger, LedgerRefusal, MemoryLedger, NewReservation, Outcome,
+};
 use crate::{config::LimitProfile, providers::Usage, router::CostModel};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -397,6 +399,7 @@ pub struct LimitEngine {
     cost_tracking: bool,
     ledger: Arc<dyn Ledger>,
     quota_split: Option<QuotaSplit>,
+    fingerprinter: Fingerprinter,
 }
 
 impl LimitEngine {
@@ -406,7 +409,7 @@ impl LimitEngine {
     }
 
     pub fn with_ledger(max_concurrent_global: usize, cost_tracking: bool, ledger: Arc<dyn Ledger>) -> Arc<Self> {
-        Self::with_ledger_split(max_concurrent_global, cost_tracking, ledger, None)
+        Self::with_ledger_split(max_concurrent_global, cost_tracking, ledger, None, Fingerprinter::unkeyed())
     }
 
     /// An engine that enforces this replica's share of every budget.
@@ -415,6 +418,7 @@ impl LimitEngine {
         cost_tracking: bool,
         ledger: Arc<dyn Ledger>,
         quota_split: Option<QuotaSplit>,
+        fingerprinter: Fingerprinter,
     ) -> Arc<Self> {
         Arc::new(Self {
             tenants: DashMap::new(),
@@ -422,7 +426,13 @@ impl LimitEngine {
             cost_tracking,
             ledger,
             quota_split,
+            fingerprinter,
         })
+    }
+
+    /// How idempotency claims fingerprint their requests.
+    pub fn fingerprinter(&self) -> &Fingerprinter {
+        &self.fingerprinter
     }
 
     pub fn quota_split(&self) -> Option<QuotaSplit> {
@@ -1357,7 +1367,7 @@ mod tests {
         let split = QuotaSplit { replicas: 3, margin_percent: 100 };
         // Room for 6 requests in all, so 2 per replica.
         let l = limits(0, 0, 64, per_request * 6 + 5);
-        let replica = LimitEngine::with_ledger_split(64, true, Arc::new(MemoryLedger::default()), Some(split));
+        let replica = LimitEngine::with_ledger_split(64, true, Arc::new(MemoryLedger::default()), Some(split), Fingerprinter::unkeyed());
         let mut held = Vec::new();
         while let Ok(r) = replica.admit("t", &l, 10, 100, estimate_for(10, 100)).await {
             held.push(r);
@@ -1372,7 +1382,7 @@ mod tests {
     async fn a_share_that_rounds_to_zero_refuses_instead_of_unlimiting() {
         let split = QuotaSplit { replicas: 3, margin_percent: 100 };
         let l = limits(0, 0, 64, 2);
-        let replica = LimitEngine::with_ledger_split(64, true, Arc::new(MemoryLedger::default()), Some(split));
+        let replica = LimitEngine::with_ledger_split(64, true, Arc::new(MemoryLedger::default()), Some(split), Fingerprinter::unkeyed());
         let err = replica
             .admit("t", &l, 1, 1, CostEstimate { prompt_nano_usd: 1, completion_nano_usd: 0 })
             .await

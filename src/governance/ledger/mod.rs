@@ -20,6 +20,7 @@
 //! The provider is contacted only after [`Ledger::try_reserve`] returns, i.e.
 //! after the reservation is durable. "Called but unrecorded" cannot happen.
 
+pub mod decisions;
 mod memory;
 pub mod postgres;
 pub mod sealed;
@@ -58,7 +59,19 @@ pub struct NewReservation<'a> {
 #[derive(Debug, Clone)]
 pub struct IdempotencyClaim<'a> {
     pub key: &'a str,
-    pub fingerprint: [u8; 32],
+    /// The encoding stored for a new record: keyed, with the current key.
+    pub fingerprint: Vec<u8>,
+    /// Other encodings of this same request that a stored record may carry:
+    /// under an older fingerprint key still configured, or the unkeyed form
+    /// used before keys existed. Lets records outlive a key rotation.
+    pub also_matches: Vec<Vec<u8>>,
+}
+
+impl IdempotencyClaim<'_> {
+    /// Whether a stored fingerprint is this request's.
+    pub fn matches(&self, stored: &[u8]) -> bool {
+        stored == self.fingerprint.as_slice() || self.also_matches.iter().any(|f| f.as_slice() == stored)
+    }
 }
 
 /// How a reservation was closed. The first closing decides the bill.
@@ -143,19 +156,132 @@ pub trait Ledger: Send + Sync + std::fmt::Debug {
 
     /// Backend name, for logs and readiness.
     fn backend(&self) -> &'static str;
+
+    /// Record a routine refusal or failure. Never blocks and never fails the
+    /// caller: if it cannot be kept, it is dropped and counted.
+    fn record_decision(&self, decision: decisions::Decision);
+
+    /// Record an operator action before it takes effect. An error means the
+    /// action must not happen.
+    async fn record_decision_durably(&self, decision: decisions::Decision) -> Result<(), LedgerRefusal>;
+
+    /// Recorded decisions, newest first.
+    async fn decisions(&self, query: decisions::DecisionQuery)
+    -> Result<Vec<decisions::DecisionRecord>, LedgerRefusal>;
+
+    /// Routine records dropped since the process started.
+    fn decisions_dropped(&self) -> u64;
 }
 
-/// SHA-256 over a canonical rendering of the request: object keys sorted at
-/// every level, so the same request sent with its keys in another order is
-/// the same request. `scope` separates endpoints: one key used for a stream
-/// and then a completion is two different requests.
+/// The request, rendered canonically: object keys sorted at every level, so
+/// the same request sent with its keys in another order is the same request.
+/// `scope` separates endpoints: one key used for a stream and then a
+/// completion is two different requests.
+fn canonical(scope: &str, request: &serde_json::Value) -> String {
+    let mut out = String::with_capacity(256);
+    out.push_str(scope);
+    out.push('\n');
+    write_canonical(request, &mut out);
+    out
+}
+
+/// Unkeyed SHA-256 of the canonical request: the form stored before
+/// fingerprint keys existed, still accepted when comparing.
 pub fn fingerprint(scope: &str, request: &serde_json::Value) -> [u8; 32] {
     use sha2::{Digest, Sha256};
-    let mut canonical = String::with_capacity(256);
-    canonical.push_str(scope);
-    canonical.push('\n');
-    write_canonical(request, &mut canonical);
-    Sha256::digest(canonical.as_bytes()).into()
+    Sha256::digest(canonical(scope, request).as_bytes()).into()
+}
+
+/// Keyed request fingerprints.
+///
+/// A fingerprint stored in the ledger identifies a request. Unkeyed, it is a
+/// plain hash of the prompt: anyone who can read the table can confirm a
+/// guess ("did this tenant send X?") by hashing it. With a key it is an
+/// HMAC-SHA256, and confirming a guess needs the key, which lives in the
+/// environment, not the database.
+///
+/// Stored form, keyed: `b"h1"`, one length byte, the key id, then the 32-byte
+/// MAC. Unkeyed: the 32 raw digest bytes. The lengths never collide.
+/// Keys: `kid:base64[,kid:base64...]`, each at least 32 bytes; the first key
+/// fingerprints new records, every key matches old ones.
+#[derive(Clone)]
+pub struct Fingerprinter {
+    keys: Vec<(String, Vec<u8>)>,
+}
+
+impl std::fmt::Debug for Fingerprinter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ids: Vec<&str> = self.keys.iter().map(|(id, _)| id.as_str()).collect();
+        f.debug_struct("Fingerprinter").field("key_ids", &ids).finish()
+    }
+}
+
+impl Fingerprinter {
+    /// Plain SHA-256 fingerprints: the behaviour without a configured key.
+    pub fn unkeyed() -> Self {
+        Self { keys: Vec::new() }
+    }
+
+    pub fn from_keys(spec: &str) -> Result<Self, String> {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let mut keys: Vec<(String, Vec<u8>)> = Vec::new();
+        for (position, entry) in spec.split(',').map(str::trim).filter(|e| !e.is_empty()).enumerate() {
+            let (id, encoded) = entry
+                .split_once(':')
+                .ok_or_else(|| format!("fingerprint key #{} must be `kid:base64key`", position + 1))?;
+            let valid_id = !id.is_empty()
+                && id.len() <= 32
+                && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+            if !valid_id {
+                return Err(format!(
+                    "fingerprint key #{} has an invalid id: use 1 to 32 letters, digits, `_` or `-`",
+                    position + 1
+                ));
+            }
+            let bytes = STANDARD
+                .decode(encoded)
+                .map_err(|_| format!("fingerprint key `{id}` is not valid base64"))?;
+            if bytes.len() < 32 {
+                return Err(format!("fingerprint key `{id}` must be at least 32 bytes, got {}", bytes.len()));
+            }
+            if keys.iter().any(|(existing, _)| existing == id) {
+                return Err(format!("fingerprint key id `{id}` appears twice"));
+            }
+            keys.push((id.to_string(), bytes));
+        }
+        if keys.is_empty() {
+            return Err("no fingerprint keys given".into());
+        }
+        Ok(Self { keys })
+    }
+
+    pub fn is_keyed(&self) -> bool {
+        !self.keys.is_empty()
+    }
+
+    fn keyed(id: &str, key: &[u8], canonical: &str) -> Vec<u8> {
+        use hmac::{Hmac, Mac};
+        let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+        mac.update(canonical.as_bytes());
+        let mut out = Vec::with_capacity(3 + id.len() + 32);
+        out.extend_from_slice(b"h1");
+        out.push(id.len() as u8);
+        out.extend_from_slice(id.as_bytes());
+        out.extend_from_slice(&mac.finalize().into_bytes());
+        out
+    }
+
+    /// The claim for this request: fingerprinted with the current key, and
+    /// matching every encoding a stored record of the same request may carry.
+    pub fn claim<'a>(&self, key: &'a str, scope: &str, request: &serde_json::Value) -> IdempotencyClaim<'a> {
+        let canonical = canonical(scope, request);
+        let plain = fingerprint(scope, request).to_vec();
+        let mut encodings: Vec<Vec<u8>> =
+            self.keys.iter().map(|(id, k)| Self::keyed(id, k, &canonical)).collect();
+        encodings.push(plain);
+        let fingerprint = encodings.remove(0);
+        IdempotencyClaim { key, fingerprint, also_matches: encodings }
+    }
 }
 
 fn write_canonical(value: &serde_json::Value, out: &mut String) {
@@ -216,5 +342,53 @@ mod tests {
         assert!(!valid_idempotency_key("has space"));
         assert!(!valid_idempotency_key(&"k".repeat(256)));
         assert!(!valid_idempotency_key("naïve"));
+    }
+
+    const K1: &str = "k1:AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
+    const K2: &str = "k2:ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=";
+
+    #[test]
+    fn a_keyed_fingerprint_does_not_reveal_the_request_to_a_guesser() {
+        let request = json!({ "messages": [{ "role": "user", "content": "yes" }] });
+        let claim = Fingerprinter::from_keys(K1).unwrap().claim("idem", "stream", &request);
+        // Someone reading the table hashes a guess the unkeyed way: no match.
+        let guess = fingerprint("stream", &request);
+        assert_ne!(claim.fingerprint.as_slice(), &guess[..]);
+        assert!(claim.fingerprint.starts_with(b"h1"));
+        // The same request, keys reordered, still has the same fingerprint.
+        let reordered: serde_json::Value = serde_json::from_str(&request.to_string()).unwrap();
+        let again = Fingerprinter::from_keys(K1).unwrap().claim("idem", "stream", &reordered);
+        assert_eq!(claim.fingerprint, again.fingerprint);
+    }
+
+    #[test]
+    fn records_made_before_keys_or_before_a_rotation_still_match() {
+        let request = json!({ "model": "m", "messages": [] });
+        let unkeyed = Fingerprinter::unkeyed().claim("idem", "stream", &request);
+        let under_k1 = Fingerprinter::from_keys(K1).unwrap().claim("idem", "stream", &request);
+        let rotated = Fingerprinter::from_keys(&format!("{K2},{K1}")).unwrap().claim("idem", "stream", &request);
+        assert!(rotated.fingerprint.starts_with(b"h1\x02k2"), "the first key fingerprints new records");
+        assert!(rotated.matches(&unkeyed.fingerprint), "a record from before keys existed");
+        assert!(rotated.matches(&under_k1.fingerprint), "a record from before the rotation");
+        let other = Fingerprinter::from_keys(K1).unwrap().claim("idem", "stream", &json!({ "model": "other" }));
+        assert!(!rotated.matches(&other.fingerprint), "a different request never matches");
+        let retired = Fingerprinter::from_keys(K2).unwrap().claim("idem", "stream", &request);
+        assert!(!retired.matches(&under_k1.fingerprint), "a retired key's records no longer match");
+    }
+
+    #[test]
+    fn malformed_fingerprint_keys_are_refused_without_echoing_them() {
+        for (spec, fragment) in [
+            ("", "no fingerprint keys"),
+            ("k1", "kid:base64key"),
+            ("k1:not-base64!!", "not valid base64"),
+            ("k1:AAAA", "at least 32 bytes"),
+            (&format!("{K1},{K1}"), "twice"),
+        ] {
+            let err = Fingerprinter::from_keys(spec).unwrap_err();
+            assert!(err.contains(fragment), "{spec:?} -> {err}");
+            assert!(!err.contains("AQIDBAUG"), "key material in error: {err}");
+        }
+        assert!(!format!("{:?}", Fingerprinter::from_keys(K1).unwrap()).contains("AQIDBAUG"));
     }
 }

@@ -11,3 +11,8 @@
 # Local scratch
 /logs
 *.log
+
+# The default SQLite ledger, created next to the config it is run with.
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
