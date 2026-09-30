@@ -1,0 +1,62 @@
+# The gateway against the real Groq, OpenRouter and NVIDIA APIs.
+#
+# Not part of the gate on purpose: it spends real money, depends on three
+# vendors being up, and needs secrets that pull requests from forks never
+# get. It runs nightly, on demand, and whenever the adapters, the catalogue
+# or the suite change, so a vendor changing its wire format or retiring a
+# catalogue model shows up within a day.
+#
+# Set the three repository secrets once: GROQ_API_KEY, OPENROUTER_API_KEY and
+# NVIDIA_API_KEY. A missing one fails that provider's test rather than
+# skipping it. Each test's tenant has a daily budget of 5 cents; a full run
+# costs well under a cent.
+
+name: live
+
+on:
+  # A change to what the live suite verifies (the provider adapters, the
+  # catalogue) or to the suite itself is run for real, on any branch of this
+  # repository (pushes never come from forks, so the secrets are there).
+  push:
+    paths:
+      - src/providers/**
+      - config/models.yaml
+      - tests/live.rs
+      - .github/workflows/live.yml
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      providers:
+        description: "Providers to call: all, or a comma list of groq, openrouter, nvidia"
+        default: all
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Live provider tests
+        env:
+          LLM_GATEWAY_LIVE: ${{ github.event.inputs.providers || 'all' }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+        run: cargo test --locked --test live -- --nocapture
+      - name: Keep what was measured
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-report
+          path: target/live-report.jsonl
+          if-no-files-found: ignore

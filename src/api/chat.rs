@@ -637,8 +637,12 @@ async fn admit(
     //    and must not cost the tenant anything.
     let provider = router::provider_for(&resolved, &state.providers)?.clone();
     let prompt_tokens = estimate_prompt_tokens(&req.messages);
+    // The reservation also covers what the vendor adds around the prompt.
+    // `prompt_tokens` alone stays the billing floor and the rate-limit count:
+    // the overhead is reserved, never billed unless the vendor reports it.
+    let reserved_prompt_tokens = prompt_tokens.saturating_add(resolved.config.prompt_overhead_tokens);
     let cost = CostEstimate {
-        prompt_nano_usd: estimate_cost_nano_usd(&resolved.config.cost, prompt_tokens, 0),
+        prompt_nano_usd: estimate_cost_nano_usd(&resolved.config.cost, reserved_prompt_tokens, 0),
         completion_nano_usd: estimate_cost_nano_usd(&resolved.config.cost, 0, max_output_tokens),
     };
     //    A repeated Idempotency-Key is decided here too, by the ledger, in the

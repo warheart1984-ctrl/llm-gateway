@@ -438,8 +438,21 @@ struct WireError {
     message: Option<String>,
     #[serde(default, rename = "type")]
     kind: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_or_number")]
     code: Option<String>,
+}
+
+/// Vendors disagree on the type of an error's `code`: OpenAI sends a string
+/// (`"invalid_api_key"`), NVIDIA a number (`503`). Both read as text. Read
+/// strictly, a numeric code made the whole error frame unparseable, and an
+/// overloaded provider was reported as a non-retryable protocol error.
+fn string_or_number<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    use serde::Deserialize;
+    Ok(match Option::<Value>::deserialize(d)? {
+        Some(Value::String(s)) => Some(s),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    })
 }
 
 /// A completed (non-streaming) response: `message` where a chunk has `delta`.
@@ -898,6 +911,27 @@ mod tests {
                 assert!(*retryable, "a 200-then-error carries no transience signal");
             }
             other => panic!("expected upstream error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_error_with_a_numeric_code_is_an_error_not_a_protocol_failure() {
+        // NVIDIA, under load, mid-stream: found by the live suite.
+        let frame = r#"{"error":{"message":"Service temporarily overloaded","type":"service_unavailable","code":503}}"#;
+        let chunk: WireChunk = serde_json::from_str(frame).unwrap();
+        let mut s = st();
+        match &translate(&chunk, &quirks(), &mut s)[0] {
+            Err(ProviderError::Upstream { status, body, retryable }) => {
+                assert_eq!((*status, body.as_str(), *retryable), (502, "Service temporarily overloaded", true));
+            }
+            other => panic!("expected a retryable upstream error, got {other:?}"),
+        }
+        let completion = parse_completion(&serde_json::from_str(frame).unwrap(), quirks()).unwrap_err();
+        assert!(matches!(completion, ProviderError::Upstream { retryable: true, .. }), "{completion:?}");
+        let bare: WireChunk = serde_json::from_str(r#"{"error":{"code":503}}"#).unwrap();
+        match &translate(&bare, &quirks(), &mut st())[0] {
+            Err(ProviderError::Upstream { body, .. }) => assert_eq!(body, "503"),
+            other => panic!("{other:?}"),
         }
     }
 

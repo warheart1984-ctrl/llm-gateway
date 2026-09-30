@@ -99,8 +99,11 @@ pub fn provider_for<'a>(
         })
 }
 
-/// Cheap prompt-size estimate for pre-flight cost reservation: ~4 characters
-/// per token. Deliberately an over-estimate so the budget check fails closed.
+/// Cheap estimate of the prompt's own tokens, for pre-flight cost
+/// reservation: ~3.5 characters per token plus a little per message, which
+/// runs above the content's real count. It cannot see what a vendor adds
+/// around the messages (a chat template, a default system prompt); that is
+/// the catalogue's `prompt_overhead_tokens`, added at reservation.
 pub fn estimate_prompt_tokens(messages: &[crate::providers::ChatMessage]) -> u32 {
     let mut chars = 0usize;
     for m in messages {
