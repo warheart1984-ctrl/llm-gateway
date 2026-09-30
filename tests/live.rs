@@ -471,7 +471,7 @@ async fn live_openrouter() {
 
 #[tokio::test]
 async fn live_nvidia() {
-    live("nvidia", "NVIDIA_API_KEY", "nvidia/nemotron-4-340b").await;
+    live("nvidia", "NVIDIA_API_KEY", "nvidia/nemotron-3-super").await;
 }
 
 // ---------------------------------------------------------------------------

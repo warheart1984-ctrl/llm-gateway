@@ -82,10 +82,12 @@ models:
   # ---------------------------------------------------------------------------
   # NVIDIA — cloud NIM and self-hosted. `endpoint` is what makes local work.
   # ---------------------------------------------------------------------------
-  nvidia/nemotron-4-340b:
+  # Nemotron 4 340B is still listed by NVIDIA's API but no longer served to
+  # new accounts (404, found by the live suite on 2026-09-30).
+  nvidia/nemotron-3-super:
     provider: nvidia
-    display_name: Nemotron 4 340B (NVIDIA)
-    upstream_model: nvidia/nemotron-4-340b-instruct
+    display_name: Nemotron 3 Super 120B (NVIDIA)
+    upstream_model: nvidia/nemotron-3-super-120b-a12b
     default_params:
       temperature: 0.7
       max_tokens: 2048
@@ -95,7 +97,7 @@ models:
     latency_slo_ms: 1200
     max_context_tokens: 131072
     max_output_tokens: 32768
-    aliases: [nemotron-4, nvidia-large]
+    aliases: [nemotron-3-super, nvidia-large]
 
   # Self-hosted NIM. The `endpoint` override is the whole point: a local
   # container is reachable with no cloud credential. Switch it by uncommenting.
