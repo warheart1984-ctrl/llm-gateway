@@ -147,7 +147,7 @@ No database server, so these run on every platform, Windows included.
 |---|---|---|---|
 | Restart, on the in-memory ledger | spend is forgotten | `gap_memory_ledger_a_restart_forgets_todays_spend` | **GAP by design:** use `sqlite` or `postgres` |
 | Two replicas, on the in-memory ledger | each enforces the full budget | `gap_memory_ledger_replicas_each_enforce_the_full_budget` | **GAP by design:** use `postgres`, or `sqlite` with quota split |
-| Rate limits and concurrency caps across replicas | enforced per process, on both backends | none | NOT BUILT |
+| Rate limits and concurrency caps across replicas | enforced per process, on every ledger backend | none | NOT BUILT |
 | HOLD (neither GO nor NO-GO: wait for approval) | no such decision exists | none | NOT BUILT |
 
 The in-memory ledger is the default and is exact within one process. The
