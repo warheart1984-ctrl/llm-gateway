@@ -1509,13 +1509,21 @@ mod tests {
             .await
             .unwrap();
 
-        // Expired to every reader at once, before the sweeper runs.
+        // Expired to every reader at once, before any sweep runs.
         assert_eq!(ledger.hold(waiting.id).await.unwrap().unwrap().state, HoldState::Expired);
-        assert_eq!(ledger.expire_holds().await.unwrap(), 2, "the denial is final and stays a denial");
+        // The background sweeper's first tick fires at boot and may run
+        // between the backdating above and this call, expiring some or all
+        // of the holds itself. Between the two, each lapsed hold is expired
+        // exactly once, whoever gets there first.
+        assert!(ledger.expire_holds().await.unwrap() <= 2, "the denial is final and stays a denial");
         assert_eq!(ledger.hold(denied.id).await.unwrap().unwrap().state, HoldState::Denied);
-        let reason = |codes: Vec<(String, String)>| codes.into_iter().find(|(c, _)| c == "hold_expired").unwrap().1;
-        assert_eq!(reason(codes_for(&ledger, waiting.id).await), holds::EXPIRED_UNDECIDED);
-        assert_eq!(reason(codes_for(&ledger, approved.id).await), holds::EXPIRED_UNUSED);
+        assert_eq!(ledger.hold(approved.id).await.unwrap().unwrap().state, HoldState::Expired);
+        let expiries = |codes: Vec<(String, String)>| -> Vec<String> {
+            codes.into_iter().filter(|(c, _)| c == "hold_expired").map(|(_, r)| r).collect()
+        };
+        assert_eq!(expiries(codes_for(&ledger, waiting.id).await), vec![holds::EXPIRED_UNDECIDED]);
+        assert_eq!(expiries(codes_for(&ledger, approved.id).await), vec![holds::EXPIRED_UNUSED]);
+        assert!(expiries(codes_for(&ledger, denied.id).await).is_empty(), "a denial never expires");
         assert_eq!(ledger.expire_holds().await.unwrap(), 0, "and only once");
         let late = ledger.decide_hold(verdict(waiting.id, holds::Verdict::Approve)).await;
         assert_eq!(late, Err(LedgerRefusal::HoldNotDecidable { state: HoldState::Expired }));
