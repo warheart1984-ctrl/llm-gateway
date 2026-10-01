@@ -35,6 +35,11 @@
 //!
 //!   The memory ledger has no tables, so it checks (1) against `/v1/usage`.
 //!   Totals are cumulative across levels, since the ledger is too;
+//! * **late released / swept / sweep failures**: the ledger's upkeep
+//!   counters from `/metrics`, cumulative: admissions whose commit landed
+//!   after their deadline and were released at no charge; reservations the
+//!   sweeper billed in full; and sweeper steps that failed. A released row
+//!   is one no client was admitted on, so it must bill nothing;
 //! * **KiB/stream**: peak heap through the gateway minus peak heap straight
 //!   to the upstream, divided by the most streams the gateway held open at
 //!   once. Counted by this binary's allocator, so heap only.
@@ -289,6 +294,8 @@ where
 // Gateway
 // ---------------------------------------------------------------------------
 
+const ADMIN_KEY: &str = "load-admin-key";
+
 fn key_of(tenant: usize) -> String {
     format!("load-key-{tenant}")
 }
@@ -323,9 +330,15 @@ fn boot_gateway(upstream: SocketAddr, plan: &Plan, kind: LedgerKind, threads: us
     // gateway-wide cap or the ledger.
     let mut tenants = String::from("tenants:\n");
     for t in 0..plan.tenants {
+        // The first tenant also holds the key that reads `/metrics`.
+        let admin = if t == 0 {
+            format!("      - key_id: ak_load_admin\n        key: {ADMIN_KEY}\n        scopes: [admin]\n")
+        } else {
+            String::new()
+        };
         tenants.push_str(&format!(
             "  - tenant_id: load-{t}\n    enabled: true\n    credentials:\n      - key_id: ak_load_{t}\n        key: {}\n        \
-             scopes: [chat:stream]\n    allowed_models: [\"*\"]\n    limits:\n      requests_per_minute: 100000000\n      \
+             scopes: [chat:stream]\n{admin}    allowed_models: [\"*\"]\n    limits:\n      requests_per_minute: 100000000\n      \
              tokens_per_minute: 4000000000\n      max_concurrent_streams: 1000000\n      max_output_tokens: 4096\n      \
              daily_budget_nano_usd: 1000000000000000\n",
             key_of(t)
@@ -616,6 +629,11 @@ struct LedgerRows {
     reserved: u64,
     /// `reserved + delta` over every row.
     billed: u64,
+    /// Rows released without reaching a client: an admission whose commit
+    /// landed after its deadline. Each must bill exactly nothing.
+    released: u64,
+    released_reserved: u64,
+    released_billed: u64,
     /// The tenant's `spend_days`, all days.
     spend_days: u64,
 }
@@ -667,6 +685,11 @@ async fn ledger_rows(store: &Store) -> Option<BTreeMap<String, LedgerRows>> {
     let mut out: BTreeMap<String, LedgerRows> = BTreeMap::new();
     for (tenant, state, count, reserved, billed) in rows {
         let t = out.entry(tenant).or_default();
+        if state == "released" {
+            t.released += count as u64;
+            t.released_reserved += reserved as u64;
+            t.released_billed += billed as u64;
+        }
         *t.states.entry(state).or_default() += count as u64;
         t.reserved += reserved as u64;
         t.billed += billed as u64;
@@ -722,17 +745,26 @@ async fn reconcile(
         let Some(rows) = &rows else { continue };
         let empty = LedgerRows::default();
         let r = rows.get(&name).unwrap_or(&empty);
-        let total: u64 = r.states.values().sum();
-        if total != seen.admitted {
-            problems.push(format!("{name}: {total} reservation rows, {} admitted streams", seen.admitted));
+        // A client is told nothing about a released row: its request was
+        // refused. Every other row is one admitted stream.
+        let admitted_rows = r.states.values().sum::<u64>() - r.released;
+        if admitted_rows != seen.admitted {
+            problems.push(format!("{name}: {admitted_rows} reservation rows, {} admitted streams", seen.admitted));
+        }
+        if r.released_billed != 0 {
+            problems.push(format!("{name}: {} released rows bill {}", r.released, r.released_billed));
         }
         for bad in ["open", "swept"] {
             if let Some(n) = r.states.get(bad).filter(|n| **n > 0) {
                 problems.push(format!("{name}: {n} reservations left `{bad}`"));
             }
         }
-        if r.reserved != seen.reserved {
-            problems.push(format!("{name}: rows reserved {}, clients were told {}", r.reserved, seen.reserved));
+        if r.reserved - r.released_reserved != seen.reserved {
+            problems.push(format!(
+                "{name}: rows reserved {}, clients were told {}",
+                r.reserved - r.released_reserved,
+                seen.reserved
+            ));
         }
         if r.billed != seen.billed {
             problems.push(format!("{name}: rows bill {}, clients were billed {}", r.billed, seen.billed));
@@ -742,6 +774,30 @@ async fn reconcile(
         }
     }
     (lag, problems)
+}
+
+/// The ledger's upkeep counters, cumulative: `(late commits released,
+/// reservations swept, sweep failures)`.
+async fn upkeep_of(client: &reqwest::Client, gw: &GatewayUnderTest) -> (u64, u64, u64) {
+    let text = client
+        .get(format!("http://{}/metrics", gw.addr))
+        .header("x-api-key", ADMIN_KEY)
+        .send()
+        .await
+        .expect("metrics")
+        .text()
+        .await
+        .unwrap_or_default();
+    let read = |name: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(name)?.strip_prefix(' ')?.trim().parse().ok())
+            .unwrap_or(0)
+    };
+    (
+        read("gw_ledger_late_commits_released_total"),
+        read("gw_ledger_swept_reservations_total"),
+        read("gw_ledger_sweep_failures_total"),
+    )
 }
 
 /// `(spent, in flight)` for every tenant, from `GET /v1/usage`.
@@ -851,9 +907,9 @@ fn main() {
             }
         }
         println!(
-            "| ledger | streams | ok/s | refused | broken | added TTFT p50 / p99 (ms) | reserved | billed | settle lag | reconciled | heap KiB/stream |"
+            "| ledger | streams | ok/s | refused | broken | added TTFT p50 / p99 (ms) | reserved | billed | settle lag | reconciled | late released / swept / sweep failures | heap KiB/stream |"
         );
-        println!("|---|---:|---:|---|---:|---|---:|---:|---:|---|---:|");
+        println!("|---|---:|---:|---|---:|---|---:|---:|---:|---|---|---:|");
         let mut failures = Vec::new();
         for &level in &plan.levels {
             let direct = run_level(&client, Target::Upstream, &upstream_url, &plan, level).await;
@@ -868,7 +924,8 @@ fn main() {
                 if via.tally.unbilled > 0 {
                     problems.push(format!("{} admitted streams ended without an `end` event", via.tally.unbilled));
                 }
-                report(&plan, level, gw, &direct, &via, level_money, lag, &problems, smoke);
+                let upkeep = upkeep_of(&client, gw).await;
+                report(&plan, level, gw, &direct, &via, level_money, lag, upkeep, &problems, smoke);
                 failures.extend(problems.into_iter().map(|p| format!("{} at {level} streams: {p}", gw.kind.name())));
             }
         }
@@ -896,6 +953,7 @@ fn report(
     via: &Run,
     money: Money,
     lag: Duration,
+    (late, swept, sweep_failures): (u64, u64, u64),
     problems: &[String],
     smoke: bool,
 ) {
@@ -914,7 +972,7 @@ fn report(
     };
     let verdict = if problems.is_empty() { "✓".to_string() } else { format!("✗ {} problems", problems.len()) };
     println!(
-        "| {} | {level} | {ok_per_s:.0} | {refused} | {} | {:.1} / {:.1} | {} | {} | {} ms | {verdict} | {kib_per_stream:.1} |",
+        "| {} | {level} | {ok_per_s:.0} | {refused} | {} | {:.1} / {:.1} | {} | {} | {} ms | {verdict} | {late} / {swept} / {sweep_failures} | {kib_per_stream:.1} |",
         gw.kind.name(),
         via.tally.broken + direct.tally.broken,
         g50 - d50,
@@ -947,6 +1005,7 @@ fn report(
         "ttft_ms": { "direct_p50": d50, "direct_p99": d99, "gateway_p50": g50, "gateway_p99": g99 },
         "settle_lag_ms": lag.as_millis() as u64,
         "reconciled": problems.is_empty(),
+        "upkeep": { "late_commits_released": late, "swept": swept, "sweep_failures": sweep_failures },
         "problems": problems,
         "max_open_via_gateway": via.max_open,
         "heap_kib_per_open_stream": kib_per_stream,
