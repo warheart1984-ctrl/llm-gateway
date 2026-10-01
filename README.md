@@ -588,7 +588,16 @@ What the gateway does itself, and what it expects of the deployment around it.
 cargo test --locked --all-targets                  # 302 tests
 cargo clippy --locked --all-targets -- -D warnings
 cargo bench --bench framing                        # add `-- --quick` for a fast pass
+cargo bench --bench load                           # gateway overhead and ceilings under concurrent streams
 ```
+
+`benches/load.rs` streams from a paced fake upstream at 50, 200, 500 and
+1,000 concurrent clients, first directly and then through the gateway, and
+reports what the gateway adds to time-to-first-token, completed streams per
+second, refusals by status, and heap per open stream. Upstream, gateway and
+clients share one machine over loopback, so the results show the gateway's own
+overhead and limits on that machine, not production numbers. The module docs
+list the `LOAD_*` knobs; each run appends to `target/load-report.jsonl`.
 
 CI (`.github/workflows/ci.yml`) runs that gate from a clean checkout on Linux
 and Windows: the full suite three times over, the money tests five more times,
