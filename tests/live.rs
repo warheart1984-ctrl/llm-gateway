@@ -442,6 +442,14 @@ async fn check_unknown_model(gw: &Gateway, t: &Target) -> String {
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{}: {body}", t.provider);
     let code = body["error"]["code"].as_str().unwrap_or_default().to_string();
     assert!(code.starts_with("upstream"), "{}: {body}", t.provider);
+    // The vendor's own refusal (NVIDIA's names the operator's account) stays
+    // in the logs; the tenant gets the gateway's sentence and nothing else.
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.starts_with("the upstream provider") && !message.contains('{') && !message.contains("account"),
+        "{}: a vendor body reached the tenant: {body}",
+        t.provider
+    );
     assert_eq!(gw.settled_spend().await, before, "{}: a refused request costs nothing", t.provider);
     code
 }
