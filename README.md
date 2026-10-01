@@ -368,6 +368,15 @@ database decides, not any gateway process:
   and hold their tenant's money. `gw_ledger_swept_reservations_total`
   counts reservations billed in full because their lease lapsed; outside a
   crash it should stay at zero, so alert on it.
+- **A connection is never reused mid-transaction.** An operation cut off by
+  its deadline while starting a transaction can leave the database's
+  transaction open with nothing in the gateway to roll it back. Every
+  ledger connection is checked as it returns to the pool, and one still
+  inside a transaction is closed, which ends it
+  (`gw_ledger_stuck_connections_closed_total`). Reused, it stopped the
+  whole SQLite ledger under overload (it holds the write lock), and on
+  Postgres it held a tenant's day-row lock, refusing that tenant's
+  admissions.
 - **Closing** is `UPDATE … WHERE state = 'open'`, so a duplicate close from
   any process changes nothing. Closings are queued to one writer that
   retries until each one is durable, and graceful shutdown flushes the queue.

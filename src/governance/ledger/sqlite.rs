@@ -50,6 +50,7 @@ use uuid::Uuid;
 
 use super::{
     Closing, CommitOutcome, Ledger, LedgerRefusal, NewReservation, Outcome, Upkeep, UpkeepCounts, commit_within,
+    release_clean,
     decisions::{DECISION_QUEUE, Decision, DecisionKind, DecisionQuery, DecisionRecord},
     holds::{self, HoldClaim, HoldDecision, HoldProblem, HoldQuery, HoldRecord, HoldState, NewHold, Transition},
     sealed::{ResponseSealer, binding},
@@ -151,10 +152,18 @@ impl SqliteLedger {
         // processes alike, so more connections never mean more writers.
         // All of them opened at boot: opening a connection under write
         // contention can outlast a request's deadline.
+        let upkeep = Arc::new(Upkeep::default());
         let pool = SqlitePoolOptions::new()
             .max_connections(4)
             .min_connections(4)
             .acquire_timeout(Duration::from_secs(10))
+            .after_release({
+                let upkeep = Arc::clone(&upkeep);
+                move |conn, _| {
+                    let upkeep = Arc::clone(&upkeep);
+                    Box::pin(async move { Ok(release_clean(conn, &upkeep).await) })
+                }
+            })
             .connect_with(connect)
             .await
             .map_err(|e| format!("cannot open the ledger database `{}`: {e}", opts.path.display()))?;
@@ -173,7 +182,6 @@ impl SqliteLedger {
             opts.sealer.clone(),
             Arc::clone(&live),
         ));
-        let upkeep = Arc::new(Upkeep::default());
         let sweeper = tokio::spawn(run_sweeper(
             pool.clone(),
             opts.sweep_interval,
@@ -1113,7 +1121,43 @@ mod tests {
     const KEYS: &str = "k1:AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
 
     async fn open(file: &TempFile) -> Arc<SqliteLedger> {
-        SqliteLedger::connect(SqliteOptions {
+        SqliteLedger::connect(options(file)).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_connection_left_inside_a_transaction_is_closed_not_reused() {
+        // What a deadline can leave behind: a transaction begun and
+        // acknowledged, with nothing left to own it, because the future that
+        // would have received it was dropped first. Forgetting the handle
+        // makes the same state on purpose. The connection then goes back to
+        // the pool holding SQLite's write lock. Reused, it stopped the whole
+        // ledger: every admission, closing and sweep after it failed.
+        let file = TempFile::new();
+        let ledger = open(&file).await;
+        {
+            let mut conn = ledger.pool().acquire().await.unwrap();
+            let tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await.unwrap();
+            std::mem::forget(tx);
+        }
+        // Released asynchronously; let the pool take it back.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let bucket = ledger.try_reserve(reservation("t", 100, 0)).await.expect("the ledger still admits");
+        ledger.close(closing(Uuid::new_v4(), "t", bucket, 0, Outcome::Released));
+        ledger.flush().await;
+        assert_eq!(ledger.upkeep().stuck_connections_closed, 1);
+        // Every connection the pool now holds can start a transaction.
+        let mut held = Vec::new();
+        for n in 0..4 {
+            let mut conn = ledger.pool().acquire().await.unwrap();
+            let begun = sqlx::Connection::begin(&mut *conn).await.map(drop);
+            assert!(begun.is_ok(), "connection {n}: {begun:?}");
+            held.push(conn);
+        }
+    }
+
+    fn options(file: &TempFile) -> SqliteOptions {
+        SqliteOptions {
             path: file.0.clone(),
             timeout: Duration::from_secs(5),
             lease: Duration::from_secs(60),
@@ -1121,9 +1165,7 @@ mod tests {
             idempotency_retention: Duration::from_secs(86_400),
             sealer: Some(Arc::new(ResponseSealer::from_keys(KEYS).unwrap())),
             decision_retention: Duration::from_secs(30 * 86_400),
-        })
-        .await
-        .unwrap()
+        }
     }
 
     fn reservation<'a>(tenant: &'a str, amount: u64, budget: u64) -> NewReservation<'a> {

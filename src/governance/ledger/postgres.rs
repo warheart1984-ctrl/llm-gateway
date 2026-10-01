@@ -52,6 +52,7 @@ use tokio::{
 
 use super::{
     Closing, CommitOutcome, Ledger, LedgerRefusal, NewReservation, Outcome, Upkeep, UpkeepCounts, commit_within,
+    release_clean,
     decisions::{DECISION_QUEUE, Decision, DecisionKind, DecisionQuery, DecisionRecord},
     holds::{self, HoldClaim, HoldDecision, HoldProblem, HoldQuery, HoldRecord, HoldState, NewHold, Transition},
     sealed::{ResponseSealer, binding},
@@ -171,10 +172,18 @@ impl PostgresLedger {
         // instead, so a slow handshake cannot stop the gateway starting. A
         // few connections are kept warm so no request pays for setup.
         let max = opts.max_connections.max(1);
+        let upkeep = Arc::new(Upkeep::default());
         let pool = PgPoolOptions::new()
             .max_connections(max)
             .min_connections(max.min(2))
             .acquire_timeout(Duration::from_secs(10))
+            .after_release({
+                let upkeep = Arc::clone(&upkeep);
+                move |conn, _| {
+                    let upkeep = Arc::clone(&upkeep);
+                    Box::pin(async move { Ok(release_clean(conn, &upkeep).await) })
+                }
+            })
             .connect_with(connect)
             .await
             .map_err(|e| format!("cannot connect to the ledger database: {e}"))?;
@@ -197,7 +206,6 @@ impl PostgresLedger {
             opts.sealer.clone(),
             Arc::clone(&live),
         ));
-        let upkeep = Arc::new(Upkeep::default());
         let sweeper = tokio::spawn(run_sweeper(
             pool.clone(),
             opts.sweep_interval,
