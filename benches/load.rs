@@ -54,6 +54,11 @@
 //! upstream that never slows down. Read the results as the gateway's own
 //! overhead and ceilings on the machine that produced them.
 //!
+//! `LOAD_PG_SLOW_COMMIT_MS` makes every Postgres commit take that long (a
+//! deferred trigger in the run's schema), so commits overrun their window and
+//! the late-commit release is exercised under load; reconciliation then
+//! requires every such reservation to be released at zero cost.
+//!
 //! Other knobs: `LOAD_LEVELS` (default `50,200,500,1000`), `LOAD_FRAMING`
 //! (`normalized` or `passthrough`), `LOAD_GLOBAL_CAP`. Each level is appended
 //! to `target/load-report.jsonl`. Under `cargo test` (no `--bench` flag) it
@@ -148,6 +153,10 @@ struct Plan {
     tenants: usize,
     ledgers: Vec<LedgerKind>,
     ledger_timeout_ms: u64,
+    /// Postgres only: make every reservation's commit take this long, so
+    /// commits overrun their window and the late-commit release runs under
+    /// load. 0 is off.
+    pg_slow_commit_ms: u64,
 }
 
 impl Plan {
@@ -193,6 +202,7 @@ impl Plan {
                 tenants: 2,
                 ledgers,
                 ledger_timeout_ms: 5_000,
+                pg_slow_commit_ms: 0,
             };
         }
         let levels = std::env::var("LOAD_LEVELS")
@@ -210,6 +220,7 @@ impl Plan {
             tenants: num("LOAD_TENANTS", 10).max(1) as usize,
             ledgers,
             ledger_timeout_ms: num("LOAD_LEDGER_TIMEOUT_MS", 1_000),
+            pg_slow_commit_ms: num("LOAD_PG_SLOW_COMMIT_MS", 0),
         }
     }
 }
@@ -700,6 +711,37 @@ async fn ledger_rows(store: &Store) -> Option<BTreeMap<String, LedgerRows>> {
     Some(out)
 }
 
+/// A deferred trigger that makes every reservation's commit sleep `ms`. Waits
+/// for the gateway to have created the table first.
+async fn slow_commits(url: &str, schema: &str, ms: u64) {
+    let pool = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect(url).await.expect("connect");
+    let table = format!("\"{schema}\".reservations");
+    for _ in 0..200 {
+        let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+            .bind(&table)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        if exists.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let seconds = ms as f64 / 1000.0;
+    for ddl in [
+        format!(
+            "CREATE FUNCTION \"{schema}\".load_slow_commit() RETURNS trigger LANGUAGE plpgsql AS $$              BEGIN PERFORM pg_sleep({seconds}); RETURN NULL; END $$"
+        ),
+        format!(
+            "CREATE CONSTRAINT TRIGGER load_slow_commit AFTER INSERT ON {table} DEFERRABLE INITIALLY DEFERRED              FOR EACH ROW EXECUTE FUNCTION \"{schema}\".load_slow_commit()"
+        ),
+    ] {
+        sqlx::query(&ddl).execute(&pool).await.expect("install the slow-commit trigger");
+    }
+    pool.close().await;
+    println!("load: postgres commits slowed by {ms} ms");
+}
+
 /// Wait for the ledger to close every reservation, then check that the
 /// clients, the rows and the totals agree. Returns the settle lag and every
 /// disagreement found.
@@ -868,6 +910,14 @@ fn main() {
             .build()
             .unwrap();
         let upstream_url = format!("http://{upstream}/v1/chat/completions");
+
+        if plan.pg_slow_commit_ms > 0 {
+            for gw in &gateways {
+                if let Store::Postgres { url, schema } = &gw.store {
+                    slow_commits(url, schema, plan.pg_slow_commit_ms).await;
+                }
+            }
+        }
 
         // Wait for every gateway to accept, then warm each path.
         let warm = Plan { seconds: 1, ..plan.clone() };
