@@ -371,6 +371,20 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         "# HELP gw_decisions_dropped_total Routine decision records dropped because they could not be kept.\n# TYPE gw_decisions_dropped_total counter\ngw_decisions_dropped_total {}",
         state.limits.ledger().decisions_dropped()
     );
+    let upkeep = state.limits.ledger().upkeep();
+    let _ = writeln!(
+        body,
+        "# HELP gw_ledger_sweep_failures_total Ledger sweeper steps that failed; while they fail, lapsed reservations stay open.
+# TYPE gw_ledger_sweep_failures_total counter
+gw_ledger_sweep_failures_total {}
+         # HELP gw_ledger_swept_reservations_total Reservations closed by the sweeper after their lease lapsed, each billed its full reservation.
+# TYPE gw_ledger_swept_reservations_total counter
+gw_ledger_swept_reservations_total {}
+         # HELP gw_ledger_late_commits_released_total Reservations that committed after their admission timed out, released at no charge.
+# TYPE gw_ledger_late_commits_released_total counter
+gw_ledger_late_commits_released_total {}",
+        upkeep.sweep_failures, upkeep.swept, upkeep.late_commits_released
+    );
     let mut response = body.into_response();
     response.headers_mut().insert(
         CONTENT_TYPE,

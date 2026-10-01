@@ -27,12 +27,13 @@
 //! "Today" comes from the host clock, via SQLite's `strftime`.
 
 use std::{
+    future::Future,
     path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use dashmap::DashMap;
@@ -48,7 +49,7 @@ use tokio::{
 use uuid::Uuid;
 
 use super::{
-    Closing, Ledger, LedgerRefusal, NewReservation, Outcome,
+    Closing, CommitOutcome, Ledger, LedgerRefusal, NewReservation, Outcome, Upkeep, UpkeepCounts, commit_within,
     decisions::{DECISION_QUEUE, Decision, DecisionKind, DecisionQuery, DecisionRecord},
     holds::{self, HoldClaim, HoldDecision, HoldProblem, HoldQuery, HoldRecord, HoldState, NewHold, Transition},
     sealed::{ResponseSealer, binding},
@@ -101,6 +102,7 @@ pub struct SqliteLedger {
     live: Arc<DashMap<Uuid, ()>>,
     decision_queue: mpsc::Sender<Decision>,
     decisions_dropped: Arc<AtomicU64>,
+    upkeep: Arc<Upkeep>,
 }
 
 impl Drop for SqliteLedger {
@@ -109,6 +111,9 @@ impl Drop for SqliteLedger {
         self.renewer.abort();
     }
 }
+
+/// Direct attempts to release a late commit before handing it to the writer.
+const LATE_RELEASE_ATTEMPTS: u32 = 5;
 
 fn to_i64(v: u64) -> i64 {
     i64::try_from(v).unwrap_or(i64::MAX)
@@ -168,7 +173,13 @@ impl SqliteLedger {
             opts.sealer.clone(),
             Arc::clone(&live),
         ));
-        let sweeper = tokio::spawn(run_sweeper(pool.clone(), opts.sweep_interval, opts.decision_retention));
+        let upkeep = Arc::new(Upkeep::default());
+        let sweeper = tokio::spawn(run_sweeper(
+            pool.clone(),
+            opts.sweep_interval,
+            opts.decision_retention,
+            Arc::clone(&upkeep),
+        ));
         let renewer = tokio::spawn(run_renewer(pool.clone(), Arc::clone(&live), opts.lease));
         let (decision_queue, decision_inbox) = mpsc::channel(DECISION_QUEUE);
         let decisions_dropped = Arc::new(AtomicU64::new(0));
@@ -187,6 +198,7 @@ impl SqliteLedger {
             live,
             decision_queue,
             decisions_dropped,
+            upkeep,
         }))
     }
 
@@ -223,7 +235,59 @@ impl SqliteLedger {
         opened
     }
 
-    async fn reserve_tx(&self, r: &NewReservation<'_>) -> Result<Result<u64, LedgerRefusal>, sqlx::Error> {
+    /// What to do if this admission's commit lands after it was refused:
+    /// release the reservation, exactly as for a request the provider never
+    /// saw. Lazy: it runs only if awaited.
+    ///
+    /// Written straight to the database, not queued: a late commit happens
+    /// when the ledger is overloaded, which is when the writer's queue is
+    /// deepest, and a release that waited behind it could lose to the
+    /// sweeper and become the full bill it exists to prevent. If the direct
+    /// write keeps failing, the writer takes it, and retries until durable.
+    fn release_if_late(&self, r: &NewReservation<'_>, bucket: u64) -> impl Future<Output = ()> + Send + 'static {
+        let closing = Closing {
+            id: r.id,
+            tenant_id: Arc::from(r.tenant_id),
+            bucket,
+            delta_nano_usd: -(r.amount_nano_usd as i128),
+            outcome: Outcome::Released,
+            at: SystemTime::now(),
+            response: None,
+            completion_tokens: 0,
+        };
+        let pool = self.pool.clone();
+        let (writer, pending, upkeep) = (self.writer.clone(), Arc::clone(&self.pending), Arc::clone(&self.upkeep));
+        async move {
+            upkeep.late_commit_released();
+            tracing::warn!(
+                reservation = %closing.id,
+                tenant = %closing.tenant_id,
+                "a reservation committed after its admission timed out; releasing it at no charge"
+            );
+            for attempt in 0..LATE_RELEASE_ATTEMPTS {
+                match apply_close(&pool, &closing, None).await {
+                    Ok(()) => return,
+                    Err(error) => {
+                        tracing::warn!(%error, attempt, reservation = %closing.id, "releasing a late commit failed; retrying");
+                        tokio::time::sleep(Duration::from_millis(100 << attempt)).await;
+                    }
+                }
+            }
+            pending.fetch_add(1, Ordering::Relaxed);
+            if writer.send(WriterMsg::Close(closing)).is_err() {
+                pending.fetch_sub(1, Ordering::Relaxed);
+                tracing::error!("ledger writer has stopped; the sweeper will bill this reservation in full");
+            }
+        }
+    }
+
+    /// Everything an admission decides, up to but not including the commit.
+    /// Returns the open transaction and the day charged; dropping the
+    /// transaction rolls the whole admission back.
+    async fn decide(
+        &self,
+        r: &NewReservation<'_>,
+    ) -> Result<Result<(sqlx::Transaction<'static, sqlx::Sqlite>, i64), LedgerRefusal>, sqlx::Error> {
         // Dropping `tx` on any early return rolls back, including when the
         // caller's deadline cancels this future.
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -357,9 +421,7 @@ impl SqliteLedger {
             }
             Err(e) => return Err(e),
         }
-        tx.commit().await?;
-        self.live.insert(r.id, ());
-        Ok(Ok(today.max(0) as u64))
+        Ok(Ok((tx, today)))
     }
 }
 
@@ -712,7 +774,7 @@ async fn run_decision_writer(pool: SqlitePool, mut inbox: mpsc::Receiver<Decisio
     }
 }
 
-async fn run_sweeper(pool: SqlitePool, interval: Duration, decision_retention: Duration) {
+async fn run_sweeper(pool: SqlitePool, interval: Duration, decision_retention: Duration, upkeep: Arc<Upkeep>) {
     let mut ticker = tokio::time::interval(interval.max(Duration::from_secs(1)));
     loop {
         ticker.tick().await;
@@ -721,9 +783,11 @@ async fn run_sweeper(pool: SqlitePool, interval: Duration, decision_retention: D
             .execute(&pool)
             .await
         {
+            upkeep.sweep_failed();
             tracing::warn!(%error, "decision retention sweep failed; will retry");
         }
         if let Err(error) = expire_holds(&pool).await {
+            upkeep.sweep_failed();
             tracing::warn!(%error, "hold expiry failed; will retry");
         }
         // Holds that can never change again go with the decisions about them.
@@ -734,15 +798,22 @@ async fn run_sweeper(pool: SqlitePool, interval: Duration, decision_retention: D
         .execute(&pool)
         .await
         {
+            upkeep.sweep_failed();
             tracing::warn!(%error, "hold retention sweep failed; will retry");
         }
         match sweep(&pool).await {
             Ok(0) => {}
-            Ok(n) => tracing::warn!(
-                reservations = n,
-                "swept reservations left open by a crash; each keeps its full reservation as the bill"
-            ),
-            Err(error) => tracing::warn!(%error, "ledger sweep failed; will retry"),
+            Ok(n) => {
+                upkeep.swept(n);
+                tracing::warn!(
+                    reservations = n,
+                    "swept reservations whose lease lapsed; each keeps its full reservation as the bill"
+                );
+            }
+            Err(error) => {
+                upkeep.sweep_failed();
+                tracing::warn!(%error, "ledger sweep failed; will retry");
+            }
         }
     }
 }
@@ -750,10 +821,34 @@ async fn run_sweeper(pool: SqlitePool, interval: Duration, decision_retention: D
 #[async_trait::async_trait]
 impl Ledger for SqliteLedger {
     async fn try_reserve(&self, r: NewReservation<'_>) -> Result<u64, LedgerRefusal> {
-        match tokio::time::timeout(self.timeout, self.reserve_tx(&r)).await {
-            Ok(Ok(decision)) => decision,
-            Ok(Err(error)) => Err(unavailable("reserve", error)),
-            Err(_) => Err(unavailable("reserve", "timed out")),
+        // Deciding may be abandoned: running out drops the transaction before
+        // its commit, which rolls it back and holds nothing. It keeps the
+        // whole deadline, because under contention deciding is mostly queueing
+        // for the tenant's day row, and cutting it short refuses requests that
+        // would have been served.
+        let started = Instant::now();
+        let (tx, today) = match tokio::time::timeout(self.timeout, self.decide(&r)).await {
+            Ok(Ok(Ok(decided))) => decided,
+            Ok(Ok(Err(refusal))) => return Err(refusal),
+            Ok(Err(error)) => return Err(unavailable("reserve", error)),
+            Err(_) => return Err(unavailable("reserve", "timed out")),
+        };
+        let bucket = today.max(0) as u64;
+        // The commit is the step that must not be cut short. It gets what
+        // deciding left, but never less than a quarter of the deadline: an
+        // overloaded ledger is slow to decide, and without the floor every
+        // commit there would start with nothing left. So an admission can take
+        // up to 1.25 times the deadline, and only under overload. One that
+        // still overruns is refused like any timeout, but it is not abandoned:
+        // if it lands, the reservation is released at once.
+        let committing = self.timeout.saturating_sub(started.elapsed()).max(self.timeout / 4);
+        match commit_within(tx.commit(), committing, self.release_if_late(&r, bucket)).await {
+            CommitOutcome::Committed => {
+                self.live.insert(r.id, ());
+                Ok(bucket)
+            }
+            CommitOutcome::Failed(error) => Err(unavailable("reserve", error)),
+            CommitOutcome::Late => Err(unavailable("reserve", "timed out committing")),
         }
     }
 
@@ -851,6 +946,10 @@ impl Ledger for SqliteLedger {
 
     fn decisions_dropped(&self) -> u64 {
         self.decisions_dropped.load(Ordering::Relaxed)
+    }
+
+    fn upkeep(&self) -> UpkeepCounts {
+        self.upkeep.counts()
     }
 
     async fn create_hold(&self, h: NewHold) -> Result<HoldRecord, LedgerRefusal> {

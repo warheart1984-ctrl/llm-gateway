@@ -351,6 +351,23 @@ database decides, not any gateway process:
   usage is unknowable. A stream that simply runs long keeps renewing and is
   never swept while live. (`sweep_after_secs`, the older name for the
   setting, is still accepted.)
+- **A refused request is never billed.** `timeout_ms` bounds deciding an
+  admission; running out rolls the transaction back, so nothing is held.
+  The commit gets what is left, but never less than a quarter of
+  `timeout_ms`, so under overload an admission can take up to 1.25 times
+  it. A commit still running past that is refused with 503
+  like any timeout, but left to finish rather than abandoned: if it lands,
+  the reservation is released at once, at no charge, written straight to
+  the database rather than queued behind settlements
+  (`gw_ledger_late_commits_released_total`). The SQLite ledger does the
+  same. Abandoning it would leave a reservation nothing closes, holding a
+  concurrency slot and its idempotency key until the sweeper billed it in
+  full.
+- **Upkeep is on `/metrics`.** `gw_ledger_sweep_failures_total` counts
+  sweeper steps that failed: while they fail, lapsed reservations stay open
+  and hold their tenant's money. `gw_ledger_swept_reservations_total`
+  counts reservations billed in full because their lease lapsed; outside a
+  crash it should stay at zero, so alert on it.
 - **Closing** is `UPDATE … WHERE state = 'open'`, so a duplicate close from
   any process changes nothing. Closings are queued to one writer that
   retries until each one is durable, and graceful shutdown flushes the queue.
@@ -592,12 +609,17 @@ cargo bench --bench load                           # gateway overhead and ceilin
 ```
 
 `benches/load.rs` streams from a paced fake upstream at 50, 200, 500 and
-1,000 concurrent clients, first directly and then through the gateway, and
-reports what the gateway adds to time-to-first-token, completed streams per
-second, refusals by status, and heap per open stream. Upstream, gateway and
-clients share one machine over loopback, so the results show the gateway's own
-overhead and limits on that machine, not production numbers. The module docs
-list the `LOAD_*` knobs; each run appends to `target/load-report.jsonl`.
+1,000 concurrent clients spread over 10 tenants, first directly and then
+through a gateway on each ledger (memory and SQLite, plus Postgres when
+`LLM_GATEWAY_TEST_DATABASE_URL` is set). It reports what the gateway adds to
+time-to-first-token, reservations settled per second, refusals by status,
+reserved and billed totals, and heap per open stream. After every level it
+waits for the ledger to settle and reconciles, per tenant, what the clients
+were told against the ledger's reservation rows and its daily totals; any
+disagreement fails the run. Upstream, gateway, clients and database share one
+machine over loopback, so the results show the gateway's own overhead and
+limits on that machine, not production numbers. The module docs list the
+`LOAD_*` knobs; each run appends to `target/load-report.jsonl`.
 
 CI (`.github/workflows/ci.yml`) runs that gate from a clean checkout on Linux
 and Windows: the full suite three times over, the money tests five more times,
