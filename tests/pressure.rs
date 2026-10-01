@@ -431,7 +431,7 @@ enum LedgerChoice {
     /// Every gateway process shares one Postgres ledger: a schema of its own
     /// per deployment, so parallel tests never share rows. `sealed` says
     /// whether stored answers are encrypted (and therefore stored at all).
-    Shared { url: String, schema: String, sealed: bool },
+    Shared { url: String, schema: String, sealed: bool, deadline: Duration },
 }
 
 /// The test database, or `None` to skip. CI sets
@@ -452,10 +452,22 @@ fn test_database_url() -> Option<String> {
 /// Test-only answer-sealing key: 32 bytes, base64.
 const TEST_RESPONSE_KEYS: &str = "test-1:AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
 
+/// A loaded machine's ledger deadline: see `local_ledger`.
+const LEDGER_DEADLINE: Duration = Duration::from_millis(5000);
+
 async fn postgres_ledger(
     url: &str,
     schema: &str,
     sealed: bool,
+) -> Result<Arc<llm_gateway::governance::ledger::PostgresLedger>, String> {
+    postgres_ledger_with(url, schema, sealed, LEDGER_DEADLINE).await
+}
+
+async fn postgres_ledger_with(
+    url: &str,
+    schema: &str,
+    sealed: bool,
+    deadline: Duration,
 ) -> Result<Arc<llm_gateway::governance::ledger::PostgresLedger>, String> {
     let sealer = sealed.then(|| {
         Arc::new(llm_gateway::governance::ledger::sealed::ResponseSealer::from_keys(TEST_RESPONSE_KEYS).unwrap())
@@ -465,8 +477,7 @@ async fn postgres_ledger(
             url: url.to_string(),
             schema: schema.to_string(),
             max_connections: 8,
-            // A loaded machine's deadline: see `local_ledger`.
-            timeout: Duration::from_millis(5000),
+            timeout: deadline,
             lease: Duration::from_secs(60),
             sweep_interval: Duration::from_secs(3_600),
             idempotency_retention: Duration::from_secs(86_400),
@@ -501,9 +512,17 @@ impl Deployment {
     fn shared_with(provider: &MockProvider, url: &str, sealed: bool) -> Self {
         let schema = format!("pressure_{}", uuid::Uuid::new_v4().simple());
         Self {
-            ledger: LedgerChoice::Shared { url: url.to_string(), schema, sealed },
+            ledger: LedgerChoice::Shared { url: url.to_string(), schema, sealed, deadline: LEDGER_DEADLINE },
             ..Self::new(provider)
         }
+    }
+
+    /// The same, with every gateway's ledger deadline set to `deadline`.
+    fn with_ledger_deadline(mut self, deadline: Duration) -> Self {
+        if let LedgerChoice::Shared { deadline: d, .. } = &mut self.ledger {
+            *d = deadline;
+        }
+        self
     }
 
     /// Direct access to the shared ledger's tables, for inspecting what is
@@ -565,8 +584,8 @@ impl Deployment {
             LedgerChoice::Memory => llm_gateway::bootstrap::build(settings).await.map_err(|e| e.to_string())?,
             // A fresh ledger client per boot, exactly as a separate process
             // would have: nothing is shared but the database.
-            LedgerChoice::Shared { url, schema, sealed } => {
-                let ledger = postgres_ledger(url, schema, *sealed).await?;
+            LedgerChoice::Shared { url, schema, sealed, deadline } => {
+                let ledger = postgres_ledger_with(url, schema, *sealed, *deadline).await?;
                 llm_gateway::bootstrap::build_with_ledger(settings, ledger)
                     .await
                     .map_err(|e| e.to_string())?
@@ -1665,6 +1684,46 @@ async fn shared_ledger_concurrency_is_one_cap_across_replicas() {
     );
     provider.open_gate(20);
     futures_util::future::join_all(burst).await;
+}
+
+#[tokio::test]
+async fn shared_ledger_a_reservation_that_commits_after_its_deadline_is_released_not_billed() {
+    // The ledger deadline covers a whole admission. Postgres bounds each
+    // statement by it too, so the race needs an admission whose statements
+    // each fit but together do not: here the insert takes 0.6 s and the
+    // commit another 0.6 s, against a 1 s deadline. The gateway refuses the
+    // request while the commit is still running, and the commit then lands.
+    // That reservation used to stay open, unclosed, until the sweeper billed
+    // it in full: a tenant charged for a request it was told had failed.
+    let Some(url) = test_database_url() else { return };
+    let provider = MockProvider::start(Provider::Healthy).await;
+    let deployment = Deployment::shared(&provider, &url).with_ledger_deadline(Duration::from_millis(1000));
+    let pool = deployment.ledger_pool().await;
+    for ddl in [
+        "CREATE FUNCTION slow_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.6); RETURN NEW; END $$",
+        "CREATE TRIGGER slow_insert BEFORE INSERT ON reservations FOR EACH ROW EXECUTE FUNCTION slow_insert()",
+        "CREATE FUNCTION slow_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.6); RETURN NULL; END $$",
+        "CREATE CONSTRAINT TRIGGER slow_commit AFTER INSERT ON reservations DEFERRABLE INITIALLY DEFERRED
+             FOR EACH ROW EXECUTE FUNCTION slow_commit()",
+    ] {
+        sqlx::query(ddl).execute(&pool).await.expect(ddl);
+    }
+    let gw = deployment.boot().await;
+
+    let reply = gw.chat(Some("key-app"), small_request()).await;
+    assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE, "{}", reply.body);
+    assert_eq!(reply.code(), "ledger_unavailable");
+    assert_eq!(provider.calls(), 0, "a refused request never reaches the provider");
+
+    eventually_async("the late reservation is released", || async {
+        let states: Vec<(String,)> = sqlx::query_as("SELECT state FROM reservations").fetch_all(&pool).await.unwrap();
+        states == [("released".to_string(),)]
+    })
+    .await;
+    assert_eq!(gw.spent("key-app").await, 0, "a refused request costs nothing");
+    let metrics = gw.get("/metrics", "key-admin").await.body;
+    assert!(metrics.contains("gw_ledger_late_commits_released_total 1"), "{metrics}");
+    assert!(metrics.contains("gw_ledger_swept_reservations_total 0"), "{metrics}");
 }
 
 #[tokio::test]

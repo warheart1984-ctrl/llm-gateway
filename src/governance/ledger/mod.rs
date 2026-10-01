@@ -27,7 +27,14 @@ pub mod postgres;
 pub mod sealed;
 pub mod sqlite;
 
-use std::{sync::Arc, time::SystemTime};
+use std::{
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime},
+};
 
 use uuid::Uuid;
 
@@ -36,6 +43,91 @@ pub use memory::MemoryLedger;
 pub(crate) use memory::SpendLedger;
 pub use postgres::PostgresLedger;
 pub use sqlite::SqliteLedger;
+
+/// Counters for a durable ledger's background upkeep, on `/metrics`. Each is
+/// something an operator should hear about without reading logs.
+#[derive(Debug, Default)]
+pub struct Upkeep {
+    sweep_failures: AtomicU64,
+    swept: AtomicU64,
+    late_commits_released: AtomicU64,
+}
+
+/// A reading of [`Upkeep`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UpkeepCounts {
+    /// Sweeper steps that failed. Each is retried on the next pass, but while
+    /// they fail, lapsed reservations stay open and hold their tenant's money.
+    pub sweep_failures: u64,
+    /// Reservations the sweeper closed because their lease lapsed: a crash,
+    /// or a closing that never arrived. Each was billed its full reservation.
+    pub swept: u64,
+    /// Reservations whose commit landed after the admission's deadline had
+    /// passed and the request had been refused. Each was released at once, at
+    /// no charge.
+    pub late_commits_released: u64,
+}
+
+impl Upkeep {
+    pub fn sweep_failed(&self) {
+        self.sweep_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn swept(&self, reservations: u64) {
+        self.swept.fetch_add(reservations, Ordering::Relaxed);
+    }
+
+    pub fn late_commit_released(&self) {
+        self.late_commits_released.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn counts(&self) -> UpkeepCounts {
+        UpkeepCounts {
+            sweep_failures: self.sweep_failures.load(Ordering::Relaxed),
+            swept: self.swept.load(Ordering::Relaxed),
+            late_commits_released: self.late_commits_released.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// How an admission's commit ended, as far as the admission could wait.
+#[derive(Debug)]
+pub(crate) enum CommitOutcome {
+    Committed,
+    Failed(String),
+    /// Still running when the deadline passed. It was left to finish in the
+    /// background rather than abandoned; if it landed, `if_late` ran.
+    Late,
+}
+
+/// Commit an admission's reservation, waiting at most `within`.
+///
+/// Abandoning a commit at a deadline does not stop it: the database may
+/// still apply it after the caller has refused the request, and nothing
+/// would then close that reservation until the sweeper billed it in full. So
+/// the commit runs in its own task, and if it is still running at the
+/// deadline it is allowed to finish; `if_late` runs if it lands, to release
+/// what the refused request reserved.
+pub(crate) async fn commit_within<F, E>(commit: F, within: Duration, if_late: impl FnOnce() + Send + 'static) -> CommitOutcome
+where
+    F: Future<Output = Result<(), E>> + Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    let mut handle = tokio::spawn(commit);
+    match tokio::time::timeout(within, &mut handle).await {
+        Ok(Ok(Ok(()))) => CommitOutcome::Committed,
+        Ok(Ok(Err(error))) => CommitOutcome::Failed(error.to_string()),
+        Ok(Err(join)) => CommitOutcome::Failed(join.to_string()),
+        Err(_) => {
+            tokio::spawn(async move {
+                if let Ok(Ok(())) = handle.await {
+                    if_late();
+                }
+            });
+            CommitOutcome::Late
+        }
+    }
+}
 
 /// A request to put money on hold for one gateway request.
 #[derive(Debug, Clone)]
@@ -216,6 +308,12 @@ pub trait Ledger: Send + Sync + std::fmt::Debug {
     /// Routine records dropped since the process started.
     fn decisions_dropped(&self) -> u64;
 
+    /// Background upkeep since the process started. The memory ledger has
+    /// none: it neither sweeps nor commits.
+    fn upkeep(&self) -> UpkeepCounts {
+        UpkeepCounts::default()
+    }
+
     /// Hold a request for approval, recording it as one step. Refused when
     /// the tenant already has `max_pending` holds waiting.
     async fn create_hold(&self, h: holds::NewHold) -> Result<holds::HoldRecord, LedgerRefusal>;
@@ -387,6 +485,58 @@ pub fn valid_idempotency_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A commit that takes `delay`, then reports `result`.
+    async fn slow_commit(delay: Duration, result: Result<(), &'static str>) -> Result<(), &'static str> {
+        tokio::time::sleep(delay).await;
+        result
+    }
+
+    fn late_flag() -> (Arc<std::sync::atomic::AtomicBool>, impl FnOnce() + Send + 'static) {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let set = Arc::clone(&flag);
+        (flag, move || set.store(true, Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn a_commit_within_the_deadline_is_committed_and_nothing_is_released() {
+        let (released, if_late) = late_flag();
+        let outcome = commit_within(slow_commit(Duration::ZERO, Ok(())), Duration::from_secs(5), if_late).await;
+        assert!(matches!(outcome, CommitOutcome::Committed), "{outcome:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!released.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_commit_that_lands_after_the_deadline_is_released() {
+        let (released, if_late) = late_flag();
+        let outcome = commit_within(slow_commit(Duration::from_millis(150), Ok(())), Duration::from_millis(10), if_late).await;
+        assert!(matches!(outcome, CommitOutcome::Late), "{outcome:?}");
+        assert!(!released.load(Ordering::SeqCst), "not before the commit lands");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !released.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "the late commit was never released");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_late_commit_that_fails_releases_nothing() {
+        let (released, if_late) = late_flag();
+        let outcome =
+            commit_within(slow_commit(Duration::from_millis(50), Err("rolled back")), Duration::from_millis(10), if_late).await;
+        assert!(matches!(outcome, CommitOutcome::Late), "{outcome:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!released.load(Ordering::SeqCst), "nothing landed, so there is nothing to release");
+    }
+
+    #[tokio::test]
+    async fn a_failed_commit_is_reported() {
+        let (_, if_late) = late_flag();
+        let outcome = commit_within(slow_commit(Duration::ZERO, Err("disk full")), Duration::from_secs(5), if_late).await;
+        assert!(matches!(outcome, CommitOutcome::Failed(ref e) if e == "disk full"), "{outcome:?}");
+    }
+
     use serde_json::json;
 
     #[test]
