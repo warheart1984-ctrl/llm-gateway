@@ -351,14 +351,18 @@ database decides, not any gateway process:
   usage is unknowable. A stream that simply runs long keeps renewing and is
   never swept while live. (`sweep_after_secs`, the older name for the
   setting, is still accepted.)
-- **A refused request is never billed.** `timeout_ms` bounds each
-  admission. Running out while deciding rolls the transaction back, so
-  nothing is held. A commit still running when the deadline passes is
-  refused with 503 like any timeout, but it is left to finish rather than
-  abandoned: if it lands, the reservation is released at once, at no charge
+- **A refused request is never billed.** `timeout_ms` bounds deciding an
+  admission; running out rolls the transaction back, so nothing is held.
+  The commit gets what is left, but never less than a quarter of
+  `timeout_ms`, so under overload an admission can take up to 1.25 times
+  it. A commit still running past that is refused with 503
+  like any timeout, but left to finish rather than abandoned: if it lands,
+  the reservation is released at once, at no charge, written straight to
+  the database rather than queued behind settlements
   (`gw_ledger_late_commits_released_total`). The SQLite ledger does the
-  same. Abandoning it would leave a reservation nothing closes, which the
-  sweeper would later bill in full.
+  same. Abandoning it would leave a reservation nothing closes, holding a
+  concurrency slot and its idempotency key until the sweeper billed it in
+  full.
 - **Upkeep is on `/metrics`.** `gw_ledger_sweep_failures_total` counts
   sweeper steps that failed: while they fail, lapsed reservations stay open
   and hold their tenant's money. `gw_ledger_swept_reservations_total`

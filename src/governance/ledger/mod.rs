@@ -106,9 +106,14 @@ pub(crate) enum CommitOutcome {
 /// still apply it after the caller has refused the request, and nothing
 /// would then close that reservation until the sweeper billed it in full. So
 /// the commit runs in its own task, and if it is still running at the
-/// deadline it is allowed to finish; `if_late` runs if it lands, to release
-/// what the refused request reserved.
-pub(crate) async fn commit_within<F, E>(commit: F, within: Duration, if_late: impl FnOnce() + Send + 'static) -> CommitOutcome
+/// deadline it is allowed to finish. `if_late` is awaited only if it lands,
+/// to release what the refused request reserved; futures are lazy, so it
+/// does nothing otherwise.
+pub(crate) async fn commit_within<F, E>(
+    commit: F,
+    within: Duration,
+    if_late: impl Future<Output = ()> + Send + 'static,
+) -> CommitOutcome
 where
     F: Future<Output = Result<(), E>> + Send + 'static,
     E: std::fmt::Display + Send + 'static,
@@ -121,7 +126,7 @@ where
         Err(_) => {
             tokio::spawn(async move {
                 if let Ok(Ok(())) = handle.await {
-                    if_late();
+                    if_late.await;
                 }
             });
             CommitOutcome::Late
@@ -492,10 +497,10 @@ mod tests {
         result
     }
 
-    fn late_flag() -> (Arc<std::sync::atomic::AtomicBool>, impl FnOnce() + Send + 'static) {
+    fn late_flag() -> (Arc<std::sync::atomic::AtomicBool>, impl Future<Output = ()> + Send + 'static) {
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let set = Arc::clone(&flag);
-        (flag, move || set.store(true, Ordering::SeqCst))
+        (flag, async move { set.store(true, Ordering::SeqCst) })
     }
 
     #[tokio::test]

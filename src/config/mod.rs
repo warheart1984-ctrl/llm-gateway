@@ -68,7 +68,9 @@ pub struct LedgerConfig {
     pub max_connections: u32,
     /// Bound on each admission's ledger round trip. When it is exceeded, or
     /// the database is down, requests are refused with 503: there is no
-    /// setting that admits without the ledger, because that fails open.
+    /// setting that admits without the ledger, because that fails open. The
+    /// commit always gets at least a quarter of it, so under overload an
+    /// admission can take up to 1.25 times this.
     pub timeout_ms: u64,
     /// How long a reservation's lease lasts without renewal, in seconds. The
     /// gateway renews the leases it holds every third of this; after a crash

@@ -31,6 +31,7 @@
 //! that simply runs long keeps its lease and is never swept while live.
 
 use std::{
+    future::Future,
     str::FromStr,
     sync::{
         Arc,
@@ -129,6 +130,9 @@ fn valid_schema(schema: &str) -> bool {
         && schema.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
         && !schema.as_bytes()[0].is_ascii_digit()
 }
+
+/// Direct attempts to release a late commit before handing it to the writer.
+const LATE_RELEASE_ATTEMPTS: u32 = 5;
 
 fn to_i64(v: u64) -> i64 {
     i64::try_from(v).unwrap_or(i64::MAX)
@@ -260,8 +264,14 @@ impl PostgresLedger {
 
     /// What to do if this admission's commit lands after it was refused:
     /// release the reservation, exactly as for a request the provider never
-    /// saw.
-    fn release_if_late(&self, r: &NewReservation<'_>, bucket: u64) -> impl FnOnce() + Send + 'static {
+    /// saw. Lazy: it runs only if awaited.
+    ///
+    /// Written straight to the database, not queued: a late commit happens
+    /// when the ledger is overloaded, which is when the writer's queue is
+    /// deepest, and a release that waited behind it could lose to the
+    /// sweeper and become the full bill it exists to prevent. If the direct
+    /// write keeps failing, the writer takes it, and retries until durable.
+    fn release_if_late(&self, r: &NewReservation<'_>, bucket: u64) -> impl Future<Output = ()> + Send + 'static {
         let closing = Closing {
             id: r.id,
             tenant_id: Arc::from(r.tenant_id),
@@ -272,14 +282,24 @@ impl PostgresLedger {
             response: None,
             completion_tokens: 0,
         };
+        let pool = self.pool.clone();
         let (writer, pending, upkeep) = (self.writer.clone(), Arc::clone(&self.pending), Arc::clone(&self.upkeep));
-        move || {
+        async move {
             upkeep.late_commit_released();
             tracing::warn!(
                 reservation = %closing.id,
                 tenant = %closing.tenant_id,
                 "a reservation committed after its admission timed out; releasing it at no charge"
             );
+            for attempt in 0..LATE_RELEASE_ATTEMPTS {
+                match apply_close(&pool, &closing, None).await {
+                    Ok(()) => return,
+                    Err(error) => {
+                        tracing::warn!(%error, attempt, reservation = %closing.id, "releasing a late commit failed; retrying");
+                        tokio::time::sleep(Duration::from_millis(100 << attempt)).await;
+                    }
+                }
+            }
             pending.fetch_add(1, Ordering::Relaxed);
             if writer.send(WriterMsg::Close(closing)).is_err() {
                 pending.fetch_sub(1, Ordering::Relaxed);
@@ -978,9 +998,12 @@ async fn run_sweeper(pool: PgPool, interval: Duration, decision_retention: Durat
 #[async_trait::async_trait]
 impl Ledger for PostgresLedger {
     async fn try_reserve(&self, r: NewReservation<'_>) -> Result<u64, LedgerRefusal> {
+        // Deciding may be abandoned: running out drops the transaction before
+        // its commit, which rolls it back and holds nothing. It keeps the
+        // whole deadline, because under contention deciding is mostly queueing
+        // for the tenant's day row, and cutting it short refuses requests that
+        // would have been served.
         let started = Instant::now();
-        // Deciding is bounded by the deadline. Running out drops the
-        // transaction before its commit, which rolls it back: nothing is held.
         let (tx, today) = match tokio::time::timeout(self.timeout, self.decide(&r)).await {
             Ok(Ok(Ok(decided))) => decided,
             Ok(Ok(Err(refusal))) => return Err(refusal),
@@ -988,12 +1011,15 @@ impl Ledger for PostgresLedger {
             Err(_) => return Err(unavailable("reserve", "timed out")),
         };
         let bucket = today.max(0) as u64;
-        // The commit gets what is left of the deadline. One that overruns is
-        // refused like any timeout, but it is not abandoned: if it lands, the
-        // reservation is released at once, instead of staying open until the
-        // sweeper bills it in full.
-        let remaining = self.timeout.saturating_sub(started.elapsed());
-        match commit_within(tx.commit(), remaining, self.release_if_late(&r, bucket)).await {
+        // The commit is the step that must not be cut short. It gets what
+        // deciding left, but never less than a quarter of the deadline: an
+        // overloaded ledger is slow to decide, and without the floor every
+        // commit there would start with nothing left. So an admission can take
+        // up to 1.25 times the deadline, and only under overload. One that
+        // still overruns is refused like any timeout, but it is not abandoned:
+        // if it lands, the reservation is released at once.
+        let committing = self.timeout.saturating_sub(started.elapsed()).max(self.timeout / 4);
+        match commit_within(tx.commit(), committing, self.release_if_late(&r, bucket)).await {
             CommitOutcome::Committed => {
                 self.live.insert(r.id, ());
                 Ok(bucket)
