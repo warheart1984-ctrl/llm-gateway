@@ -592,12 +592,17 @@ cargo bench --bench load                           # gateway overhead and ceilin
 ```
 
 `benches/load.rs` streams from a paced fake upstream at 50, 200, 500 and
-1,000 concurrent clients, first directly and then through the gateway, and
-reports what the gateway adds to time-to-first-token, completed streams per
-second, refusals by status, and heap per open stream. Upstream, gateway and
-clients share one machine over loopback, so the results show the gateway's own
-overhead and limits on that machine, not production numbers. The module docs
-list the `LOAD_*` knobs; each run appends to `target/load-report.jsonl`.
+1,000 concurrent clients spread over 10 tenants, first directly and then
+through a gateway on each ledger (memory and SQLite, plus Postgres when
+`LLM_GATEWAY_TEST_DATABASE_URL` is set). It reports what the gateway adds to
+time-to-first-token, reservations settled per second, refusals by status,
+reserved and billed totals, and heap per open stream. After every level it
+waits for the ledger to settle and reconciles, per tenant, what the clients
+were told against the ledger's reservation rows and its daily totals; any
+disagreement fails the run. Upstream, gateway, clients and database share one
+machine over loopback, so the results show the gateway's own overhead and
+limits on that machine, not production numbers. The module docs list the
+`LOAD_*` knobs; each run appends to `target/load-report.jsonl`.
 
 CI (`.github/workflows/ci.yml`) runs that gate from a clean checkout on Linux
 and Windows: the full suite three times over, the money tests five more times,

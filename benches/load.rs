@@ -1,4 +1,5 @@
-//! Load harness: how much the gateway adds, and where it starts refusing.
+//! Load harness: what the gateway adds, where it starts refusing, and whether
+//! its ledger settles every reservation exactly, under concurrent load.
 //!
 //! ```text
 //! cargo bench --bench load
@@ -7,37 +8,59 @@
 //! A fake upstream streams answers at a fixed pace (first token after
 //! `LOAD_TTFT_MS`, then `LOAD_TOKENS` tokens `LOAD_INTERVAL_MS` apart). At
 //! each concurrency level, `C` clients loop on streaming requests for
-//! `LOAD_SECONDS`, first straight at the upstream, then through the gateway.
-//! The difference is what the gateway costs:
+//! `LOAD_SECONDS`: first straight at the upstream, then through a gateway on
+//! each ledger in `LOAD_LEDGERS`. Clients are spread over `LOAD_TENANTS`
+//! tenants. Per level and ledger it reports:
 //!
 //! * **added TTFT**: time to the first token through the gateway minus the
 //!   same percentile straight from the upstream, at the same concurrency;
-//! * **ok/s**: completed streams per second through the gateway;
+//! * **ok/s**: completed streams per second, i.e. reservations made and
+//!   settled per second;
 //! * **refused**: answers that were not a 200, by status. The gateway runs
-//!   with the shipped `max_concurrent_streams_global` (512) unless
-//!   `LOAD_GLOBAL_CAP` says otherwise, so levels above it show the cap
-//!   refusing. A refused client waits 50 ms before its next attempt;
+//!   with the shipped `max_concurrent_streams_global` (512) and ledger
+//!   deadline (`LOAD_LEDGER_TIMEOUT_MS`, default the shipped 1,000 ms), so a
+//!   level past the cap shows 429s and a ledger that cannot keep up shows
+//!   503s. A refused client waits 50 ms before its next attempt;
+//! * **reserved / billed**: the totals the clients were told, from each
+//!   response's `x-reserved-nano-usd` header and its `end` event;
+//! * **settle lag**: from the last response finishing to the ledger holding
+//!   no open reservation;
+//! * **reconciled**: after every level, per tenant, three independent records
+//!   must agree, or the run fails:
+//!   1. what the clients saw: admitted streams, reserved and billed totals;
+//!   2. the ledger's `reservations` rows: one per admitted stream, none left
+//!      `open` or `swept`, each bill `reserved + delta`;
+//!   3. the tenant's total: `spend_days` in the database, and
+//!      `spent_nano_usd` from `GET /v1/usage`, with no stream in flight.
+//!
+//!   The memory ledger has no tables, so it checks (1) against `/v1/usage`.
+//!   Totals are cumulative across levels, since the ledger is too;
 //! * **KiB/stream**: peak heap through the gateway minus peak heap straight
 //!   to the upstream, divided by the most streams the gateway held open at
-//!   once. Counted by this binary's allocator, so it is heap only.
+//!   once. Counted by this binary's allocator, so heap only.
 //!
-//! What this is not: production numbers. Upstream, gateway and clients share
-//! one machine and its CPU (each on its own runtime), over loopback, against
-//! an upstream that never slows down. Real vendors add tens to hundreds of
-//! milliseconds that dwarf everything here. Read the results as the
-//! gateway's own overhead and ceilings, on the machine that produced them.
+//! `LOAD_LEDGERS` is a list of `memory`, `sqlite` and `postgres` (default
+//! `memory,sqlite`, plus `postgres` when `LLM_GATEWAY_TEST_DATABASE_URL` is
+//! set). Postgres gets a fresh schema per run, named in the output; SQLite a
+//! fresh file in a temp directory.
 //!
-//! Levels are `LOAD_LEVELS` (default `50,200,500,1000`) and framing is
-//! `LOAD_FRAMING` (`normalized`, the default, or `passthrough`). Each level
-//! is appended to `target/load-report.jsonl`. Under `cargo test` (no
-//! `--bench` flag) it runs one tiny level as a smoke check.
+//! What this is not: production numbers. Upstream, gateway, clients and the
+//! database share one machine and its CPU, over loopback, against an
+//! upstream that never slows down. Read the results as the gateway's own
+//! overhead and ceilings on the machine that produced them.
+//!
+//! Other knobs: `LOAD_LEVELS` (default `50,200,500,1000`), `LOAD_FRAMING`
+//! (`normalized` or `passthrough`), `LOAD_GLOBAL_CAP`. Each level is appended
+//! to `target/load-report.jsonl`. Under `cargo test` (no `--bench` flag) it
+//! runs one tiny level on the memory and SQLite ledgers as a smoke check,
+//! reconciliation included.
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     collections::BTreeMap,
     io::Write as _,
     net::SocketAddr,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -89,6 +112,25 @@ fn reset_peak() -> usize {
 // Settings
 // ---------------------------------------------------------------------------
 
+const DATABASE_URL_ENV: &str = "LLM_GATEWAY_TEST_DATABASE_URL";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LedgerKind {
+    Memory,
+    Sqlite,
+    Postgres,
+}
+
+impl LedgerKind {
+    fn name(self) -> &'static str {
+        match self {
+            LedgerKind::Memory => "memory",
+            LedgerKind::Sqlite => "sqlite",
+            LedgerKind::Postgres => "postgres",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Plan {
     levels: Vec<usize>,
@@ -98,6 +140,9 @@ struct Plan {
     interval_ms: u64,
     global_cap: usize,
     framing: String,
+    tenants: usize,
+    ledgers: Vec<LedgerKind>,
+    ledger_timeout_ms: u64,
 }
 
 impl Plan {
@@ -105,15 +150,32 @@ impl Plan {
         let num = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
         };
-        let levels = std::env::var("LOAD_LEVELS")
-            .ok()
-            .map(|v| v.split(',').filter_map(|l| l.trim().parse().ok()).collect::<Vec<usize>>())
-            .filter(|l| !l.is_empty());
         let framing = std::env::var("LOAD_FRAMING").unwrap_or_else(|_| "normalized".into());
         assert!(
             framing == "normalized" || framing == "passthrough",
             "LOAD_FRAMING must be `normalized` or `passthrough`"
         );
+        let database = std::env::var(DATABASE_URL_ENV).is_ok_and(|v| !v.trim().is_empty());
+        let ledgers = match std::env::var("LOAD_LEDGERS") {
+            Ok(list) => list
+                .split(',')
+                .map(|l| match l.trim() {
+                    "memory" => LedgerKind::Memory,
+                    "sqlite" => LedgerKind::Sqlite,
+                    "postgres" => {
+                        assert!(database, "LOAD_LEDGERS names postgres, but {DATABASE_URL_ENV} is not set");
+                        LedgerKind::Postgres
+                    }
+                    other => panic!("LOAD_LEDGERS: unknown ledger `{other}`"),
+                })
+                .collect(),
+            Err(_) if smoke => vec![LedgerKind::Memory, LedgerKind::Sqlite],
+            Err(_) if database => vec![LedgerKind::Memory, LedgerKind::Sqlite, LedgerKind::Postgres],
+            Err(_) => {
+                println!("load: postgres skipped; set {DATABASE_URL_ENV} to include it");
+                vec![LedgerKind::Memory, LedgerKind::Sqlite]
+            }
+        };
         if smoke {
             return Self {
                 levels: vec![4],
@@ -123,8 +185,15 @@ impl Plan {
                 interval_ms: 5,
                 global_cap: 512,
                 framing,
+                tenants: 2,
+                ledgers,
+                ledger_timeout_ms: 5_000,
             };
         }
+        let levels = std::env::var("LOAD_LEVELS")
+            .ok()
+            .map(|v| v.split(',').filter_map(|l| l.trim().parse().ok()).collect::<Vec<usize>>())
+            .filter(|l| !l.is_empty());
         Self {
             levels: levels.unwrap_or_else(|| vec![50, 200, 500, 1000]),
             seconds: num("LOAD_SECONDS", 10),
@@ -133,6 +202,9 @@ impl Plan {
             interval_ms: num("LOAD_INTERVAL_MS", 20),
             global_cap: num("LOAD_GLOBAL_CAP", 512) as usize,
             framing,
+            tenants: num("LOAD_TENANTS", 10).max(1) as usize,
+            ledgers,
+            ledger_timeout_ms: num("LOAD_LEDGER_TIMEOUT_MS", 1_000),
         }
     }
 }
@@ -210,16 +282,33 @@ where
             });
         })
         .expect("spawn server thread");
-    rx.recv().expect("server address")
+    rx.recv().expect("server address: the server thread failed to start; see its panic above")
 }
 
 // ---------------------------------------------------------------------------
 // Gateway
 // ---------------------------------------------------------------------------
 
-const KEY: &str = "load-key";
+fn key_of(tenant: usize) -> String {
+    format!("load-key-{tenant}")
+}
 
-fn boot_gateway(upstream: SocketAddr, plan: &Plan, threads: usize) -> SocketAddr {
+/// Where a gateway's ledger keeps its rows, for reconciliation.
+#[derive(Clone)]
+enum Store {
+    /// Process memory: only `/v1/usage` can see it.
+    Memory,
+    Sqlite(PathBuf),
+    Postgres { url: String, schema: String },
+}
+
+struct GatewayUnderTest {
+    kind: LedgerKind,
+    addr: SocketAddr,
+    store: Store,
+}
+
+fn boot_gateway(upstream: SocketAddr, plan: &Plan, kind: LedgerKind, threads: usize) -> GatewayUnderTest {
     let dir = std::env::temp_dir().join(format!("llm-gateway-load-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -230,27 +319,46 @@ fn boot_gateway(upstream: SocketAddr, plan: &Plan, threads: usize) -> SocketAddr
         ),
     )
     .unwrap();
-    // One tenant whose own limits never bind, so any refusal is the
-    // gateway-wide cap.
-    std::fs::write(
-        dir.join("tenants.yaml"),
-        r#"tenants:
-  - tenant_id: load
-    enabled: true
-    credentials:
-      - key_id: ak_load
-        key: load-key
-        scopes: [chat:stream]
-    allowed_models: ["*"]
-    limits:
-      requests_per_minute: 100000000
-      tokens_per_minute: 4000000000
-      max_concurrent_streams: 1000000
-      max_output_tokens: 4096
-      daily_budget_nano_usd: 1000000000000000
-"#,
-    )
-    .unwrap();
+    // Tenants whose own limits never bind, so any refusal is the
+    // gateway-wide cap or the ledger.
+    let mut tenants = String::from("tenants:\n");
+    for t in 0..plan.tenants {
+        tenants.push_str(&format!(
+            "  - tenant_id: load-{t}\n    enabled: true\n    credentials:\n      - key_id: ak_load_{t}\n        key: {}\n        \
+             scopes: [chat:stream]\n    allowed_models: [\"*\"]\n    limits:\n      requests_per_minute: 100000000\n      \
+             tokens_per_minute: 4000000000\n      max_concurrent_streams: 1000000\n      max_output_tokens: 4096\n      \
+             daily_budget_nano_usd: 1000000000000000\n",
+            key_of(t)
+        ));
+    }
+    std::fs::write(dir.join("tenants.yaml"), tenants).unwrap();
+
+    let mut ledger = llm_gateway::config::LedgerConfig {
+        timeout_ms: plan.ledger_timeout_ms,
+        // Never pick up a developer's sealing keys from the environment.
+        response_keys_env: "LLM_GATEWAY_LOAD_NO_RESPONSE_KEYS".into(),
+        fingerprint_keys_env: "LLM_GATEWAY_LOAD_NO_FINGERPRINT_KEYS".into(),
+        ..Default::default()
+    };
+    let store = match kind {
+        LedgerKind::Memory => {
+            ledger.backend = llm_gateway::config::LedgerBackend::Memory;
+            Store::Memory
+        }
+        LedgerKind::Sqlite => {
+            let path = dir.join("ledger.sqlite3");
+            ledger.backend = llm_gateway::config::LedgerBackend::Sqlite;
+            ledger.sqlite_path = path.clone();
+            Store::Sqlite(path)
+        }
+        LedgerKind::Postgres => {
+            let schema = format!("load_{}", uuid::Uuid::new_v4().simple());
+            ledger.backend = llm_gateway::config::LedgerBackend::Postgres;
+            ledger.url_env = DATABASE_URL_ENV.into();
+            ledger.schema = schema.clone();
+            Store::Postgres { url: std::env::var(DATABASE_URL_ENV).unwrap(), schema }
+        }
+    };
     let settings = llm_gateway::config::Settings {
         server: llm_gateway::config::ServerConfig {
             bind_addr: "127.0.0.1".into(),
@@ -264,29 +372,47 @@ fn boot_gateway(upstream: SocketAddr, plan: &Plan, threads: usize) -> SocketAddr
             hot_reload: false,
             reload_interval_ms: 60_000,
         },
-        ledger: llm_gateway::config::LedgerConfig {
-            backend: llm_gateway::config::LedgerBackend::Memory,
-            ..Default::default()
-        },
+        ledger,
         ..Default::default()
     };
-    serve_on_own_runtime("gateway", threads, move || async move {
+    let addr = serve_on_own_runtime(&format!("gateway-{}", kind.name()), threads, move || async move {
         let state = llm_gateway::bootstrap::build(settings).await.expect("build gateway");
         llm_gateway::api::router(state)
-    })
+    });
+    GatewayUnderTest { kind, addr, store }
 }
 
 // ---------------------------------------------------------------------------
 // Clients
 // ---------------------------------------------------------------------------
 
+/// What the clients were told, per tenant.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct Money {
+    admitted: u64,
+    reserved: u64,
+    billed: u64,
+}
+
+impl std::ops::AddAssign for Money {
+    fn add_assign(&mut self, o: Self) {
+        self.admitted += o.admitted;
+        self.reserved += o.reserved;
+        self.billed += o.billed;
+    }
+}
+
 #[derive(Default)]
 struct Tally {
     ttft_us: Vec<u64>,
-    total_us: Vec<u64>,
     ok: u64,
     refused: BTreeMap<u16, u64>,
     broken: u64,
+    /// Per tenant. A broken stream that was admitted still counts here: it
+    /// holds a reservation the ledger must settle.
+    money: BTreeMap<usize, Money>,
+    /// Admitted streams whose bill the client never learned.
+    unbilled: u64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -302,7 +428,13 @@ struct Run {
     max_open: usize,
 }
 
-async fn run_level(client: &reqwest::Client, target: Target, url: &str, plan: &Plan, concurrency: usize) -> Run {
+async fn run_level(
+    client: &reqwest::Client,
+    target: Target,
+    url: &str,
+    plan: &Plan,
+    concurrency: usize,
+) -> Run {
     let tally = Arc::new(Mutex::new(Tally::default()));
     let open = Arc::new(AtomicUsize::new(0));
     let max_open = Arc::new(AtomicUsize::new(0));
@@ -314,18 +446,29 @@ async fn run_level(client: &reqwest::Client, target: Target, url: &str, plan: &P
                                    "messages": [{ "role": "user", "content": "hi" }],
                                    "params": { "max_tokens": 64 } }),
     };
-    let body = Arc::new(serde_json::to_vec(&body).unwrap());
+    let body = bytes::Bytes::from(serde_json::to_vec(&body).unwrap());
+    let passthrough = plan.framing == "passthrough";
 
     let baseline = reset_peak();
     let started = Instant::now();
     let workers: Vec<_> = (0..concurrency)
-        .map(|_| {
-            let (client, url, body) = (client.clone(), url.to_string(), Arc::clone(&body));
-            let (tally, open, max_open, stop) =
-                (Arc::clone(&tally), Arc::clone(&open), Arc::clone(&max_open), Arc::clone(&stop));
+        .map(|worker| {
+            let tenant = worker % plan.tenants;
+            let ctx = Worker {
+                client: client.clone(),
+                url: url.to_string(),
+                body: body.clone(),
+                key: key_of(tenant),
+                tenant,
+                passthrough,
+                tally: Arc::clone(&tally),
+                open: Arc::clone(&open),
+                max_open: Arc::clone(&max_open),
+            };
+            let stop = Arc::clone(&stop);
             tokio::spawn(async move {
                 while !stop.load(Ordering::Relaxed) {
-                    one_request(&client, &url, &body, &tally, &open, &max_open).await;
+                    ctx.one_request().await;
                 }
             })
         })
@@ -341,76 +484,285 @@ async fn run_level(client: &reqwest::Client, target: Target, url: &str, plan: &P
     Run { tally, wall, peak_heap, max_open: max_open.load(Ordering::Relaxed) }
 }
 
-async fn one_request(
-    client: &reqwest::Client,
-    url: &str,
-    body: &Arc<Vec<u8>>,
-    tally: &Mutex<Tally>,
-    open: &AtomicUsize,
-    max_open: &AtomicUsize,
-) {
-    let sent = Instant::now();
-    let reply = client
-        .post(url)
-        .header("x-api-key", KEY)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(body.as_ref().clone())
-        .send()
-        .await;
-    let reply = match reply {
-        Ok(r) => r,
-        Err(_) => {
-            tally.lock().unwrap().broken += 1;
+struct Worker {
+    client: reqwest::Client,
+    url: String,
+    body: bytes::Bytes,
+    key: String,
+    tenant: usize,
+    passthrough: bool,
+    tally: Arc<Mutex<Tally>>,
+    open: Arc<AtomicUsize>,
+    max_open: Arc<AtomicUsize>,
+}
+
+impl Worker {
+    async fn one_request(&self) {
+        let sent = Instant::now();
+        let reply = self
+            .client
+            .post(&self.url)
+            .header("x-api-key", &self.key)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(self.body.clone())
+            .send()
+            .await;
+        let reply = match reply {
+            Ok(r) => r,
+            Err(_) => {
+                self.tally.lock().unwrap().broken += 1;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                return;
+            }
+        };
+        let status = reply.status().as_u16();
+        if status != 200 {
+            let _ = reply.bytes().await;
+            *self.tally.lock().unwrap().refused.entry(status).or_default() += 1;
             tokio::time::sleep(Duration::from_millis(50)).await;
             return;
         }
-    };
-    let status = reply.status().as_u16();
-    if status != 200 {
-        let _ = reply.bytes().await;
-        *tally.lock().unwrap().refused.entry(status).or_default() += 1;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        return;
-    }
-    let now_open = open.fetch_add(1, Ordering::Relaxed) + 1;
-    max_open.fetch_max(now_open, Ordering::Relaxed);
+        // Absent straight from the upstream; present on every admitted
+        // gateway stream.
+        let reserved: Option<u64> = reply
+            .headers()
+            .get("x-reserved-nano-usd")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok());
+        let now_open = self.open.fetch_add(1, Ordering::Relaxed) + 1;
+        self.max_open.fetch_max(now_open, Ordering::Relaxed);
 
-    let mut stream = reply.bytes_stream();
-    let mut first: Option<Duration> = None;
-    // Frames can split across reads; keep a short tail to match across them.
-    let mut tail = Vec::<u8>::new();
-    let mut seen_done = false;
-    let mut failed = false;
-    while let Some(piece) = stream.next().await {
-        let Ok(piece) = piece else {
-            failed = true;
-            break;
-        };
-        tail.extend_from_slice(&piece);
-        let text = String::from_utf8_lossy(&tail);
-        if first.is_none() && text.contains(TOKEN) {
-            first = Some(sent.elapsed());
+        let mut events = Events::default();
+        let mut stream = reply.bytes_stream();
+        let mut failed = false;
+        while let Some(piece) = stream.next().await {
+            let Ok(piece) = piece else {
+                failed = true;
+                break;
+            };
+            events.feed(&piece, sent);
         }
-        if text.contains("event: error") {
-            failed = true;
-        }
-        if text.contains("[DONE]") {
-            seen_done = true;
-        }
-        let keep = tail.len().saturating_sub(32);
-        tail.drain(..keep);
-    }
-    open.fetch_sub(1, Ordering::Relaxed);
-    let total = sent.elapsed();
-    let mut t = tally.lock().unwrap();
-    match first {
-        Some(first) if seen_done && !failed => {
+        self.open.fetch_sub(1, Ordering::Relaxed);
+
+        let mut t = self.tally.lock().unwrap();
+        let clean = !failed && !events.error && events.done && events.first.is_some();
+        if clean {
             t.ok += 1;
-            t.ttft_us.push(first.as_micros() as u64);
-            t.total_us.push(total.as_micros() as u64);
+            t.ttft_us.push(events.first.unwrap().as_micros() as u64);
+        } else {
+            t.broken += 1;
         }
-        _ => t.broken += 1,
+        if let Some(reserved) = reserved {
+            // Passthrough is billed the reservation; normalized says what it
+            // billed in its `end` event.
+            let billed = if self.passthrough { Some(reserved) } else { events.cost };
+            let money = t.money.entry(self.tenant).or_default();
+            money.admitted += 1;
+            money.reserved += reserved;
+            match billed {
+                Some(b) => money.billed += b,
+                None => t.unbilled += 1,
+            }
+        }
     }
+}
+
+/// An SSE reader that keeps only the event in progress, so a long stream
+/// costs the client a few hundred bytes, not its whole body.
+#[derive(Default)]
+struct Events {
+    pending: String,
+    first: Option<Duration>,
+    done: bool,
+    error: bool,
+    /// `cost_nano_usd` from the gateway's `end` event.
+    cost: Option<u64>,
+}
+
+impl Events {
+    fn feed(&mut self, piece: &[u8], sent: Instant) {
+        self.pending.push_str(&String::from_utf8_lossy(piece));
+        while let Some(end) = self.pending.find("\n\n") {
+            let event: String = self.pending.drain(..end + 2).collect();
+            if self.first.is_none() && event.contains(TOKEN) {
+                self.first = Some(sent.elapsed());
+            }
+            if event.contains("[DONE]") {
+                self.done = true;
+            }
+            if event.starts_with("event: error") || event.contains("\nevent: error") {
+                self.error = true;
+            }
+            if event.starts_with("event: end") || event.contains("\nevent: end") {
+                self.cost = event
+                    .lines()
+                    .find_map(|l| l.strip_prefix("data:"))
+                    .and_then(|d| serde_json::from_str::<Value>(d.trim()).ok())
+                    .and_then(|v| v["cost_nano_usd"].as_u64());
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reconciliation
+// ---------------------------------------------------------------------------
+
+/// One tenant's reservations as the ledger holds them.
+#[derive(Default, Debug)]
+struct LedgerRows {
+    /// Rows by state.
+    states: BTreeMap<String, u64>,
+    reserved: u64,
+    /// `reserved + delta` over every row.
+    billed: u64,
+    /// The tenant's `spend_days`, all days.
+    spend_days: u64,
+}
+
+async fn ledger_rows(store: &Store) -> Option<BTreeMap<String, LedgerRows>> {
+    // Same SQL for both databases; casts keep Postgres' SUM from widening to
+    // NUMERIC.
+    let rows_sql = |t: &str| {
+        format!(
+            "SELECT tenant_id, state, COUNT(*), CAST(COALESCE(SUM(reserved_nano_usd), 0) AS BIGINT),
+                    CAST(COALESCE(SUM(reserved_nano_usd + COALESCE(delta_nano_usd, 0)), 0) AS BIGINT)
+               FROM {t} GROUP BY tenant_id, state"
+        )
+    };
+    let days_sql =
+        |t: &str| format!("SELECT tenant_id, CAST(COALESCE(SUM(spent_nano_usd), 0) AS BIGINT) FROM {t} GROUP BY tenant_id");
+    type Row = (String, String, i64, i64, i64);
+    let (rows, days): (Vec<Row>, Vec<(String, i64)>) = match store {
+        Store::Memory => return None,
+        Store::Sqlite(path) => {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(path).read_only(true))
+                .await
+                .expect("open the SQLite ledger for reading");
+            let rows = sqlx::query_as(&rows_sql("reservations")).fetch_all(&pool).await.unwrap();
+            let days = sqlx::query_as(&days_sql("spend_days")).fetch_all(&pool).await.unwrap();
+            pool.close().await;
+            (rows, days)
+        }
+        Store::Postgres { url, schema } => {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect(url)
+                .await
+                .expect("connect to the Postgres ledger");
+            let rows = sqlx::query_as(&rows_sql(&format!("\"{schema}\".reservations")))
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+            let days = sqlx::query_as(&days_sql(&format!("\"{schema}\".spend_days")))
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+            pool.close().await;
+            (rows, days)
+        }
+    };
+    let mut out: BTreeMap<String, LedgerRows> = BTreeMap::new();
+    for (tenant, state, count, reserved, billed) in rows {
+        let t = out.entry(tenant).or_default();
+        *t.states.entry(state).or_default() += count as u64;
+        t.reserved += reserved as u64;
+        t.billed += billed as u64;
+    }
+    for (tenant, spent) in days {
+        out.entry(tenant).or_default().spend_days = spent as u64;
+    }
+    Some(out)
+}
+
+/// Wait for the ledger to close every reservation, then check that the
+/// clients, the rows and the totals agree. Returns the settle lag and every
+/// disagreement found.
+async fn reconcile(
+    client: &reqwest::Client,
+    gw: &GatewayUnderTest,
+    plan: &Plan,
+    seen: &BTreeMap<usize, Money>,
+) -> (Duration, Vec<String>) {
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(60);
+    // Settled: nothing open in the database (or, for memory, nothing in
+    // flight) and the totals have stopped moving.
+    let mut last: Option<Vec<(u64, u64)>> = None;
+    loop {
+        let usage = usage_of_all(client, gw, plan).await;
+        let open_rows = match ledger_rows(&gw.store).await {
+            Some(rows) => rows.values().map(|r| r.states.get("open").copied().unwrap_or(0)).sum(),
+            None => 0,
+        };
+        let in_flight: u64 = usage.iter().map(|u| u.1).sum();
+        if open_rows == 0 && in_flight == 0 && last.as_ref() == Some(&usage) {
+            break;
+        }
+        if Instant::now() > deadline {
+            return (started.elapsed(), vec![format!("never settled: {open_rows} open rows, {in_flight} in flight")]);
+        }
+        last = Some(usage);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The last check found it settled twice in a row, 50 ms apart.
+    let lag = started.elapsed().saturating_sub(Duration::from_millis(50));
+
+    let mut problems = Vec::new();
+    let usage = usage_of_all(client, gw, plan).await;
+    let rows = ledger_rows(&gw.store).await;
+    for (tenant, &(api_spent, _)) in usage.iter().enumerate() {
+        let name = format!("load-{tenant}");
+        let seen = seen.get(&tenant).copied().unwrap_or_default();
+        if api_spent != seen.billed {
+            problems.push(format!("{name}: /v1/usage spent {api_spent}, clients were billed {}", seen.billed));
+        }
+        let Some(rows) = &rows else { continue };
+        let empty = LedgerRows::default();
+        let r = rows.get(&name).unwrap_or(&empty);
+        let total: u64 = r.states.values().sum();
+        if total != seen.admitted {
+            problems.push(format!("{name}: {total} reservation rows, {} admitted streams", seen.admitted));
+        }
+        for bad in ["open", "swept"] {
+            if let Some(n) = r.states.get(bad).filter(|n| **n > 0) {
+                problems.push(format!("{name}: {n} reservations left `{bad}`"));
+            }
+        }
+        if r.reserved != seen.reserved {
+            problems.push(format!("{name}: rows reserved {}, clients were told {}", r.reserved, seen.reserved));
+        }
+        if r.billed != seen.billed {
+            problems.push(format!("{name}: rows bill {}, clients were billed {}", r.billed, seen.billed));
+        }
+        if r.spend_days != r.billed {
+            problems.push(format!("{name}: spend_days {} but rows bill {}", r.spend_days, r.billed));
+        }
+    }
+    (lag, problems)
+}
+
+/// `(spent, in flight)` for every tenant, from `GET /v1/usage`.
+async fn usage_of_all(client: &reqwest::Client, gw: &GatewayUnderTest, plan: &Plan) -> Vec<(u64, u64)> {
+    let mut out = Vec::with_capacity(plan.tenants);
+    for tenant in 0..plan.tenants {
+        let usage: Value = client
+            .get(format!("http://{}/v1/usage", gw.addr))
+            .header("x-api-key", key_of(tenant))
+            .send()
+            .await
+            .expect("usage")
+            .json()
+            .await
+            .expect("usage json");
+        out.push((
+            usage["spent_nano_usd"].as_u64().unwrap_or(u64::MAX),
+            usage["streams_in_flight"].as_u64().unwrap_or(u64::MAX),
+        ));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -423,6 +775,10 @@ fn pct(sorted: &[u64], p: f64) -> f64 {
     }
     let rank = ((p / 100.0) * sorted.len() as f64).ceil() as usize;
     sorted[rank.clamp(1, sorted.len()) - 1] as f64 / 1000.0
+}
+
+fn usd(nano: u64) -> String {
+    format!("${:.4}", nano as f64 / 1e9)
 }
 
 fn main() {
@@ -443,50 +799,106 @@ fn main() {
         let plan = plan.clone();
         move || async move { upstream_app(&plan) }
     });
-    let gateway = boot_gateway(upstream, &plan, share);
+    // One gateway per ledger, each on its own runtime. Only one is driven at
+    // a time; the others sit idle.
+    let gateways: Vec<GatewayUnderTest> =
+        plan.ledgers.iter().map(|&kind| boot_gateway(upstream, &plan, kind, share)).collect();
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(share)
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(async {
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(share).enable_all().build().unwrap();
+    let failures = rt.block_on(async {
         let client = reqwest::Client::builder()
             .pool_max_idle_per_host(4096)
             .timeout(Duration::from_secs(60))
             .build()
             .unwrap();
         let upstream_url = format!("http://{upstream}/v1/chat/completions");
-        let gateway_url = format!("http://{gateway}/v1/chat/stream");
 
-        // Wait for the gateway to accept, then warm both paths.
-        for _ in 0..100 {
-            if client.get(format!("http://{gateway}/health/live")).send().await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        // Wait for every gateway to accept, then warm each path.
         let warm = Plan { seconds: 1, ..plan.clone() };
         run_level(&client, Target::Upstream, &upstream_url, &warm, 8).await;
-        run_level(&client, Target::Gateway, &gateway_url, &warm, 8).await;
+        // Client-side totals per gateway and tenant, cumulative like the ledger.
+        let mut seen: Vec<BTreeMap<usize, Money>> = vec![BTreeMap::new(); gateways.len()];
+        for (g, gw) in gateways.iter().enumerate() {
+            for _ in 0..200 {
+                if client.get(format!("http://{}/health/live", gw.addr)).send().await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let run = run_level(&client, Target::Gateway, &gateway_url(gw), &warm, 8).await;
+            for (t, m) in run.tally.money {
+                *seen[g].entry(t).or_default() += m;
+            }
+        }
 
         println!(
-            "load: {} framing, {}s per level, upstream TTFT {} ms + {} tokens every {} ms, gateway cap {}, {} cores ({} threads each for upstream, gateway, clients)",
-            plan.framing, plan.seconds, plan.ttft_ms, plan.tokens, plan.interval_ms, plan.global_cap, cores, share
+            "load: {} framing, {}s per level, {} tenants, upstream TTFT {} ms + {} tokens every {} ms, gateway cap {}, \
+             ledger deadline {} ms, {} cores ({} threads each for upstream, each gateway, clients)",
+            plan.framing,
+            plan.seconds,
+            plan.tenants,
+            plan.ttft_ms,
+            plan.tokens,
+            plan.interval_ms,
+            plan.global_cap,
+            plan.ledger_timeout_ms,
+            cores,
+            share
         );
+        for gw in &gateways {
+            if let Store::Postgres { schema, .. } = &gw.store {
+                println!("load: postgres ledger in schema `{schema}`");
+            }
+        }
         println!(
-            "| streams | ok/s via gateway | refused | broken | TTFT p50 / p99 direct (ms) | TTFT p50 / p99 via gateway (ms) | added p50 / p99 (ms) | heap KiB per open stream |"
+            "| ledger | streams | ok/s | refused | broken | added TTFT p50 / p99 (ms) | reserved | billed | settle lag | reconciled | heap KiB/stream |"
         );
-        println!("|---:|---:|---|---:|---|---|---|---:|");
+        println!("|---|---:|---:|---|---:|---|---:|---:|---:|---|---:|");
+        let mut failures = Vec::new();
         for &level in &plan.levels {
             let direct = run_level(&client, Target::Upstream, &upstream_url, &plan, level).await;
-            let via = run_level(&client, Target::Gateway, &gateway_url, &plan, level).await;
-            report(&plan, level, &direct, &via, smoke);
+            for (g, gw) in gateways.iter().enumerate() {
+                let via = run_level(&client, Target::Gateway, &gateway_url(gw), &plan, level).await;
+                let mut level_money = Money::default();
+                for (&t, &m) in &via.tally.money {
+                    *seen[g].entry(t).or_default() += m;
+                    level_money += m;
+                }
+                let (lag, mut problems) = reconcile(&client, gw, &plan, &seen[g]).await;
+                if via.tally.unbilled > 0 {
+                    problems.push(format!("{} admitted streams ended without an `end` event", via.tally.unbilled));
+                }
+                report(&plan, level, gw, &direct, &via, level_money, lag, &problems, smoke);
+                failures.extend(problems.into_iter().map(|p| format!("{} at {level} streams: {p}", gw.kind.name())));
+            }
         }
+        failures
     });
+    if !failures.is_empty() {
+        eprintln!("\nreconciliation failed:");
+        for f in &failures {
+            eprintln!("  {f}");
+        }
+        std::process::exit(1);
+    }
 }
 
-fn report(plan: &Plan, level: usize, direct: &Run, via: &Run, smoke: bool) {
+fn gateway_url(gw: &GatewayUnderTest) -> String {
+    format!("http://{}/v1/chat/stream", gw.addr)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn report(
+    plan: &Plan,
+    level: usize,
+    gw: &GatewayUnderTest,
+    direct: &Run,
+    via: &Run,
+    money: Money,
+    lag: Duration,
+    problems: &[String],
+    smoke: bool,
+) {
     let mut d_ttft = direct.tally.ttft_us.clone();
     let mut g_ttft = via.tally.ttft_us.clone();
     d_ttft.sort_unstable();
@@ -500,11 +912,16 @@ fn report(plan: &Plan, level: usize, direct: &Run, via: &Run, smoke: bool) {
     } else {
         f64::NAN
     };
+    let verdict = if problems.is_empty() { "✓".to_string() } else { format!("✗ {} problems", problems.len()) };
     println!(
-        "| {level} | {ok_per_s:.0} | {refused} | {} | {d50:.1} / {d99:.1} | {g50:.1} / {g99:.1} | {:.1} / {:.1} | {kib_per_stream:.1} |",
+        "| {} | {level} | {ok_per_s:.0} | {refused} | {} | {:.1} / {:.1} | {} | {} | {} ms | {verdict} | {kib_per_stream:.1} |",
+        gw.kind.name(),
         via.tally.broken + direct.tally.broken,
         g50 - d50,
         g99 - d99,
+        usd(money.reserved),
+        usd(money.billed),
+        lag.as_millis(),
     );
     if smoke {
         assert!(via.tally.ok > 0 && direct.tally.ok > 0, "the smoke run completed no stream");
@@ -512,16 +929,25 @@ fn report(plan: &Plan, level: usize, direct: &Run, via: &Run, smoke: bool) {
     }
     let line = json!({
         "at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+        "ledger": gw.kind.name(),
         "framing": plan.framing,
         "streams": level,
+        "tenants": plan.tenants,
         "seconds": plan.seconds,
         "upstream": { "ttft_ms": plan.ttft_ms, "tokens": plan.tokens, "interval_ms": plan.interval_ms },
         "global_cap": plan.global_cap,
+        "ledger_timeout_ms": plan.ledger_timeout_ms,
         "ok_per_s": ok_per_s,
         "ok": via.tally.ok,
+        "admitted": money.admitted,
+        "reserved_nano_usd": money.reserved,
+        "billed_nano_usd": money.billed,
         "refused": via.tally.refused.iter().map(|(s, n)| (s.to_string(), json!(n))).collect::<serde_json::Map<String, Value>>(),
         "broken": { "direct": direct.tally.broken, "gateway": via.tally.broken },
         "ttft_ms": { "direct_p50": d50, "direct_p99": d99, "gateway_p50": g50, "gateway_p99": g99 },
+        "settle_lag_ms": lag.as_millis() as u64,
+        "reconciled": problems.is_empty(),
+        "problems": problems,
         "max_open_via_gateway": via.max_open,
         "heap_kib_per_open_stream": kib_per_stream,
     });
