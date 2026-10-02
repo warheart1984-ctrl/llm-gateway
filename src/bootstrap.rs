@@ -215,6 +215,15 @@ async fn build_ledger(
 
     let retention = Duration::from_secs(cfg.idempotency_retention_secs);
     let decision_retention = Duration::from_secs(u64::from(cfg.decision_retention_days) * 86_400);
+    let reservation_retention = Duration::from_secs(u64::from(cfg.reservation_retention_days) * 86_400);
+    // A reservation deleted while its idempotency key should still be
+    // remembered would let a repeat execute again.
+    if !reservation_retention.is_zero() && reservation_retention < retention {
+        return Err(BootError::Ledger(format!(
+            "ledger.reservation_retention_days ({}) must cover ledger.idempotency_retention_secs ({})",
+            cfg.reservation_retention_days, cfg.idempotency_retention_secs
+        )));
+    }
     match cfg.backend {
         LedgerBackend::Memory => Ok(Arc::new(MemoryLedger::new(retention))),
         LedgerBackend::Sqlite => {
@@ -228,6 +237,7 @@ async fn build_ledger(
                     sealer: response_sealer(&cfg.response_keys_env)?,
                     decision_retention,
                     max_pending_closings: cfg.max_pending_closings,
+                    reservation_retention,
                 },
             )
             .await
@@ -250,6 +260,7 @@ async fn build_ledger(
                 sealer,
                 decision_retention,
                 max_pending_closings: cfg.max_pending_closings,
+                reservation_retention,
             })
             .await
             .map_err(BootError::Ledger)?;
@@ -328,5 +339,31 @@ fn fingerprinter(
             }
             Ok(Fingerprinter::unkeyed())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{LedgerBackend, LedgerConfig};
+
+    fn ledger_config(reservation_retention_days: u32, idempotency_retention_secs: u64) -> LedgerConfig {
+        LedgerConfig {
+            backend: LedgerBackend::Memory,
+            reservation_retention_days,
+            idempotency_retention_secs,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn reservations_must_outlive_the_keys_that_point_at_them() {
+        // Deleting a reservation while its idempotency key is still honoured
+        // would let a repeat execute again.
+        let err = build_ledger(&ledger_config(1, 2 * 86_400)).await.unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("reservation_retention_days") && message.contains("idempotency_retention_secs"), "{message}");
+        assert!(build_ledger(&ledger_config(0, 2 * 86_400)).await.is_ok(), "0 keeps reservations forever");
+        assert!(build_ledger(&ledger_config(30, 86_400)).await.is_ok(), "the shipped defaults");
     }
 }

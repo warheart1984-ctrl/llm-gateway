@@ -409,6 +409,12 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
             "Admissions refused because too many settlements were waiting to be written.",
             upkeep.backlog_refusals,
         ),
+        (
+            "gw_ledger_reservations_pruned_total",
+            "counter",
+            "Closed reservations deleted after `ledger.reservation_retention_days`.",
+            upkeep.reservations_pruned,
+        ),
     ] {
         let _ = writeln!(body, "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}");
     }

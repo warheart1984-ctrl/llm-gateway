@@ -484,6 +484,7 @@ async fn postgres_ledger_with(
             sealer,
             decision_retention: Duration::from_secs(30 * 86_400),
             max_pending_closings: 10_000,
+            reservation_retention: Duration::from_secs(30 * 86_400),
         },
     )
     .await
@@ -1707,6 +1708,7 @@ async fn shared_ledger_admissions_are_refused_while_settlements_back_up() {
             sealer: None,
             decision_retention: Duration::from_secs(30 * 86_400),
             max_pending_closings: 3,
+            reservation_retention: Duration::from_secs(30 * 86_400),
         },
     )
     .await
@@ -1755,6 +1757,62 @@ async fn shared_ledger_admissions_are_refused_while_settlements_back_up() {
     ledger.flush().await;
     assert_eq!(ledger.upkeep().pending_closings, 0);
     ledger.try_reserve(reservation()).await.expect("admitted once the writer caught up");
+}
+
+#[tokio::test]
+async fn shared_ledger_closed_reservations_are_kept_for_their_retention_then_deleted() {
+    use llm_gateway::governance::ledger::{Closing, Ledger as _, NewReservation, Outcome, SharedLimits};
+    let Some(url) = test_database_url() else { return };
+    let schema = format!("pressure_{}", uuid::Uuid::new_v4().simple());
+    let ledger = postgres_ledger(&url, &schema, false).await.expect("connect ledger");
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        let id = uuid::Uuid::new_v4();
+        let bucket = ledger
+            .try_reserve(NewReservation {
+                id,
+                tenant_id: "t",
+                now: std::time::SystemTime::now(),
+                amount_nano_usd: 100,
+                prompt_nano_usd: 25,
+                budget_nano_usd: 0,
+                idempotency: None,
+                hold: None,
+                limits: SharedLimits::default(),
+            })
+            .await
+            .expect("admitted");
+        ledger.close(Closing {
+            id,
+            tenant_id: std::sync::Arc::from("t"),
+            bucket,
+            delta_nano_usd: 0,
+            outcome: Outcome::Settled,
+            at: std::time::SystemTime::now(),
+            response: None,
+            completion_tokens: 0,
+        });
+        ids.push(id);
+    }
+    ledger.flush().await;
+    let pool = ledger.pool();
+    sqlx::query("UPDATE reservations SET response = 'the answer'").execute(pool).await.unwrap();
+    for (id, days) in [(ids[0], 31), (ids[1], 2)] {
+        sqlx::query("UPDATE reservations SET closed_at = now() - make_interval(days => $2) WHERE id = $1")
+            .bind(id)
+            .bind(days)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+    // The background sweeper may get here first; the outcome is the same.
+    ledger.apply_retention().await.unwrap();
+    let rows: Vec<(uuid::Uuid, Option<String>)> =
+        sqlx::query_as("SELECT id, response FROM reservations").fetch_all(pool).await.unwrap();
+    let row = |id| rows.iter().find(|(r, _)| *r == id).map(|(_, resp)| resp.clone());
+    assert_eq!(row(ids[0]), None, "deleted after 30 days");
+    assert_eq!(row(ids[1]), Some(None), "kept, without its answer");
+    assert_eq!(row(ids[2]), Some(Some("the answer".to_string())), "recent: kept whole");
 }
 
 #[tokio::test]
