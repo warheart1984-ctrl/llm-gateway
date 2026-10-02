@@ -122,50 +122,112 @@ const WINDOW: Duration = Duration::from_secs(60);
 // Per-tenant state
 // ---------------------------------------------------------------------------
 
+/// The window's resolution. Events are counted per slice, so memory is
+/// bounded by the window (`WINDOW / SLICE` slices), not by traffic.
+const SLICE: Duration = Duration::from_millis(100);
+
+/// One minute of a count, in slices. Nothing inside the window is dropped:
+/// a busy minute costs more additions, not lost events.
+#[derive(Debug, Default)]
+struct Series {
+    /// `(slice index, amount)`, oldest first.
+    slices: VecDeque<(u64, u64)>,
+    total: u64,
+}
+
+impl Series {
+    fn add(&mut self, slice: u64, amount: u64) {
+        self.total += amount;
+        // In order by slice. A concurrent admission can record a moment just
+        // before the newest slice; it still lands in its own slice, so a
+        // withdrawal finds it there.
+        match self.slices.iter().rposition(|(s, _)| *s <= slice) {
+            Some(i) if self.slices[i].0 == slice => self.slices[i].1 += amount,
+            Some(i) => self.slices.insert(i + 1, (slice, amount)),
+            None => self.slices.push_front((slice, amount)),
+        }
+    }
+
+    fn take_back(&mut self, slice: u64, amount: u64) {
+        if let Some(i) = self.slices.iter().rposition(|(s, _)| *s == slice) {
+            let taken = amount.min(self.slices[i].1);
+            self.slices[i].1 -= taken;
+            self.total -= taken;
+            if self.slices[i].1 == 0 {
+                self.slices.remove(i);
+            }
+        }
+    }
+
+    fn evict_before(&mut self, oldest: u64) {
+        while let Some(&(slice, amount)) = self.slices.front() {
+            if slice >= oldest {
+                break;
+            }
+            self.total -= amount;
+            self.slices.pop_front();
+        }
+    }
+
+    fn total_u32(&self) -> u32 {
+        u32::try_from(self.total).unwrap_or(u32::MAX)
+    }
+}
+
+/// A tenant's last minute: requests and tokens, in [`SLICE`]s.
+///
+/// A slice is kept until all of it is older than [`WINDOW`], so the window
+/// can count up to one slice (100 ms) more than a minute: it errs toward
+/// refusing, never toward admitting past a limit.
 #[derive(Debug, Default)]
 struct Window {
-    request_times: VecDeque<Instant>,
-    // Kept as a separate field so the struct is `Debug` without a `Debug` bound
-    // on `Instant` in older toolchains.
-    token_events: VecDeque<(Instant, u32)>,
+    /// Slice 0 starts here: the first moment this window saw.
+    epoch: Option<Instant>,
+    requests: Series,
+    tokens: Series,
 }
 
 impl Window {
+    fn slice(&mut self, at: Instant) -> u64 {
+        let epoch = *self.epoch.get_or_insert(at);
+        (at.saturating_duration_since(epoch).as_millis() / SLICE.as_millis()) as u64
+    }
+
     fn evict(&mut self, now: Instant) {
-        while let Some(t) = self.request_times.front() {
-            if now.saturating_duration_since(*t) > WINDOW {
-                self.request_times.pop_front();
-            } else {
-                break;
-            }
-        }
-        while let Some((t, _)) = self.token_events.front() {
-            if now.saturating_duration_since(*t) > WINDOW {
-                self.token_events.pop_front();
-            } else {
-                break;
-            }
-        }
+        let current = self.slice(now);
+        let kept = (WINDOW.as_millis() / SLICE.as_millis()) as u64;
+        let oldest = current.saturating_sub(kept);
+        self.requests.evict_before(oldest);
+        self.tokens.evict_before(oldest);
+    }
+
+    fn requests(&self) -> u32 {
+        self.requests.total_u32()
     }
 
     fn tokens(&self) -> u32 {
-        self.token_events.iter().map(|(_, t)| *t).sum()
+        self.tokens.total_u32()
+    }
+
+    /// Count one admission attempt and its prompt tokens at `at`.
+    fn record(&mut self, at: Instant, prompt_tokens: u32) {
+        let slice = self.slice(at);
+        self.requests.add(slice, 1);
+        self.tokens.add(slice, u64::from(prompt_tokens));
+    }
+
+    fn record_tokens(&mut self, at: Instant, tokens: u32) {
+        let slice = self.slice(at);
+        self.tokens.add(slice, u64::from(tokens));
     }
 
     /// Take back one attempt recorded at `at` whose admission was refused.
-    /// Entries recorded at the same instant are interchangeable, so removing
-    /// any one of them restores the counts exactly.
+    /// It is found in exactly the slice it was recorded in, so the counts are
+    /// restored exactly.
     fn withdraw(&mut self, at: Instant, prompt_tokens: u32) {
-        if let Some(i) = self.request_times.iter().rposition(|t| *t == at) {
-            self.request_times.remove(i);
-        }
-        if let Some(i) = self
-            .token_events
-            .iter()
-            .rposition(|(t, n)| *t == at && *n == prompt_tokens)
-        {
-            self.token_events.remove(i);
-        }
+        let slice = self.slice(at);
+        self.requests.take_back(slice, 1);
+        self.tokens.take_back(slice, u64::from(prompt_tokens));
     }
 }
 
@@ -364,7 +426,7 @@ impl Reservation {
         let mut window = self.state.window();
         let now = Instant::now();
         window.evict(now);
-        window.token_events.push_back((now, completion));
+        window.record_tokens(now, completion);
     }
 }
 
@@ -593,9 +655,9 @@ impl LimitEngine {
             let mut window = state.window();
             window.evict(now);
             if !shared {
-                if requests_per_minute > 0 && window.request_times.len() as u32 >= requests_per_minute {
+                if requests_per_minute > 0 && window.requests() >= requests_per_minute {
                     return Err(LimitError::RateLimited {
-                        done: window.request_times.len() as u32,
+                        done: window.requests(),
                         limit: requests_per_minute,
                     });
                 }
@@ -608,12 +670,7 @@ impl LimitEngine {
                     });
                 }
             }
-            window.request_times.push_back(now);
-            window.token_events.push_back((now, req.prompt_tokens));
-            if window.token_events.len() > 8_192 {
-                let drop_to = window.token_events.len() - 4_096;
-                window.token_events.drain(..drop_to);
-            }
+            window.record(now, req.prompt_tokens);
         }
 
         // Phase 2, no lock held: the ledger decides, atomically, whether the
@@ -705,7 +762,7 @@ impl LimitEngine {
         let mut window = state.window();
         window.evict(Instant::now());
         TenantUsage {
-            requests_last_minute: window.request_times.len() as u32,
+            requests_last_minute: window.requests(),
             tokens_last_minute: window.tokens(),
             in_flight: state.inflight.load(Ordering::Relaxed),
         }
@@ -1022,6 +1079,65 @@ mod tests {
         // $8/MTok -> 8,000. 800 of 1_000 prompt tokens were cached.
         let cost = nano_usd_for(1_000, Some(800), 100, &c);
         assert_eq!(cost, 200 * 2_000 + 800 * 500 + 100 * 8_000);
+    }
+
+    #[test]
+    fn the_window_lets_go_of_an_event_only_once_it_is_a_minute_old() {
+        let t0 = Instant::now();
+        let mut w = Window::default();
+        w.record(t0, 7);
+        w.evict(t0 + Duration::from_millis(60_050));
+        assert_eq!((w.requests(), w.tokens()), (1, 7), "within a slice of the minute: still counted");
+        w.evict(t0 + Duration::from_millis(60_150));
+        assert_eq!((w.requests(), w.tokens()), (0, 0), "a full slice past the minute: gone");
+    }
+
+    #[test]
+    fn a_withdrawal_is_exact_even_out_of_order() {
+        // Concurrent admissions can record moments out of order; each is
+        // taken back from the slice it went into.
+        let t0 = Instant::now();
+        let mut w = Window::default();
+        w.record(t0, 1);
+        w.record(t0 + Duration::from_millis(500), 50);
+        w.record(t0 + Duration::from_millis(250), 20);
+        w.withdraw(t0 + Duration::from_millis(250), 20);
+        assert_eq!((w.requests(), w.tokens()), (2, 51));
+        w.withdraw(t0, 1);
+        assert_eq!((w.requests(), w.tokens()), (1, 50));
+    }
+
+    #[test]
+    fn the_window_holds_a_bounded_number_of_slices_however_busy() {
+        let t0 = Instant::now();
+        let mut w = Window::default();
+        for i in 0..100_000u64 {
+            let at = t0 + Duration::from_micros(i * 1_200); // two minutes
+            w.evict(at);
+            w.record(at, 3);
+        }
+        assert!(w.tokens.slices.len() <= 601, "{} slices", w.tokens.slices.len());
+        // The last minute's events, all of them: 50,000 at 1.2 ms apart.
+        assert!((50_000..=50_100).contains(&w.requests()), "{}", w.requests());
+        assert_eq!(w.tokens(), w.requests() * 3);
+    }
+
+    #[tokio::test]
+    async fn a_busy_minute_forgets_nothing_inside_the_window() {
+        // More events in a minute than any per-event list would keep: every
+        // one of them must still count against the limit.
+        let engine = LimitEngine::new(1_000_000, false);
+        let l = limits(0, 10_000, 1_000_000, 0);
+        for _ in 0..9_000 {
+            let mut r = engine.admit("t", &l, 1, 10, CostEstimate::default()).await.unwrap();
+            r.release();
+        }
+        assert_eq!(engine.usage("t").tokens_last_minute, 9_000);
+        assert_eq!(engine.usage("t").requests_last_minute, 9_000);
+        let err = engine.admit("t", &l, 2_000, 10, CostEstimate::default()).await.unwrap_err();
+        assert!(matches!(err, LimitError::TokenRateLimited { done: 9_000, .. }), "{err:?}");
+        let mut fits = engine.admit("t", &l, 1_000, 10, CostEstimate::default()).await.unwrap();
+        fits.release();
     }
 
     #[tokio::test]
