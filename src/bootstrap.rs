@@ -227,6 +227,7 @@ async fn build_ledger(
                     idempotency_retention: retention,
                     sealer: response_sealer(&cfg.response_keys_env)?,
                     decision_retention,
+                    max_pending_closings: cfg.max_pending_closings,
                 },
             )
             .await
@@ -248,6 +249,7 @@ async fn build_ledger(
                 idempotency_retention: retention,
                 sealer,
                 decision_retention,
+                max_pending_closings: cfg.max_pending_closings,
             })
             .await
             .map_err(BootError::Ledger)?;

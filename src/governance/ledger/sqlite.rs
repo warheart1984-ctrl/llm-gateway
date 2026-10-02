@@ -50,6 +50,7 @@ use uuid::Uuid;
 
 use super::{
     Closing, CommitOutcome, Ledger, LedgerRefusal, NewReservation, Outcome, Upkeep, UpkeepCounts, commit_within,
+    refuse_if_backlogged,
     release_clean,
     decisions::{DECISION_QUEUE, Decision, DecisionKind, DecisionQuery, DecisionRecord},
     holds::{self, HoldClaim, HoldDecision, HoldProblem, HoldQuery, HoldRecord, HoldState, NewHold, Transition},
@@ -73,6 +74,9 @@ pub struct SqliteOptions {
     pub sealer: Option<Arc<ResponseSealer>>,
     /// Decision records older than this are deleted by the sweeper.
     pub decision_retention: Duration,
+    /// Closings waiting to be written, at most, before admissions are
+    /// refused. 0: no bound.
+    pub max_pending_closings: u64,
 }
 
 enum WriterMsg {
@@ -104,6 +108,7 @@ pub struct SqliteLedger {
     decision_queue: mpsc::Sender<Decision>,
     decisions_dropped: Arc<AtomicU64>,
     upkeep: Arc<Upkeep>,
+    max_pending_closings: u64,
 }
 
 impl Drop for SqliteLedger {
@@ -207,6 +212,7 @@ impl SqliteLedger {
             decision_queue,
             decisions_dropped,
             upkeep,
+            max_pending_closings: opts.max_pending_closings,
         }))
     }
 
@@ -829,6 +835,7 @@ async fn run_sweeper(pool: SqlitePool, interval: Duration, decision_retention: D
 #[async_trait::async_trait]
 impl Ledger for SqliteLedger {
     async fn try_reserve(&self, r: NewReservation<'_>) -> Result<u64, LedgerRefusal> {
+        refuse_if_backlogged(self.pending.load(Ordering::Relaxed), self.max_pending_closings, &self.upkeep)?;
         // Deciding may be abandoned: running out drops the transaction before
         // its commit, which rolls it back and holds nothing. It keeps the
         // whole deadline, because under contention deciding is mostly queueing
@@ -957,7 +964,7 @@ impl Ledger for SqliteLedger {
     }
 
     fn upkeep(&self) -> UpkeepCounts {
-        self.upkeep.counts()
+        UpkeepCounts { pending_closings: self.pending.load(Ordering::Relaxed), ..self.upkeep.counts() }
     }
 
     async fn create_hold(&self, h: NewHold) -> Result<HoldRecord, LedgerRefusal> {
@@ -1156,6 +1163,38 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn admissions_are_refused_while_settlements_back_up() {
+        // Closings carry money and are never dropped, so when the writer
+        // falls behind, the bound is at the door: past the limit, admissions
+        // are refused at once, without touching the database.
+        let file = TempFile::new();
+        let ledger = SqliteLedger::connect(SqliteOptions { max_pending_closings: 3, ..options(&file) })
+            .await
+            .unwrap();
+        // Another process holds the write lock: no closing can be applied.
+        let outside = SqlitePool::connect_with(SqliteConnectOptions::new().filename(&file.0)).await.unwrap();
+        let lock = outside.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        for _ in 0..3 {
+            ledger.close(closing(Uuid::new_v4(), "t", 0, 0, Outcome::Released));
+        }
+
+        let started = Instant::now();
+        let refused = ledger.try_reserve(reservation("t", 100, 0)).await;
+        assert!(
+            matches!(refused, Err(LedgerRefusal::Unavailable(ref m)) if m.contains("settlements are waiting")),
+            "{refused:?}"
+        );
+        assert!(started.elapsed() < Duration::from_millis(500), "refused at the door, not after waiting on the lock");
+        let upkeep = ledger.upkeep();
+        assert_eq!((upkeep.pending_closings, upkeep.backlog_refusals), (3, 1));
+
+        lock.rollback().await.unwrap();
+        ledger.flush().await;
+        assert_eq!(ledger.upkeep().pending_closings, 0);
+        ledger.try_reserve(reservation("t", 100, 0)).await.expect("admitted once the writer caught up");
+    }
+
     fn options(file: &TempFile) -> SqliteOptions {
         SqliteOptions {
             path: file.0.clone(),
@@ -1165,6 +1204,7 @@ mod tests {
             idempotency_retention: Duration::from_secs(86_400),
             sealer: Some(Arc::new(ResponseSealer::from_keys(KEYS).unwrap())),
             decision_retention: Duration::from_secs(30 * 86_400),
+            max_pending_closings: 10_000,
         }
     }
 
@@ -1399,6 +1439,7 @@ mod tests {
             idempotency_retention: Duration::from_secs(86_400),
             sealer: None,
             decision_retention: Duration::from_secs(86_400),
+            max_pending_closings: 10_000,
         })
         .await
         .unwrap()

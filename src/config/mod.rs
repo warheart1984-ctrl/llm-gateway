@@ -94,6 +94,11 @@ pub struct LedgerConfig {
     /// How long decision records (refusals, failures, operator actions) are
     /// kept before the sweeper deletes them.
     pub decision_retention_days: u32,
+    /// Closings waiting to be written, at most, before new admissions are
+    /// refused (503, retryable). Closings carry money, so they are never
+    /// dropped; when the writer falls behind, the gateway stops taking on
+    /// work instead of queueing without limit. 0 turns the bound off.
+    pub max_pending_closings: u64,
     /// The SQLite database file. Relative paths resolve against the config
     /// directory. Must be on a local disk; its directory must exist.
     pub sqlite_path: PathBuf,
@@ -123,6 +128,7 @@ impl Default for LedgerConfig {
             response_keys_env: "LLM_GATEWAY_RESPONSE_KEYS".to_string(),
             fingerprint_keys_env: "LLM_GATEWAY_FINGERPRINT_KEYS".to_string(),
             decision_retention_days: 30,
+            max_pending_closings: 10_000,
             sqlite_path: PathBuf::from("ledger.sqlite3"),
             quota_split_replicas: 0,
             quota_split_margin_percent: 100,

@@ -483,6 +483,7 @@ async fn postgres_ledger_with(
             idempotency_retention: Duration::from_secs(86_400),
             sealer,
             decision_retention: Duration::from_secs(30 * 86_400),
+            max_pending_closings: 10_000,
         },
     )
     .await
@@ -1684,6 +1685,76 @@ async fn shared_ledger_concurrency_is_one_cap_across_replicas() {
     );
     provider.open_gate(20);
     futures_util::future::join_all(burst).await;
+}
+
+#[tokio::test]
+async fn shared_ledger_admissions_are_refused_while_settlements_back_up() {
+    // Closings carry money and are never dropped, so when the writer falls
+    // behind the bound is at the door: past the limit, admissions are refused
+    // at once, without touching the database.
+    use llm_gateway::governance::ledger::{Closing, Ledger as _, NewReservation, Outcome, SharedLimits};
+    let Some(url) = test_database_url() else { return };
+    let schema = format!("pressure_{}", uuid::Uuid::new_v4().simple());
+    let ledger = llm_gateway::governance::ledger::PostgresLedger::connect(
+        llm_gateway::governance::ledger::postgres::PostgresOptions {
+            url: url.clone(),
+            schema: schema.clone(),
+            max_connections: 8,
+            timeout: LEDGER_DEADLINE,
+            lease: Duration::from_secs(60),
+            sweep_interval: Duration::from_secs(3_600),
+            idempotency_retention: Duration::from_secs(86_400),
+            sealer: None,
+            decision_retention: Duration::from_secs(30 * 86_400),
+            max_pending_closings: 3,
+        },
+    )
+    .await
+    .expect("connect ledger");
+    let reservation = || NewReservation {
+        id: uuid::Uuid::new_v4(),
+        tenant_id: "t",
+        now: std::time::SystemTime::now(),
+        amount_nano_usd: 100,
+        prompt_nano_usd: 25,
+        budget_nano_usd: 0,
+        idempotency: None,
+        hold: None,
+        limits: SharedLimits::default(),
+    };
+    let first = reservation();
+    let id = first.id;
+    let bucket = ledger.try_reserve(first).await.expect("admitted");
+    let close = |id| Closing {
+        id,
+        tenant_id: std::sync::Arc::from("t"),
+        bucket,
+        delta_nano_usd: 0,
+        outcome: Outcome::Settled,
+        at: std::time::SystemTime::now(),
+        response: None,
+        completion_tokens: 0,
+    };
+    // Another session holds that reservation's row: its closing, first in
+    // the writer's queue, waits on it, and so does everything behind it.
+    let outside = postgres_ledger(&url, &schema, false).await.expect("connect");
+    let mut lock = outside.pool().begin().await.unwrap();
+    sqlx::query("SELECT id FROM reservations WHERE id = $1 FOR UPDATE").bind(id).fetch_one(&mut *lock).await.unwrap();
+    ledger.close(close(id));
+    ledger.close(close(uuid::Uuid::new_v4()));
+    ledger.close(close(uuid::Uuid::new_v4()));
+
+    let started = std::time::Instant::now();
+    let refused = ledger.try_reserve(reservation()).await;
+    assert!(format!("{refused:?}").contains("settlements are waiting"), "{refused:?}");
+    assert!(started.elapsed() < Duration::from_millis(500), "refused at the door, not after waiting on the lock");
+    assert_eq!(ledger.upkeep().backlog_refusals, 1);
+    assert_eq!(ledger.upkeep().pending_closings, 3);
+
+    lock.rollback().await.unwrap();
+    ledger.flush().await;
+    assert_eq!(ledger.upkeep().pending_closings, 0);
+    ledger.try_reserve(reservation()).await.expect("admitted once the writer caught up");
 }
 
 #[tokio::test]
