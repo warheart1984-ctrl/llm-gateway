@@ -51,7 +51,8 @@ use tokio::{
 };
 
 use super::{
-    Closing, CommitOutcome, Ledger, LedgerRefusal, NewReservation, Outcome, Upkeep, UpkeepCounts, commit_within,
+    Closing, CommitOutcome, Ledger, LedgerRefusal, NewReservation, Outcome, PRUNE_BATCH, PRUNE_BATCHES_PER_PASS,
+    Retention, Upkeep, UpkeepCounts, commit_within,
     refuse_if_backlogged,
     release_clean,
     decisions::{DECISION_QUEUE, Decision, DecisionKind, DecisionQuery, DecisionRecord},
@@ -87,6 +88,8 @@ pub struct PostgresOptions {
     /// Closings waiting to be written, at most, before admissions are
     /// refused. 0: no bound.
     pub max_pending_closings: u64,
+    /// When a closed reservation is deleted. Zero keeps them forever.
+    pub reservation_retention: Duration,
 }
 
 enum WriterMsg {
@@ -111,6 +114,7 @@ pub struct PostgresLedger {
     decisions_dropped: Arc<AtomicU64>,
     upkeep: Arc<Upkeep>,
     max_pending_closings: u64,
+    retention_policy: Retention,
 }
 
 impl std::fmt::Debug for WriterMsg {
@@ -211,10 +215,12 @@ impl PostgresLedger {
             opts.sealer.clone(),
             Arc::clone(&live),
         ));
+        let retention = Retention { answers: opts.idempotency_retention, reservations: opts.reservation_retention };
         let sweeper = tokio::spawn(run_sweeper(
             pool.clone(),
             opts.sweep_interval,
             opts.decision_retention,
+            retention,
             Arc::clone(&upkeep),
         ));
         let renewer = tokio::spawn(run_renewer(pool.clone(), Arc::clone(&live), opts.lease));
@@ -237,6 +243,7 @@ impl PostgresLedger {
             decisions_dropped,
             upkeep,
             max_pending_closings: opts.max_pending_closings,
+            retention_policy: retention,
         }))
     }
 
@@ -248,6 +255,15 @@ impl PostgresLedger {
     /// Closings accepted but not yet durable.
     pub fn pending_closings(&self) -> u64 {
         self.pending.load(Ordering::Relaxed)
+    }
+
+    /// Clear stored answers whose idempotency key has expired and delete
+    /// closed reservations past their retention, as the sweeper does on its
+    /// interval. Returns how many reservations were deleted.
+    pub async fn apply_retention(&self) -> Result<u64, String> {
+        let pruned = apply_retention(&self.pool, self.retention_policy).await.map_err(|e| e.to_string())?;
+        self.upkeep.pruned(pruned);
+        Ok(pruned)
     }
 
     /// Close every reservation whose lease has lapsed as `swept`, keeping
@@ -918,6 +934,54 @@ async fn run_renewer(pool: PgPool, live: Arc<DashMap<uuid::Uuid, ()>>, lease: Du
     }
 }
 
+/// What reservations leave behind, pruned by age: stored answers once their
+/// idempotency key has expired, then closed reservations past retention.
+/// Returns how many reservations were deleted.
+async fn apply_retention(pool: &PgPool, retention: Retention) -> Result<u64, sqlx::Error> {
+    prune(
+        pool,
+        "UPDATE reservations SET response = NULL WHERE id IN (
+             SELECT id FROM reservations
+              WHERE state <> 'open' AND response IS NOT NULL
+                AND closed_at < now() - make_interval(secs => $1)
+              LIMIT $2)",
+        retention.answers,
+    )
+    .await?;
+    if retention.reservations.is_zero() {
+        return Ok(0);
+    }
+    prune(
+        pool,
+        "DELETE FROM reservations WHERE id IN (
+             SELECT id FROM reservations
+              WHERE state <> 'open' AND closed_at < now() - make_interval(secs => $1)
+              LIMIT $2)",
+        retention.reservations,
+    )
+    .await
+}
+
+/// Run one batched cleanup statement until it touches less than a batch, or
+/// this pass's share is done. Returns the rows touched.
+async fn prune(pool: &PgPool, sql: &str, age: Duration) -> Result<u64, sqlx::Error> {
+    let mut touched = 0;
+    for _ in 0..PRUNE_BATCHES_PER_PASS {
+        let n = sqlx::query(sql)
+            .bind(age.as_secs_f64())
+            .bind(PRUNE_BATCH as i64)
+            .execute(pool)
+            .await?
+            .rows_affected();
+        touched += n;
+        if n < PRUNE_BATCH {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    Ok(touched)
+}
+
 async fn sweep(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let swept = sqlx::query(
         "UPDATE reservations SET state = 'swept', delta_nano_usd = 0, closed_at = now()
@@ -964,7 +1028,13 @@ async fn run_decision_writer(pool: PgPool, mut inbox: mpsc::Receiver<Decision>, 
     }
 }
 
-async fn run_sweeper(pool: PgPool, interval: Duration, decision_retention: Duration, upkeep: Arc<Upkeep>) {
+async fn run_sweeper(
+    pool: PgPool,
+    interval: Duration,
+    decision_retention: Duration,
+    retention: Retention,
+    upkeep: Arc<Upkeep>,
+) {
     let mut ticker = tokio::time::interval(interval.max(Duration::from_secs(1)));
     loop {
         ticker.tick().await;
@@ -991,6 +1061,13 @@ async fn run_sweeper(pool: PgPool, interval: Duration, decision_retention: Durat
         {
             upkeep.sweep_failed();
             tracing::warn!(%error, "hold retention sweep failed; will retry");
+        }
+        match apply_retention(&pool, retention).await {
+            Ok(pruned) => upkeep.pruned(pruned),
+            Err(error) => {
+                upkeep.sweep_failed();
+                tracing::warn!(%error, "reservation retention sweep failed; will retry");
+            }
         }
         match sweep(&pool).await {
             Ok(0) => {}

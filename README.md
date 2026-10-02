@@ -385,6 +385,14 @@ database decides, not any gateway process:
   waiting to be written, new admissions are refused with a retryable 503
   until the writer catches up. `gw_ledger_pending_closings` shows the
   backlog, and `gw_ledger_backlog_refusals_total` counts the refusals.
+- **Retention.** A closed reservation (one per admitted request, with its
+  bill) is deleted after `reservation_retention_days` (30), in batches, by
+  the sweeper (`gw_ledger_reservations_pruned_total`); `spend_days` keeps
+  the daily totals regardless. A stored answer is cleared once its
+  idempotency key expires (`idempotency_retention_secs`), since nothing can
+  replay it after that. The gateway will not start with a reservation
+  retention shorter than the idempotency window. 0 keeps reservations
+  forever.
 - **There is no fail-open setting.** A ledger that is unreachable at startup
   stops the gateway starting. One that is unreachable at runtime refuses
   requests with 503.

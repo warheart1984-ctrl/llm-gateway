@@ -49,7 +49,8 @@ use tokio::{
 use uuid::Uuid;
 
 use super::{
-    Closing, CommitOutcome, Ledger, LedgerRefusal, NewReservation, Outcome, Upkeep, UpkeepCounts, commit_within,
+    Closing, CommitOutcome, Ledger, LedgerRefusal, NewReservation, Outcome, PRUNE_BATCH, PRUNE_BATCHES_PER_PASS,
+    Retention, Upkeep, UpkeepCounts, commit_within,
     refuse_if_backlogged,
     release_clean,
     decisions::{DECISION_QUEUE, Decision, DecisionKind, DecisionQuery, DecisionRecord},
@@ -77,6 +78,8 @@ pub struct SqliteOptions {
     /// Closings waiting to be written, at most, before admissions are
     /// refused. 0: no bound.
     pub max_pending_closings: u64,
+    /// When a closed reservation is deleted. Zero keeps them forever.
+    pub reservation_retention: Duration,
 }
 
 enum WriterMsg {
@@ -109,6 +112,7 @@ pub struct SqliteLedger {
     decisions_dropped: Arc<AtomicU64>,
     upkeep: Arc<Upkeep>,
     max_pending_closings: u64,
+    retention_policy: Retention,
 }
 
 impl Drop for SqliteLedger {
@@ -187,10 +191,12 @@ impl SqliteLedger {
             opts.sealer.clone(),
             Arc::clone(&live),
         ));
+        let retention = Retention { answers: opts.idempotency_retention, reservations: opts.reservation_retention };
         let sweeper = tokio::spawn(run_sweeper(
             pool.clone(),
             opts.sweep_interval,
             opts.decision_retention,
+            retention,
             Arc::clone(&upkeep),
         ));
         let renewer = tokio::spawn(run_renewer(pool.clone(), Arc::clone(&live), opts.lease));
@@ -213,6 +219,7 @@ impl SqliteLedger {
             decisions_dropped,
             upkeep,
             max_pending_closings: opts.max_pending_closings,
+            retention_policy: retention,
         }))
     }
 
@@ -223,6 +230,15 @@ impl SqliteLedger {
 
     pub fn pending_closings(&self) -> u64 {
         self.pending.load(Ordering::Relaxed)
+    }
+
+    /// Clear stored answers whose idempotency key has expired and delete
+    /// closed reservations past their retention, as the sweeper does on its
+    /// interval. Returns how many reservations were deleted.
+    pub async fn apply_retention(&self) -> Result<u64, String> {
+        let pruned = apply_retention(&self.pool, self.retention_policy).await.map_err(|e| e.to_string())?;
+        self.upkeep.pruned(pruned);
+        Ok(pruned)
     }
 
     /// Close every reservation whose lease has lapsed as `swept`, keeping
@@ -743,6 +759,57 @@ async fn run_renewer(pool: SqlitePool, live: Arc<DashMap<Uuid, ()>>, lease: Dura
     }
 }
 
+/// What reservations leave behind, pruned by age: stored answers once their
+/// idempotency key has expired, then closed reservations past retention.
+/// Returns how many reservations were deleted.
+async fn apply_retention(pool: &SqlitePool, retention: Retention) -> Result<u64, sqlx::Error> {
+    prune(
+        pool,
+        &format!(
+            "UPDATE reservations SET response = NULL WHERE id IN (
+                 SELECT id FROM reservations
+                  WHERE state <> 'open' AND response IS NOT NULL AND closed_at < {NOW} - ?1
+                  LIMIT ?2)"
+        ),
+        retention.answers,
+    )
+    .await?;
+    if retention.reservations.is_zero() {
+        return Ok(0);
+    }
+    prune(
+        pool,
+        &format!(
+            "DELETE FROM reservations WHERE id IN (
+                 SELECT id FROM reservations
+                  WHERE state <> 'open' AND closed_at < {NOW} - ?1
+                  LIMIT ?2)"
+        ),
+        retention.reservations,
+    )
+    .await
+}
+
+/// Run one batched cleanup statement until it touches less than a batch, or
+/// this pass's share is done. Returns the rows touched.
+async fn prune(pool: &SqlitePool, sql: &str, age: Duration) -> Result<u64, sqlx::Error> {
+    let mut touched = 0;
+    for _ in 0..PRUNE_BATCHES_PER_PASS {
+        let n = sqlx::query(sql)
+            .bind(age.as_secs() as i64)
+            .bind(PRUNE_BATCH as i64)
+            .execute(pool)
+            .await?
+            .rows_affected();
+        touched += n;
+        if n < PRUNE_BATCH {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    Ok(touched)
+}
+
 async fn sweep(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
     let swept = sqlx::query(&format!(
         "UPDATE reservations SET state = 'swept', delta_nano_usd = 0, closed_at = {NOW}
@@ -788,7 +855,13 @@ async fn run_decision_writer(pool: SqlitePool, mut inbox: mpsc::Receiver<Decisio
     }
 }
 
-async fn run_sweeper(pool: SqlitePool, interval: Duration, decision_retention: Duration, upkeep: Arc<Upkeep>) {
+async fn run_sweeper(
+    pool: SqlitePool,
+    interval: Duration,
+    decision_retention: Duration,
+    retention: Retention,
+    upkeep: Arc<Upkeep>,
+) {
     let mut ticker = tokio::time::interval(interval.max(Duration::from_secs(1)));
     loop {
         ticker.tick().await;
@@ -814,6 +887,13 @@ async fn run_sweeper(pool: SqlitePool, interval: Duration, decision_retention: D
         {
             upkeep.sweep_failed();
             tracing::warn!(%error, "hold retention sweep failed; will retry");
+        }
+        match apply_retention(&pool, retention).await {
+            Ok(pruned) => upkeep.pruned(pruned),
+            Err(error) => {
+                upkeep.sweep_failed();
+                tracing::warn!(%error, "reservation retention sweep failed; will retry");
+            }
         }
         match sweep(&pool).await {
             Ok(0) => {}
@@ -1195,6 +1275,70 @@ mod tests {
         ledger.try_reserve(reservation("t", 100, 0)).await.expect("admitted once the writer caught up");
     }
 
+    #[tokio::test]
+    async fn closed_reservations_are_kept_for_their_retention_then_deleted() {
+        let file = TempFile::new();
+        let ledger = open(&file).await; // answers: 1 day; reservations: 30 days
+        let mut closed = Vec::new();
+        for _ in 0..3 {
+            let r = reservation("t", 100, 0);
+            let id = r.id;
+            let bucket = ledger.try_reserve(r).await.unwrap();
+            let mut c = closing(id, "t", bucket, 0, Outcome::Settled);
+            c.response = Some("the answer".into());
+            ledger.close(c);
+            closed.push(id);
+        }
+        let open_one = reservation("t", 100, 0);
+        let open_id = open_one.id;
+        ledger.try_reserve(open_one).await.unwrap();
+        ledger.flush().await;
+        let aging = format!(
+            "UPDATE reservations SET created_at = {NOW} - ?2,
+                    closed_at = CASE WHEN closed_at IS NULL THEN NULL ELSE {NOW} - ?2 END
+              WHERE id = ?1"
+        );
+        let age = |id: Uuid, days: i64| {
+            sqlx::query(&aging).bind(id.to_string()).bind(days * 86_400 + 60).execute(ledger.pool())
+        };
+        age(closed[0], 31).await.unwrap(); // past retention: deleted
+        age(closed[1], 2).await.unwrap(); // past its key's retention: answer cleared
+        age(open_id, 40).await.unwrap(); // open, however old: untouched
+
+        // The background sweeper runs once at boot and may get here first;
+        // between it and this call, the outcome is the same.
+        ledger.apply_retention().await.unwrap();
+        let rows: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT id, response FROM reservations").fetch_all(ledger.pool()).await.unwrap();
+        let row = |id: Uuid| rows.iter().find(|(r, _)| *r == id.to_string()).map(|(_, resp)| resp.clone());
+        assert_eq!(row(closed[0]), None, "deleted after 30 days");
+        assert_eq!(row(closed[1]), Some(None), "kept, without its answer");
+        assert!(matches!(row(closed[2]), Some(Some(_))), "recent: kept whole");
+        assert_eq!(row(open_id), Some(None), "open: never pruned");
+        assert_eq!(ledger.upkeep().reservations_pruned, 1);
+    }
+
+    #[tokio::test]
+    async fn a_large_backlog_of_old_reservations_is_pruned_in_batches() {
+        let file = TempFile::new();
+        let ledger = open(&file).await;
+        sqlx::query(&format!(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2500)
+             INSERT INTO reservations (id, tenant_id, day, reserved_nano_usd, prompt_nano_usd, state, delta_nano_usd,
+                                       created_at, closed_at, lease_expires_at)
+             SELECT 'old-' || i, 't', 0, 100, 25, 'settled', 0, {NOW} - 40 * 86400, {NOW} - 40 * 86400, 0 FROM n"
+        ))
+        .execute(ledger.pool())
+        .await
+        .unwrap();
+        // The background sweeper runs once at boot and may get here first;
+        // both count what they prune.
+        ledger.apply_retention().await.unwrap();
+        assert_eq!(ledger.upkeep().reservations_pruned, 2_500);
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM reservations").fetch_one(ledger.pool()).await.unwrap();
+        assert_eq!(left, 0);
+    }
+
     fn options(file: &TempFile) -> SqliteOptions {
         SqliteOptions {
             path: file.0.clone(),
@@ -1205,6 +1349,7 @@ mod tests {
             sealer: Some(Arc::new(ResponseSealer::from_keys(KEYS).unwrap())),
             decision_retention: Duration::from_secs(30 * 86_400),
             max_pending_closings: 10_000,
+            reservation_retention: Duration::from_secs(30 * 86_400),
         }
     }
 
@@ -1440,6 +1585,7 @@ mod tests {
             sealer: None,
             decision_retention: Duration::from_secs(86_400),
             max_pending_closings: 10_000,
+            reservation_retention: Duration::from_secs(30 * 86_400),
         })
         .await
         .unwrap()

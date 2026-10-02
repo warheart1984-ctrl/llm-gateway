@@ -53,6 +53,7 @@ pub struct Upkeep {
     late_commits_released: AtomicU64,
     stuck_connections_closed: AtomicU64,
     backlog_refusals: AtomicU64,
+    reservations_pruned: AtomicU64,
 }
 
 /// A reading of [`Upkeep`].
@@ -77,6 +78,9 @@ pub struct UpkeepCounts {
     pub backlog_refusals: u64,
     /// Closings waiting to be written now. A gauge, not a counter.
     pub pending_closings: u64,
+    /// Closed reservations deleted because they were older than the
+    /// retention period.
+    pub reservations_pruned: u64,
 }
 
 impl Upkeep {
@@ -100,6 +104,10 @@ impl Upkeep {
         self.backlog_refusals.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn pruned(&self, reservations: u64) {
+        self.reservations_pruned.fetch_add(reservations, Ordering::Relaxed);
+    }
+
     pub fn counts(&self) -> UpkeepCounts {
         UpkeepCounts {
             sweep_failures: self.sweep_failures.load(Ordering::Relaxed),
@@ -108,6 +116,7 @@ impl Upkeep {
             stuck_connections_closed: self.stuck_connections_closed.load(Ordering::Relaxed),
             backlog_refusals: self.backlog_refusals.load(Ordering::Relaxed),
             pending_closings: 0,
+            reservations_pruned: self.reservations_pruned.load(Ordering::Relaxed),
         }
     }
 }
@@ -154,6 +163,22 @@ pub(crate) fn refuse_if_backlogged(pending: u64, max: u64, upkeep: &Upkeep) -> R
         "{pending} settlements are waiting to be written (at most {max}); refusing new work until they are"
     )))
 }
+
+/// How long the sweeper keeps what reservations leave behind.
+#[derive(Debug, Clone, Copy)]
+pub struct Retention {
+    /// A stored answer is cleared once its idempotency key has expired:
+    /// nothing can replay it after that.
+    pub answers: Duration,
+    /// A closed reservation is deleted after this. Zero keeps them forever.
+    pub reservations: Duration,
+}
+
+/// Rows touched per statement when pruning, and statements per sweeper pass:
+/// a large first cleanup proceeds in steps rather than holding the write
+/// lock for long, and finishes over later passes.
+pub(crate) const PRUNE_BATCH: u64 = 1_000;
+pub(crate) const PRUNE_BATCHES_PER_PASS: u64 = 100;
 
 /// How an admission's commit ended, as far as the admission could wait.
 #[derive(Debug)]

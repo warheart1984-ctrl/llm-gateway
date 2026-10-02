@@ -164,7 +164,13 @@ pub struct MemoryLedger {
     holds: Mutex<HashMap<Uuid, HeldRequest>>,
     /// Reservation id -> the hold it consumed, to restore a released one.
     consumed: DashMap<Uuid, Uuid>,
+    /// Closings applied, to prune expired keys every [`PRUNE_EVERY`] of them.
+    closings: std::sync::atomic::AtomicU64,
 }
+
+/// How often, in closings, expired idempotency keys are pruned. A key is
+/// otherwise only replaced when the same key is used again.
+const PRUNE_EVERY: u64 = 1_024;
 
 impl Default for MemoryLedger {
     fn default() -> Self {
@@ -182,6 +188,7 @@ impl MemoryLedger {
             decisions: DecisionRing::default(),
             holds: Mutex::new(HashMap::new()),
             consumed: DashMap::new(),
+            closings: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -218,6 +225,18 @@ impl MemoryLedger {
             return Arc::clone(existing.value());
         }
         Arc::clone(self.spend.entry(tenant_id.to_string()).or_default().value())
+    }
+
+    /// Every [`PRUNE_EVERY`] closings, forget the keys that no longer decide
+    /// anything: released ones (a repeat runs afresh either way) and billed
+    /// ones past retention.
+    fn prune_keys(&self, now: SystemTime) {
+        let n = self.closings.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if !n.is_multiple_of(PRUNE_EVERY) {
+            return;
+        }
+        self.keys
+            .retain(|_, record| !(record.state == KeyState::Released || self.expired(record, now)));
     }
 
     fn expired(&self, record: &KeyRecord, now: SystemTime) -> bool {
@@ -332,9 +351,12 @@ impl Ledger for MemoryLedger {
     }
 
     fn close(&self, c: Closing) {
-        // Nothing was executed: the approval can be used again.
+        // The hold this reservation used, if any, is needed only now: to give
+        // it back if nothing was executed. Taken out on every closing, so
+        // settled reservations do not leave entries behind.
+        let consumed = self.consumed.remove(&c.id);
         if c.outcome == Outcome::Released
-            && let Some((_, hold_id)) = self.consumed.remove(&c.id)
+            && let Some((_, hold_id)) = consumed
             && let Some(hold) = self.held().get_mut(&hold_id)
             && hold.record.state == HoldState::Consumed
         {
@@ -344,7 +366,8 @@ impl Ledger for MemoryLedger {
         if c.delta_nano_usd != 0 {
             self.spend_for(&c.tenant_id).correct(c.at, c.bucket, c.delta_nano_usd);
         }
-        let Some(key) = self.by_id.get(&c.id).map(|k| k.value().clone()) else {
+        // Likewise the id-to-key entry: removed once its closing is applied.
+        let Some((_, key)) = self.by_id.remove(&c.id) else {
             return;
         };
         if let Some(mut record) = self.keys.get_mut(&key)
@@ -360,6 +383,7 @@ impl Ledger for MemoryLedger {
             record.response = c.response;
             record.closed_at = Some(c.at);
         }
+        self.prune_keys(c.at);
     }
 
     async fn snapshot(&self, tenant_id: &str, now: SystemTime) -> Result<(u64, u64), LedgerRefusal> {
@@ -495,5 +519,67 @@ impl Ledger for MemoryLedger {
             .with_reason(&d.reason()),
         );
         Ok(hold.effective(now))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::governance::ledger::{IdempotencyClaim, SharedLimits};
+
+    fn keyed(id: Uuid, key: &str) -> NewReservation<'_> {
+        NewReservation {
+            id,
+            tenant_id: "t",
+            now: SystemTime::now(),
+            amount_nano_usd: 100,
+            prompt_nano_usd: 25,
+            budget_nano_usd: 0,
+            idempotency: Some(IdempotencyClaim { key, fingerprint: vec![1], also_matches: vec![] }),
+            hold: None,
+            limits: SharedLimits::default(),
+        }
+    }
+
+    fn settled(id: Uuid, bucket: u64, at: SystemTime) -> Closing {
+        Closing {
+            id,
+            tenant_id: Arc::from("t"),
+            bucket,
+            delta_nano_usd: 0,
+            outcome: Outcome::Settled,
+            at,
+            response: None,
+            completion_tokens: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_closing_leaves_no_bookkeeping_behind() {
+        let ledger = MemoryLedger::default();
+        let id = Uuid::new_v4();
+        let bucket = ledger.try_reserve(keyed(id, "k")).await.unwrap();
+        // As a reservation that used an approval hold would have.
+        ledger.consumed.insert(id, Uuid::new_v4());
+        ledger.close(settled(id, bucket, SystemTime::now()));
+        assert!(ledger.by_id.is_empty(), "the id-to-key entry is only needed until the closing");
+        assert!(ledger.consumed.is_empty(), "a settled reservation's hold entry goes too");
+        assert_eq!(ledger.keys.len(), 1, "the key itself is kept, to answer repeats");
+    }
+
+    #[tokio::test]
+    async fn keys_past_retention_are_pruned() {
+        let ledger = MemoryLedger::new(Duration::from_millis(1));
+        let t0 = SystemTime::now();
+        for i in 0..PRUNE_EVERY {
+            let id = Uuid::new_v4();
+            let key = format!("k{i}");
+            let bucket = ledger.try_reserve(keyed(id, &key)).await.unwrap();
+            // The last closing comes a second later: every earlier key is
+            // past its 1 ms retention by then, the last one is not.
+            let at = if i + 1 == PRUNE_EVERY { t0 + Duration::from_secs(1) } else { t0 };
+            ledger.close(settled(id, bucket, at));
+        }
+        assert_eq!(ledger.keys.len(), 1, "only the key still inside retention is left");
     }
 }

@@ -112,6 +112,11 @@ max_pending_closings = 10000
 lease_secs = 60
 sweep_interval_secs = 60
 idempotency_retention_secs = 86400
+# Closed reservations (one per admitted request, with its bill) are deleted
+# after this many days; `spend_days` keeps the daily totals. A stored answer
+# is cleared once its idempotency key expires (above). Must cover
+# idempotency_retention_secs. 0 keeps reservations forever.
+reservation_retention_days = 30
 # Env var NAME holding the keys that seal answers kept for replay (postgres):
 # `kid:base64-of-32-bytes[,kid:...]`, first key seals, all keys open.
 # Unset: answers are not stored and repeated completions get 409.
