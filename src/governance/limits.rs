@@ -193,11 +193,20 @@ struct Slot(Arc<TenantState>);
 impl Slot {
     fn try_acquire(state: &Arc<TenantState>, limit: u32) -> Option<Self> {
         let limit = u64::from(limit.max(1));
-        state
-            .inflight
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < limit).then_some(n + 1))
-            .ok()
-            .map(|_| Slot(Arc::clone(state)))
+        // An explicit compare-exchange loop: `fetch_update` is deprecated
+        // from Rust 1.99, and its replacement `try_update` is newer than the
+        // declared `rust-version`.
+        let mut current = state.inflight.load(Ordering::Acquire);
+        while current < limit {
+            match state
+                .inflight
+                .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Some(Slot(Arc::clone(state))),
+                Err(actual) => current = actual,
+            }
+        }
+        None
     }
 }
 
