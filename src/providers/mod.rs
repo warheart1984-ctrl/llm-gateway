@@ -694,6 +694,8 @@ pub struct UpstreamTuning {
     pub pool_idle_timeout: Duration,
     pub tcp_keepalive: Duration,
     pub user_agent: String,
+    /// See [`crate::config::UpstreamConfig::max_response_bytes`].
+    pub max_response_bytes: usize,
 }
 
 impl Default for UpstreamTuning {
@@ -705,6 +707,7 @@ impl Default for UpstreamTuning {
             pool_idle_timeout: Duration::from_millis(90_000),
             tcp_keepalive: Duration::from_secs(75),
             user_agent: concat!("llm-gateway/", env!("CARGO_PKG_VERSION")).to_string(),
+            max_response_bytes: 8 * 1024 * 1024,
         }
     }
 }
@@ -718,6 +721,7 @@ impl From<&crate::config::UpstreamConfig> for UpstreamTuning {
             pool_idle_timeout: Duration::from_millis(c.pool_idle_timeout_ms),
             tcp_keepalive: Duration::from_secs(c.tcp_keepalive_secs),
             user_agent: c.user_agent.clone(),
+            max_response_bytes: c.max_response_bytes.max(1),
         }
     }
 }

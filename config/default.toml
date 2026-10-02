@@ -76,6 +76,10 @@ pool_idle_timeout_ms = 90000
 user_agent = "llm-gateway/0.1.0"
 # Ask providers for usage in the terminal chunk so billing is exact.
 request_usage = true
+# The largest upstream answer held in memory: a whole non-streaming response,
+# or one streamed event or line. Beyond it the request fails (502,
+# upstream_protocol_error) instead of buffering without limit. 8 MiB.
+max_response_bytes = 8388608
 
 [ledger]
 # sqlite (default): a durable ledger in a local file (`sqlite_path` below).

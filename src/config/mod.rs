@@ -374,6 +374,16 @@ pub struct UpstreamConfig {
     pub user_agent: String,
     /// Send `stream_options.include_usage` so we can bill accurately.
     pub request_usage: bool,
+    /// The largest upstream answer the gateway will hold in memory: a whole
+    /// non-streaming response, or one streamed event or line. Beyond it the
+    /// request fails as an upstream protocol error instead of growing a
+    /// buffer without limit.
+    #[serde(default = "default_max_response_bytes")]
+    pub max_response_bytes: usize,
+}
+
+fn default_max_response_bytes() -> usize {
+    8 * 1024 * 1024
 }
 
 impl Default for UpstreamConfig {
@@ -386,6 +396,7 @@ impl Default for UpstreamConfig {
             pool_idle_timeout_ms: 90_000,
             user_agent: concat!("llm-gateway/", env!("CARGO_PKG_VERSION")).to_string(),
             request_usage: true,
+            max_response_bytes: default_max_response_bytes(),
         }
     }
 }
