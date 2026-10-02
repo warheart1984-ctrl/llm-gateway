@@ -725,3 +725,7 @@ examples/
   mock_upstream.rs a stand-in provider for the demo
 demo/              docker compose demo: config, secrets, scripted client
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
