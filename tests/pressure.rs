@@ -1687,6 +1687,54 @@ async fn shared_ledger_concurrency_is_one_cap_across_replicas() {
 }
 
 #[tokio::test]
+async fn shared_ledger_a_connection_left_inside_a_transaction_never_swallows_an_admission() {
+    // A deadline can leave a pooled connection inside a transaction nothing
+    // owns: begun and acknowledged, but the future that would have received
+    // it was dropped first. Forgetting the handle makes that state on
+    // purpose. On Postgres, `begin` on such a connection silently opens a
+    // savepoint instead. An admission handed it commits only the savepoint:
+    // its reservation is not durable, and the tenant's day row it locked
+    // stays locked by the outer transaction, so the tenant's next admissions
+    // wait on it until their deadline. Without the fix this test fails that
+    // way: a later admission is refused as `Unavailable`. The pool must
+    // close the connection instead of reusing it.
+    use llm_gateway::governance::ledger::{Ledger as _, NewReservation, SharedLimits};
+    let Some(url) = test_database_url() else { return };
+    let schema = format!("pressure_{}", uuid::Uuid::new_v4().simple());
+    let ledger = postgres_ledger(&url, &schema, false).await.expect("connect ledger");
+    {
+        let mut conn = ledger.pool().acquire().await.unwrap();
+        let tx = sqlx::Connection::begin(&mut *conn).await.unwrap();
+        std::mem::forget(tx);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // More admissions than the pool has connections, so the stuck one would
+    // be handed out if it were still there.
+    let mut admitted = 0;
+    for _ in 0..20 {
+        let reservation = NewReservation {
+            id: uuid::Uuid::new_v4(),
+            tenant_id: "t",
+            now: std::time::SystemTime::now(),
+            amount_nano_usd: 100,
+            prompt_nano_usd: 25,
+            budget_nano_usd: 0,
+            idempotency: None,
+            hold: None,
+            limits: SharedLimits::default(),
+        };
+        ledger.try_reserve(reservation).await.expect("admitted");
+        admitted += 1;
+    }
+    assert_eq!(ledger.upkeep().stuck_connections_closed, 1);
+    // Every admission is committed and visible from another connection.
+    let reader = postgres_ledger(&url, &schema, false).await.expect("connect reader");
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM reservations").fetch_one(reader.pool()).await.unwrap();
+    assert_eq!(rows, admitted, "every admission must be durable");
+}
+
+#[tokio::test]
 async fn shared_ledger_a_reservation_that_commits_after_its_deadline_is_released_not_billed() {
     // With a 1 s ledger deadline, the commit gets what deciding left (at
     // least a quarter). Triggers make deciding take about 0.5 s and the

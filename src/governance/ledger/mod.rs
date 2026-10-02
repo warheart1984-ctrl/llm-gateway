@@ -51,6 +51,7 @@ pub struct Upkeep {
     sweep_failures: AtomicU64,
     swept: AtomicU64,
     late_commits_released: AtomicU64,
+    stuck_connections_closed: AtomicU64,
 }
 
 /// A reading of [`Upkeep`].
@@ -66,6 +67,10 @@ pub struct UpkeepCounts {
     /// passed and the request had been refused. Each was released at once, at
     /// no charge.
     pub late_commits_released: u64,
+    /// Pooled connections that came back inside a transaction nothing owned,
+    /// and were closed instead of reused. On SQLite, one reused would hold
+    /// the write lock indefinitely. See [`release_clean`].
+    pub stuck_connections_closed: u64,
 }
 
 impl Upkeep {
@@ -81,13 +86,48 @@ impl Upkeep {
         self.late_commits_released.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn stuck_connection_closed(&self) {
+        self.stuck_connections_closed.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn counts(&self) -> UpkeepCounts {
         UpkeepCounts {
             sweep_failures: self.sweep_failures.load(Ordering::Relaxed),
             swept: self.swept.load(Ordering::Relaxed),
             late_commits_released: self.late_commits_released.load(Ordering::Relaxed),
+            stuck_connections_closed: self.stuck_connections_closed.load(Ordering::Relaxed),
         }
     }
+}
+
+/// Whether a connection coming back to its pool may be reused: not if it is
+/// still inside a transaction. Every ledger pool runs this on release.
+///
+/// A transaction can be left open with nothing owning it when an operation
+/// is cut off by its deadline while starting one: the database begins the
+/// transaction and acknowledges it, but the caller's future is dropped before
+/// it reads the acknowledgement, so the handle whose drop would roll it back
+/// is never created. The connection then comes back to the pool mid-
+/// transaction. On SQLite that transaction holds the write lock, so every
+/// admission, closing and sweep after it fails, indefinitely: under
+/// overload, the whole ledger stopped. On Postgres every operation handed
+/// that connection fails instead.
+///
+/// The ping comes first: a dropped transaction's rollback is queued ahead of
+/// it, so a connection still in a transaction after the ping is one nothing
+/// will roll back. It is closed rather than reused, which ends the
+/// transaction and frees what it held; the pool opens a fresh one in its
+/// place.
+pub(crate) async fn release_clean<C: sqlx::Connection>(conn: &mut C, upkeep: &Upkeep) -> bool {
+    if conn.ping().await.is_err() {
+        return false;
+    }
+    if !conn.is_in_transaction() {
+        return true;
+    }
+    upkeep.stuck_connection_closed();
+    tracing::error!("a ledger connection came back inside a transaction nothing owned; closing it instead of reusing it");
+    false
 }
 
 /// How an admission's commit ended, as far as the admission could wait.

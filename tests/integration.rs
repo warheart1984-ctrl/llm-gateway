@@ -1043,6 +1043,11 @@ async fn metrics_expose_request_and_stream_counters() {
     assert!(text.contains("gw_cost_nano_usd_total 48000"), "{text}");
     assert!(text.contains("gw_tenant_streams_total{tenant=\"acme\"} 1"), "{text}");
     assert!(text.contains("# TYPE gw_streams_completed_total counter"));
+    assert!(text.contains("# TYPE gw_ledger_swept_reservations_total counter"), "{text}");
+    // Every line is a comment or a sample, starting in the first column.
+    for line in text.lines() {
+        assert!(!line.starts_with(char::is_whitespace), "indented exposition line: {line:?}");
+    }
 }
 
 #[tokio::test]

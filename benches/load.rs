@@ -35,11 +35,13 @@
 //!
 //!   The memory ledger has no tables, so it checks (1) against `/v1/usage`.
 //!   Totals are cumulative across levels, since the ledger is too;
-//! * **late released / swept / sweep failures**: the ledger's upkeep
-//!   counters from `/metrics`, cumulative: admissions whose commit landed
-//!   after their deadline and were released at no charge; reservations the
-//!   sweeper billed in full; and sweeper steps that failed. A released row
-//!   is one no client was admitted on, so it must bill nothing;
+//! * **late released / swept / sweep failures / stuck closed**: the
+//!   ledger's upkeep counters from `/metrics`, cumulative: admissions whose
+//!   commit landed after their deadline and were released at no charge;
+//!   reservations the sweeper billed in full; sweeper steps that failed; and
+//!   pooled connections closed because they came back inside a transaction
+//!   nothing owned. A released row is one no client was admitted on, so it
+//!   must bill nothing;
 //! * **KiB/stream**: peak heap through the gateway minus peak heap straight
 //!   to the upstream, divided by the most streams the gateway held open at
 //!   once. Counted by this binary's allocator, so heap only.
@@ -58,6 +60,9 @@
 //! deferred trigger in the run's schema), so commits overrun their window and
 //! the late-commit release is exercised under load; reconciliation then
 //! requires every such reservation to be released at zero cost.
+//!
+//! `LOAD_LOG=path` writes the gateway's warnings to a file instead of
+//! discarding them, for diagnosing a run.
 //!
 //! Other knobs: `LOAD_LEVELS` (default `50,200,500,1000`), `LOAD_FRAMING`
 //! (`normalized` or `passthrough`), `LOAD_GLOBAL_CAP`. Each level is appended
@@ -820,7 +825,7 @@ async fn reconcile(
 
 /// The ledger's upkeep counters, cumulative: `(late commits released,
 /// reservations swept, sweep failures)`.
-async fn upkeep_of(client: &reqwest::Client, gw: &GatewayUnderTest) -> (u64, u64, u64) {
+async fn upkeep_of(client: &reqwest::Client, gw: &GatewayUnderTest) -> (u64, u64, u64, u64) {
     let text = client
         .get(format!("http://{}/metrics", gw.addr))
         .header("x-api-key", ADMIN_KEY)
@@ -839,6 +844,7 @@ async fn upkeep_of(client: &reqwest::Client, gw: &GatewayUnderTest) -> (u64, u64
         read("gw_ledger_late_commits_released_total"),
         read("gw_ledger_swept_reservations_total"),
         read("gw_ledger_sweep_failures_total"),
+        read("gw_ledger_stuck_connections_closed_total"),
     )
 }
 
@@ -883,13 +889,28 @@ fn main() {
     let smoke = !std::env::args().any(|a| a == "--bench");
     let plan = Plan::from_env(smoke);
     // The gateway logs one summary line per stream; format it, discard it,
-    // so its cost is in the numbers.
-    let subscriber = tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
-        .with_writer(std::io::sink)
-        .finish();
-    let _ = tracing::subscriber::set_global_default(subscriber);
+    // so its cost is in the numbers. `LOAD_LOG=path` keeps the warnings
+    // instead (ledger failures, sweeps, late commits), with timestamps, for
+    // diagnosing a run; info lines still go nowhere.
+    match std::env::var("LOAD_LOG") {
+        Ok(path) if !path.is_empty() => {
+            let file = std::fs::File::create(&path).expect("create LOAD_LOG");
+            let subscriber = tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(tracing_subscriber::EnvFilter::new("warn"))
+                .with_writer(Mutex::new(file))
+                .finish();
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        }
+        _ => {
+            let subscriber = tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
+                .with_writer(std::io::sink)
+                .finish();
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        }
+    }
 
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let share = (cores / 3).max(1);
@@ -957,7 +978,7 @@ fn main() {
             }
         }
         println!(
-            "| ledger | streams | ok/s | refused | broken | added TTFT p50 / p99 (ms) | reserved | billed | settle lag | reconciled | late released / swept / sweep failures | heap KiB/stream |"
+            "| ledger | streams | ok/s | refused | broken | added TTFT p50 / p99 (ms) | reserved | billed | settle lag | reconciled | late released / swept / sweep failures / stuck closed | heap KiB/stream |"
         );
         println!("|---|---:|---:|---|---:|---|---:|---:|---:|---|---|---:|");
         let mut failures = Vec::new();
@@ -1003,7 +1024,7 @@ fn report(
     via: &Run,
     money: Money,
     lag: Duration,
-    (late, swept, sweep_failures): (u64, u64, u64),
+    (late, swept, sweep_failures, stuck): (u64, u64, u64, u64),
     problems: &[String],
     smoke: bool,
 ) {
@@ -1022,7 +1043,7 @@ fn report(
     };
     let verdict = if problems.is_empty() { "✓".to_string() } else { format!("✗ {} problems", problems.len()) };
     println!(
-        "| {} | {level} | {ok_per_s:.0} | {refused} | {} | {:.1} / {:.1} | {} | {} | {} ms | {verdict} | {late} / {swept} / {sweep_failures} | {kib_per_stream:.1} |",
+        "| {} | {level} | {ok_per_s:.0} | {refused} | {} | {:.1} / {:.1} | {} | {} | {} ms | {verdict} | {late} / {swept} / {sweep_failures} / {stuck} | {kib_per_stream:.1} |",
         gw.kind.name(),
         via.tally.broken + direct.tally.broken,
         g50 - d50,
@@ -1055,7 +1076,12 @@ fn report(
         "ttft_ms": { "direct_p50": d50, "direct_p99": d99, "gateway_p50": g50, "gateway_p99": g99 },
         "settle_lag_ms": lag.as_millis() as u64,
         "reconciled": problems.is_empty(),
-        "upkeep": { "late_commits_released": late, "swept": swept, "sweep_failures": sweep_failures },
+        "upkeep": {
+            "late_commits_released": late,
+            "swept": swept,
+            "sweep_failures": sweep_failures,
+            "stuck_connections_closed": stuck,
+        },
         "problems": problems,
         "max_open_via_gateway": via.max_open,
         "heap_kib_per_open_stream": kib_per_stream,

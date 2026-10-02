@@ -136,6 +136,8 @@ impl Install {
             let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             probe.local_addr().unwrap().port()
         };
+        let log_path = self.dir.join(format!("gateway-{port}.log"));
+        let log = std::fs::File::create(&log_path).expect("create the gateway log");
         let child = Command::new(env!("CARGO_BIN_EXE_llm-gateway"))
             .env("LLM_GATEWAY_CONFIG_DIR", &self.dir)
             .env("LLM_GATEWAY__SERVER__BIND_ADDR", "127.0.0.1")
@@ -147,11 +149,15 @@ impl Install {
             .env("LLM_GATEWAY__LEDGER__SWEEP_INTERVAL_SECS", "1")
             .env("LLM_GATEWAY__LEDGER__TIMEOUT_MS", "5000")
             .env("LLM_GATEWAY__TELEMETRY__LOG_FILTER", "warn")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .env("RUST_BACKTRACE", "1")
+            // Its logs (stdout) and any panic (stderr) are kept, and shown if
+            // the test fails: a gateway that errors mid-test is otherwise
+            // invisible.
+            .stdout(Stdio::from(log.try_clone().expect("gateway log")))
+            .stderr(Stdio::from(log.try_clone().expect("gateway log")))
             .spawn()
             .expect("start llm-gateway");
-        let process = Process { child, base: format!("http://127.0.0.1:{port}") };
+        let process = Process { child, base: format!("http://127.0.0.1:{port}"), log: log_path };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
             if let Ok(reply) = reqwest::get(format!("{}/health/ready", process.base)).await
@@ -209,6 +215,8 @@ impl Drop for Install {
 struct Process {
     child: Child,
     base: String,
+    /// This process's output, stdout and stderr.
+    log: PathBuf,
 }
 
 impl Process {
@@ -234,6 +242,10 @@ impl Drop for Process {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if std::thread::panicking() {
+            let log = std::fs::read_to_string(&self.log).unwrap_or_default();
+            eprintln!("--- llm-gateway output ({}) ---\n{log}--- end ---", self.log.display());
+        }
     }
 }
 
