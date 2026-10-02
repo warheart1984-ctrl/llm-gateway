@@ -52,6 +52,7 @@ pub struct Upkeep {
     swept: AtomicU64,
     late_commits_released: AtomicU64,
     stuck_connections_closed: AtomicU64,
+    backlog_refusals: AtomicU64,
 }
 
 /// A reading of [`Upkeep`].
@@ -71,6 +72,11 @@ pub struct UpkeepCounts {
     /// and were closed instead of reused. On SQLite, one reused would hold
     /// the write lock indefinitely. See [`release_clean`].
     pub stuck_connections_closed: u64,
+    /// Admissions refused because too many closings were waiting to be
+    /// written.
+    pub backlog_refusals: u64,
+    /// Closings waiting to be written now. A gauge, not a counter.
+    pub pending_closings: u64,
 }
 
 impl Upkeep {
@@ -90,12 +96,18 @@ impl Upkeep {
         self.stuck_connections_closed.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn backlog_refused(&self) {
+        self.backlog_refusals.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn counts(&self) -> UpkeepCounts {
         UpkeepCounts {
             sweep_failures: self.sweep_failures.load(Ordering::Relaxed),
             swept: self.swept.load(Ordering::Relaxed),
             late_commits_released: self.late_commits_released.load(Ordering::Relaxed),
             stuck_connections_closed: self.stuck_connections_closed.load(Ordering::Relaxed),
+            backlog_refusals: self.backlog_refusals.load(Ordering::Relaxed),
+            pending_closings: 0,
         }
     }
 }
@@ -128,6 +140,19 @@ pub(crate) async fn release_clean<C: sqlx::Connection>(conn: &mut C, upkeep: &Up
     upkeep.stuck_connection_closed();
     tracing::error!("a ledger connection came back inside a transaction nothing owned; closing it instead of reusing it");
     false
+}
+
+/// Whether the closings waiting to be written have reached `max` (0: no
+/// bound). If so, the admission is refused before it touches the database:
+/// a writer that has fallen behind must not be handed more work.
+pub(crate) fn refuse_if_backlogged(pending: u64, max: u64, upkeep: &Upkeep) -> Result<(), LedgerRefusal> {
+    if max == 0 || pending < max {
+        return Ok(());
+    }
+    upkeep.backlog_refused();
+    Err(LedgerRefusal::Unavailable(format!(
+        "{pending} settlements are waiting to be written (at most {max}); refusing new work until they are"
+    )))
 }
 
 /// How an admission's commit ended, as far as the admission could wait.

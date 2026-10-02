@@ -100,6 +100,11 @@ max_connections = 16
 # There is deliberately no option to admit without the ledger. On the sqlite
 # backend with a slow or busy disk, raise it rather than see spurious 503s.
 timeout_ms = 1000
+# Settlements (closings) waiting to be written, at most. Past it, new
+# admissions are refused with a retryable 503 until the writer catches up:
+# closings carry money and are never dropped, so the bound is at the door.
+# Watch `gw_ledger_pending_closings`. 0 turns the bound off.
+max_pending_closings = 10000
 # A reservation's lease, in seconds. The gateway renews the leases it holds
 # every third of this; after a crash they lapse within it, and the sweeper
 # bills those reservations in full. A long stream keeps renewing and is never

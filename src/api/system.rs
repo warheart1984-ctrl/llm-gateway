@@ -372,29 +372,45 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         state.limits.ledger().decisions_dropped()
     );
     let upkeep = state.limits.ledger().upkeep();
-    for (name, help, value) in [
+    for (name, kind, help, value) in [
         (
             "gw_ledger_sweep_failures_total",
+            "counter",
             "Ledger sweeper steps that failed; while they fail, lapsed reservations stay open.",
             upkeep.sweep_failures,
         ),
         (
             "gw_ledger_swept_reservations_total",
+            "counter",
             "Reservations closed by the sweeper after their lease lapsed, each billed its full reservation.",
             upkeep.swept,
         ),
         (
             "gw_ledger_late_commits_released_total",
+            "counter",
             "Reservations that committed after their admission timed out, released at no charge.",
             upkeep.late_commits_released,
         ),
         (
             "gw_ledger_stuck_connections_closed_total",
+            "counter",
             "Ledger connections that came back inside a transaction they could not roll back, closed instead of reused.",
             upkeep.stuck_connections_closed,
         ),
+        (
+            "gw_ledger_pending_closings",
+            "gauge",
+            "Settlements waiting to be written. At `ledger.max_pending_closings`, admissions are refused.",
+            upkeep.pending_closings,
+        ),
+        (
+            "gw_ledger_backlog_refusals_total",
+            "counter",
+            "Admissions refused because too many settlements were waiting to be written.",
+            upkeep.backlog_refusals,
+        ),
     ] {
-        let _ = writeln!(body, "# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}");
+        let _ = writeln!(body, "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}");
     }
     let mut response = body.into_response();
     response.headers_mut().insert(

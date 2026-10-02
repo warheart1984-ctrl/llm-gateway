@@ -380,6 +380,11 @@ database decides, not any gateway process:
 - **Closing** is `UPDATE … WHERE state = 'open'`, so a duplicate close from
   any process changes nothing. Closings are queued to one writer that
   retries until each one is durable, and graceful shutdown flushes the queue.
+- **The settlement queue is bounded at the door.** Closings carry money, so
+  none is ever dropped. Instead, once `max_pending_closings` (10,000) are
+  waiting to be written, new admissions are refused with a retryable 503
+  until the writer catches up. `gw_ledger_pending_closings` shows the
+  backlog, and `gw_ledger_backlog_refusals_total` counts the refusals.
 - **There is no fail-open setting.** A ledger that is unreachable at startup
   stops the gateway starting. One that is unreachable at runtime refuses
   requests with 503.

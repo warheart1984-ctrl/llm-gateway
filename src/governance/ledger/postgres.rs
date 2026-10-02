@@ -52,6 +52,7 @@ use tokio::{
 
 use super::{
     Closing, CommitOutcome, Ledger, LedgerRefusal, NewReservation, Outcome, Upkeep, UpkeepCounts, commit_within,
+    refuse_if_backlogged,
     release_clean,
     decisions::{DECISION_QUEUE, Decision, DecisionKind, DecisionQuery, DecisionRecord},
     holds::{self, HoldClaim, HoldDecision, HoldProblem, HoldQuery, HoldRecord, HoldState, NewHold, Transition},
@@ -83,6 +84,9 @@ pub struct PostgresOptions {
     pub sealer: Option<Arc<ResponseSealer>>,
     /// Decision records older than this are deleted by the sweeper.
     pub decision_retention: Duration,
+    /// Closings waiting to be written, at most, before admissions are
+    /// refused. 0: no bound.
+    pub max_pending_closings: u64,
 }
 
 enum WriterMsg {
@@ -106,6 +110,7 @@ pub struct PostgresLedger {
     decision_queue: mpsc::Sender<Decision>,
     decisions_dropped: Arc<AtomicU64>,
     upkeep: Arc<Upkeep>,
+    max_pending_closings: u64,
 }
 
 impl std::fmt::Debug for WriterMsg {
@@ -231,6 +236,7 @@ impl PostgresLedger {
             decision_queue,
             decisions_dropped,
             upkeep,
+            max_pending_closings: opts.max_pending_closings,
         }))
     }
 
@@ -1006,6 +1012,7 @@ async fn run_sweeper(pool: PgPool, interval: Duration, decision_retention: Durat
 #[async_trait::async_trait]
 impl Ledger for PostgresLedger {
     async fn try_reserve(&self, r: NewReservation<'_>) -> Result<u64, LedgerRefusal> {
+        refuse_if_backlogged(self.pending.load(Ordering::Relaxed), self.max_pending_closings, &self.upkeep)?;
         // Deciding may be abandoned: running out drops the transaction before
         // its commit, which rolls it back and holds nothing. It keeps the
         // whole deadline, because under contention deciding is mostly queueing
@@ -1137,7 +1144,7 @@ impl Ledger for PostgresLedger {
     }
 
     fn upkeep(&self) -> UpkeepCounts {
-        self.upkeep.counts()
+        UpkeepCounts { pending_closings: self.pending.load(Ordering::Relaxed), ..self.upkeep.counts() }
     }
 
     async fn create_hold(&self, h: NewHold) -> Result<HoldRecord, LedgerRefusal> {
