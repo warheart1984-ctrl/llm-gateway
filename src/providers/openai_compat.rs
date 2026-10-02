@@ -61,14 +61,16 @@ pub(crate) struct OpenAiCompatAdapter {
     spec: OpenAiCompatSpec,
     api_key: Option<String>,
     client: reqwest::Client,
+    /// The most bytes held for one answer, event or line.
+    max_response_bytes: usize,
 }
 
 impl OpenAiCompatAdapter {
     /// Build with the transport settings from gateway config. A client that
     /// cannot be constructed is a configuration error and is surfaced at boot,
     /// not silently replaced with defaults.
-    pub fn new(spec: OpenAiCompatSpec, api_key: Option<String>, client: reqwest::Client) -> Self {
-        Self { spec, api_key, client }
+    pub fn new(spec: OpenAiCompatSpec, api_key: Option<String>, client: reqwest::Client, max_response_bytes: usize) -> Self {
+        Self { spec, api_key, client, max_response_bytes }
     }
 
 }
@@ -85,17 +87,14 @@ impl ChatProvider for OpenAiCompatAdapter {
 
     async fn stream_chat(&self, req: ProviderRequest) -> Result<ProviderStream, ProviderError> {
         let resp = self.post(&req, true).await?;
-        Ok(decode(data_stream(resp, self.spec.quirks), self.spec.quirks))
+        Ok(decode(data_stream(resp, self.spec.quirks, self.max_response_bytes), self.spec.quirks))
     }
 
     async fn complete(&self, req: ProviderRequest) -> Result<Completion, ProviderError> {
         let resp = self.post(&req, false).await?;
         // A non-streaming answer is one JSON document. A body that cannot be
         // read (reset, read timeout) is a transport failure after acceptance.
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| ProviderError::Stream(describe(&e)))?;
+        let bytes = read_capped(resp, self.max_response_bytes).await?;
         let value: Value = serde_json::from_slice(&bytes).map_err(|e| {
             ProviderError::Protocol(format!(
                 "upstream answer was not JSON ({e}): {}",
@@ -161,7 +160,7 @@ impl OpenAiCompatAdapter {
             // The body is read here, before streaming starts, so an upstream
             // error is a normal HTTP status the client can act on rather than
             // an error buried inside a 200 SSE stream.
-            let snippet = resp.text().await.unwrap_or_default();
+            let snippet = read_snippet(resp, ERROR_BODY_MAX).await;
             return Err(ProviderError::Upstream {
                 status: status.as_u16(),
                 body: snippet,
@@ -272,7 +271,7 @@ type DataStream = Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Sen
 
 /// Normalize the transport to a stream of SSE `data:` payloads. Handles real
 /// SSE and, for vendors flagged as tolerant, newline-delimited JSON.
-fn data_stream(resp: reqwest::Response, quirks: QuirkFlags) -> DataStream {
+fn data_stream(resp: reqwest::Response, quirks: QuirkFlags, max_frame: usize) -> DataStream {
     // Read content-type before `bytes_stream` consumes the response.
     let content_type = resp
         .headers()
@@ -284,12 +283,19 @@ fn data_stream(resp: reqwest::Response, quirks: QuirkFlags) -> DataStream {
     let bytes = resp.bytes_stream();
 
     if is_sse {
+        // `eventsource-stream` buffers an event until its blank line; bound
+        // how far it can get without one.
+        let bytes = bounded_events(bytes, max_frame);
         Box::pin(bytes.eventsource().map(|res| {
-            res.map(|ev| ev.data)
-                .map_err(|e| ProviderError::Stream(e.to_string()))
+            res.map(|ev| ev.data).map_err(|e| match e {
+                eventsource_stream::EventStreamError::Transport(BoundedError::TooLarge(max)) => {
+                    too_large("event", max)
+                }
+                other => ProviderError::Stream(other.to_string()),
+            })
         }))
     } else if quirks.accept_json_lines {
-        Box::pin(line_delimited(bytes).map_err(|e| ProviderError::Stream(e.to_string())))
+        Box::pin(line_delimited(bytes, max_frame))
     } else {
         // Not SSE and the vendor is not tolerant of a JSON-lines fallback:
         // surface the real content-type rather than a generic parse error.
@@ -304,11 +310,12 @@ fn data_stream(resp: reqwest::Response, quirks: QuirkFlags) -> DataStream {
 /// `text/event-stream` and emit one JSON object per line.
 fn line_delimited(
     bytes: impl Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
-) -> impl Stream<Item = Result<String, String>> + Send {
+    max_line: usize,
+) -> impl Stream<Item = Result<String, ProviderError>> + Send {
     // Boxed so the returned stream is `Unpin` and `unfold` can poll it without
     // pinning gymnastics at every await point.
     let bytes: Pin<Box<dyn Stream<Item = reqwest::Result<bytes::Bytes>> + Send>> = Box::pin(bytes);
-    futures_util::stream::unfold((bytes, Vec::<u8>::new()), |(mut source, mut buf)| async move {
+    futures_util::stream::unfold((bytes, Vec::<u8>::new()), move |(mut source, mut buf)| async move {
         loop {
             let newline = buf.iter().position(|b| *b == b'\n');
             if let Some(idx) = newline {
@@ -329,12 +336,111 @@ fn line_delimited(
                         Some((Ok(rest), (source, Vec::new())))
                     };
                 }
-                Some(Err(e)) => return Some((Err(e.to_string()), (source, Vec::new()))),
-                Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+                Some(Err(e)) => return Some((Err(ProviderError::Stream(e.to_string())), (source, Vec::new()))),
+                Some(Ok(chunk)) => {
+                    buf.extend_from_slice(&chunk);
+                    // A line is never longer than the cap: past it with no
+                    // newline, the stream is refused rather than buffered.
+                    if !buf.contains(&b'\n') && buf.len() > max_line {
+                        return Some((Err(too_large("line", max_line)), (source, Vec::new())));
+                    }
+                }
             }
         }
     })
 }
+
+/// How much of an upstream error body is kept. It is only ever logged, and
+/// truncated well below this.
+const ERROR_BODY_MAX: usize = 16 * 1024;
+
+fn too_large(what: &str, max: usize) -> ProviderError {
+    ProviderError::Protocol(format!("upstream {what} exceeded {max} bytes"))
+}
+
+/// Read a whole response body, refusing one larger than `max` bytes. A
+/// declared length over the cap is refused before anything is read.
+async fn read_capped(mut resp: reqwest::Response, max: usize) -> Result<Vec<u8>, ProviderError> {
+    if resp.content_length().is_some_and(|len| len > max as u64) {
+        return Err(too_large("answer", max));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| ProviderError::Stream(describe(&e)))? {
+        if body.len() + chunk.len() > max {
+            return Err(too_large("answer", max));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// The first `max` bytes of a body, for an error message. The rest is never
+/// read; a read failure keeps what arrived.
+async fn read_snippet(mut resp: reqwest::Response, max: usize) -> String {
+    let mut body = Vec::new();
+    while body.len() < max {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = max - body.len();
+                body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&body).into_owned()
+}
+
+/// Pass SSE bytes through unchanged, failing the stream if more than `max`
+/// bytes arrive without an event boundary (a blank line). `\r` is ignored,
+/// so `\r\n\r\n` counts as a boundary too.
+fn bounded_events(
+    bytes: impl Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
+    max: usize,
+) -> impl Stream<Item = Result<bytes::Bytes, BoundedError>> + Send {
+    let mut since_boundary = 0usize;
+    let mut after_newline = false;
+    let mut failed = false;
+    bytes.map(move |chunk| {
+        if failed {
+            return Err(BoundedError::Ended);
+        }
+        let chunk = chunk.map_err(|e| BoundedError::Transport(e.to_string()))?;
+        for &b in chunk.iter() {
+            match b {
+                b'\n' if after_newline => since_boundary = 0,
+                b'\n' => after_newline = true,
+                b'\r' => {}
+                _ => after_newline = false,
+            }
+            since_boundary += 1;
+        }
+        if since_boundary > max {
+            failed = true;
+            return Err(BoundedError::TooLarge(max));
+        }
+        Ok(chunk)
+    })
+}
+
+/// Why [`bounded_events`] stopped a stream.
+#[derive(Debug)]
+enum BoundedError {
+    Transport(String),
+    TooLarge(usize),
+    Ended,
+}
+
+impl std::fmt::Display for BoundedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BoundedError::Transport(e) => f.write_str(e),
+            BoundedError::TooLarge(max) => write!(f, "upstream event exceeded {max} bytes"),
+            BoundedError::Ended => f.write_str("upstream stream already failed"),
+        }
+    }
+}
+
+impl std::error::Error for BoundedError {}
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -1038,6 +1144,93 @@ mod tests {
             }
             other => panic!("expected Finished with usage, got {other:?}"),
         }
+    }
+
+    /// A response whose body arrives as `chunks`, with no declared length.
+    fn chunked(chunks: Vec<&'static [u8]>) -> reqwest::Response {
+        let stream = futures_util::stream::iter(chunks.into_iter().map(|c| Ok::<_, std::io::Error>(bytes::Bytes::from_static(c))));
+        reqwest::Response::from(http::Response::new(reqwest::Body::wrap_stream(stream)))
+    }
+
+    fn byte_stream(chunks: Vec<Vec<u8>>) -> impl Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static {
+        futures_util::stream::iter(chunks.into_iter().map(|c| Ok(bytes::Bytes::from(c))))
+    }
+
+    #[tokio::test]
+    async fn an_answer_within_the_cap_is_read_whole() {
+        let body = read_capped(chunked(vec![b"{\"a\":", b"1}"]), 64).await.unwrap();
+        assert_eq!(body, b"{\"a\":1}");
+    }
+
+    #[tokio::test]
+    async fn an_answer_declared_over_the_cap_is_refused_before_reading() {
+        let resp = reqwest::Response::from(http::Response::new(vec![b'x'; 100]));
+        let err = read_capped(resp, 64).await.unwrap_err();
+        assert!(matches!(err, ProviderError::Protocol(ref m) if m.contains("exceeded 64 bytes")), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_grows_past_the_cap_is_refused() {
+        // No declared length: the cap is enforced as the chunks arrive.
+        let err = read_capped(chunked(vec![&[b'x'; 40], &[b'x'; 40]]), 64).await.unwrap_err();
+        assert!(matches!(err, ProviderError::Protocol(_)), "{err:?}");
+        assert_eq!(err.code(), "upstream_protocol_error");
+    }
+
+    #[tokio::test]
+    async fn an_error_body_is_read_only_as_far_as_it_is_shown() {
+        let snippet = read_snippet(chunked(vec![b"0123456789", b"abcdef"]), 12).await;
+        assert_eq!(snippet, "0123456789ab");
+    }
+
+    #[tokio::test]
+    async fn many_small_events_pass_however_long_the_stream() {
+        let event = b"data: {\"x\":1}\n\n".to_vec();
+        let total: usize = event.len() * 50;
+        let out: Vec<_> = bounded_events(byte_stream(vec![event; 50]), 32).collect().await;
+        assert!(out.iter().all(Result::is_ok));
+        assert_eq!(out.iter().map(|c| c.as_ref().unwrap().len()).sum::<usize>(), total);
+        // CRLF line endings are boundaries too.
+        let crlf = b"data: {\"x\":1}\r\n\r\n".to_vec();
+        let out: Vec<_> = bounded_events(byte_stream(vec![crlf; 50]), 32).collect().await;
+        assert!(out.iter().all(Result::is_ok));
+    }
+
+    #[tokio::test]
+    async fn an_event_without_a_boundary_past_the_cap_fails_the_stream() {
+        let chunks = vec![b"data: ".to_vec(), vec![b'x'; 40], vec![b'x'; 40]];
+        let out: Vec<_> = bounded_events(byte_stream(chunks), 64).collect().await;
+        assert!(out[0].is_ok() && out[1].is_ok());
+        assert!(matches!(out[2], Err(BoundedError::TooLarge(64))), "{:?}", out[2]);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_sse_event_is_an_upstream_protocol_error() {
+        let mut big = b"data: ".to_vec();
+        big.extend(vec![b'x'; 200]);
+        let resp = http::Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(reqwest::Body::wrap_stream(byte_stream(vec![b"data: {}\n\n".to_vec(), big])))
+            .unwrap();
+        let frames: Vec<_> = data_stream(reqwest::Response::from(resp), quirks(), 64).collect().await;
+        assert_eq!(frames[0].as_deref().ok(), Some("{}"));
+        assert!(
+            frames.iter().any(|f| matches!(f, Err(ProviderError::Protocol(m)) if m.contains("event exceeded 64 bytes"))),
+            "{frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn json_lines_within_the_cap_pass_and_an_endless_line_fails() {
+        let lines: Vec<_> = line_delimited(byte_stream(vec![b"{\"a\":1}\n{\"b\"".to_vec(), b":2}\n".to_vec()]), 32)
+            .collect()
+            .await;
+        assert_eq!(lines.iter().map(|l| l.as_deref().unwrap()).collect::<Vec<_>>(), ["{\"a\":1}", "{\"b\":2}"]);
+        let endless: Vec<_> = line_delimited(byte_stream(vec![vec![b'x'; 20], vec![b'x'; 20]]), 32).collect().await;
+        assert!(
+            matches!(endless.last(), Some(Err(ProviderError::Protocol(m))) if m.contains("line exceeded 32 bytes")),
+            "{endless:?}"
+        );
     }
 
     #[test]

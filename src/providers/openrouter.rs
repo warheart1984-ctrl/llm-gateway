@@ -52,6 +52,7 @@ impl OpenRouterAdapter {
                 },
                 api_key,
                 client,
+                tuning.max_response_bytes,
             ),
         })
     }

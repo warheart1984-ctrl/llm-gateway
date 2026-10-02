@@ -44,7 +44,7 @@ impl NvidiaAdapter {
 
     pub fn tuned(api_key: Option<String>, tuning: &UpstreamTuning) -> Result<Self, ProviderError> {
         let client = super::tuned_client(tuning)?;
-        Ok(Self { inner: OpenAiCompatAdapter::new(spec(), api_key, client) })
+        Ok(Self { inner: OpenAiCompatAdapter::new(spec(), api_key, client, tuning.max_response_bytes) })
     }
 }
 
