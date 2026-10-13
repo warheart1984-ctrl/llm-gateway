@@ -1,0 +1,28 @@
+# Isolated deterministic benchmark tenant. This file intentionally contains no
+# unrelated tenants: the documented GATEWAY_KEY_BENCHMARK_MAIN is the only
+# credential required to boot this benchmark configuration.
+#
+# Credentials are referenced by env var, never inlined. At boot the raw value is
+# hashed and only the digest is retained, so a memory dump yields digests rather
+# than keys. `key` is accepted for local development.
+
+tenants:
+  - tenant_id: benchmark
+    display_name: Benchmark (bounded live runs)
+    enabled: true
+    credentials:
+      - key_id: ak_benchmark_main
+        key_env: GATEWAY_KEY_BENCHMARK_MAIN
+        scopes: [chat:stream, models:read, admin]
+        enabled: true
+    allowed_models:
+      - "openrouter/gpt-4.1-mini"
+      - "nvidia/mock-chat"
+    default_model: nvidia/mock-chat
+    limits:
+      requests_per_minute: 100000
+      tokens_per_minute: 10000000
+      max_concurrent_streams: 2048
+      max_output_tokens: 1024
+      # $50/day: enough for bounded benchmark repetitions, not an open spend.
+      daily_budget_nano_usd: 50000000000

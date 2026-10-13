@@ -245,7 +245,7 @@ async fn run() -> Result<(), String> {
         source_revision,
         source_dirty,
         source_diff_sha256,
-        rust_version: command_version("rustc", "--version"),
+        rust_version: rustc_version(),
         os: env::consts::OS.into(),
         architecture: env::consts::ARCH.into(),
         cpu_model: cpu_model(),
@@ -1442,12 +1442,16 @@ fn source_provenance() -> Result<(String, bool, String), String> {
     ))
 }
 
-fn command_version(command: &str, arg: &str) -> String {
-    Command::new(command)
-        .arg(arg)
+fn rustc_version() -> String {
+    let compiler = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    Command::new(compiler)
+        .arg("--version")
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().into())
-        .unwrap_or_else(|_| "unknown".into())
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().into())
+        .filter(|version: &String| !version.is_empty())
+        .unwrap_or_else(|| "unknown".into())
 }
 
 fn cpu_model() -> String {

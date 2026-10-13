@@ -1,0 +1,143 @@
+# llm-gateway — effective configuration.
+#
+# Precedence: this file < environment. Environment overrides use
+# `LLM_GATEWAY__<SECTION>__<FIELD>`, e.g.
+#   LLM_GATEWAY__SERVER__PORT=9000
+#   LLM_GATEWAY__GOVERNANCE__DEFAULT_LIMITS__REQUESTS_PER_MINUTE=600
+#
+# Relative paths below resolve against the config directory (LLM_GATEWAY_CONFIG_DIR,
+# default `config/`), so the binary can start from any working directory.
+
+[server]
+bind_addr = "0.0.0.0"
+port = 8081
+# 1 MiB. A chat request is text; anything larger is a mistake or an attack.
+request_body_limit_bytes = 1048576
+# SSE comment ping. Intermediaries reap "idle-looking" connections, and during
+# a long tool call there may be no tokens for a while.
+keep_alive_interval_ms = 15000
+max_concurrent_streams_global = 2048
+shutdown_grace_ms = 20000
+metrics_enabled = true
+# Serve /metrics (unauthenticated) and /v1/admin/* on a separate listener,
+# and remove both from the public port. Unset, they stay on the public port
+# and /metrics requires the `admin` scope. See "Security posture" in README.
+# ops_port = 9091
+ops_port = 9091
+# ops_bind_addr = "127.0.0.1"
+
+[registry]
+models_path = "models.yaml"
+tenants_path = "tenants.yaml"
+# Re-read on mtime change. Keeps the data plane up while the control plane
+# edits YAML.
+hot_reload = true
+reload_interval_ms = 5000
+
+[auth]
+# api_key | api_key_or_jwt | disabled
+mode = "api_key"
+api_key_header = "x-api-key"
+accept_bearer = true
+allow_anonymous = false
+
+# [auth.jwt]
+# issuer = "jarvis"
+# audience = "llm-gateway"
+# secret_env = "LLM_GATEWAY_JWT_SECRET"   # name only; the value stays in env
+# leeway_secs = 30
+# required_scopes = ["chat:stream"]
+
+[governance]
+# Deny by default: a tenant calling a model not on its allowlist is a 403.
+require_model_allowlist = true
+# Clamp silently and log, or 400. Clamp is friendlier for a UI that always
+# sends a generous max_tokens.
+on_max_tokens_exceeded = "clamp"
+cost_tracking_enabled = true
+
+[governance.default_limits]
+requests_per_minute = 120
+tokens_per_minute = 200000
+max_concurrent_streams = 16
+max_output_tokens = 8192
+# 5 USD/day.
+daily_budget_nano_usd = 5000000000
+max_messages = 512
+max_prompt_chars = 200000
+
+[upstream]
+connect_timeout_ms = 5000
+# Per-chunk read timeout, not a whole-response deadline. An idle SSE stream is
+# torn down rather than pinning a socket forever.
+stream_read_timeout_ms = 120000
+tcp_keepalive_secs = 75
+pool_max_idle_per_host = 64
+pool_idle_timeout_ms = 90000
+user_agent = "llm-gateway/0.1.0"
+# Ask providers for usage in the terminal chunk so billing is exact.
+request_usage = true
+# The largest upstream answer held in memory: a whole non-streaming response,
+# or one streamed event or line. Beyond it the request fails (502,
+# upstream_protocol_error) instead of buffering without limit. 8 MiB.
+max_response_bytes = 8388608
+
+[ledger]
+# sqlite (default): a durable ledger in a local file (`sqlite_path` below).
+#         Survives restarts with no database server. The file's directory
+#         must exist and be writable; the gateway will not start otherwise.
+# memory: spend lives in this process. A restart forgets it, and replicas
+#         each enforce the full budget. For tests and development only.
+# postgres: one durable ledger shared by every replica. Survives restarts;
+#           replicas draw on one budget; a repeated Idempotency-Key is
+#           answered from the ledger instead of running again.
+# sqlite is not shared: for several replicas, use postgres, or pair sqlite
+# with quota_split_replicas below.
+backend = "sqlite"
+url_env = "LLM_GATEWAY_DATABASE_URL"   # env var NAME; the URL stays in env
+schema = "public"
+max_connections = 16
+# Ledger unreachable or slower than this: the request is refused with 503.
+# There is deliberately no option to admit without the ledger. On the sqlite
+# backend with a slow or busy disk, raise it rather than see spurious 503s.
+timeout_ms = 10000
+# Settlements (closings) waiting to be written, at most. Past it, new
+# admissions are refused with a retryable 503 until the writer catches up:
+# closings carry money and are never dropped, so the bound is at the door.
+# Watch `gw_ledger_pending_closings`. 0 turns the bound off.
+max_pending_closings = 10000
+# A reservation's lease, in seconds. The gateway renews the leases it holds
+# every third of this; after a crash they lapse within it, and the sweeper
+# bills those reservations in full. A long stream keeps renewing and is never
+# swept while live. (`sweep_after_secs`, the older name, is still accepted.)
+lease_secs = 60
+sweep_interval_secs = 60
+idempotency_retention_secs = 86400
+# Closed reservations (one per admitted request, with its bill) are deleted
+# after this many days; `spend_days` keeps the daily totals. A stored answer
+# is cleared once its idempotency key expires (above). Must cover
+# idempotency_retention_secs. 0 keeps reservations forever.
+reservation_retention_days = 30
+# Env var NAME holding the keys that seal answers kept for replay (postgres):
+# `kid:base64-of-32-bytes[,kid:...]`, first key seals, all keys open.
+# Unset: answers are not stored and repeated completions get 409.
+response_keys_env = "LLM_GATEWAY_RESPONSE_KEYS"
+# Env var NAME holding the keys that fingerprint idempotent requests:
+# `kid:base64-of-32+-bytes[,kid:...]`. Unset: plain SHA-256, which lets anyone
+# reading the ledger test a guessed prompt. First key fingerprints, all match.
+fingerprint_keys_env = "LLM_GATEWAY_FINGERPRINT_KEYS"
+# sqlite backend: the database file, relative to this config directory.
+sqlite_path = "ledger.sqlite3"
+# Quota split, for N replicas without a shared database (sqlite backend):
+# each replica enforces budget * margin% / N of every tenant's budget, so
+# together they never exceed it. 0 = off. Same N on every replica; change it
+# only at the UTC day boundary.
+quota_split_replicas = 0
+quota_split_margin_percent = 100
+
+[telemetry]
+service_name = "llm-gateway"
+service_version = "0.1.0"
+# pretty | json
+log_format = "json"
+log_filter = "info,llm_gateway=debug"

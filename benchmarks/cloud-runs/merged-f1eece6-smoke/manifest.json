@@ -1,0 +1,44 @@
+{
+  "run_id": "merged-f1eece6-smoke",
+  "started_at_unix_ms": 1791903717759,
+  "source_revision": "f1eece6668c4ad7a786d099f638f589ad4c0941d",
+  "rust_version": "rustc 1.88.0 (6b00bc388 2025-06-23)",
+  "os": "linux",
+  "architecture": "x86_64",
+  "cpu_model": "INTEL(R) XEON(R) PLATINUM 8573C",
+  "vcpus": 4,
+  "memory_mib": 34087,
+  "instance_type": null,
+  "container_image_digest": null,
+  "backend": "sqlite",
+  "direct_url_configured": true,
+  "gateway_url_configured": true,
+  "gateway_metrics_url_configured": true,
+  "upstream_model": "mock/chat",
+  "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "source_dirty": false,
+  "concurrency": [
+    1
+  ],
+  "repetitions": 1,
+  "warmup_secs": 0,
+  "duration_secs": 3,
+  "max_requests": 10,
+  "refusal_backoff_ms": 100,
+  "settlement_wait_ms": 2000,
+  "seed": 1280068935,
+  "request": {
+    "max_tokens": 64,
+    "messages": [
+      {
+        "content_bytes": 23,
+        "content_sha256": "44de7d418d3553fc68423bef50ea0207f6f31e1687d8d766df593020b74ed8a7",
+        "role": "user"
+      }
+    ],
+    "model": "nvidia/mock-chat",
+    "prompt_redacted": true,
+    "stream": true,
+    "upstream_model": "mock/chat"
+  }
+}
