@@ -1,15 +1,14 @@
 # Measuring Governed Streaming Overhead in an LLM Gateway
 
-> **Evidence status (2026-10-13):** This is a provisional experiment draft.
-> The previously committed cloud bundles were removed because their manifests
-> came from a dirty checkout and did not identify the source tree that ran the
-> harness. The numeric observations below are retained as historical notes,
-> not as reproducible benchmark results. Rerun the experiment from a clean,
-> pinned commit before citing any result.
+> **Evidence status (2026-10-13):** This is a provisional local experiment
+> report. The current clean bundles record source revision `9a3ab2c`, Rust
+> `1.88.0`, and `source_dirty: false`. The short comparison run is reproducible
+> evidence; the separate 30-second pressure run is diagnostic evidence because
+> it exercised the gateway's 2,048-stream governance ceiling.
 
 ## Abstract
 
-This paper draft describes a planned controlled experiment measuring the performance and governance behavior of a Rust-based large-language-model (LLM) gateway when the upstream provider is deterministic and fast. It compares direct access to a mock streaming provider with gateway passthrough and normalized streaming while keeping authentication, model authorization, concurrency admission, durable reservations, settlement, billing, and evidence generation enabled. Historical observations are included only to document the experiment that must be rerun; they are not currently reproducible evidence. The intended result is a local, single-host baseline rather than a completed cloud or cross-provider benchmark.
+This paper reports a controlled local experiment measuring the performance and governance behavior of a Rust-based large-language-model (LLM) gateway when the upstream provider is deterministic and fast. It compares direct access to a mock streaming provider with gateway passthrough and normalized streaming while keeping authentication, model authorization, concurrency admission, durable reservations, settlement, billing, and evidence generation enabled. The result is a local, single-host baseline rather than a completed cloud or cross-provider benchmark.
 
 **Keywords:** LLM gateway, streaming inference, governance, admission control, billing reconciliation, performance measurement, reproducibility
 
@@ -67,7 +66,7 @@ The provider emitted a deterministic server-sent event stream. Its token delay w
 - model identifier: `mock/chat`; and
 - requested maximum output: 64 tokens.
 
-The workload used 50 concurrent clients, a ten-second configured interval, zero warm-up seconds, three repetitions, and a maximum of 10,000 attempts per variant. The harness measured the synchronized interval directly; the reported throughput is successful completions divided by that measured interval. The harness backed off for 100 ms after HTTP 429 and 5xx responses. This cap and backoff prevented immediate governance refusals from becoming an open-loop request storm.
+The reproducible comparison workload used 50 concurrent clients, a ten-second configured interval, zero warm-up seconds, three repetitions, and a maximum of 500 requests per variant. The harness measured the synchronized interval directly; the reported throughput is successful completions divided by that measured interval. The harness backed off for 100 ms after HTTP 429 and 5xx responses. A separate 30-second pressure run allowed up to 20,000 requests per variant to test sustained behavior.
 
 ### 3.3 Measurements
 
@@ -79,15 +78,14 @@ The gateway usage endpoint was sampled before and after each workload. A bounded
 
 ### 3.4 Evidence and analysis
 
-Each run emitted a manifest, raw per-request records, summary statistics, governance results, comparison table, and SHA-256 checksum file. The final run's manifest recorded the source revision, machine metadata, concurrency, duration, request cap, refusal backoff, and settlement wait.
+Each run emitted a manifest, raw per-request records, summary statistics, governance results, comparison table, and SHA-256 checksum file. The comparison manifest recorded the exact source revision, clean-tree status, Rust `1.88.0`, machine metadata, concurrency, duration, request cap, refusal backoff, and settlement wait. The comparison table also records reserved and billed nano-USD and identifies whether accounting is provider-usage- or reservation-settlement-based.
 
 No inferential statistical tests were applied. Results are reported descriptively across three repetitions, and the refusal population is kept separate from successful-completion throughput. A preliminary repeat with the default one-second SQLite admission timeout produced retryable 503 ledger timeouts; it was retained as diagnostic evidence but excluded from the capacity table. The reported run used the explicitly recorded ten-second timeout and produced no 429 or 5xx responses.
 
 ## 4. Results
 
-The results in this section are historical observations from the removed
-bundles. They are not accepted benchmark results until a clean, pinned rerun
-produces manifests containing the current harness and exact tenant policy.
+The results in this section come from the clean, pinned comparison bundle
+`benchmarks/cloud-runs/merged-f1eece6-c50-r3` and its SHA-256 manifest.
 
 ### 4.1 Throughput and latency
 
@@ -97,62 +95,62 @@ Table 1 summarizes the high-limit capacity run. Throughput is successful complet
 
 | Variant | Successful completions | Aggregate throughput (req/s) | TTFT p50 (ms) | TTFT p95 (ms) | TTFT p99 (ms) | Full latency p50 (ms) | Full latency p95 (ms) | Full latency p99 (ms) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Direct mock provider | 14,890 | 491.0 | 46.175 | 62.505 | 90.845 | 92.515 | 154.282 | 193.477 |
-| Gateway passthrough | 4,859 | 152.3 | 244.534 | 465.823 | 702.449 | 295.487 | 517.294 | 733.069 |
-| Gateway normalized | 5,041 | 152.7 | 206.787 | 451.499 | 863.514 | 269.270 | 535.739 | 980.481 |
+| Direct mock provider | 1,500 | 594.86 | 38.561 | 40.9 | 41.7 | 80.1 | 85.0 | 87.8 |
+| Gateway passthrough | 1,500 | 528.58 | 45.116 | 61.2 | 171.9 | 84.0 | 108.2 | 209.1 |
+| Gateway normalized | 1,500 | 504.47 | 46.329 | 64.8 | 181.3 | 84.1 | 115.5 | 264.8 |
 
-Across repetitions, aggregate gateway throughput was approximately 31% of the direct baseline for passthrough and 31% for normalized streaming. Run-level throughput ranged from 128.6 to 178.4 req/s for passthrough, 148.3 to 157.3 req/s for normalized streaming, and 455.9 to 512.7 req/s for direct access. These ranges show why the earlier 20-request live runs were smoke tests rather than provider benchmarks.
+Across the three capped repetitions, passthrough throughput ranged from 522.1 to 533.3 req/s and normalized throughput ranged from 484.7 to 526.2 req/s. Direct throughput ranged from 583.7 to 611.3 req/s. Thus the gateway achieved 85–89% of direct throughput in this short, clean comparison. These results should not be interpreted as a sustained ceiling: the 30-second pressure run below exercised a different regime.
 
 ### 4.2 Refusals and provider-boundary evidence
 
-The reported high-limit run generated no HTTP 429 or 5xx responses. Gateway rejection counters for authentication, policy, rate limit, concurrency, budget, and model were all zero at every measured gateway snapshot. In workload order, provider counter deltas were 1,674 normalized, 1,641 passthrough, 1,722 normalized, 1,826 passthrough, 1,645 normalized, and 1,392 passthrough. These sum to 5,041 normalized and 4,859 passthrough completions, matching Table 1 exactly. All provider-boundary invariants passed.
+The clean comparison generated no HTTP 429 or 5xx responses. Gateway rejection counters for authentication, policy, rate limit, concurrency, budget, and model were zero for every workload. Each variant completed 500/500 requests in each repetition, and provider counter deltas matched accepted gateway requests. All provider-boundary invariants passed.
 
-The earlier policy-limited run, `mock-benchmark-50-v3`, remains a valid governance-pressure result: it recorded 681 passthrough and 773 normalized concurrency refusals, and provider counters increased only for accepted requests. It is not an unconstrained capacity result. Separating these runs prevents policy refusal capacity from being confused with gateway processing capacity.
+The separate 30-second pressure run is reported independently below with sampled stream, open-reservation, and settlement-queue gauges. It is governed-pressure evidence, not an unconstrained capacity result.
 
 ### 4.3 Resource observations
 
-The final gateway metrics reached approximately 117,380 ms cumulative process CPU time and 34.3 MiB resident memory by the last passthrough snapshot; peak client-observed concurrency was 50. Because variants ran sequentially in one process, these are process snapshots rather than isolated per-variant costs. The ledger pending-closing gauge returned to zero after the final settlement drain, with no backlog refusals or ledger sweep failures.
+The committed bundle records process CPU, resident memory, active streams, and gateway counters at each snapshot. Because variants ran sequentially in one process, these are process snapshots rather than isolated per-variant costs. The short comparison returned to zero pending streams and verified settlement after every gateway workload.
 
 The host exposed four virtual CPUs. The process was therefore not demonstrably CPU-saturated during the ten-second runs. The experiment did not collect heap-per-stream measurements, so memory cost per active stream remains unreported.
 
 ### 4.4 Accounting and evidence integrity
 
-All six gateway workloads passed usage-versus-per-request accounting reconciliation. The final cumulative usage was 3,754,864,000 nano-USD, and the provider counter matched every accepted gateway request. The provider-boundary, accounting, and evidence-integrity invariants all passed for both gateway variants. The SHA-256 checksum file verified every emitted bundle file, including the manifest, raw request records, summaries, metrics snapshots, and governance results.
+All six gateway workloads passed usage-versus-per-request accounting reconciliation. Normalized streaming settled against terminal billed usage. Passthrough does not expose a gateway-normalized cost field in its vendor framing, so the harness records the gateway's full reservation settlement as billed; a successful request with no billed settlement or usage delta fails reconciliation. The SHA-256 checksum file verified every emitted bundle file.
 
 ## 5. Discussion
 
 ### 5.1 Main finding
 
-Under the measured local high-limit configuration, the gateway sustained approximately 152 successful requests per second at 50 concurrent clients while keeping governance and evidence controls enabled. The direct mock-provider path sustained 491 successful requests per second. The observed gateway cost was material in throughput terms, and the gateway's median latency was higher because admission, ledger, settlement, and framing work were exercised on every request.
+Under the short, capped local comparison, the gateway completed 504–529 req/s at 50 concurrent clients versus 595 req/s direct, with zero failures and full settlement/accounting reconciliation. The observed gateway cost was material in throughput terms, and the gateway's latency was modestly higher because admission, ledger, settlement, and framing work were exercised on every request. The fixed-concurrency pressure run below tests whether the SQLite settlement writer keeps durable open rows bounded instead of falsely reaching the configured concurrency ceiling.
 
-The experiment's answer to RQ1 is consequently conditional: the gateway added measurable overhead, but the magnitude depended on the streaming mode, ledger contention, and run-to-run scheduling. RQ2 cannot be answered as a stable normalized-versus-passthrough ranking from only three repetitions; their aggregate throughputs were nearly equal while their run-level variance differed. RQ3 is supported by the policy-limited provider counters and by the zero-refusal high-limit run. RQ4 is supported by the passing billing and checksum checks after settlement synchronization.
+The experiment's answer to RQ1 is conditional: the gateway added measurable overhead, but the magnitude depended on the streaming mode, ledger contention, and run duration. RQ2 cannot be treated as a universal normalized-versus-passthrough ranking; in the short run they were close, while the pressure run exposed transient governance backpressure. RQ3 is supported by provider counters showing that classified refusals did not cross the provider boundary. RQ4 is supported by settlement-aware accounting and checksum checks.
 
 ### 5.2 Interpretation of normalized-streaming overhead
 
 Normalized streaming requires the gateway to parse provider events and produce its own normalized framing. Passthrough streaming can forward provider framing with less transformation. In the pooled raw records, normalized TTFT was 206.8 ms at p50 versus 244.5 ms for passthrough, 37.7 ms lower; normalized p95 and p99 TTFT were 451.5 and 863.5 ms versus 465.8 and 702.4 ms for passthrough. These descriptive differences do not isolate the contribution of any one subsystem.
 
-The final run did not establish a consistent normalized-streaming advantage or penalty relative to passthrough: normalized throughput was 152.7 req/s and passthrough was 152.3 req/s in aggregate, while passthrough had a wider run-level range. Queueing, event scheduling, SQLite reservation activity, and stream timing interact under concurrent load, so a larger repeated matrix is needed to isolate framing cost.
+The clean short run did not establish a consistent normalized-streaming advantage or penalty relative to passthrough: normalized throughput averaged 504.5 req/s and passthrough 528.6 req/s, with overlapping run-level behavior. Queueing, event scheduling, SQLite reservation activity, and stream timing interact under concurrent load, so longer runs must be reported separately from the capped comparison.
 
 ### 5.3 Governance is part of the performance result
 
 The throughput result cannot be separated from governance in this experiment. The gateway did not win a higher number by bypassing admission checks, and refused requests did not reach the provider. A transport-only comparison would report the direct baseline and forwarding latency, but it would omit the cost and operational value of authorization, concurrency control, reservation, settlement, billing, and evidence generation.
 
-The appropriate claim is therefore not that the gateway is equivalent to a direct connection. The stronger and more useful claim is narrower: in this configuration, the gateway maintained its governance boundary while completing about 150 streaming requests per second against a fast deterministic provider.
+The appropriate claim is therefore not that the gateway is equivalent to a direct connection. The narrower evidence-backed claim is: in the short local comparison, the gateway completed about 500–530 governed streaming requests per second at 50 clients, roughly 85–89% of direct, with zero failures and full accounting reconciliation. Sustained pressure separately reached the configured concurrency boundary.
 
 ### 5.4 Settlement synchronization as a measurement requirement
 
-An earlier run showed that a usage snapshot could be captured before durable reservation corrections were visible, producing a temporary billing mismatch even though the ledger later converged. The final harness includes a bounded settlement wait and verifies usage stability before evaluating reconciliation. This is an important methodological result: a benchmark for a financially governed service must define when a run is considered settled. Sampling only transport counters is insufficient.
+An earlier run showed that a usage snapshot could be captured before durable reservation corrections were visible, producing a temporary billing mismatch even though the ledger later converged. The harness includes a bounded settlement wait and verifies usage stability before evaluating reconciliation. It distinguishes normalized billed usage from passthrough reservation settlement and fails when a successful request has no corresponding billed settlement or usage delta. This is an important methodological result: a benchmark for a financially governed service must define when a run is considered settled.
 
 ## 6. Limitations
 
 Several limitations restrict the scope of the conclusions.
 
 1. **Single-host topology.** The experiment did not use independent cloud instances for the load generator, gateway, and provider. Network latency, bandwidth, CPU contention, and failure domains were therefore not representative of a three-node deployment.
-2. **Descriptive repetitions.** Three valid repetitions were run, but the sample is still too small for confidence intervals or broad claims about run-to-run variance.
+2. **Short comparison interval.** The committed comparison is capped at 500 requests per variant. The 30-second pressure run is reported separately as sustained-load evidence.
 3. **SQLite only.** The experiment used a durable SQLite ledger. It did not compare in-memory and PostgreSQL backends or measure distributed settlement contention.
 4. **Fast mock provider.** A 1 ms/token deterministic provider isolates gateway work but is not a model of a real inference service. Its timing should not be interpreted as user-visible LLM latency.
 5. **One concurrency level.** Only 50 concurrent clients were tested. The experiment does not establish behavior at 200, 500, or 1,000 clients.
-6. **Incomplete resource instrumentation.** Heap-per-active-stream, network utilization, detailed admission latency, and settlement lag were not captured.
+6. **Incomplete resource instrumentation.** The pressure run captures stream slots, durable open reservations, and pending settlements; heap-per-active-stream, network utilization, detailed admission latency, and per-reservation settlement lag remain unreported.
 7. **Live-provider smoke tests.** The OpenRouter and Groq runs were small smoke/concurrency checks, not provider-capacity benchmarks. Their results should not be pooled with the deterministic mock-provider capacity result.
 
 ## 7. Future Work
@@ -163,9 +161,9 @@ The ledger study should compare SQLite and PostgreSQL while recording admission 
 
 ## 8. Conclusion
 
-This experiment measured a governed streaming gateway against a deterministic mock provider. In the three-repetition high-limit run at 50 concurrent clients, direct access completed 491.0 requests per second in aggregate, gateway passthrough completed 152.3 requests per second, and gateway normalized streaming completed 152.7 requests per second. Pooled median TTFT was 46.2 ms direct, 244.5 ms passthrough, and 206.8 ms normalized. The separate policy-limited run demonstrated refusals before the provider boundary; the high-limit run demonstrated accepted-request throughput without policy refusals. Billing reconciled after settlement synchronization, and the evidence bundles verified by SHA-256.
+This experiment measured a governed streaming gateway against a deterministic mock provider. In the clean three-repetition capped run at 50 concurrent clients, direct access averaged 594.9 requests per second, gateway passthrough 528.6 requests per second, and gateway normalized streaming 504.5 requests per second. Run-level gateway throughput ranged from 522.1–533.3 req/s for passthrough and 484.7–526.2 req/s for normalized streaming. Every capped request succeeded, settlement and accounting reconciled, and the evidence bundles verified by SHA-256. The separate 30-second pressure run reports sustained throughput together with maximum active streams, open reservations, pending settlements, refusals, and checksum result.
 
-The result is a credible local baseline, not a final cloud performance claim. It demonstrates that the gateway can process about 150 governed streaming completions per second against a fast upstream while preserving its admission and accounting controls. A multi-node, multi-repetition benchmark with PostgreSQL comparison is required to determine how this behavior generalizes beyond the local test environment.
+The result is a credible local baseline, not a final cloud performance claim. It demonstrates that the gateway can process roughly 85–89% of direct throughput in a short capped comparison while preserving its admission and accounting controls. A multi-node, multi-repetition benchmark with PostgreSQL comparison and longer settled intervals is required to determine how this behavior generalizes beyond the local test environment.
 
 ## References and Evidence
 
