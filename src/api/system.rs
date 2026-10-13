@@ -109,12 +109,17 @@ pub async fn list_models(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
 ) -> Result<Response, ApiError> {
-    let principal = caller(&state, &headers).await?;
-    let tenants = state.current_tenants();
-    let tenant = tenants
+    let generation = state.current_generation();
+    let principal = generation
+        .auth
+        .authenticate(&headers)
+        .await
+        .map_err(|_| ApiError::Unauthorized)?;
+    let tenant = generation
+        .tenants
         .get(&principal.tenant_id)
         .ok_or(ApiError::TenantUnknown)?;
-    let snapshot = state.models.snapshot().await;
+    let snapshot = Arc::clone(&generation.models);
 
     let mut models: Vec<_> = snapshot
         .ids()
@@ -157,9 +162,14 @@ pub async fn get_usage(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
 ) -> Result<Response, ApiError> {
-    let principal = caller(&state, &headers).await?;
-    let tenants = state.current_tenants();
-    let tenant = tenants
+    let generation = state.current_generation();
+    let principal = generation
+        .auth
+        .authenticate(&headers)
+        .await
+        .map_err(|_| ApiError::Unauthorized)?;
+    let tenant = generation
+        .tenants
         .get(&principal.tenant_id)
         .ok_or(ApiError::TenantUnknown)?;
     let limits = state.policy.limits_for(&tenant);
@@ -235,18 +245,7 @@ pub async fn reload_registry(
         .await
         .map_err(|_| ApiError::LedgerUnavailable)?;
 
-    let reloaded = async {
-        let models = state
-            .models
-            .reload()
-            .await
-            .map_err(|e| format!("model registry reload failed: {e}"))?;
-        let tenants = state
-            .reload_tenants()
-            .map_err(|e| format!("tenant registry reload failed: {e}"))?;
-        Ok::<_, String>((models, tenants))
-    }
-    .await;
+    let reloaded = state.reload_all().await;
     let (models, tenants) = match reloaded {
         Ok(counts) => counts,
         Err(message) => {
@@ -268,7 +267,7 @@ pub async fn reload_registry(
     Ok(Json(json!({
         "status": "reloaded",
         "model_generation": models,
-        "models": state.models.snapshot().await.len(),
+        "models": state.current_generation().models.len(),
         "tenants": tenants,
     }))
     .into_response())
@@ -303,7 +302,7 @@ fn ledger_scope(state: &AppState) -> serde_json::Value {
 }
 
 pub async fn ready(State(state): State<Arc<AppState>>) -> Response {
-    let snapshot = state.models.snapshot().await;
+    let snapshot = Arc::clone(&state.current_generation().models);
     let mut issues: Vec<String> = Vec::new();
 
     if snapshot.is_empty() {

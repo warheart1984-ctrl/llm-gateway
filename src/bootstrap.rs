@@ -15,7 +15,7 @@ use crate::{
         ChatProvider, GroqAdapter, NvidiaAdapter, OpenRouterAdapter, ProviderPool, UpstreamTuning,
     },
     router::ModelRegistry,
-    state::AppState,
+    state::{AppState, RegistryGeneration},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -189,17 +189,22 @@ pub async fn build_with_ledger(
     }
 
     let metrics = crate::observability::Metrics::new(std::time::Instant::now());
+    let generation = Arc::new(RegistryGeneration {
+        models: snapshot,
+        tenants,
+        auth,
+    });
 
     Ok(Arc::new(AppState {
         settings,
         models,
-        tenants: std::sync::RwLock::new(tenants),
+        generation: std::sync::RwLock::new(generation),
         providers,
-        auth: std::sync::RwLock::new(auth),
         policy,
         limits,
         metrics,
         started_at: std::time::Instant::now(),
+        reload_lock: tokio::sync::Mutex::new(()),
         inflight: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     }))
 }
