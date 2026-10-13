@@ -1,0 +1,92 @@
+[
+  {
+    "invariant": "INV-PERF-001/002",
+    "status": "not_applicable",
+    "evidence": "no gateway refusals in this workload"
+  },
+  {
+    "invariant": "INV-PERF-007",
+    "status": "pass",
+    "evidence": "usage delta and per-request reserved reconcile at 541500 nano-USD"
+  },
+  {
+    "invariant": "INV-PERF-009",
+    "status": "pass",
+    "evidence": "manifest, raw requests, summary, and SHA256SUMS emitted"
+  },
+  {
+    "invariant": "INV-PERF-001/002",
+    "status": "not_applicable",
+    "evidence": "no gateway refusals in this workload"
+  },
+  {
+    "invariant": "INV-PERF-007",
+    "status": "pass",
+    "evidence": "usage delta and per-request billed reconcile at 495000 nano-USD"
+  },
+  {
+    "invariant": "INV-PERF-009",
+    "status": "pass",
+    "evidence": "manifest, raw requests, summary, and SHA256SUMS emitted"
+  },
+  {
+    "invariant": "INV-PERF-001/002",
+    "status": "not_applicable",
+    "evidence": "no gateway refusals in this workload"
+  },
+  {
+    "invariant": "INV-PERF-007",
+    "status": "pass",
+    "evidence": "usage delta and per-request reserved reconcile at 541500 nano-USD"
+  },
+  {
+    "invariant": "INV-PERF-009",
+    "status": "pass",
+    "evidence": "manifest, raw requests, summary, and SHA256SUMS emitted"
+  },
+  {
+    "invariant": "INV-PERF-001/002",
+    "status": "not_applicable",
+    "evidence": "no gateway refusals in this workload"
+  },
+  {
+    "invariant": "INV-PERF-007",
+    "status": "pass",
+    "evidence": "usage delta and per-request billed reconcile at 495000 nano-USD"
+  },
+  {
+    "invariant": "INV-PERF-009",
+    "status": "pass",
+    "evidence": "manifest, raw requests, summary, and SHA256SUMS emitted"
+  },
+  {
+    "invariant": "INV-PERF-001/002",
+    "status": "not_measured",
+    "evidence": "configure --upstream-metrics-url for provider-boundary evidence"
+  },
+  {
+    "invariant": "INV-PERF-007",
+    "status": "pass",
+    "evidence": "usage delta and per-request reserved reconcile at 460275 nano-USD"
+  },
+  {
+    "invariant": "INV-PERF-009",
+    "status": "pass",
+    "evidence": "manifest, raw requests, summary, and SHA256SUMS emitted"
+  },
+  {
+    "invariant": "INV-PERF-001/002",
+    "status": "not_measured",
+    "evidence": "configure --upstream-metrics-url for provider-boundary evidence"
+  },
+  {
+    "invariant": "INV-PERF-007",
+    "status": "pass",
+    "evidence": "usage delta and per-request billed reconcile at 396000 nano-USD"
+  },
+  {
+    "invariant": "INV-PERF-009",
+    "status": "pass",
+    "evidence": "manifest, raw requests, summary, and SHA256SUMS emitted"
+  }
+]

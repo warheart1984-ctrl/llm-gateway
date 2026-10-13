@@ -1,0 +1,92 @@
+[
+  {
+    "invariant": "INV-PERF-001/002",
+    "status": "pass",
+    "evidence": "5 refused requests; provider counter increased only for 1742 accepted requests"
+  },
+  {
+    "invariant": "INV-PERF-007",
+    "status": "pass",
+    "evidence": "usage delta and per-request billed reconcile at 407628000 nano-USD"
+  },
+  {
+    "invariant": "INV-PERF-009",
+    "status": "pass",
+    "evidence": "manifest, raw requests, summary, and SHA256SUMS emitted"
+  },
+  {
+    "invariant": "INV-PERF-001/002",
+    "status": "pass",
+    "evidence": "2 refused requests; provider counter increased only for 1816 accepted requests"
+  },
+  {
+    "invariant": "INV-PERF-007",
+    "status": "pass",
+    "evidence": "usage delta and per-request reserved reconcile at 962480000 nano-USD"
+  },
+  {
+    "invariant": "INV-PERF-009",
+    "status": "pass",
+    "evidence": "manifest, raw requests, summary, and SHA256SUMS emitted"
+  },
+  {
+    "invariant": "INV-PERF-001/002",
+    "status": "pass",
+    "evidence": "5 refused requests; provider counter increased only for 1599 accepted requests"
+  },
+  {
+    "invariant": "INV-PERF-007",
+    "status": "pass",
+    "evidence": "usage delta and per-request billed reconcile at 374166000 nano-USD"
+  },
+  {
+    "invariant": "INV-PERF-009",
+    "status": "pass",
+    "evidence": "manifest, raw requests, summary, and SHA256SUMS emitted"
+  },
+  {
+    "invariant": "INV-PERF-001/002",
+    "status": "pass",
+    "evidence": "5 refused requests; provider counter increased only for 1780 accepted requests"
+  },
+  {
+    "invariant": "INV-PERF-007",
+    "status": "pass",
+    "evidence": "usage delta and per-request reserved reconcile at 943400000 nano-USD"
+  },
+  {
+    "invariant": "INV-PERF-009",
+    "status": "pass",
+    "evidence": "manifest, raw requests, summary, and SHA256SUMS emitted"
+  },
+  {
+    "invariant": "INV-PERF-001/002",
+    "status": "pass",
+    "evidence": "8 refused requests; provider counter increased only for 1722 accepted requests"
+  },
+  {
+    "invariant": "INV-PERF-007",
+    "status": "pass",
+    "evidence": "usage delta and per-request billed reconcile at 402948000 nano-USD"
+  },
+  {
+    "invariant": "INV-PERF-009",
+    "status": "pass",
+    "evidence": "manifest, raw requests, summary, and SHA256SUMS emitted"
+  },
+  {
+    "invariant": "INV-PERF-001/002",
+    "status": "pass",
+    "evidence": "4 refused requests; provider counter increased only for 1788 accepted requests"
+  },
+  {
+    "invariant": "INV-PERF-007",
+    "status": "pass",
+    "evidence": "usage delta and per-request reserved reconcile at 947640000 nano-USD"
+  },
+  {
+    "invariant": "INV-PERF-009",
+    "status": "pass",
+    "evidence": "manifest, raw requests, summary, and SHA256SUMS emitted"
+  }
+]

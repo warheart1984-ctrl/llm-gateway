@@ -12,6 +12,7 @@
 use std::{
     collections::BTreeMap,
     fmt::Write as _,
+    fs,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -27,6 +28,7 @@ struct Counters {
     requests_total: AtomicU64,
     requests_rejected_total: AtomicU64,
     streams_started_total: AtomicU64,
+    streams_in_flight: AtomicU64,
     streams_completed_total: AtomicU64,
     streams_failed_total: AtomicU64,
     streams_aborted_total: AtomicU64,
@@ -109,6 +111,7 @@ impl Metrics {
     /// actual streaming work rather than attempts.
     pub fn stream_started(&self, provider: &str, model: &str) {
         self.global.streams_started_total.fetch_add(1, Ordering::Relaxed);
+        self.global.streams_in_flight.fetch_add(1, Ordering::Relaxed);
         self.model_rollup(provider, model).streams_started.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -173,6 +176,7 @@ impl Metrics {
         ttft_ms: Option<u64>,
     ) {
         let g = &self.global;
+        g.streams_in_flight.fetch_sub(1, Ordering::Relaxed);
         let failed = summary.error_code.is_some();
 
         if failed {
@@ -312,6 +316,14 @@ impl Metrics {
         );
         metric(
             &mut out,
+            "gw_streams_in_flight",
+            "gauge",
+            "Streams currently relayed from an upstream provider.",
+            &[],
+            g.streams_in_flight.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut out,
             "gw_streams_completed_total",
             "counter",
             "Streams that ended with a terminal event.",
@@ -404,6 +416,24 @@ impl Metrics {
             &[],
             self.uptime_secs.load(Ordering::Relaxed),
         );
+        if let Some((cpu_seconds, resident_bytes)) = process_stats() {
+            metric(
+                &mut out,
+                "gw_process_cpu_millis_total",
+                "counter",
+                "Gateway process CPU time in milliseconds.",
+                &[],
+                cpu_seconds,
+            );
+            metric(
+                &mut out,
+                "gw_process_resident_memory_bytes",
+                "gauge",
+                "Gateway process resident memory.",
+                &[],
+                resident_bytes,
+            );
+        }
 
         let mut models: BTreeMap<String, Arc<ModelRollup>> = BTreeMap::new();
         for entry in self.by_model.iter() {
@@ -474,6 +504,38 @@ impl Metrics {
 
         out
     }
+}
+
+/// Read process resource gauges without adding a background sampler or a
+/// platform-specific dependency. On non-Linux hosts the gauges are omitted.
+#[cfg(target_os = "linux")]
+fn process_stats() -> Option<(u64, u64)> {
+    let stat = fs::read_to_string("/proc/self/stat").ok()?;
+    let fields = stat.rsplit_once(") ")?.1.split_whitespace().collect::<Vec<_>>();
+    let user_ticks = fields.get(11)?.parse::<u64>().ok()?;
+    let system_ticks = fields.get(12)?.parse::<u64>().ok()?;
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks_per_second <= 0 {
+        return None;
+    }
+    let cpu_millis = (user_ticks + system_ticks)
+        .saturating_mul(1000)
+        / ticks_per_second as u64;
+
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    let resident_kib = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))?
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()?;
+    Some((cpu_millis, resident_kib.saturating_mul(1024)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_stats() -> Option<(u64, u64)> {
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

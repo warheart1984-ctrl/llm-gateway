@@ -9,14 +9,19 @@
 //! It never calls anything and costs nothing, so the gateway's governance can
 //! be exercised end to end without a provider account.
 
-use std::{convert::Infallible, net::SocketAddr, time::Duration};
+use std::{
+    convert::Infallible, net::SocketAddr, sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    }, time::Duration,
+};
 
 use axum::{
     Json, Router,
     body::Body,
     http::header,
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
 };
 use serde_json::{Value, json};
 
@@ -35,11 +40,28 @@ async fn main() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(40),
     );
+    let calls = Arc::new(AtomicU64::new(0));
+    let calls_for_chat = Arc::clone(&calls);
+    let calls_for_metrics = Arc::clone(&calls);
 
-    let app = Router::new().route(
-        "/v1/chat/completions",
-        post(move |body: Json<Value>| completions(body, delay)),
-    );
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(move |body: Json<Value>| {
+                let calls = Arc::clone(&calls_for_chat);
+                async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    completions(body, delay).await
+                }
+            }),
+        )
+        .route(
+            "/metrics",
+            get(move || {
+                let calls = Arc::clone(&calls_for_metrics);
+                async move { Json(json!({"requests": calls.load(Ordering::Relaxed)})) }
+            }),
+        );
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind mock");
     println!("mock upstream listening on {}", listener.local_addr().unwrap());
     axum::serve(listener, app).await.expect("serve mock");

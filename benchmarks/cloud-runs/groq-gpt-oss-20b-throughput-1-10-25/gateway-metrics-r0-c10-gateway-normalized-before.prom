@@ -1,0 +1,134 @@
+# HELP gw_requests_total Chat requests received.
+# TYPE gw_requests_total counter
+gw_requests_total 245
+# HELP gw_requests_rejected_total Requests rejected during governance.
+# TYPE gw_requests_rejected_total counter
+gw_requests_rejected_total 0
+# HELP gw_requests_rejected_by_reason_total Requests rejected during governance, by reason.
+# TYPE gw_requests_rejected_by_reason_total counter
+gw_requests_rejected_by_reason_total{reason="auth"} 0
+gw_requests_rejected_by_reason_total{reason="policy"} 0
+gw_requests_rejected_by_reason_total{reason="rate_limit"} 0
+gw_requests_rejected_by_reason_total{reason="concurrency"} 0
+gw_requests_rejected_by_reason_total{reason="budget"} 0
+gw_requests_rejected_by_reason_total{reason="model"} 0
+# HELP gw_streams_started_total Streams that reached the provider.
+# TYPE gw_streams_started_total counter
+gw_streams_started_total 245
+# HELP gw_streams_in_flight Streams currently relayed from an upstream provider.
+# TYPE gw_streams_in_flight gauge
+gw_streams_in_flight 0
+# HELP gw_streams_completed_total Streams that ended with a terminal event.
+# TYPE gw_streams_completed_total counter
+gw_streams_completed_total 245
+# HELP gw_streams_failed_total Streams that ended in an error.
+# TYPE gw_streams_failed_total counter
+gw_streams_failed_total 0
+# HELP gw_streams_client_aborted_total Streams the client disconnected from before completion.
+# TYPE gw_streams_client_aborted_total counter
+gw_streams_client_aborted_total 0
+# HELP gw_stream_events_total Normalized stream events produced across all providers.
+# TYPE gw_stream_events_total counter
+gw_stream_events_total 6661
+# HELP gw_prompt_tokens_total Prompt tokens billed.
+# TYPE gw_prompt_tokens_total counter
+gw_prompt_tokens_total 7015
+# HELP gw_completion_tokens_total Completion tokens generated.
+# TYPE gw_completion_tokens_total counter
+gw_completion_tokens_total 4736
+# HELP gw_cost_nano_usd_total Estimated spend in nano-USD (1 USD = 1e6).
+# TYPE gw_cost_nano_usd_total counter
+gw_cost_nano_usd_total 5230125
+# HELP gw_response_bytes_total SSE bytes written to clients.
+# TYPE gw_response_bytes_total counter
+gw_response_bytes_total 3328476
+# HELP gw_upstream_errors_total Errors surfaced by a provider adapter.
+# TYPE gw_upstream_errors_total counter
+gw_upstream_errors_total 0
+# HELP gw_stream_duration_ms Wall-clock duration of a stream, from request to terminal event.
+# TYPE gw_stream_duration_ms summary
+gw_stream_duration_ms_sum 52766
+gw_stream_duration_ms_count 245
+# TYPE gw_stream_duration_ms_avg gauge
+gw_stream_duration_ms_avg 215.371
+# HELP gw_stream_ttft_ms Time to first client-visible token.
+# TYPE gw_stream_ttft_ms summary
+gw_stream_ttft_ms_sum 24729
+gw_stream_ttft_ms_count 175
+# TYPE gw_stream_ttft_ms_avg gauge
+gw_stream_ttft_ms_avg 141.309
+# HELP gw_uptime_seconds Process uptime.
+# TYPE gw_uptime_seconds gauge
+gw_uptime_seconds 40
+# HELP gw_process_cpu_millis_total Gateway process CPU time in milliseconds.
+# TYPE gw_process_cpu_millis_total counter
+gw_process_cpu_millis_total 3250
+# HELP gw_process_resident_memory_bytes Gateway process resident memory.
+# TYPE gw_process_resident_memory_bytes gauge
+gw_process_resident_memory_bytes 30453760
+# HELP gw_model_streams_started_total Connections opened per model.
+# TYPE gw_model_streams_started_total counter
+gw_model_streams_started_total{provider="groq",model="groq/gpt-oss-20b"} 245
+# HELP gw_model_streams_total Streams that ran per model.
+# TYPE gw_model_streams_total counter
+gw_model_streams_total{provider="groq",model="groq/gpt-oss-20b"} 245
+# HELP gw_model_errors_total Failed streams per model.
+# TYPE gw_model_errors_total counter
+gw_model_errors_total{provider="groq",model="groq/gpt-oss-20b"} 0
+# HELP gw_model_prompt_tokens_total Prompt tokens per model.
+# TYPE gw_model_prompt_tokens_total counter
+gw_model_prompt_tokens_total{provider="groq",model="groq/gpt-oss-20b"} 7015
+# HELP gw_model_completion_tokens_total Completion tokens per model.
+# TYPE gw_model_completion_tokens_total counter
+gw_model_completion_tokens_total{provider="groq",model="groq/gpt-oss-20b"} 4736
+# HELP gw_model_cost_nano_usd_total Spend per model, nano-USD.
+# TYPE gw_model_cost_nano_usd_total counter
+gw_model_cost_nano_usd_total{provider="groq",model="groq/gpt-oss-20b"} 5230125
+# HELP gw_model_ttft_ms Time to first token per model.
+# TYPE gw_model_ttft_ms summary
+gw_model_ttft_ms_sum{provider="groq",model="groq/gpt-oss-20b"} 24729
+gw_model_ttft_ms_count{provider="groq",model="groq/gpt-oss-20b"} 175
+# TYPE gw_model_ttft_ms_avg gauge
+gw_model_ttft_ms_avg{provider="groq",model="groq/gpt-oss-20b"} 141.309
+# HELP gw_model_duration_ms Stream duration per model.
+# TYPE gw_model_duration_ms summary
+gw_model_duration_ms_sum{provider="groq",model="groq/gpt-oss-20b"} 52766
+gw_model_duration_ms_count{provider="groq",model="groq/gpt-oss-20b"} 245
+# TYPE gw_model_duration_ms_avg gauge
+gw_model_duration_ms_avg{provider="groq",model="groq/gpt-oss-20b"} 215.371
+# HELP gw_tenant_streams_total Streams per tenant.
+# TYPE gw_tenant_streams_total counter
+gw_tenant_streams_total{tenant="benchmark"} 245
+# HELP gw_tenant_policy_denied_total Policy denials per tenant.
+# TYPE gw_tenant_policy_denied_total counter
+gw_tenant_policy_denied_total{tenant="benchmark"} 0
+# HELP gw_tenant_errors_total Failed streams per tenant.
+# TYPE gw_tenant_errors_total counter
+gw_tenant_errors_total{tenant="benchmark"} 0
+# HELP gw_tenant_cost_nano_usd_total Spend per tenant, nano-USD.
+# TYPE gw_tenant_cost_nano_usd_total counter
+gw_tenant_cost_nano_usd_total{tenant="benchmark"} 5230125
+# HELP gw_decisions_dropped_total Routine decision records dropped because they could not be kept.
+# TYPE gw_decisions_dropped_total counter
+gw_decisions_dropped_total 0
+# HELP gw_ledger_sweep_failures_total Ledger sweeper steps that failed; while they fail, lapsed reservations stay open.
+# TYPE gw_ledger_sweep_failures_total counter
+gw_ledger_sweep_failures_total 0
+# HELP gw_ledger_swept_reservations_total Reservations closed by the sweeper after their lease lapsed, each billed its full reservation.
+# TYPE gw_ledger_swept_reservations_total counter
+gw_ledger_swept_reservations_total 0
+# HELP gw_ledger_late_commits_released_total Reservations that committed after their admission timed out, released at no charge.
+# TYPE gw_ledger_late_commits_released_total counter
+gw_ledger_late_commits_released_total 0
+# HELP gw_ledger_stuck_connections_closed_total Ledger connections that came back inside a transaction they could not roll back, closed instead of reused.
+# TYPE gw_ledger_stuck_connections_closed_total counter
+gw_ledger_stuck_connections_closed_total 0
+# HELP gw_ledger_pending_closings Settlements waiting to be written. At `ledger.max_pending_closings`, admissions are refused.
+# TYPE gw_ledger_pending_closings gauge
+gw_ledger_pending_closings 0
+# HELP gw_ledger_backlog_refusals_total Admissions refused because too many settlements were waiting to be written.
+# TYPE gw_ledger_backlog_refusals_total counter
+gw_ledger_backlog_refusals_total 0
+# HELP gw_ledger_reservations_pruned_total Closed reservations deleted after `ledger.reservation_retention_days`.
+# TYPE gw_ledger_reservations_pruned_total counter
+gw_ledger_reservations_pruned_total 0

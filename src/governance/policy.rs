@@ -838,6 +838,7 @@ mod tests {
             "GATEWAY_KEY_ACME_CI",
             "GATEWAY_KEY_JARVIS_MAIN",
             "GATEWAY_KEY_SANDBOX",
+            "GATEWAY_KEY_BENCHMARK_MAIN",
         ] {
             // Rust 2024 edition: process env mutation is `unsafe`. This is a
             // single-threaded unit test, so it is sound here.
