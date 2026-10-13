@@ -1,8 +1,8 @@
 {
-  "run_id": "merged-d5007fc-smoke",
-  "started_at_unix_ms": 1791903235290,
-  "source_revision": "d5007fce7e59891a8113671a41706bc7a3eaffb2",
-  "rust_version": "unknown",
+  "run_id": "merged-f1eece6-c50-r3-short",
+  "started_at_unix_ms": 1791904102192,
+  "source_revision": "f1eece6668c4ad7a786d099f638f589ad4c0941d",
+  "rust_version": "rustc 1.88.0 (6b00bc388 2025-06-23)",
   "os": "linux",
   "architecture": "x86_64",
   "cpu_model": "INTEL(R) XEON(R) PLATINUM 8573C",
@@ -18,14 +18,14 @@
   "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "source_dirty": false,
   "concurrency": [
-    1
+    50
   ],
-  "repetitions": 1,
+  "repetitions": 3,
   "warmup_secs": 0,
-  "duration_secs": 3,
-  "max_requests": 10,
+  "duration_secs": 10,
+  "max_requests": 500,
   "refusal_backoff_ms": 100,
-  "settlement_wait_ms": 2000,
+  "settlement_wait_ms": 5000,
   "seed": 1280068935,
   "request": {
     "max_tokens": 64,

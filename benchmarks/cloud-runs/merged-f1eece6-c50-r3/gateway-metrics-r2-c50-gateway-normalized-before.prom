@@ -1,6 +1,6 @@
 # HELP gw_requests_total Chat requests received.
 # TYPE gw_requests_total counter
-gw_requests_total 1520
+gw_requests_total 2000
 # HELP gw_requests_rejected_total Requests rejected during governance.
 # TYPE gw_requests_rejected_total counter
 gw_requests_rejected_total 0
@@ -14,13 +14,13 @@ gw_requests_rejected_by_reason_total{reason="budget"} 0
 gw_requests_rejected_by_reason_total{reason="model"} 0
 # HELP gw_streams_started_total Streams that reached the provider.
 # TYPE gw_streams_started_total counter
-gw_streams_started_total 1520
+gw_streams_started_total 2000
 # HELP gw_streams_in_flight Streams currently relayed from an upstream provider.
 # TYPE gw_streams_in_flight gauge
 gw_streams_in_flight 0
 # HELP gw_streams_completed_total Streams that ended with a terminal event.
 # TYPE gw_streams_completed_total counter
-gw_streams_completed_total 1520
+gw_streams_completed_total 2000
 # HELP gw_streams_failed_total Streams that ended in an error.
 # TYPE gw_streams_failed_total counter
 gw_streams_failed_total 0
@@ -29,76 +29,76 @@ gw_streams_failed_total 0
 gw_streams_client_aborted_total 0
 # HELP gw_stream_events_total Normalized stream events produced across all providers.
 # TYPE gw_stream_events_total counter
-gw_stream_events_total 44590
+gw_stream_events_total 59001
 # HELP gw_prompt_tokens_total Prompt tokens billed.
 # TYPE gw_prompt_tokens_total counter
-gw_prompt_tokens_total 13680
+gw_prompt_tokens_total 18000
 # HELP gw_completion_tokens_total Completion tokens generated.
 # TYPE gw_completion_tokens_total counter
-gw_completion_tokens_total 27270
+gw_completion_tokens_total 27000
 # HELP gw_cost_nano_usd_total Estimated spend in nano-USD (1 USD = 1e6).
 # TYPE gw_cost_nano_usd_total counter
-gw_cost_nano_usd_total 735900
+gw_cost_nano_usd_total 1090000
 # HELP gw_response_bytes_total SSE bytes written to clients.
 # TYPE gw_response_bytes_total counter
-gw_response_bytes_total 1892610
+gw_response_bytes_total 3711000
 # HELP gw_upstream_errors_total Errors surfaced by a provider adapter.
 # TYPE gw_upstream_errors_total counter
 gw_upstream_errors_total 0
 # HELP gw_stream_duration_ms Wall-clock duration of a stream, from request to terminal event.
 # TYPE gw_stream_duration_ms summary
-gw_stream_duration_ms_sum 172045
-gw_stream_duration_ms_count 1520
+gw_stream_duration_ms_sum 176217
+gw_stream_duration_ms_count 2000
 # TYPE gw_stream_duration_ms_avg gauge
-gw_stream_duration_ms_avg 113.188
+gw_stream_duration_ms_avg 88.109
 # HELP gw_stream_ttft_ms Time to first client-visible token.
 # TYPE gw_stream_ttft_ms summary
-gw_stream_ttft_ms_sum 103218
-gw_stream_ttft_ms_count 1520
+gw_stream_ttft_ms_sum 87073
+gw_stream_ttft_ms_count 2000
 # TYPE gw_stream_ttft_ms_avg gauge
-gw_stream_ttft_ms_avg 67.907
+gw_stream_ttft_ms_avg 43.536
 # HELP gw_uptime_seconds Process uptime.
 # TYPE gw_uptime_seconds gauge
-gw_uptime_seconds 35
+gw_uptime_seconds 16
 # HELP gw_process_cpu_millis_total Gateway process CPU time in milliseconds.
 # TYPE gw_process_cpu_millis_total counter
-gw_process_cpu_millis_total 3770
+gw_process_cpu_millis_total 3180
 # HELP gw_process_resident_memory_bytes Gateway process resident memory.
 # TYPE gw_process_resident_memory_bytes gauge
-gw_process_resident_memory_bytes 18014208
+gw_process_resident_memory_bytes 18006016
 # HELP gw_model_streams_started_total Connections opened per model.
 # TYPE gw_model_streams_started_total counter
-gw_model_streams_started_total{provider="nvidia",model="nvidia/mock-chat"} 1520
+gw_model_streams_started_total{provider="nvidia",model="nvidia/mock-chat"} 2000
 # HELP gw_model_streams_total Streams that ran per model.
 # TYPE gw_model_streams_total counter
-gw_model_streams_total{provider="nvidia",model="nvidia/mock-chat"} 1520
+gw_model_streams_total{provider="nvidia",model="nvidia/mock-chat"} 2000
 # HELP gw_model_errors_total Failed streams per model.
 # TYPE gw_model_errors_total counter
 gw_model_errors_total{provider="nvidia",model="nvidia/mock-chat"} 0
 # HELP gw_model_prompt_tokens_total Prompt tokens per model.
 # TYPE gw_model_prompt_tokens_total counter
-gw_model_prompt_tokens_total{provider="nvidia",model="nvidia/mock-chat"} 13680
+gw_model_prompt_tokens_total{provider="nvidia",model="nvidia/mock-chat"} 18000
 # HELP gw_model_completion_tokens_total Completion tokens per model.
 # TYPE gw_model_completion_tokens_total counter
-gw_model_completion_tokens_total{provider="nvidia",model="nvidia/mock-chat"} 27270
+gw_model_completion_tokens_total{provider="nvidia",model="nvidia/mock-chat"} 27000
 # HELP gw_model_cost_nano_usd_total Spend per model, nano-USD.
 # TYPE gw_model_cost_nano_usd_total counter
-gw_model_cost_nano_usd_total{provider="nvidia",model="nvidia/mock-chat"} 735900
+gw_model_cost_nano_usd_total{provider="nvidia",model="nvidia/mock-chat"} 1090000
 # HELP gw_model_ttft_ms Time to first token per model.
 # TYPE gw_model_ttft_ms summary
-gw_model_ttft_ms_sum{provider="nvidia",model="nvidia/mock-chat"} 103218
-gw_model_ttft_ms_count{provider="nvidia",model="nvidia/mock-chat"} 1520
+gw_model_ttft_ms_sum{provider="nvidia",model="nvidia/mock-chat"} 87073
+gw_model_ttft_ms_count{provider="nvidia",model="nvidia/mock-chat"} 2000
 # TYPE gw_model_ttft_ms_avg gauge
-gw_model_ttft_ms_avg{provider="nvidia",model="nvidia/mock-chat"} 67.907
+gw_model_ttft_ms_avg{provider="nvidia",model="nvidia/mock-chat"} 43.536
 # HELP gw_model_duration_ms Stream duration per model.
 # TYPE gw_model_duration_ms summary
-gw_model_duration_ms_sum{provider="nvidia",model="nvidia/mock-chat"} 172045
-gw_model_duration_ms_count{provider="nvidia",model="nvidia/mock-chat"} 1520
+gw_model_duration_ms_sum{provider="nvidia",model="nvidia/mock-chat"} 176217
+gw_model_duration_ms_count{provider="nvidia",model="nvidia/mock-chat"} 2000
 # TYPE gw_model_duration_ms_avg gauge
-gw_model_duration_ms_avg{provider="nvidia",model="nvidia/mock-chat"} 113.188
+gw_model_duration_ms_avg{provider="nvidia",model="nvidia/mock-chat"} 88.109
 # HELP gw_tenant_streams_total Streams per tenant.
 # TYPE gw_tenant_streams_total counter
-gw_tenant_streams_total{tenant="benchmark"} 1520
+gw_tenant_streams_total{tenant="benchmark"} 2000
 # HELP gw_tenant_policy_denied_total Policy denials per tenant.
 # TYPE gw_tenant_policy_denied_total counter
 gw_tenant_policy_denied_total{tenant="benchmark"} 0
@@ -107,7 +107,7 @@ gw_tenant_policy_denied_total{tenant="benchmark"} 0
 gw_tenant_errors_total{tenant="benchmark"} 0
 # HELP gw_tenant_cost_nano_usd_total Spend per tenant, nano-USD.
 # TYPE gw_tenant_cost_nano_usd_total counter
-gw_tenant_cost_nano_usd_total{tenant="benchmark"} 735900
+gw_tenant_cost_nano_usd_total{tenant="benchmark"} 1090000
 # HELP gw_decisions_dropped_total Routine decision records dropped because they could not be kept.
 # TYPE gw_decisions_dropped_total counter
 gw_decisions_dropped_total 0
