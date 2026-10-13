@@ -12,12 +12,14 @@
 use std::{
     collections::BTreeMap,
     fmt::Write as _,
-    fs,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
 };
+
+#[cfg(target_os = "linux")]
+use std::fs;
 
 use dashmap::DashMap;
 
