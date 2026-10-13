@@ -83,6 +83,8 @@ pub enum ParamViolation {
         value: f64,
         allowed: String,
     },
+    #[error("`max_tokens` must be between 1 and {max}: got {value}")]
+    MaxTokensOutOfRange { value: u64, max: u64 },
     #[error("`max_tokens` must be greater than zero")]
     ZeroMaxTokens,
 }
@@ -183,6 +185,13 @@ mod tests {
     fn out_of_range_temperature_is_rejected() {
         let p = ResolvedParams { temperature: Some(9.0), ..Default::default() };
         assert!(validate_params(&p).is_err());
+    }
+
+    #[test]
+    fn oversized_max_tokens_do_not_wrap_or_truncate() {
+        let requested = map(&[("max_tokens", json!(u64::from(u32::MAX) + 1))]);
+        let merged = merge_params(&Map::new(), Some(&requested));
+        assert_eq!(merged.max_tokens, None, "an oversized max_tokens must not be silently truncated");
     }
 
     #[test]

@@ -602,6 +602,19 @@ async fn admit(
     //    constraint, and a governance constraint a caller can override is not
     //    one. Use a `default_model` or a registry `default_params` for a
     //    preference rather than a policy.
+    if let Some(requested) = req.params.as_ref() {
+        for (key, value) in requested {
+            if matches!(key.as_str(), "max_tokens" | "max_completion_tokens")
+                && let Some(raw) = value.as_u64()
+                && raw > u32::MAX as u64
+            {
+                return Err(RequestError::Param(router::ParamViolation::MaxTokensOutOfRange {
+                    value: raw,
+                    max: u32::MAX as u64,
+                }));
+            }
+        }
+    }
     let mut params = merge_params(&resolved.config.default_params, req.params.as_ref());
     if let Some(policy_params) = decision.tenant.model_params.get(&resolved.registry_id) {
         for (key, value) in policy_params {
