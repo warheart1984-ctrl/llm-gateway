@@ -48,6 +48,28 @@ tenants:
       # 100 USD/day.
       daily_budget_nano_usd: 100000000000
 
+  # Isolated benchmark tenant. Limits are intentionally high enough to expose
+  # provider and gateway capacity at the selected test point, but remain finite
+  # so a misconfigured load generator cannot run without a budget boundary.
+  - tenant_id: benchmark
+    display_name: Benchmark (bounded live runs)
+    enabled: true
+    credentials:
+      - key_id: ak_benchmark_main
+        key_env: GATEWAY_KEY_BENCHMARK_MAIN
+        scopes: [chat:stream, models:read, admin]
+        enabled: true
+    allowed_models:
+      - "openrouter/gpt-4.1-mini"
+    default_model: openrouter/gpt-4.1-mini
+    limits:
+      requests_per_minute: 12000
+      tokens_per_minute: 2000000
+      max_concurrent_streams: 64
+      max_output_tokens: 2048
+      # $0.25/day: enough for bounded benchmark repetitions, not an open spend.
+      daily_budget_nano_usd: 250000000
+
   - tenant_id: jarvis
     display_name: Jarvis Internal
     enabled: true

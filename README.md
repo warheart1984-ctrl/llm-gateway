@@ -646,6 +646,12 @@ machine over loopback, so the results show the gateway's own overhead and
 limits on that machine, not production numbers. The module docs list the
 `LOAD_*` knobs; each run appends to `target/load-report.jsonl`.
 
+For separated-host measurements and RFC-LLMGW-001 evidence bundles, use the
+external runner documented in [docs/cloud-benchmark.md](docs/cloud-benchmark.md).
+It runs a one-client smoke test first, then emits sanitized request records,
+machine metadata, governance evidence, and `SHA256SUMS` without changing the
+local load harness.
+
 CI (`.github/workflows/ci.yml`) runs that gate from a clean checkout on Linux
 and Windows: the full suite three times over, the money tests five more times,
 clippy with warnings as errors, a build on the declared `rust-version`, the

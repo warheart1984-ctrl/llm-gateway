@@ -14,6 +14,7 @@ mod openrouter;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env,
+    fs,
     pin::Pin,
     sync::Arc,
     time::Duration,
@@ -671,7 +672,7 @@ pub fn build_http_client(
     tcp_keepalive: Duration,
     user_agent: &str,
 ) -> Result<reqwest::Client, ProviderError> {
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .connect_timeout(connect_timeout)
         // Per-read idle timeout so a half-open SSE stream is torn down instead
         // of pinning a socket forever. Not applied to HTTP/2, where hyper
@@ -684,9 +685,63 @@ pub fn build_http_client(
         .tcp_nodelay(true)
         .http2_adaptive_window(true)
         .http2_keep_alive_interval(Duration::from_secs(30))
-        .user_agent(user_agent)
+        .user_agent(user_agent);
+
+    if let Some(path) = ca_bundle_env() {
+        let pem = fs::read(&path).map_err(|e| {
+            ProviderError::NotConfigured(format!("read configured CA bundle: {e}"))
+        })?;
+        let certificates = reqwest::Certificate::from_pem_bundle(&pem).map_err(|e| {
+            ProviderError::NotConfigured(format!("parse configured CA bundle: {e}"))
+        })?;
+        for certificate in certificates {
+            builder = builder.add_root_certificate(certificate);
+        }
+    }
+
+    // The managed cloud runtime exposes outbound HTTPS through its session
+    // proxy. `reqwest` is built with default features disabled, so configure
+    // the inherited proxy explicitly instead of assuming system-proxy support
+    // is active. Respect NO_PROXY so private/self-hosted upstreams stay direct.
+    if let Some(proxy) = proxy_env("HTTPS_PROXY") {
+        let proxy = reqwest::Proxy::https(proxy)
+            .map_err(|_| ProviderError::NotConfigured("invalid HTTPS proxy".into()))?
+            .no_proxy(reqwest::NoProxy::from_env());
+        builder = builder.proxy(proxy);
+    }
+    if let Some(proxy) = proxy_env("HTTP_PROXY") {
+        let proxy = reqwest::Proxy::http(proxy)
+            .map_err(|_| ProviderError::NotConfigured("invalid HTTP proxy".into()))?
+            .no_proxy(reqwest::NoProxy::from_env());
+        builder = builder.proxy(proxy);
+    }
+
+    builder
         .build()
         .map_err(|e| ProviderError::NotConfigured(format!("http client: {e}")))
+}
+
+fn proxy_env(name: &str) -> Option<String> {
+    env::var(name)
+        .or_else(|_| env::var(name.to_ascii_lowercase()))
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            env::var("ALL_PROXY")
+                .or_else(|_| env::var("all_proxy"))
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+}
+
+fn ca_bundle_env() -> Option<String> {
+    ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"]
+        .into_iter()
+        .find_map(|name| {
+            env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
 }
 
 /// Transport tuning, pulled from `config::UpstreamConfig` so a single
