@@ -862,6 +862,19 @@ async fn max_tokens_above_the_tenant_ceiling_is_clamped() {
 }
 
 #[tokio::test]
+async fn max_tokens_above_u32_limit_is_rejected_before_upstream_call() {
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let gw = Gateway::start(&upstream).await;
+
+    let mut body = chat_body();
+    body["params"] = json!({ "max_tokens": u64::from(u32::MAX) + 1 });
+    let (status, _, text) = gw.post_chat(TEST_KEY, body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert!(text.contains("max_tokens"), "{text}");
+    assert_eq!(upstream.calls(), 0, "a rejected request must not reach the provider");
+}
+
+#[tokio::test]
 async fn missing_credentials_are_rejected_before_any_upstream_call() {
     let upstream = MockUpstream::start(Scenario::Happy).await;
     let gw = Gateway::start(&upstream).await;

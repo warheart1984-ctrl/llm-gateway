@@ -351,7 +351,12 @@ impl ResolvedParams {
         match key {
             "temperature" => self.temperature = value.as_f64(),
             "top_p" => self.top_p = value.as_f64(),
-            "max_tokens" | "max_completion_tokens" => self.max_tokens = value.as_u64().map(|v| v as u32),
+            "max_tokens" | "max_completion_tokens" => {
+                self.max_tokens = value
+                    .as_u64()
+                    .filter(|v| *v <= u32::MAX as u64)
+                    .map(|v| v as u32)
+            }
             "stop" => self.stop = stop_from_value(value),
             "seed" => self.seed = value.as_i64(),
             "presence_penalty" => self.presence_penalty = value.as_f64(),
