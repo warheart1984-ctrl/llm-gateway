@@ -456,6 +456,12 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
             upkeep.pending_closings,
         ),
         (
+            "gw_ledger_open_reservations",
+            "gauge",
+            "Durable reservation rows still open in the ledger.",
+            upkeep.open_reservations,
+        ),
+        (
             "gw_ledger_backlog_refusals_total",
             "counter",
             "Admissions refused because too many settlements were waiting to be written.",
