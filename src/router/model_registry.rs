@@ -398,6 +398,14 @@ pub struct ModelRegistry {
     last_error: RwLock<Option<String>>,
 }
 
+/// A fully parsed model generation that has not been made visible yet.
+/// Preparing it separately lets the application validate all reloadable
+/// registries before publishing any one of them.
+pub struct PreparedRegistry {
+    pub snapshot: Arc<RegistrySnapshot>,
+    pub stamp: SystemTime,
+}
+
 impl ModelRegistry {
     pub fn load(path: impl Into<PathBuf>, hot_reload: bool, reload_interval_ms: u64) -> Result<Arc<Self>, RegistryError> {
         let path = path.into();
@@ -437,17 +445,33 @@ impl ModelRegistry {
         self.last_error.read().await.clone()
     }
 
+    /// Parse and build the next model generation without publishing it.
+    pub fn prepare_reload(&self) -> Result<PreparedRegistry, RegistryError> {
+        let (file, stamp) = read_registry(&self.path)?;
+        let generation = self.generation.load(Ordering::Acquire) + 1;
+        Ok(PreparedRegistry {
+            snapshot: Arc::new(build_snapshot(&file, generation, stamp)),
+            stamp,
+        })
+    }
+
+    /// Publish a previously prepared generation. The caller must have
+    /// validated any other registries that participate in the same reload
+    /// before calling this method.
+    pub async fn install_prepared(&self, prepared: PreparedRegistry) -> u64 {
+        let generation = prepared.snapshot.generation;
+        *self.snapshot.write().await = prepared.snapshot;
+        self.generation.store(generation, Ordering::Release);
+        *self.last_loaded.write().await = Some(prepared.stamp);
+        *self.last_error.write().await = None;
+        generation
+    }
+
     /// Re-read the file. A failed reload keeps the previous generation serving
     /// traffic and records the error, because losing the catalogue is worse
     /// than serving yesterday's catalogue.
     pub async fn reload(&self) -> Result<u64, RegistryError> {
-        let (file, stamp) = read_registry(&self.path)?;
-        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        let snapshot = build_snapshot(&file, generation, stamp);
-        *self.snapshot.write().await = Arc::new(snapshot);
-        *self.last_loaded.write().await = Some(stamp);
-        *self.last_error.write().await = None;
-        Ok(generation)
+        Ok(self.install_prepared(self.prepare_reload()?).await)
     }
 
     /// Cheap poll: reload only when mtime moved. Returns `Some(generation)` if

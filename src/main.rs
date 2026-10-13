@@ -51,39 +51,42 @@ async fn run(state: std::sync::Arc<AppState>) -> anyhow::Result<()> {
         address = %bound,
         settings = ?config::redacted_settings(&state.settings),
         providers = ?state.providers.names(),
-        models = state.models.snapshot().await.len(),
-        tenants = state.current_tenants().len(),
+        models = state.current_generation().models.len(),
+        tenants = state.current_generation().tenants.len(),
         version = llm_gateway::VERSION,
         "llm-gateway listening"
     );
 
-    // Hot reload: poll the registry mtime off the request path so a control
-    // plane edit takes effect without dropping in-flight streams. A tenant
-    // file that fails to load keeps the previous registry serving; the mtime
-    // is remembered either way so a broken file is not re-litigated every tick.
+    // Hot reload: poll both registry mtimes off the request path so a control
+    // plane edit takes effect without dropping in-flight streams. When either
+    // file changes, both are prepared and published as one generation; a
+    // broken file therefore cannot leave the other registry half-reloaded.
     if hot_reload {
         let reload_state = std::sync::Arc::clone(&state);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(reload_interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let models_path = reload_state.settings.registry.models_path.clone();
             let tenants_path = reload_state.settings.registry.tenants_path.clone();
-            let mut tenants_mtime = tenants_file_mtime(&tenants_path);
+            let mut models_mtime = file_mtime(&models_path);
+            let mut tenants_mtime = file_mtime(&tenants_path);
             loop {
                 ticker.tick().await;
-                if let Some(generation) = reload_state.models.reload_if_changed().await {
-                    tracing::info!(generation, "model registry hot-reloaded");
-                }
-                let mtime = tenants_file_mtime(&tenants_path);
-                if mtime.is_some() && mtime != tenants_mtime {
-                    tenants_mtime = mtime;
-                    match reload_state.reload_tenants() {
-                        Ok(tenants) => {
-                            tracing::info!(tenants, "tenant registry hot-reloaded")
+                let next_models_mtime = file_mtime(&models_path);
+                let next_tenants_mtime = file_mtime(&tenants_path);
+                if next_models_mtime != models_mtime || next_tenants_mtime != tenants_mtime {
+                    // Remember the attempted mtimes whether loading succeeds
+                    // or fails; a later edit produces a new attempt.
+                    models_mtime = next_models_mtime;
+                    tenants_mtime = next_tenants_mtime;
+                    match reload_state.reload_all().await {
+                        Ok((generation, tenants)) => {
+                            tracing::info!(generation, tenants, "registries hot-reloaded")
                         }
                         Err(error) => {
                             tracing::warn!(
                                 %error,
-                                "tenant registry reload failed; keeping previous generation"
+                                "registry reload failed; keeping previous generation"
                             )
                         }
                     };
@@ -184,9 +187,9 @@ async fn force_close_after_grace(grace: std::time::Duration) {
     tokio::time::sleep(grace).await;
 }
 
-/// Modified timestamp of the tenant file, for the hot-reload poll. `None` when
+/// Modified timestamp of a registry file, for the hot-reload poll. `None` when
 /// the file is missing or unreadable, which the poll treats as "no change".
-fn tenants_file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+fn file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
 

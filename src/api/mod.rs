@@ -172,7 +172,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    fn build_state(metrics_enabled: bool) -> Arc<AppState> {
+    async fn build_state(metrics_enabled: bool) -> Arc<AppState> {
         // Each call gets its own directory: the helper used one
         // `llm-gateway-router-{pid}` dir for every test, and parallel tests
         // raced the trailing `remove_dir_all` against the next `fs::write`.
@@ -202,13 +202,17 @@ mod tests {
         let auth =
             crate::governance::auth::build_authenticator(&settings.auth, tenants.key_records())
                 .unwrap();
+        let generation = Arc::new(crate::state::RegistryGeneration {
+            models: models.snapshot().await,
+            tenants,
+            auth,
+        });
         let _ = std::fs::remove_dir_all(&dir);
 
         Arc::new(AppState {
             settings,
             models,
-            tenants: std::sync::RwLock::new(tenants),
-            auth: std::sync::RwLock::new(auth),
+            generation: std::sync::RwLock::new(generation),
             policy: crate::governance::policy::PolicyEngine::new(
                 true,
                 crate::config::DEFAULT_LIMITS,
@@ -217,6 +221,7 @@ mod tests {
             limits: crate::governance::limits::LimitEngine::new(8, false),
             metrics: crate::observability::Metrics::new(std::time::Instant::now()),
             started_at: std::time::Instant::now(),
+            reload_lock: tokio::sync::Mutex::new(()),
             inflight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
@@ -233,7 +238,7 @@ mod tests {
                 .unwrap()
         };
 
-        let on = ops_router(build_state(true));
+        let on = ops_router(build_state(true).await);
         let response = on.oneshot(request()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
@@ -242,14 +247,14 @@ mod tests {
             "a scraped /metrics must carry the gateway counters"
         );
 
-        let off = router(build_state(false));
+        let off = router(build_state(false).await);
         let response = off.oneshot(request()).await.unwrap();
         assert_eq!(
             response.status(),
             StatusCode::NOT_FOUND,
             "metrics disabled means no such route"
         );
-        let off = ops_router(build_state(false));
+        let off = ops_router(build_state(false).await);
         let response = off.oneshot(request()).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
@@ -258,7 +263,7 @@ mod tests {
     /// admin operation: no key is a 401, a tenant key without `admin` a 403.
     #[tokio::test]
     async fn public_metrics_require_the_admin_scope() {
-        let app = router(build_state(true));
+        let app = router(build_state(true).await);
         let anonymous = Request::builder().uri(ROUTE_METRICS).body(Body::empty()).unwrap();
         let response = app.clone().oneshot(anonymous).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -276,7 +281,7 @@ mod tests {
     /// port entirely: not a 401 to probe, a 404.
     #[tokio::test]
     async fn an_ops_port_removes_operator_routes_from_the_public_port() {
-        let state = build_state(true);
+        let state = build_state(true).await;
         let mut settings = (*state.settings).clone();
         settings.server.ops_port = Some(0);
         let state = Arc::new(AppState {
@@ -304,7 +309,7 @@ mod tests {
     /// nothing in the extractor path answered until bytes actually arrived.
     #[tokio::test]
     async fn an_oversized_declared_body_is_rejected_without_reading() {
-        let app = router(build_state(true));
+        let app = router(build_state(true).await);
         let request = Request::builder()
             .method("POST")
             .uri(ROUTE_CHAT_STREAM)
@@ -320,7 +325,7 @@ mod tests {
     /// not intercept legitimately-sized requests.
     #[tokio::test]
     async fn a_normal_sized_body_still_reaches_the_handler() {
-        let app = router(build_state(true));
+        let app = router(build_state(true).await);
         let payload = r#"{"model":"groq/gpt-oss-20b","messages":[{"role":"user","content":"hi"}],"max_tokens":16}"#;
         let request = Request::builder()
             .method("POST")
