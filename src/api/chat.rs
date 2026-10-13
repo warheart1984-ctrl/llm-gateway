@@ -552,8 +552,10 @@ async fn admit(
         return Err(RequestError::PayloadTooLarge);
     }
 
-    // 1. Authenticate.
-    let principal = state.current_auth().authenticate(headers).await?;
+    // 1. Authenticate. Keep the generation pinned for the whole admission so
+    // auth, tenant policy, and model routing cannot straddle a reload.
+    let generation = state.current_generation();
+    let principal = generation.auth.authenticate(headers).await?;
     span.tenant_id = principal.tenant_id.to_string();
     span.key_id = principal.key_id.to_string();
     span.scheme = principal.scheme.to_string();
@@ -577,10 +579,9 @@ async fn admit(
 
     // 3. Authorize: may this tenant call this model, at this size?
     let prompt_chars: usize = req.messages.iter().map(ChatMessage::approx_chars).sum();
-    let tenants = state.current_tenants();
     let decision = state.policy.authorize(
         &principal,
-        &tenants,
+        &generation.tenants,
         &req.model,
         req.messages.len(),
         prompt_chars,
@@ -588,7 +589,7 @@ async fn admit(
 
     // 4. Resolve against the allowlisted registry. A client-supplied endpoint is
     //    never honoured; the URL comes from `models.yaml`.
-    let snapshot = state.models.snapshot().await;
+    let snapshot = Arc::clone(&generation.models);
     let resolved =
         snapshot.resolve_supported(&decision.qualified_model, &state.providers.names())?;
     span.model = resolved.registry_id.clone();

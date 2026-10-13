@@ -660,6 +660,16 @@ pub trait ChatProvider: Send + Sync + 'static {
     fn base_url(&self) -> Option<&str> {
         None
     }
+
+    /// Whether this adapter can serve a model route right now.
+    ///
+    /// The endpoint is supplied because NVIDIA can serve a self-hosted NIM
+    /// without a cloud credential when a model names its local endpoint.
+    /// Implementations that do not support that deployment mode should only
+    /// return true when their normal credentials are available.
+    fn route_ready(&self, _endpoint: Option<&str>) -> bool {
+        true
+    }
 }
 
 /// Shared HTTP client. One pool per adapter so a slow Groq connection cannot
