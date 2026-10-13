@@ -1,8 +1,15 @@
 # Measuring Governed Streaming Overhead in an LLM Gateway
 
+> **Evidence status (2026-10-13):** This is a provisional experiment draft.
+> The previously committed cloud bundles were removed because their manifests
+> came from a dirty checkout and did not identify the source tree that ran the
+> harness. The numeric observations below are retained as historical notes,
+> not as reproducible benchmark results. Rerun the experiment from a clean,
+> pinned commit before citing any result.
+
 ## Abstract
 
-This paper reports a controlled experiment measuring the performance and governance behavior of a Rust-based large-language-model (LLM) gateway when the upstream provider is deterministic and fast. The experiment compared direct access to a mock streaming provider with gateway passthrough and normalized streaming. All gateway governance controls remained enabled, including authentication, model authorization, concurrency admission, durable SQLite reservations, settlement, billing, and evidence generation. In a three-repetition, high-limit run at 50 concurrent clients, direct access sustained 491.0 successful requests per second in aggregate, while gateway passthrough and normalized streaming sustained 152.3 and 152.7 requests per second, respectively. Pooled median TTFT was 46.2 ms direct, 244.5 ms passthrough, and 206.8 ms normalized. No gateway requests were refused in the reported run; provider-side counters matched accepted requests exactly. Billing reconciliation and SHA-256 evidence verification passed. A separate policy-limited run remains useful as a governance result, but its concurrency refusals must not be interpreted as an unconstrained gateway ceiling. The results are a local, single-host baseline rather than a completed cloud or cross-provider benchmark.
+This paper draft describes a planned controlled experiment measuring the performance and governance behavior of a Rust-based large-language-model (LLM) gateway when the upstream provider is deterministic and fast. It compares direct access to a mock streaming provider with gateway passthrough and normalized streaming while keeping authentication, model authorization, concurrency admission, durable reservations, settlement, billing, and evidence generation enabled. Historical observations are included only to document the experiment that must be rerun; they are not currently reproducible evidence. The intended result is a local, single-host baseline rather than a completed cloud or cross-provider benchmark.
 
 **Keywords:** LLM gateway, streaming inference, governance, admission control, billing reconciliation, performance measurement, reproducibility
 
@@ -77,6 +84,10 @@ Each run emitted a manifest, raw per-request records, summary statistics, govern
 No inferential statistical tests were applied. Results are reported descriptively across three repetitions, and the refusal population is kept separate from successful-completion throughput. A preliminary repeat with the default one-second SQLite admission timeout produced retryable 503 ledger timeouts; it was retained as diagnostic evidence but excluded from the capacity table. The reported run used the explicitly recorded ten-second timeout and produced no 429 or 5xx responses.
 
 ## 4. Results
+
+The results in this section are historical observations from the removed
+bundles. They are not accepted benchmark results until a clean, pinned rerun
+produces manifests containing the current harness and exact tenant policy.
 
 ### 4.1 Throughput and latency
 
@@ -159,11 +170,6 @@ The result is a credible local baseline, not a final cloud performance claim. It
 ## References and Evidence
 
 1. RFC-LLMGW-001, *Cloud Performance & Governance Proof Harness*, version 0.1, 2026-10-13. Internal project specification supplied with the experiment.
-2. `llm-gateway`, governed policy-pressure run `mock-benchmark-50-v3`, source revision `be4c9d49b1290a9e0c60b8cd4b7d6036c4f13bdd`.
-3. `llm-gateway`, high-limit capacity run `mock-benchmark-50-high-limits-r3-ledger10s`, source revision recorded in its manifest.
-4. [Governed baseline manifest](../benchmarks/cloud-runs/mock-benchmark-50-v3/manifest.json).
-5. [High-limit run manifest](../benchmarks/cloud-runs/mock-benchmark-50-high-limits-r3-ledger10s/manifest.json).
-6. [High-limit run summary](../benchmarks/cloud-runs/mock-benchmark-50-high-limits-r3-ledger10s/summary.json).
-7. [High-limit governance results](../benchmarks/cloud-runs/mock-benchmark-50-high-limits-r3-ledger10s/governance-results.json).
-8. [High-limit human-readable comparison](../benchmarks/cloud-runs/mock-benchmark-50-high-limits-r3-ledger10s/comparison.md).
-9. [High-limit SHA-256 evidence manifest](../benchmarks/cloud-runs/mock-benchmark-50-high-limits-r3-ledger10s/SHA256SUMS).
+2. `llm-gateway`, harness implementation in `src/bin/cloud_harness.rs`.
+3. `llm-gateway`, exact benchmark tenant policy in `config/tenants.yaml`.
+4. `llm-gateway`, rerun procedure in `docs/cloud-benchmark.md`.

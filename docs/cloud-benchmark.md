@@ -49,6 +49,8 @@ cargo run --release --bin cloud_harness -- \
   --gateway-url http://gateway-private:8080/v1/chat/stream \
   --upstream-metrics-url http://provider-private:9000/metrics \
   --gateway-usage-url http://gateway-private:8080/v1/usage \
+  --gateway-metrics-url http://gateway-private:8080/metrics \
+  --model mock/chat --upstream-model mock/chat \
   --concurrency 1 --repetitions 1 --warmup-secs 0 --duration-secs 5 \
   --backend sqlite --output target/cloud-runs/smoke-1
 ```
@@ -66,17 +68,20 @@ cargo run --release --bin cloud_harness -- \
   --gateway-url http://gateway-private:8080/v1/chat/stream \
   --gateway-usage-url http://gateway-private:8080/v1/usage \
   --gateway-metrics-url http://gateway-private:8080/metrics \
-  --model openrouter/gpt-4.1-mini --concurrency 50 --repetitions 1 \
+  --model openrouter/gpt-4.1-mini --upstream-model openai/gpt-4.1-mini \
+  --concurrency 50 --repetitions 1 \
   --warmup-secs 0 --duration-secs 5 --max-requests 500 \
   --refusal-backoff-ms 100 --output target/cloud-runs/openrouter-50
 ```
 
 The metrics snapshots include gateway request/rejection counters, upstream
 errors, active streams, process CPU time, and resident memory. Request records
-also retain response status and retryable-error headers so gateway refusals can
-be separated from upstream `5xx` signals. A provider-side `/metrics` endpoint
-is still required for the refused-before-provider invariant; OpenRouter does
-not provide that counter to this harness.
+retain response status, stable gateway error codes, and retryable-error headers.
+The harness cross-checks classified gateway rejections against
+`gw_requests_rejected_total`, so an upstream `502` is counted as an accepted
+provider-bound request rather than as a governance refusal. A provider-side
+`/metrics` endpoint is still required for the refused-before-provider
+invariant; OpenRouter does not provide that counter to this harness.
 
 The runner never writes `CLOUD_GATEWAY_API_KEY`. It writes only sanitized
 request metadata and outcomes. Missing provider or usage endpoints are marked
@@ -124,15 +129,20 @@ Every run produces:
 
 The provider counter and usage baseline are sampled after each workload's
 warmup and before its measured requests. A refused request can support the
-authorization/budget boundary claim only when the counter endpoint is
-configured and unchanged; the harness expects the counter delta to equal the
-measured non-refused requests. `/v1/usage` is useful evidence for spend
+authorization/budget boundary claim only when both gateway rejection metrics
+and the provider counter are configured and unchanged; the harness expects
+the gateway rejection counter delta to match request metadata and the
+provider counter delta to equal requests not rejected by the gateway.
+`/v1/usage` is useful evidence for spend
 deltas, but it is not a substitute for durable reservation rows; shared-ledger
 reconciliation must still inspect PostgreSQL records before a run is
 published.
 
 The harness does not disable limits, bypass the ledger, or label missing data
-as success. Direct, passthrough, and normalized measurements belong to
+as success. It refuses to start from a dirty checkout and records the pinned
+commit, dirty flag, and SHA-256 hash of the Git diff in every manifest. Keep
+the exact benchmark tenant policy in `config/tenants.yaml` and pin the
+checkout before running. Direct, passthrough, and normalized measurements belong to
 different capability classes; a transport-only comparison must not be written
 up as an equivalent governed-gateway comparison.
 

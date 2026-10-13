@@ -15,6 +15,7 @@
 //!   --gateway-url http://gateway:8080/v1/chat/stream \
 //!   --upstream-metrics-url http://provider:9000/metrics \
 //!   --gateway-usage-url http://gateway:8080/v1/usage \
+//!   --model mock/chat --upstream-model mock/chat \
 //!   --concurrency 50,200,500,1000 --repetitions 3 \
 //!   --warmup-secs 60 --duration-secs 180 --output target/cloud-runs/run-1
 //! ```
@@ -56,6 +57,7 @@ struct Config {
     seed: u64,
     backend: String,
     model: String,
+    upstream_model: Option<String>,
     max_tokens: u64,
     prompt: String,
     max_requests: Option<usize>,
@@ -84,6 +86,8 @@ struct RequestRecord {
     sequence: usize,
     status: u16,
     retryable: Option<bool>,
+    error_code: Option<String>,
+    gateway_rejection: Option<bool>,
     outcome: String,
     ttft_ms: Option<f64>,
     latency_ms: f64,
@@ -119,6 +123,8 @@ struct WorkloadSummary {
     status_counts: BTreeMap<String, usize>,
     refusal_counts: BTreeMap<String, usize>,
     retryable_refusals: usize,
+    gateway_rejections: usize,
+    unclassified_gateway_errors: usize,
     upstream_error_status_counts: BTreeMap<String, usize>,
     transport_errors: usize,
     incomplete_streams: usize,
@@ -136,6 +142,8 @@ struct WorkloadSummary {
     gateway_usage_after_nano_usd: Option<u64>,
     gateway_metrics_before: Option<BTreeMap<String, u64>>,
     gateway_metrics_after: Option<BTreeMap<String, u64>>,
+    settlement_before_verified: Option<bool>,
+    settlement_after_verified: Option<bool>,
 }
 
 #[derive(Debug, Default)]
@@ -145,6 +153,8 @@ struct Aggregate {
     status_counts: BTreeMap<String, usize>,
     refusal_counts: BTreeMap<String, usize>,
     retryable_refusals: usize,
+    gateway_rejections: usize,
+    unclassified_gateway_errors: usize,
     upstream_error_status_counts: BTreeMap<String, usize>,
     transport_errors: usize,
     incomplete: usize,
@@ -193,6 +203,9 @@ struct Manifest {
     direct_url_configured: bool,
     gateway_url_configured: bool,
     gateway_metrics_url_configured: bool,
+    upstream_model: Option<String>,
+    source_diff_sha256: String,
+    source_dirty: bool,
     concurrency: Vec<usize>,
     repetitions: usize,
     warmup_secs: u64,
@@ -224,11 +237,14 @@ async fn run() -> Result<(), String> {
         .and_then(|n| n.to_str())
         .unwrap_or("cloud-run")
         .to_string();
-    let request = request_body(&cfg, false);
+    let (source_revision, source_dirty, source_diff_sha256) = source_provenance()?;
+    let request = manifest_request(&cfg);
     let manifest = Manifest {
         run_id: run_id.clone(),
         started_at_unix_ms: now_unix_ms(),
-        source_revision: source_revision(),
+        source_revision,
+        source_dirty,
+        source_diff_sha256,
         rust_version: command_version("rustc", "--version"),
         os: env::consts::OS.into(),
         architecture: env::consts::ARCH.into(),
@@ -241,6 +257,7 @@ async fn run() -> Result<(), String> {
         direct_url_configured: cfg.direct_url.is_some(),
         gateway_url_configured: cfg.gateway_url.is_some(),
         gateway_metrics_url_configured: cfg.gateway_metrics_url.is_some(),
+        upstream_model: cfg.upstream_model.clone(),
         concurrency: cfg.concurrency.clone(),
         repetitions: cfg.repetitions,
         warmup_secs: cfg.warmup_secs,
@@ -294,7 +311,7 @@ async fn run() -> Result<(), String> {
         for concurrency in &cfg.concurrency {
             for variant in &variants {
                 run_warmup(&client, &cfg, variant, *concurrency).await?;
-                if !variant.direct {
+                let settlement_before_verified = if !variant.direct {
                     wait_for_settlement(
                         &client,
                         cfg.gateway_usage_url.as_deref(),
@@ -302,8 +319,10 @@ async fn run() -> Result<(), String> {
                         cfg.gateway_key.as_deref(),
                         cfg.settlement_wait_ms,
                     )
-                    .await;
-                }
+                    .await
+                } else {
+                    false
+                };
                 let upstream_before = if !variant.direct {
                     fetch_provider_count(&client, cfg.upstream_metrics_url.as_deref()).await
                 } else {
@@ -354,8 +373,10 @@ async fn run() -> Result<(), String> {
                 )
                 .await?;
                 summary.warmup_secs = cfg.warmup_secs;
+                summary.settlement_before_verified =
+                    (!variant.direct).then_some(settlement_before_verified);
                 if !variant.direct {
-                    wait_for_settlement(
+                    let settlement_after_verified = wait_for_settlement(
                         &client,
                         cfg.gateway_usage_url.as_deref(),
                         cfg.gateway_metrics_url.as_deref(),
@@ -363,6 +384,7 @@ async fn run() -> Result<(), String> {
                         cfg.settlement_wait_ms,
                     )
                     .await;
+                    summary.settlement_after_verified = Some(settlement_after_verified);
                 }
                 let upstream_after = if !variant.direct {
                     fetch_provider_count(&client, cfg.upstream_metrics_url.as_deref()).await
@@ -500,6 +522,7 @@ impl Config {
             seed: parse("seed", "CLOUD_SEED", 0x4c4c_4d47)?,
             backend: get("backend").unwrap_or_else(|| env_or("CLOUD_BACKEND", "unknown")),
             model: get("model").unwrap_or_else(|| env_or("CLOUD_MODEL", "mock/chat")),
+            upstream_model: get("upstream-model").or_else(|| env::var("CLOUD_UPSTREAM_MODEL").ok()),
             max_tokens: parse("max-tokens", "CLOUD_MAX_TOKENS", 64)?,
             prompt: get("prompt")
                 .unwrap_or_else(|| env_or("CLOUD_PROMPT", "cloud benchmark request")),
@@ -617,6 +640,15 @@ async fn run_workload(
                 }
                 _ => {}
             }
+            if record.gateway_rejection == Some(true) {
+                aggregate.gateway_rejections += 1;
+            } else if record.variant != "direct"
+                && record.status != 0
+                && !(200..300).contains(&record.status)
+                && record.gateway_rejection.is_none()
+            {
+                aggregate.unclassified_gateway_errors += 1;
+            }
             if record.retryable == Some(true) {
                 aggregate.retryable_refusals += 1;
             }
@@ -699,6 +731,8 @@ async fn run_workload(
                             sequence,
                             status: 0,
                             retryable: None,
+                            error_code: None,
+                            gateway_rejection: None,
                             outcome: format!("transport_error:{error}"),
                             ttft_ms: None,
                             latency_ms: 0.0,
@@ -751,6 +785,8 @@ async fn run_workload(
         status_counts: aggregate.status_counts,
         refusal_counts: aggregate.refusal_counts,
         retryable_refusals: aggregate.retryable_refusals,
+        gateway_rejections: aggregate.gateway_rejections,
+        unclassified_gateway_errors: aggregate.unclassified_gateway_errors,
         upstream_error_status_counts: aggregate.upstream_error_status_counts,
         transport_errors: aggregate.transport_errors,
         incomplete_streams: aggregate.incomplete,
@@ -768,6 +804,8 @@ async fn run_workload(
         gateway_usage_after_nano_usd: usage_before,
         gateway_metrics_before: None,
         gateway_metrics_after: None,
+        settlement_before_verified: None,
+        settlement_after_verified: None,
     })
 }
 
@@ -849,6 +887,9 @@ async fn request_once(
     } else {
         "success".into()
     };
+    let error_code = json_string_field(&buffer, br#""code""#);
+    let gateway_rejection =
+        classify_gateway_rejection(variant.direct, status.as_u16(), error_code.as_deref());
     let billed_nano_usd = number_after(&buffer, b"\"cost_nano_usd\":");
     Ok(RequestRecord {
         run_id: String::new(),
@@ -862,6 +903,8 @@ async fn request_once(
         sequence: 0,
         status: status.as_u16(),
         retryable,
+        error_code,
+        gateway_rejection,
         outcome,
         ttft_ms: first_token,
         latency_ms: latency,
@@ -938,6 +981,34 @@ fn has_nonempty_json_field(buffer: &[u8], field: &[u8]) -> bool {
     false
 }
 
+fn json_string_field(buffer: &[u8], field: &[u8]) -> Option<String> {
+    let mut search_from = 0;
+    while search_from + field.len() <= buffer.len() {
+        let relative = buffer[search_from..]
+            .windows(field.len())
+            .position(|window| window == field)?;
+        let field_start = search_from + relative + field.len();
+        let colon = buffer[field_start..]
+            .iter()
+            .position(|byte| *byte == b':')?;
+        let value_start = field_start + colon + 1;
+        let mut deserializer = serde_json::Deserializer::from_slice(&buffer[value_start..]);
+        if let Ok(Value::String(value)) = Value::deserialize(&mut deserializer) {
+            return Some(value);
+        }
+        search_from = field_start;
+    }
+    None
+}
+
+fn classify_gateway_rejection(direct: bool, status: u16, error_code: Option<&str>) -> Option<bool> {
+    if direct || (200..300).contains(&status) {
+        None
+    } else {
+        error_code.map(|code| !code.starts_with("upstream_"))
+    }
+}
+
 fn json_value_has_text(value: &Value) -> bool {
     match value {
         Value::String(text) => !text.is_empty(),
@@ -951,50 +1022,109 @@ fn json_value_has_text(value: &Value) -> bool {
 }
 
 fn request_body(cfg: &Config, direct: bool) -> Value {
-    if direct {
-        json!({"model": cfg.model, "messages":[{"role":"user","content":cfg.prompt}], "stream":true, "max_tokens":cfg.max_tokens})
+    let model = if direct {
+        cfg.upstream_model.as_deref().unwrap_or(&cfg.model)
     } else {
-        json!({"model": cfg.model, "messages":[{"role":"user","content":cfg.prompt}], "stream":true, "params":{"max_tokens":cfg.max_tokens}})
+        &cfg.model
+    };
+    if direct {
+        json!({"model": model, "messages":[{"role":"user","content":cfg.prompt}], "stream":true, "max_tokens":cfg.max_tokens})
+    } else {
+        json!({"model": model, "messages":[{"role":"user","content":cfg.prompt}], "stream":true, "params":{"max_tokens":cfg.max_tokens}})
     }
+}
+
+fn manifest_request(cfg: &Config) -> Value {
+    json!({
+        "model": cfg.model,
+        "upstream_model": cfg.upstream_model,
+        "messages": [{
+            "role": "user",
+            "content_sha256": hex(&Sha256::digest(cfg.prompt.as_bytes())),
+            "content_bytes": cfg.prompt.len(),
+        }],
+        "stream": true,
+        "max_tokens": cfg.max_tokens,
+        "prompt_redacted": true,
+    })
 }
 
 fn governance_for(summary: &WorkloadSummary) -> Vec<GovernanceResult> {
     if summary.variant == "direct" {
         return Vec::new();
     }
-    let refused: usize = summary.refusal_counts.values().sum();
+    let rejection_counter_delta = metric_delta(
+        summary.gateway_metrics_before.as_ref(),
+        summary.gateway_metrics_after.as_ref(),
+        "gw_requests_rejected_total",
+    );
+    let refused = rejection_counter_delta.unwrap_or(summary.gateway_rejections as u64) as usize;
     let provider_delta = summary
         .upstream_calls_after
         .zip(summary.upstream_calls_before)
         .map(|(a, b)| a.saturating_sub(b));
     let expected_provider_calls = summary.total_requests.saturating_sub(refused);
-    let boundary = match (refused, provider_delta) {
-        (0, _) => GovernanceResult {
+    let boundary = if rejection_counter_delta.is_none() {
+        GovernanceResult {
             invariant: "INV-PERF-001/002",
-            status: "not_applicable",
-            evidence: "no gateway refusals in this workload".into(),
-        },
-        (_, Some(delta)) if delta == expected_provider_calls as u64 => GovernanceResult {
-            invariant: "INV-PERF-001/002",
-            status: "pass",
-            evidence: format!(
-                "{refused} refused requests; provider counter increased only for {delta} accepted requests"
-            ),
-        },
-        (_, Some(delta)) => GovernanceResult {
+            status: "not_measured",
+            evidence: "configure --gateway-metrics-url so gateway rejection counters can be compared with provider calls".into(),
+        }
+    } else if rejection_counter_delta != Some(summary.gateway_rejections as u64) {
+        GovernanceResult {
             invariant: "INV-PERF-001/002",
             status: "fail",
             evidence: format!(
-                "{refused} refused requests; expected {expected_provider_calls} provider calls but counter increased by {delta}"
+                "gateway rejection counter increased by {} but request metadata classified {} gateway rejections",
+                rejection_counter_delta.unwrap_or_default(),
+                summary.gateway_rejections
             ),
-        },
-        (_, None) => GovernanceResult {
+        }
+    } else if summary.transport_errors > 0 || summary.unclassified_gateway_errors > 0 {
+        GovernanceResult {
             invariant: "INV-PERF-001/002",
             status: "not_measured",
-            evidence: "configure --upstream-metrics-url for provider-boundary evidence".into(),
-        },
+            evidence: format!(
+                "provider boundary is ambiguous: {} transport errors and {} non-success responses lacked gateway error metadata",
+                summary.transport_errors, summary.unclassified_gateway_errors
+            ),
+        }
+    } else {
+        match (refused, provider_delta) {
+            (0, _) => GovernanceResult {
+                invariant: "INV-PERF-001/002",
+                status: "not_applicable",
+                evidence: "no classified gateway refusals in this workload".into(),
+            },
+            (_, Some(delta)) if delta == expected_provider_calls as u64 => GovernanceResult {
+                invariant: "INV-PERF-001/002",
+                status: "pass",
+                evidence: format!(
+                    "{refused} classified gateway refusals; provider counter increased for {delta} accepted requests, including upstream failures"
+                ),
+            },
+            (_, Some(delta)) => GovernanceResult {
+                invariant: "INV-PERF-001/002",
+                status: "fail",
+                evidence: format!(
+                    "{refused} classified gateway refusals; expected {expected_provider_calls} provider calls but counter increased by {delta}"
+                ),
+            },
+            (_, None) => GovernanceResult {
+                invariant: "INV-PERF-001/002",
+                status: "not_measured",
+                evidence: "configure --upstream-metrics-url for provider-boundary evidence".into(),
+            },
+        }
     };
-    let accounting = if let (Some(before), Some(after)) = (
+    let accounting = if summary.settlement_after_verified != Some(true) {
+        GovernanceResult {
+            invariant: "INV-PERF-007",
+            status: "not_measured",
+            evidence: "settlement barrier was not verified; usage reconciliation is unverified"
+                .into(),
+        }
+    } else if let (Some(before), Some(after)) = (
         summary.gateway_usage_before_nano_usd,
         summary.gateway_usage_after_nano_usd,
     ) {
@@ -1038,6 +1168,14 @@ fn governance_for(summary: &WorkloadSummary) -> Vec<GovernanceResult> {
             evidence: "manifest, raw requests, summary, and SHA256SUMS emitted".into(),
         },
     ]
+}
+
+fn metric_delta(
+    before: Option<&BTreeMap<String, u64>>,
+    after: Option<&BTreeMap<String, u64>>,
+    name: &str,
+) -> Option<u64> {
+    Some(after?.get(name)?.saturating_sub(*before?.get(name)?))
 }
 
 async fn fetch_gateway_metrics(
@@ -1113,9 +1251,9 @@ async fn wait_for_settlement(
     metrics_url: Option<&str>,
     key: Option<&str>,
     max_wait_ms: u64,
-) {
+) -> bool {
     if usage_url.is_none() || max_wait_ms == 0 {
-        return;
+        return false;
     }
     let deadline = Instant::now() + Duration::from_millis(max_wait_ms);
     let mut previous_usage = None;
@@ -1125,27 +1263,44 @@ async fn wait_for_settlement(
         let metrics = fetch_gateway_metrics(client, metrics_url, key)
             .await
             .map(|body| parse_metrics_snapshot(&body));
-        let pending = metrics
-            .as_ref()
-            .and_then(|values| values.get("gw_ledger_pending_closings"))
-            .copied()
-            .unwrap_or(0);
-        let in_flight = metrics
-            .as_ref()
-            .and_then(|values| values.get("gw_streams_in_flight"))
-            .copied()
-            .unwrap_or(0);
+        let Some(metrics) = metrics else {
+            stable_reads = 0;
+            previous_usage = usage;
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        };
+        let Some(&pending) = metrics.get("gw_ledger_pending_closings") else {
+            stable_reads = 0;
+            previous_usage = usage;
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        };
+        let Some(&in_flight) = metrics.get("gw_streams_in_flight") else {
+            stable_reads = 0;
+            previous_usage = usage;
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        };
         if usage.is_some() && usage == previous_usage && pending == 0 && in_flight == 0 {
             stable_reads += 1;
             if stable_reads >= 3 {
-                return;
+                return true;
             }
         } else {
             stable_reads = 0;
         }
         previous_usage = usage;
         if Instant::now() >= deadline {
-            return;
+            return false;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -1240,18 +1395,51 @@ fn display(value: Option<f64>) -> String {
     value.map_or_else(|| "-".into(), |v| format!("{v:.3}"))
 }
 
-fn source_revision() -> String {
-    env::var("GIT_COMMIT")
-        .ok()
-        .or_else(|| {
-            Command::new("git")
-                .args(["rev-parse", "HEAD"])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().into())
-        })
-        .unwrap_or_else(|| "unknown".into())
+fn source_provenance() -> Result<(String, bool, String), String> {
+    let root = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|e| format!("inspect source checkout: {e}"))?;
+    if !root.status.success() {
+        return Err("benchmark must run from a Git checkout".into());
+    }
+    let root = String::from_utf8_lossy(&root.stdout).trim().to_string();
+    let status = Command::new("git")
+        .current_dir(&root)
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .output()
+        .map_err(|e| format!("inspect source checkout status: {e}"))?;
+    if !status.status.success() {
+        return Err("could not determine whether the source checkout is dirty".into());
+    }
+    let dirty = !status.stdout.is_empty();
+    let revision = Command::new("git")
+        .current_dir(&root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|e| format!("read source revision: {e}"))?;
+    if !revision.status.success() {
+        return Err("could not read the source revision".into());
+    }
+    let diff = Command::new("git")
+        .current_dir(&root)
+        .args(["diff", "--binary", "HEAD"])
+        .output()
+        .map_err(|e| format!("hash source diff: {e}"))?;
+    if !diff.status.success() {
+        return Err("could not read the source diff".into());
+    }
+    let diff_sha256 = hex(&Sha256::digest(&diff.stdout));
+    if dirty {
+        return Err(format!(
+            "source checkout is dirty; commit or remove all tracked and untracked changes before running the benchmark (diff sha256: {diff_sha256})"
+        ));
+    }
+    Ok((
+        String::from_utf8_lossy(&revision.stdout).trim().into(),
+        dirty,
+        diff_sha256,
+    ))
 }
 
 fn command_version(command: &str, arg: &str) -> String {
@@ -1300,7 +1488,7 @@ fn shuffle<T>(values: &mut [T], mut seed: u64) {
 
 fn print_help() {
     println!(
-        "cloud-harness options:\n  --direct-url URL\n  --gateway-url URL\n  --concurrency 50,200,500,1000\n  --repetitions 3\n  --warmup-secs 60\n  --duration-secs 180\n  --max-requests N\n  --refusal-backoff-ms 100\n  --settlement-wait-ms 2000\n  --upstream-metrics-url URL\n  --gateway-usage-url URL\n  --gateway-metrics-url URL\n  --output DIR\n\nGateway credentials come from CLOUD_GATEWAY_API_KEY and are never written to evidence.\nThe workload runs for the requested duration unless --max-requests is supplied.\nRefused and 5xx responses back off; output directories must be empty or new.\nThe settlement wait lets durable ledger corrections reach the usage endpoint before reconciliation."
+        "cloud-harness options:\n  --direct-url URL\n  --gateway-url URL\n  --model GATEWAY_MODEL\n  --upstream-model PROVIDER_MODEL\n  --concurrency 50,200,500,1000\n  --repetitions 3\n  --warmup-secs 60\n  --duration-secs 180\n  --max-requests N\n  --refusal-backoff-ms 100\n  --settlement-wait-ms 2000\n  --upstream-metrics-url URL\n  --gateway-usage-url URL\n  --gateway-metrics-url URL\n  --output DIR\n\nGateway credentials come from CLOUD_GATEWAY_API_KEY and are never written to evidence.\nThe workload runs for the requested duration unless --max-requests is supplied.\nRefused and 5xx responses back off; output directories must be empty or new.\nThe settlement wait requires usage stability and explicit zero pending/in-flight metrics.\nRuns require a clean Git checkout; source commit, dirty status, and diff hash are recorded."
     );
 }
 
@@ -1314,6 +1502,31 @@ mod tests {
             framing,
             url: "http://localhost".into(),
             direct,
+        }
+    }
+
+    fn config() -> Config {
+        Config {
+            direct_url: None,
+            gateway_url: None,
+            gateway_key: None,
+            upstream_metrics_url: None,
+            gateway_usage_url: None,
+            gateway_metrics_url: None,
+            output: PathBuf::from("target/test-run"),
+            concurrency: vec![1],
+            repetitions: 1,
+            warmup_secs: 0,
+            duration_secs: 1,
+            seed: 1,
+            backend: "test".into(),
+            model: "openrouter/gpt-4.1-mini".into(),
+            upstream_model: Some("openai/gpt-4.1-mini".into()),
+            max_tokens: 8,
+            prompt: "private prompt".into(),
+            max_requests: Some(1),
+            refusal_backoff_ms: 0,
+            settlement_wait_ms: 1,
         }
     }
 
@@ -1351,6 +1564,55 @@ mod tests {
         append_scan_buffer(&mut buffer, br#"data: {"token":"late"}"#);
         assert!(token_marker(&buffer, &variant));
         assert!(buffer.len() <= TOKEN_SCAN_BYTES);
+    }
+
+    #[test]
+    fn direct_requests_accept_a_provider_native_model() {
+        let cfg = config();
+        assert_eq!(request_body(&cfg, true)["model"], "openai/gpt-4.1-mini");
+        assert_eq!(
+            request_body(&cfg, false)["model"],
+            "openrouter/gpt-4.1-mini"
+        );
+    }
+
+    #[test]
+    fn manifests_hash_prompt_content_instead_of_storing_it() {
+        let cfg = config();
+        let request = manifest_request(&cfg);
+        let serialized = serde_json::to_string(&request).expect("serialize manifest request");
+        assert!(!serialized.contains("private prompt"));
+        assert_eq!(request["messages"][0]["content_bytes"], 14);
+        assert_eq!(
+            request["messages"][0]["content_sha256"],
+            hex(&Sha256::digest(b"private prompt"))
+        );
+        assert_eq!(request["prompt_redacted"], true);
+    }
+
+    #[test]
+    fn upstream_errors_are_not_classified_as_gateway_rejections() {
+        assert_eq!(
+            classify_gateway_rejection(false, 502, Some("upstream_error")),
+            Some(false)
+        );
+        assert_eq!(
+            classify_gateway_rejection(false, 429, Some("rate_limited")),
+            Some(true)
+        );
+        assert_eq!(classify_gateway_rejection(false, 502, None), None);
+        assert_eq!(classify_gateway_rejection(true, 502, Some("error")), None);
+    }
+
+    #[test]
+    fn missing_metric_counter_is_not_treated_as_zero() {
+        let before = BTreeMap::from([(String::from("other"), 2)]);
+        let after = BTreeMap::from([(String::from("other"), 3)]);
+        assert_eq!(
+            metric_delta(Some(&before), Some(&after), "gw_requests_rejected_total"),
+            None
+        );
+        assert_eq!(metric_delta(None, Some(&after), "other"), None);
     }
 
     #[test]
