@@ -101,8 +101,13 @@ data: [DONE]
 | `POST` | `/v1/admin/holds/{id}/approve` | Approve a held request (`approve:holds`) |
 | `POST` | `/v1/admin/holds/{id}/deny` | Deny it, or revoke an approval not yet used (`approve:holds`) |
 | `GET` | `/health/live` | Liveness |
-| `GET` | `/health/ready` | Readiness; 503 if routing cannot work |
+| `GET` | `/health/ready` | Readiness; 503 if no model has a usable provider route |
 | `GET` | `/metrics` | Prometheus text exposition (admin scope) |
+
+Readiness evaluates each model route, including provider credentials and the
+explicit local endpoint used by self-hosted NVIDIA NIM. A deployment remains
+ready when at least one route is usable; the response lists unavailable model
+routes in `unavailable_models` so a fallback does not hide a degraded catalog.
 
 With `server.ops_port` set, `/metrics` (unauthenticated) and every
 `/v1/admin/*` route move to that listener and no longer exist on the public
