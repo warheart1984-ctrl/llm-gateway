@@ -28,8 +28,8 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -37,7 +37,7 @@ use std::{
 use futures_util::StreamExt as _;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
@@ -890,7 +890,7 @@ async fn request_once(
     let error_code = json_string_field(&buffer, br#""code""#);
     let gateway_rejection =
         classify_gateway_rejection(variant.direct, status.as_u16(), error_code.as_deref());
-    let billed_nano_usd = number_after(&buffer, b"\"cost_nano_usd\":");
+    let billed_nano_usd = settled_billed_nano_usd(variant, &buffer, reserved_nano_usd);
     Ok(RequestRecord {
         run_id: String::new(),
         workload: "streaming".into(),
@@ -913,6 +913,22 @@ async fn request_once(
         bytes_transferred: request_bytes.len() + response_bytes,
         reserved_nano_usd,
         billed_nano_usd,
+    })
+}
+
+/// Passthrough intentionally preserves the provider's bytes, so it does not
+/// contain the gateway-normalized `cost_nano_usd` field. The gateway still
+/// closes that stream with the full reservation (`commit_reserved`). Record
+/// that durable settlement as billed here instead of misreporting it as $0.
+fn settled_billed_nano_usd(
+    variant: &Variant,
+    response: &[u8],
+    reserved_nano_usd: Option<u64>,
+) -> Option<u64> {
+    number_after(response, b"\"cost_nano_usd\":").or_else(|| {
+        (variant.framing == Some("passthrough") && !variant.direct)
+            .then_some(reserved_nano_usd)
+            .flatten()
     })
 }
 
@@ -1117,48 +1133,13 @@ fn governance_for(summary: &WorkloadSummary) -> Vec<GovernanceResult> {
             },
         }
     };
-    let accounting = if summary.settlement_after_verified != Some(true) {
-        GovernanceResult {
-            invariant: "INV-PERF-007",
-            status: "not_measured",
-            evidence: "settlement barrier was not verified; usage reconciliation is unverified"
-                .into(),
-        }
-    } else if let (Some(before), Some(after)) = (
+    let accounting = accounting_result(
+        summary.settlement_after_verified,
         summary.gateway_usage_before_nano_usd,
         summary.gateway_usage_after_nano_usd,
-    ) {
-        let usage_delta = after.saturating_sub(before);
-        let expected = if summary.variant == "gateway-normalized" {
-            summary.billed_nano_usd
-        } else {
-            summary.reserved_nano_usd
-        };
-        if expected == usage_delta && (expected > 0 || summary.successful_completions == 0) {
-            GovernanceResult {
-                invariant: "INV-PERF-007",
-                status: "pass",
-                evidence: format!(
-                    "usage delta and per-request {} reconcile at {usage_delta} nano-USD",
-                    if summary.variant == "gateway-normalized" {
-                        "billed"
-                    } else {
-                        "reserved"
-                    }
-                ),
-            }
-        } else {
-            GovernanceResult {
-                invariant: "INV-PERF-007",
-                status: "fail",
-                evidence: format!(
-                    "usage delta={usage_delta} nano-USD but per-request expected total={expected}"
-                ),
-            }
-        }
-    } else {
-        GovernanceResult { invariant: "INV-PERF-007", status: "not_measured", evidence: "configure --gateway-usage-url and inspect durable ledger rows before claiming reconciliation".into() }
-    };
+        summary.billed_nano_usd,
+        summary.successful_completions,
+    );
     vec![
         boundary,
         accounting,
@@ -1168,6 +1149,53 @@ fn governance_for(summary: &WorkloadSummary) -> Vec<GovernanceResult> {
             evidence: "manifest, raw requests, summary, and SHA256SUMS emitted".into(),
         },
     ]
+}
+
+fn accounting_result(
+    settlement_after_verified: Option<bool>,
+    gateway_usage_before_nano_usd: Option<u64>,
+    gateway_usage_after_nano_usd: Option<u64>,
+    billed_nano_usd: u64,
+    successful_completions: usize,
+) -> GovernanceResult {
+    if settlement_after_verified != Some(true) {
+        GovernanceResult {
+            invariant: "INV-PERF-007",
+            status: "not_measured",
+            evidence: "settlement barrier was not verified; usage reconciliation is unverified"
+                .into(),
+        }
+    } else if let (Some(before), Some(after)) =
+        (gateway_usage_before_nano_usd, gateway_usage_after_nano_usd)
+    {
+        let usage_delta = after.saturating_sub(before);
+        if billed_nano_usd == 0 && successful_completions > 0 {
+            return GovernanceResult {
+                invariant: "INV-PERF-007",
+                status: "fail",
+                evidence: "successful gateway completions have no billed settlement amount".into(),
+            };
+        }
+        if billed_nano_usd == usage_delta && (billed_nano_usd > 0 || successful_completions == 0) {
+            GovernanceResult {
+                invariant: "INV-PERF-007",
+                status: "pass",
+                evidence: format!(
+                    "usage delta and per-request billed settlement reconcile at {usage_delta} nano-USD"
+                ),
+            }
+        } else {
+            GovernanceResult {
+                invariant: "INV-PERF-007",
+                status: "fail",
+                evidence: format!(
+                    "usage delta={usage_delta} nano-USD but per-request billed settlement={billed_nano_usd}"
+                ),
+            }
+        }
+    } else {
+        GovernanceResult { invariant: "INV-PERF-007", status: "not_measured", evidence: "configure --gateway-usage-url and inspect durable ledger rows before claiming reconciliation".into() }
+    }
 }
 
 fn metric_delta(
@@ -1341,13 +1369,18 @@ fn write_comparison(path: &Path, summaries: &[WorkloadSummary]) -> Result<(), St
         BufWriter::new(File::create(path).map_err(|e| format!("create comparison.md: {e}"))?);
     writeln!(file, "# Cloud benchmark comparison\n\nResults are scoped to the manifest and raw request records in this run. No result is a production or cross-gateway claim.\n")
         .map_err(|e| e.to_string())?;
-    writeln!(file, "| Variant | Concurrency | Repetition | Successful | Throughput/s | TTFT p50 ms | Latency p50 ms | Refused |\n|---|---:|---:|---:|---:|---:|---:|---:|")
+    writeln!(file, "| Variant | Concurrency | Repetition | Successful | Throughput/s | TTFT p50 ms | Latency p50 ms | Reserved nano-USD | Billed nano-USD | Accounting basis | Refused |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|")
         .map_err(|e| e.to_string())?;
     for s in summaries {
         let refused: usize = s.refusal_counts.values().sum();
+        let accounting_basis = match s.variant.as_str() {
+            "gateway-normalized" => "provider-usage-billed",
+            "gateway-passthrough" => "reservation-billed",
+            _ => "-",
+        };
         writeln!(
             file,
-            "| {} | {} | {} | {} | {:.2} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {:.2} | {} | {} | {} | {} | {} | {} |",
             s.variant,
             s.concurrency,
             s.repetition,
@@ -1355,6 +1388,9 @@ fn write_comparison(path: &Path, summaries: &[WorkloadSummary]) -> Result<(), St
             s.throughput_rps,
             display(s.client_observed_ttft.p50_ms),
             display(s.full_response_latency.p50_ms),
+            s.reserved_nano_usd,
+            s.billed_nano_usd,
+            accounting_basis,
             refused
         )
         .map_err(|e| e.to_string())?;
@@ -1617,6 +1653,47 @@ mod tests {
             None
         );
         assert_eq!(metric_delta(None, Some(&after), "other"), None);
+    }
+
+    #[test]
+    fn passthrough_reserved_without_settlement_fails_reconciliation() {
+        let result = accounting_result(Some(true), Some(100), Some(100), 0, 1);
+        assert_eq!(result.status, "fail");
+        assert!(result.evidence.contains("no billed settlement amount"));
+    }
+
+    #[test]
+    fn passthrough_settles_against_reservation_when_usage_is_observed() {
+        let result = accounting_result(Some(true), Some(100), Some(150), 50, 1);
+        assert_eq!(result.status, "pass");
+        assert!(result.evidence.contains("billed settlement"));
+    }
+
+    #[test]
+    fn passthrough_settlement_is_recorded_as_billed_when_cost_field_is_absent() {
+        let variant = Variant {
+            name: "gateway-passthrough".into(),
+            framing: Some("passthrough"),
+            url: "http://localhost".into(),
+            direct: false,
+        };
+        assert_eq!(
+            settled_billed_nano_usd(&variant, b"data: [DONE]", Some(50)),
+            Some(50)
+        );
+        assert_eq!(
+            settled_billed_nano_usd(&variant, br#"{"cost_nano_usd":37}"#, Some(50)),
+            Some(37)
+        );
+        let direct = Variant {
+            direct: true,
+            framing: None,
+            ..variant
+        };
+        assert_eq!(
+            settled_billed_nano_usd(&direct, b"data: [DONE]", Some(50)),
+            None
+        );
     }
 
     #[test]
