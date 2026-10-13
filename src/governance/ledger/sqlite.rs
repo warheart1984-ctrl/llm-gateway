@@ -105,6 +105,7 @@ pub struct SqliteLedger {
     pool: SqlitePool,
     writer: mpsc::UnboundedSender<WriterMsg>,
     pending: Arc<AtomicU64>,
+    pending_by_tenant: Arc<DashMap<String, AtomicU64>>,
     open_reservations: Arc<AtomicU64>,
     timeout: Duration,
     retention: Duration,
@@ -193,6 +194,7 @@ impl SqliteLedger {
 
         let (writer, inbox) = mpsc::unbounded_channel();
         let pending = Arc::new(AtomicU64::new(0));
+        let pending_by_tenant = Arc::new(DashMap::new());
         let open = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM reservations WHERE state = 'open'")
             .fetch_one(&pool)
             .await
@@ -203,6 +205,7 @@ impl SqliteLedger {
             pool.clone(),
             inbox,
             Arc::clone(&pending),
+            Arc::clone(&pending_by_tenant),
             Arc::clone(&open_reservations),
             opts.sealer.clone(),
             Arc::clone(&live),
@@ -232,6 +235,7 @@ impl SqliteLedger {
             pool,
             writer,
             pending,
+            pending_by_tenant,
             open_reservations,
             timeout: opts.timeout,
             retention: opts.idempotency_retention,
@@ -320,9 +324,10 @@ impl SqliteLedger {
             completion_tokens: 0,
         };
         let pool = self.pool.clone();
-        let (writer, pending, upkeep) = (
+        let (writer, pending, pending_by_tenant, upkeep) = (
             self.writer.clone(),
             Arc::clone(&self.pending),
+            Arc::clone(&self.pending_by_tenant),
             Arc::clone(&self.upkeep),
         );
         async move {
@@ -342,8 +347,16 @@ impl SqliteLedger {
                 }
             }
             pending.fetch_add(1, Ordering::Relaxed);
+            let tenant = closing.tenant_id.to_string();
+            pending_by_tenant
+                .entry(tenant.clone())
+                .or_default()
+                .fetch_add(1, Ordering::Relaxed);
             if writer.send(WriterMsg::Close(closing)).is_err() {
                 pending.fetch_sub(1, Ordering::Relaxed);
+                if let Some(value) = pending_by_tenant.get(&tenant) {
+                    value.fetch_sub(1, Ordering::Relaxed);
+                }
                 tracing::error!(
                     "ledger writer has stopped; the sweeper will bill this reservation in full"
                 );
@@ -426,15 +439,25 @@ impl SqliteLedger {
         .execute(&mut *tx)
         .await?;
         // `BEGIN IMMEDIATE` already holds the write lock, so counting here
-        // cannot be raced by any other admission, in or out of this process.
+        // cannot be raced by another admission. A close is queued after a
+        // stream ends, before its durable row is updated. Those rows are not
+        // live streams anymore; subtract this process's queued closes so a
+        // settlement backlog cannot masquerade as active concurrency. A
+        // different process's backlog remains conservative (it may cause an
+        // over-refusal, never an over-admission).
         if r.limits.max_concurrent > 0 {
-            let live: i64 = sqlx::query_scalar(&format!(
+            let open: i64 = sqlx::query_scalar(&format!(
                 "SELECT count(*) FROM reservations
                   WHERE tenant_id = ?1 AND state = 'open' AND lease_expires_at > {NOW}"
             ))
             .bind(r.tenant_id)
             .fetch_one(&mut *tx)
             .await?;
+            let queued = self
+                .pending_by_tenant
+                .get(r.tenant_id)
+                .map_or(0, |value| value.load(Ordering::Relaxed).min(i64::MAX as u64) as i64);
+            let live = open.saturating_sub(queued);
             if live >= i64::from(r.limits.max_concurrent) {
                 return Ok(Err(LedgerRefusal::ConcurrencyLimited {
                     limit: r.limits.max_concurrent,
@@ -789,6 +812,7 @@ async fn run_writer(
     pool: SqlitePool,
     mut inbox: mpsc::UnboundedReceiver<WriterMsg>,
     pending: Arc<AtomicU64>,
+    pending_by_tenant: Arc<DashMap<String, AtomicU64>>,
     open_reservations: Arc<AtomicU64>,
     sealer: Option<Arc<ResponseSealer>>,
     live: Arc<DashMap<Uuid, ()>>,
@@ -838,6 +862,9 @@ async fn run_writer(
                 for closing in closings {
                     live.remove(&closing.id);
                     pending.fetch_sub(1, Ordering::Relaxed);
+                    if let Some(value) = pending_by_tenant.get(&closing.tenant_id.to_string()) {
+                        value.fetch_sub(1, Ordering::Relaxed);
+                    }
                     open_reservations.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                         Some(value.saturating_sub(1))
                     }).ok();
@@ -1085,9 +1112,17 @@ impl Ledger for SqliteLedger {
     }
 
     fn close(&self, c: Closing) {
+        let tenant = c.tenant_id.to_string();
         self.pending.fetch_add(1, Ordering::Relaxed);
+        self.pending_by_tenant
+            .entry(tenant.clone())
+            .or_default()
+            .fetch_add(1, Ordering::Relaxed);
         if self.writer.send(WriterMsg::Close(c)).is_err() {
             self.pending.fetch_sub(1, Ordering::Relaxed);
+            if let Some(value) = self.pending_by_tenant.get(&tenant) {
+                value.fetch_sub(1, Ordering::Relaxed);
+            }
             tracing::error!(
                 "ledger writer has stopped; the sweeper will bill this reservation in full"
             );
