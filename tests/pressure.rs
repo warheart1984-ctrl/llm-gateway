@@ -19,21 +19,21 @@
 use std::{
     net::SocketAddr,
     sync::{
-        Arc,
         atomic::{AtomicU64, Ordering},
+        Arc,
     },
     time::Duration,
 };
 
 use axum::{
-    Json, Router,
     body::Body,
     extract::State,
-    http::{HeaderMap, StatusCode, header},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
+    Json, Router,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::{net::TcpListener, task::JoinHandle};
 
 // ---------------------------------------------------------------------------
@@ -82,7 +82,9 @@ impl MockProvider {
         let app = Router::new()
             .route("/v1/chat/completions", post(answer))
             .with_state(state.clone());
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind provider");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind provider");
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -96,7 +98,12 @@ impl MockProvider {
     }
 
     fn last_body(&self) -> Value {
-        self.state.last_body.lock().unwrap().clone().expect("the provider saw a request")
+        self.state
+            .last_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the provider saw a request")
     }
 
     fn open_gate(&self, permits: usize) {
@@ -123,9 +130,10 @@ fn sse_body(frames: Vec<Result<String, std::io::Error>>) -> Response {
         Some((next, frames))
     });
     let mut response = Response::new(Body::from_stream(paced));
-    response
-        .headers_mut()
-        .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("text/event-stream"));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("text/event-stream"),
+    );
     response
 }
 
@@ -135,7 +143,10 @@ async fn answer(State(state): State<ProviderState>, Json(body): Json<Value>) -> 
     *state.last_body.lock().unwrap() = Some(body);
     match state.behaviour {
         Provider::Refusing => {
-            return (StatusCode::TOO_MANY_REQUESTS, Json(json!({ "error": { "message": "slow down" } })))
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({ "error": { "message": "slow down" } })),
+            )
                 .into_response();
         }
         Provider::Hung => std::future::pending::<()>().await,
@@ -156,7 +167,9 @@ async fn answer(State(state): State<ProviderState>, Json(body): Json<Value>) -> 
                         gate.acquire().await.expect("gate").forget();
                         token(", world")
                     }
-                    2 => sse(json!({ "id": "p1", "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] })),
+                    2 => sse(
+                        json!({ "id": "p1", "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] }),
+                    ),
                     3 => sse(json!({ "id": "p1", "choices": [],
                                     "usage": { "prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15 } })),
                     4 => "data: [DONE]\n\n".to_string(),
@@ -166,9 +179,10 @@ async fn answer(State(state): State<ProviderState>, Json(body): Json<Value>) -> 
             }
         });
         let mut response = Response::new(Body::from_stream(frames));
-        response
-            .headers_mut()
-            .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("text/event-stream"));
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("text/event-stream"),
+        );
         return response;
     }
     if state.behaviour == Provider::DiesMidStream {
@@ -182,7 +196,9 @@ async fn answer(State(state): State<ProviderState>, Json(body): Json<Value>) -> 
         Ok(token("Hello")),
         Ok(token(", ")),
         Ok(token("world")),
-        Ok(sse(json!({ "id": "p1", "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] }))),
+        Ok(sse(
+            json!({ "id": "p1", "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] }),
+        )),
         Ok(sse(json!({ "id": "p1", "choices": [],
                        "usage": { "prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15 } }))),
         Ok("data: [DONE]\n\n".to_string()),
@@ -204,9 +220,10 @@ fn completion_answer(behaviour: Provider) -> Response {
             Ok(text[..text.len() / 2].to_string()),
             Err(std::io::Error::other("provider connection lost")),
         ]);
-        response
-            .headers_mut()
-            .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/json"),
+        );
         return response;
     }
     Json(whole).into_response()
@@ -238,7 +255,11 @@ fn models_yaml(provider: SocketAddr) -> String {
         model("mock/forbidden", &live, Some(256)),
         model("mock/uncapped", &live, None),
         // Nothing listens on the discard port: an unreachable provider.
-        model("mock/down", "http://127.0.0.1:9/v1/chat/completions", Some(256)),
+        model(
+            "mock/down",
+            "http://127.0.0.1:9/v1/chat/completions",
+            Some(256)
+        ),
     )
 }
 
@@ -431,7 +452,12 @@ enum LedgerChoice {
     /// Every gateway process shares one Postgres ledger: a schema of its own
     /// per deployment, so parallel tests never share rows. `sealed` says
     /// whether stored answers are encrypted (and therefore stored at all).
-    Shared { url: String, schema: String, sealed: bool, deadline: Duration },
+    Shared {
+        url: String,
+        schema: String,
+        sealed: bool,
+        deadline: Duration,
+    },
 }
 
 /// The test database, or `None` to skip. CI sets
@@ -441,8 +467,12 @@ fn test_database_url() -> Option<String> {
     match std::env::var("LLM_GATEWAY_TEST_DATABASE_URL") {
         Ok(url) if !url.is_empty() => Some(url),
         _ => {
-            let required = std::env::var("LLM_GATEWAY_REQUIRE_TEST_DATABASE").is_ok_and(|v| !v.is_empty());
-            assert!(!required, "LLM_GATEWAY_TEST_DATABASE_URL is required but not set");
+            let required =
+                std::env::var("LLM_GATEWAY_REQUIRE_TEST_DATABASE").is_ok_and(|v| !v.is_empty());
+            assert!(
+                !required,
+                "LLM_GATEWAY_TEST_DATABASE_URL is required but not set"
+            );
             eprintln!("skipped: set LLM_GATEWAY_TEST_DATABASE_URL to run the shared-ledger tests");
             None
         }
@@ -470,7 +500,10 @@ async fn postgres_ledger_with(
     deadline: Duration,
 ) -> Result<Arc<llm_gateway::governance::ledger::PostgresLedger>, String> {
     let sealer = sealed.then(|| {
-        Arc::new(llm_gateway::governance::ledger::sealed::ResponseSealer::from_keys(TEST_RESPONSE_KEYS).unwrap())
+        Arc::new(
+            llm_gateway::governance::ledger::sealed::ResponseSealer::from_keys(TEST_RESPONSE_KEYS)
+                .unwrap(),
+        )
     });
     llm_gateway::governance::ledger::PostgresLedger::connect(
         llm_gateway::governance::ledger::postgres::PostgresOptions {
@@ -503,7 +536,10 @@ impl Deployment {
         let dir = Arc::new(tempdir::TempDir::new("llm-gateway-pressure"));
         std::fs::write(dir.path().join("models.yaml"), models_yaml(provider.addr)).unwrap();
         std::fs::write(dir.path().join("tenants.yaml"), tenants_yaml(true)).unwrap();
-        Self { dir, ledger: LedgerChoice::Memory }
+        Self {
+            dir,
+            ledger: LedgerChoice::Memory,
+        }
     }
 
     /// A deployment whose gateways share one Postgres ledger at `url`.
@@ -514,7 +550,12 @@ impl Deployment {
     fn shared_with(provider: &MockProvider, url: &str, sealed: bool) -> Self {
         let schema = format!("pressure_{}", uuid::Uuid::new_v4().simple());
         Self {
-            ledger: LedgerChoice::Shared { url: url.to_string(), schema, sealed, deadline: LEDGER_DEADLINE },
+            ledger: LedgerChoice::Shared {
+                url: url.to_string(),
+                schema,
+                sealed,
+                deadline: LEDGER_DEADLINE,
+            },
             ..Self::new(provider)
         }
     }
@@ -533,7 +574,11 @@ impl Deployment {
         let LedgerChoice::Shared { url, schema, .. } = &self.ledger else {
             panic!("not a shared-ledger deployment");
         };
-        postgres_ledger(url, schema, false).await.expect("connect ledger").pool().clone()
+        postgres_ledger(url, schema, false)
+            .await
+            .expect("connect ledger")
+            .pool()
+            .clone()
     }
 
     fn rewrite_tenants(&self, yaml: &str) {
@@ -583,10 +628,17 @@ impl Deployment {
         };
         tweak(&mut settings);
         let state = match &self.ledger {
-            LedgerChoice::Memory => llm_gateway::bootstrap::build(settings).await.map_err(|e| e.to_string())?,
+            LedgerChoice::Memory => llm_gateway::bootstrap::build(settings)
+                .await
+                .map_err(|e| e.to_string())?,
             // A fresh ledger client per boot, exactly as a separate process
             // would have: nothing is shared but the database.
-            LedgerChoice::Shared { url, schema, sealed, deadline } => {
+            LedgerChoice::Shared {
+                url,
+                schema,
+                sealed,
+                deadline,
+            } => {
                 let ledger = postgres_ledger_with(url, schema, *sealed, *deadline).await?;
                 llm_gateway::bootstrap::build_with_ledger(settings, ledger)
                     .await
@@ -594,18 +646,28 @@ impl Deployment {
             }
         };
         let app = llm_gateway::api::router(state);
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind gateway");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind gateway");
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
         tokio::time::sleep(Duration::from_millis(30)).await;
-        Ok(Gateway { addr, task, _config: Arc::clone(&self.dir) })
+        Ok(Gateway {
+            addr,
+            task,
+            _config: Arc::clone(&self.dir),
+        })
     }
 
     /// Settings for a gateway on its own SQLite ledger file in this
     /// deployment's directory, optionally as one of `split` replicas.
-    fn local_ledger(&self, file: &str, split: Option<u32>) -> impl FnOnce(&mut llm_gateway::config::Settings) {
+    fn local_ledger(
+        &self,
+        file: &str,
+        split: Option<u32>,
+    ) -> impl FnOnce(&mut llm_gateway::config::Settings) {
         let path = self.dir.path().join(file);
         move |s| {
             s.ledger.backend = llm_gateway::config::LedgerBackend::Sqlite;
@@ -650,7 +712,10 @@ impl Reply {
     }
 
     fn code(&self) -> String {
-        self.json()["error"]["code"].as_str().unwrap_or_default().to_string()
+        self.json()["error"]["code"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
     }
 }
 
@@ -664,11 +729,17 @@ impl Gateway {
         let status = response.status();
         let headers = response.headers().clone();
         let body = response.text().await.unwrap_or_default();
-        Reply { status, headers, body }
+        Reply {
+            status,
+            headers,
+            body,
+        }
     }
 
     async fn chat(&self, key: Option<&str>, body: Value) -> Reply {
-        let mut request = reqwest::Client::new().post(self.url("/v1/chat/stream")).json(&body);
+        let mut request = reqwest::Client::new()
+            .post(self.url("/v1/chat/stream"))
+            .json(&body);
         if let Some(key) = key {
             request = request.header("x-api-key", key);
         }
@@ -677,7 +748,9 @@ impl Gateway {
 
     /// The second door: `POST /v1/chat/complete`.
     async fn complete(&self, key: Option<&str>, body: Value) -> Reply {
-        let mut request = reqwest::Client::new().post(self.url("/v1/chat/complete")).json(&body);
+        let mut request = reqwest::Client::new()
+            .post(self.url("/v1/chat/complete"))
+            .json(&body);
         if let Some(key) = key {
             request = request.header("x-api-key", key);
         }
@@ -685,7 +758,12 @@ impl Gateway {
     }
 
     async fn get(&self, path: &str, key: &str) -> Reply {
-        self.send(reqwest::Client::new().get(self.url(path)).header("x-api-key", key)).await
+        self.send(
+            reqwest::Client::new()
+                .get(self.url(path))
+                .header("x-api-key", key),
+        )
+        .await
     }
 
     async fn spent(&self, key: &str) -> u64 {
@@ -695,8 +773,22 @@ impl Gateway {
     }
 
     async fn in_flight(&self, key: &str) -> u64 {
-        self.get("/v1/usage", key).await.json()["streams_in_flight"].as_u64().unwrap()
+        self.get("/v1/usage", key).await.json()["streams_in_flight"]
+            .as_u64()
+            .unwrap()
     }
+
+    async fn metrics(&self) -> String {
+        let reply = self.get("/metrics", "key-admin").await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        reply.body
+    }
+}
+
+fn metric_value(body: &str, name: &str) -> Option<u64> {
+    body.lines()
+        .find(|line| line.starts_with(name) && line.as_bytes().get(name.len()) == Some(&b' '))
+        .and_then(|line| line[name.len()..].trim().parse().ok())
 }
 
 fn standard_request() -> Value {
@@ -720,7 +812,10 @@ fn small_request() -> Value {
 async fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while !condition() {
-        assert!(tokio::time::Instant::now() < deadline, "timed out waiting for: {what}");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for: {what}"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
@@ -747,14 +842,27 @@ async fn identity_a_forged_key_never_reaches_the_provider() {
 
     for forged in ["key-admin-", "KEY-ADMIN", "key-admi", "", " "] {
         let reply = gw.chat(Some(forged), standard_request()).await;
-        assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "x-api-key {forged:?}");
+        assert_eq!(
+            reply.status,
+            StatusCode::UNAUTHORIZED,
+            "x-api-key {forged:?}"
+        );
     }
-    for bearer in ["Bearer forged", "Bearer ", "Basic a2V5LWFkbWlu", "key-admin"] {
+    for bearer in [
+        "Bearer forged",
+        "Bearer ",
+        "Basic a2V5LWFkbWlu",
+        "key-admin",
+    ] {
         let request = reqwest::Client::new()
             .post(gw.url("/v1/chat/stream"))
             .header("authorization", bearer)
             .json(&standard_request());
-        assert_eq!(gw.send(request).await.status, StatusCode::UNAUTHORIZED, "authorization {bearer:?}");
+        assert_eq!(
+            gw.send(request).await.status,
+            StatusCode::UNAUTHORIZED,
+            "authorization {bearer:?}"
+        );
     }
     assert_eq!(provider.calls(), 0);
 }
@@ -766,7 +874,10 @@ async fn identity_a_switched_off_credential_never_reaches_the_provider() {
 
     let reply = gw.chat(Some("key-switched-off"), standard_request()).await;
     assert!(
-        matches!(reply.status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN),
+        matches!(
+            reply.status,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ),
         "{} {}",
         reply.status,
         reply.body
@@ -780,18 +891,31 @@ async fn identity_a_revoked_key_stops_at_the_next_request() {
     let deployment = Deployment::new(&provider);
     let gw = deployment.boot().await;
 
-    assert_eq!(gw.chat(Some("key-rotating"), standard_request()).await.status, StatusCode::OK);
+    assert_eq!(
+        gw.chat(Some("key-rotating"), standard_request())
+            .await
+            .status,
+        StatusCode::OK
+    );
     assert_eq!(provider.calls(), 1);
 
     deployment.rewrite_tenants(&tenants_yaml(false));
     let reload = gw
-        .send(reqwest::Client::new().post(gw.url("/v1/admin/registry/reload")).header("x-api-key", "key-admin"))
+        .send(
+            reqwest::Client::new()
+                .post(gw.url("/v1/admin/registry/reload"))
+                .header("x-api-key", "key-admin"),
+        )
         .await;
     assert_eq!(reload.status, StatusCode::OK, "{}", reload.body);
 
     let reply = gw.chat(Some("key-rotating"), standard_request()).await;
     assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
-    assert_eq!(provider.calls(), 1, "the revoked key's request never reached the provider");
+    assert_eq!(
+        provider.calls(),
+        1,
+        "the revoked key's request never reached the provider"
+    );
 }
 
 #[tokio::test]
@@ -801,7 +925,10 @@ async fn identity_a_disabled_tenant_never_reaches_the_provider() {
 
     let reply = gw.chat(Some("key-dormant"), standard_request()).await;
     assert!(
-        matches!(reply.status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN),
+        matches!(
+            reply.status,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ),
         "{} {}",
         reply.status,
         reply.body
@@ -829,10 +956,18 @@ async fn authority_operator_actions_need_the_admin_scope() {
     let gw = Deployment::new(&provider).boot().await;
 
     let reload = |key: &'static str| {
-        reqwest::Client::new().post(gw.url("/v1/admin/registry/reload")).header("x-api-key", key)
+        reqwest::Client::new()
+            .post(gw.url("/v1/admin/registry/reload"))
+            .header("x-api-key", key)
     };
-    assert_eq!(gw.send(reload("key-app")).await.status, StatusCode::FORBIDDEN);
-    assert_eq!(gw.get("/metrics", "key-app").await.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        gw.send(reload("key-app")).await.status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        gw.get("/metrics", "key-app").await.status,
+        StatusCode::FORBIDDEN
+    );
     let admin = gw.send(reload("key-admin")).await;
     assert_eq!(admin.status, StatusCode::OK, "{}", admin.body);
     assert_eq!(gw.get("/metrics", "key-admin").await.status, StatusCode::OK);
@@ -843,10 +978,17 @@ async fn authority_a_tenant_sees_only_its_own_spend() {
     let provider = MockProvider::start(Provider::Healthy).await;
     let gw = Deployment::new(&provider).boot().await;
 
-    assert_eq!(gw.chat(Some("key-bystander"), standard_request()).await.status, StatusCode::OK);
+    assert_eq!(
+        gw.chat(Some("key-bystander"), standard_request())
+            .await
+            .status,
+        StatusCode::OK
+    );
     // There is no way to name another tenant: the query is ignored, and the
     // answer is always the caller's own ledger.
-    let reply = gw.get("/v1/usage?tenant=bystander&tenant_id=bystander", "key-app").await;
+    let reply = gw
+        .get("/v1/usage?tenant=bystander&tenant_id=bystander", "key-app")
+        .await;
     assert_eq!(reply.json()["tenant_id"], "acme");
     assert_eq!(reply.json()["spent_nano_usd"], 0);
 }
@@ -876,7 +1018,12 @@ async fn model_denied_under_a_wildcard_never_reaches_the_provider() {
     let mut body = standard_request();
     body["model"] = json!("mock/forbidden");
     let reply = gw.chat(Some("key-app"), body).await;
-    assert_eq!(reply.status, StatusCode::FORBIDDEN, "deny beats `mock/*`: {}", reply.body);
+    assert_eq!(
+        reply.status,
+        StatusCode::FORBIDDEN,
+        "deny beats `mock/*`: {}",
+        reply.body
+    );
     assert_eq!(provider.calls(), 0);
 }
 
@@ -889,7 +1036,12 @@ async fn model_unknown_never_reaches_the_provider() {
         let mut body = standard_request();
         body["model"] = json!(model);
         let reply = gw.chat(Some("key-app"), body).await;
-        assert!(reply.status.is_client_error(), "{model}: {} {}", reply.status, reply.body);
+        assert!(
+            reply.status.is_client_error(),
+            "{model}: {} {}",
+            reply.status,
+            reply.body
+        );
     }
     assert_eq!(provider.calls(), 0);
 }
@@ -907,7 +1059,10 @@ async fn model_and_transport_cannot_be_redirected_through_parameters() {
     });
     assert_eq!(gw.chat(Some("key-app"), body).await.status, StatusCode::OK);
     let sent = provider.last_body();
-    assert_eq!(sent["model"], "mock-model", "the registry decides the upstream model");
+    assert_eq!(
+        sent["model"], "mock-model",
+        "the registry decides the upstream model"
+    );
     assert_eq!(sent["stream"], true, "the gateway decides the transport");
 }
 
@@ -937,7 +1092,8 @@ async fn budget_an_uncapped_request_is_refused() {
     let provider = MockProvider::start(Provider::Healthy).await;
     let gw = Deployment::new(&provider).boot().await;
 
-    let body = json!({ "model": "mock/uncapped", "messages": [{ "role": "user", "content": "hi" }] });
+    let body =
+        json!({ "model": "mock/uncapped", "messages": [{ "role": "user", "content": "hi" }] });
     let reply = gw.chat(Some("key-app"), body).await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
     assert_eq!(reply.code(), "max_tokens_required");
@@ -952,7 +1108,11 @@ async fn budget_the_output_ceiling_is_what_the_provider_receives() {
     let mut body = standard_request();
     body["params"] = json!({ "max_tokens": 1_000_000 });
     assert_eq!(gw.chat(Some("key-app"), body).await.status, StatusCode::OK);
-    assert_eq!(provider.last_body()["max_tokens"], 4096, "clamped to the tenant ceiling");
+    assert_eq!(
+        provider.last_body()["max_tokens"],
+        4096,
+        "clamped to the tenant ceiling"
+    );
 }
 
 #[tokio::test]
@@ -1005,13 +1165,23 @@ async fn budget_one_tenants_exhaustion_does_not_touch_another() {
         })
         .collect();
     eventually("tight at its ceiling", || provider.calls() == 3).await;
-    assert_eq!(gw.chat(Some("key-tight"), standard_request()).await.status, StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(
+        gw.chat(Some("key-tight"), standard_request()).await.status,
+        StatusCode::PAYMENT_REQUIRED
+    );
 
     let bystander = {
         let gw = Arc::clone(&gw);
-        tokio::spawn(async move { gw.chat(Some("key-bystander"), standard_request()).await.status })
+        tokio::spawn(async move {
+            gw.chat(Some("key-bystander"), standard_request())
+                .await
+                .status
+        })
     };
-    eventually("the bystander reaches the provider", || provider.calls() == 4).await;
+    eventually("the bystander reaches the provider", || {
+        provider.calls() == 4
+    })
+    .await;
     provider.open_gate(10);
     assert_eq!(bystander.await.unwrap(), StatusCode::OK);
     for h in held {
@@ -1059,11 +1229,18 @@ async fn failure_a_hung_provider_cannot_pin_budget_or_slots() {
         .await;
 
     let started = std::time::Instant::now();
-    let reply = tokio::time::timeout(Duration::from_secs(10), gw.chat(Some("key-app"), standard_request()))
-        .await
-        .expect("the gateway must give up on a hung provider");
+    let reply = tokio::time::timeout(
+        Duration::from_secs(10),
+        gw.chat(Some("key-app"), standard_request()),
+    )
+    .await
+    .expect("the gateway must give up on a hung provider");
     assert_eq!(reply.status, StatusCode::BAD_GATEWAY, "{}", reply.body);
-    assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "took {:?}",
+        started.elapsed()
+    );
     assert_eq!(provider.calls(), 1);
     assert_eq!(gw.spent("key-app").await, 0, "no answer, no charge");
     assert_eq!(gw.in_flight("key-app").await, 0);
@@ -1076,11 +1253,25 @@ async fn failure_a_provider_dying_mid_answer_bills_only_what_was_delivered() {
 
     let reply = gw.chat(Some("key-app"), standard_request()).await;
     assert_eq!(reply.status, StatusCode::OK, "headers were already sent");
-    assert!(reply.body.contains("event: error"), "the failure is reported in-band: {}", reply.body);
-    assert!(reply.body.contains("data: [DONE]"), "and the stream still terminates");
-    let reserved: u64 = reply.headers["x-reserved-nano-usd"].to_str().unwrap().parse().unwrap();
+    assert!(
+        reply.body.contains("event: error"),
+        "the failure is reported in-band: {}",
+        reply.body
+    );
+    assert!(
+        reply.body.contains("data: [DONE]"),
+        "and the stream still terminates"
+    );
+    let reserved: u64 = reply.headers["x-reserved-nano-usd"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
     let spent = gw.spent("key-app").await;
-    assert!(spent > 0 && spent < reserved, "delivered output billed, rest refunded: {spent} of {reserved}");
+    assert!(
+        spent > 0 && spent < reserved,
+        "delivered output billed, rest refunded: {spent} of {reserved}"
+    );
     assert_eq!(gw.in_flight("key-app").await, 0);
 }
 
@@ -1089,7 +1280,10 @@ async fn failure_a_disconnect_storm_leaks_no_slots() {
     let provider = MockProvider::start(Provider::Gated).await;
     let gw = Deployment::new(&provider).boot().await;
 
-    let impatient = reqwest::Client::builder().timeout(Duration::from_millis(150)).build().unwrap();
+    let impatient = reqwest::Client::builder()
+        .timeout(Duration::from_millis(150))
+        .build()
+        .unwrap();
     let storm: Vec<_> = (0..100)
         .map(|_| {
             impatient
@@ -1103,9 +1297,91 @@ async fn failure_a_disconnect_storm_leaks_no_slots() {
         assert!(result.is_err(), "every client gave up");
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(gw.in_flight("key-app").await, 0, "no slot outlives its client");
+    assert_eq!(
+        gw.in_flight("key-app").await,
+        0,
+        "no slot outlives its client"
+    );
     provider.open_gate(1);
-    assert_eq!(gw.chat(Some("key-app"), standard_request()).await.status, StatusCode::OK);
+    assert_eq!(
+        gw.chat(Some("key-app"), standard_request()).await.status,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn sqlite_sustained_fixed_concurrency_keeps_streams_and_settlements_bounded() {
+    // HeldMidStream has no artificial pacing once its gate is open, so this
+    // drives the SQLite close writer hard enough to expose a serialized
+    // per-reservation transaction. The client population remains fixed.
+    let provider = MockProvider::start(Provider::HeldMidStream).await;
+    let deployment = Deployment::new(&provider);
+    let ledger_tweak = deployment.local_ledger("sustained.sqlite", None);
+    let gw = Arc::new(deployment.boot_with(ledger_tweak).await);
+    provider.open_gate(100_000);
+
+    const CLIENTS: usize = 50;
+    let until = tokio::time::Instant::now() + Duration::from_secs(5);
+    let refused = Arc::new(AtomicU64::new(0));
+    let workers: Vec<_> = (0..CLIENTS)
+        .map(|_| {
+            let gw = Arc::clone(&gw);
+            let refused = Arc::clone(&refused);
+            tokio::spawn(async move {
+                while tokio::time::Instant::now() < until {
+                    let reply = gw.chat(Some("key-app"), small_request()).await;
+                    if reply.status != StatusCode::OK {
+                        refused.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        })
+        .collect();
+
+    let sampler_gateway = Arc::clone(&gw);
+    let sampler = tokio::spawn(async move {
+        let mut max_in_flight = 0;
+        let mut max_pending = 0;
+        let mut max_open = 0;
+        while tokio::time::Instant::now() < until {
+            max_in_flight = max_in_flight.max(sampler_gateway.in_flight("key-app").await);
+            let body = sampler_gateway.metrics().await;
+            max_pending =
+                max_pending.max(metric_value(&body, "gw_ledger_pending_closings").unwrap_or(0));
+            max_open = max_open.max(metric_value(&body, "gw_ledger_open_reservations").unwrap_or(0));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        (max_in_flight, max_open, max_pending)
+    });
+
+    for worker in workers {
+        worker.await.expect("load worker");
+    }
+    let (max_in_flight, max_open, max_pending) = sampler.await.expect("resource sampler");
+    eprintln!(
+        "sustained resource maxima: in_flight={max_in_flight}, open_reservations={max_open}, pending_closings={max_pending}"
+    );
+    assert_eq!(
+        refused.load(Ordering::Relaxed),
+        0,
+        "sustained load was refused"
+    );
+    assert!(
+        max_in_flight <= CLIENTS as u64,
+        "max in-flight {max_in_flight} exceeded {CLIENTS} clients"
+    );
+    assert!(max_open <= (CLIENTS * 10) as u64, "open reservations grew to {max_open}");
+    // A short burst may queue while the single SQLite writer commits, but
+    // batching must keep it far below the old 2,048-open-row failure.
+    assert!(
+        max_pending <= (CLIENTS * 10) as u64,
+        "settlement queue grew to {max_pending}"
+    );
+    assert_eq!(
+        gw.in_flight("key-app").await,
+        0,
+        "all stream slots released"
+    );
 }
 
 #[tokio::test]
@@ -1165,7 +1441,10 @@ async fn ledger_every_refusal_is_recorded_with_request_tenant_and_reason() {
     let entry: Value = serde_json::from_str(line).expect("structured log line");
     assert_eq!(entry["tenant"], "tight");
     assert_eq!(entry["stage"], "budget_exhausted");
-    assert!(entry["reason"].as_str().unwrap().contains("nano-USD"), "{entry}");
+    assert!(
+        entry["reason"].as_str().unwrap().contains("nano-USD"),
+        "{entry}"
+    );
     assert_eq!(entry["level"], "WARN");
 }
 
@@ -1197,7 +1476,10 @@ async fn eventually_recorded(gw: &Gateway, request_id: &str) -> Value {
         if let Some(record) = decision_for(gw, request_id).await {
             return record;
         }
-        assert!(tokio::time::Instant::now() < deadline, "{request_id} was never recorded");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{request_id} was never recorded"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -1208,7 +1490,9 @@ async fn ledger_a_refusal_is_on_the_decision_record() {
     let deployment = Deployment::new(&provider);
     for gw in [
         deployment.boot().await,
-        deployment.boot_with(deployment.local_ledger("decisions.sqlite3", None)).await,
+        deployment
+            .boot_with(deployment.local_ledger("decisions.sqlite3", None))
+            .await,
     ] {
         let request_id = refuse_on_budget(&gw, "hi").await;
         let record = eventually_recorded(&gw, &request_id).await;
@@ -1235,7 +1519,10 @@ async fn ledger_anonymous_refusals_are_never_recorded() {
     // A later, authenticated refusal is recorded, so the record is working.
     let later = refuse_on_budget(&gw, "hi").await;
     eventually_recorded(&gw, &later).await;
-    assert!(decision_for(&gw, &request_id).await.is_none(), "an anonymous refusal was persisted");
+    assert!(
+        decision_for(&gw, &request_id).await.is_none(),
+        "an anonymous refusal was persisted"
+    );
 }
 
 #[tokio::test]
@@ -1247,7 +1534,10 @@ async fn ledger_the_decision_record_holds_no_prompt_text() {
     let refused = refuse_on_budget(&gw, &marker).await;
     // A body the parser rejects while quoting the offending value.
     let malformed = gw
-        .chat(Some("key-app"), json!({ "model": "mock/chat", "messages": marker, "params": { "max_tokens": 5 } }))
+        .chat(
+            Some("key-app"),
+            json!({ "model": "mock/chat", "messages": marker, "params": { "max_tokens": 5 } }),
+        )
         .await;
     assert_eq!(malformed.status, StatusCode::BAD_REQUEST);
     let malformed_id = malformed.json()["request_id"].as_str().unwrap().to_string();
@@ -1255,21 +1545,34 @@ async fn ledger_the_decision_record_holds_no_prompt_text() {
     eventually_recorded(&gw, &refused).await;
     let record = eventually_recorded(&gw, &malformed_id).await;
     assert_eq!(record["reason"], "request body is not valid JSON");
-    let everything = gw.get("/v1/admin/decisions?limit=1000", "key-admin").await.body;
-    assert!(!everything.contains(&marker), "prompt text reached the decision record");
+    let everything = gw
+        .get("/v1/admin/decisions?limit=1000", "key-admin")
+        .await
+        .body;
+    assert!(
+        !everything.contains(&marker),
+        "prompt text reached the decision record"
+    );
 }
 
 #[tokio::test]
 async fn ledger_decisions_survive_a_restart() {
     let provider = MockProvider::start(Provider::Healthy).await;
     let deployment = Deployment::new(&provider);
-    let first = deployment.boot_with(deployment.local_ledger("decisions.sqlite3", None)).await;
+    let first = deployment
+        .boot_with(deployment.local_ledger("decisions.sqlite3", None))
+        .await;
     let request_id = refuse_on_budget(&first, "hi").await;
     eventually_recorded(&first, &request_id).await;
     drop(first);
 
-    let restarted = deployment.boot_with(deployment.local_ledger("decisions.sqlite3", None)).await;
-    assert!(decision_for(&restarted, &request_id).await.is_some(), "the record outlived the process");
+    let restarted = deployment
+        .boot_with(deployment.local_ledger("decisions.sqlite3", None))
+        .await;
+    assert!(
+        decision_for(&restarted, &request_id).await.is_some(),
+        "the record outlived the process"
+    );
 }
 
 #[tokio::test]
@@ -1277,7 +1580,11 @@ async fn ledger_an_operator_action_is_recorded() {
     let provider = MockProvider::start(Provider::Healthy).await;
     let gw = Deployment::new(&provider).boot().await;
     let reload = gw
-        .send(reqwest::Client::new().post(gw.url("/v1/admin/registry/reload")).header("x-api-key", "key-admin"))
+        .send(
+            reqwest::Client::new()
+                .post(gw.url("/v1/admin/registry/reload"))
+                .header("x-api-key", "key-admin"),
+        )
         .await;
     assert_eq!(reload.status, StatusCode::OK);
     let all = gw.get("/v1/admin/decisions", "key-admin").await.json();
@@ -1290,8 +1597,15 @@ async fn ledger_an_operator_action_is_recorded() {
         .expect("the reload is on the record");
     assert_eq!(action["kind"], "admin_action");
     assert_eq!(action["key_id"], "ak_admin");
-    assert!(gw.get("/metrics", "key-admin").await.body.contains("gw_decisions_dropped_total 0"));
-    assert_eq!(gw.get("/v1/admin/decisions", "key-app").await.status, StatusCode::FORBIDDEN);
+    assert!(gw
+        .get("/metrics", "key-admin")
+        .await
+        .body
+        .contains("gw_decisions_dropped_total 0"));
+    assert_eq!(
+        gw.get("/v1/admin/decisions", "key-app").await.status,
+        StatusCode::FORBIDDEN
+    );
 }
 
 // ===========================================================================
@@ -1334,16 +1648,27 @@ async fn second_door_model_access_holds() {
         let mut body = standard_request();
         body["model"] = json!(model);
         let reply = gw.complete(Some(key), body).await;
-        assert!(reply.status.is_client_error(), "{key} {model}: {}", reply.body);
+        assert!(
+            reply.status.is_client_error(),
+            "{key} {model}: {}",
+            reply.body
+        );
     }
     assert_eq!(provider.calls(), 0);
 
     let mut body = standard_request();
-    body["params"] = json!({ "max_tokens": 32, "model": "attacker/expensive-model", "stream": true });
-    assert_eq!(gw.complete(Some("key-app"), body).await.status, StatusCode::OK);
+    body["params"] =
+        json!({ "max_tokens": 32, "model": "attacker/expensive-model", "stream": true });
+    assert_eq!(
+        gw.complete(Some("key-app"), body).await.status,
+        StatusCode::OK
+    );
     let sent = provider.last_body();
     assert_eq!(sent["model"], "mock-model");
-    assert_eq!(sent["stream"], false, "the caller cannot turn a completion into a stream");
+    assert_eq!(
+        sent["stream"], false,
+        "the caller cannot turn a completion into a stream"
+    );
 }
 
 #[tokio::test]
@@ -1356,8 +1681,12 @@ async fn second_door_worst_case_exposure_is_refused_up_front() {
     let reply = gw.complete(Some("key-tight"), body).await;
     assert_eq!(reply.status, StatusCode::PAYMENT_REQUIRED);
     assert_eq!(provider.calls(), 0);
-    let body = json!({ "model": "mock/uncapped", "messages": [{ "role": "user", "content": "hi" }] });
-    assert_eq!(gw.complete(Some("key-app"), body).await.status, StatusCode::BAD_REQUEST);
+    let body =
+        json!({ "model": "mock/uncapped", "messages": [{ "role": "user", "content": "hi" }] });
+    assert_eq!(
+        gw.complete(Some("key-app"), body).await.status,
+        StatusCode::BAD_REQUEST
+    );
     assert_eq!(provider.calls(), 0);
 }
 
@@ -1394,7 +1723,13 @@ async fn second_door_both_doors_draw_on_one_budget() {
     assert_eq!(provider.calls(), 3, "one budget across both doors");
     provider.open_gate(20);
     let statuses = futures_util::future::join_all(burst).await;
-    assert_eq!(statuses.into_iter().filter(|s| *s.as_ref().unwrap() == StatusCode::OK).count(), 3);
+    assert_eq!(
+        statuses
+            .into_iter()
+            .filter(|s| *s.as_ref().unwrap() == StatusCode::OK)
+            .count(),
+        3
+    );
 }
 
 #[tokio::test]
@@ -1404,9 +1739,12 @@ async fn second_door_a_hung_provider_cannot_pin_budget_or_slots() {
         .boot_with(|s| s.upstream.stream_read_timeout_ms = 300)
         .await;
 
-    let reply = tokio::time::timeout(Duration::from_secs(10), gw.complete(Some("key-app"), standard_request()))
-        .await
-        .expect("the gateway must give up on a hung provider");
+    let reply = tokio::time::timeout(
+        Duration::from_secs(10),
+        gw.complete(Some("key-app"), standard_request()),
+    )
+    .await
+    .expect("the gateway must give up on a hung provider");
     assert_eq!(reply.status, StatusCode::BAD_GATEWAY, "{}", reply.body);
     assert_eq!(gw.spent("key-app").await, 0, "no answer, no charge");
     assert_eq!(gw.in_flight("key-app").await, 0);
@@ -1433,7 +1771,10 @@ async fn second_door_a_disconnect_storm_leaks_no_slots_and_bills_each_reservatio
     let provider = MockProvider::start(Provider::Gated).await;
     let gw = Deployment::new(&provider).boot().await;
 
-    let impatient = reqwest::Client::builder().timeout(Duration::from_millis(150)).build().unwrap();
+    let impatient = reqwest::Client::builder()
+        .timeout(Duration::from_millis(150))
+        .build()
+        .unwrap();
     let storm: Vec<_> = (0..20)
         .map(|_| {
             impatient
@@ -1447,7 +1788,11 @@ async fn second_door_a_disconnect_storm_leaks_no_slots_and_bills_each_reservatio
         assert!(result.is_err(), "every client gave up");
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(gw.in_flight("key-app").await, 0, "no slot outlives its client");
+    assert_eq!(
+        gw.in_flight("key-app").await,
+        0,
+        "no slot outlives its client"
+    );
     // small_request reserves 3 x 2,000 + 5 x 8,000 = 46,000 nano-USD.
     assert_eq!(gw.spent("key-app").await, 20 * 46_000);
 }
@@ -1457,14 +1802,24 @@ async fn second_door_a_disconnect_storm_leaks_no_slots_and_bills_each_reservatio
 // ===========================================================================
 
 fn with_key(request: reqwest::RequestBuilder, key: &str) -> reqwest::RequestBuilder {
-    request.header("x-api-key", "key-app").header("idempotency-key", key)
+    request
+        .header("x-api-key", "key-app")
+        .header("idempotency-key", key)
 }
 
 #[tokio::test]
 async fn replay_a_repeated_stream_is_recognised_not_executed() {
     let provider = MockProvider::start(Provider::Healthy).await;
     let gw = Deployment::new(&provider).boot().await;
-    let send = || gw.send(with_key(reqwest::Client::new().post(gw.url("/v1/chat/stream")), "order-1").json(&standard_request()));
+    let send = || {
+        gw.send(
+            with_key(
+                reqwest::Client::new().post(gw.url("/v1/chat/stream")),
+                "order-1",
+            )
+            .json(&standard_request()),
+        )
+    };
 
     let first = send().await;
     assert_eq!(first.status, StatusCode::OK);
@@ -1474,14 +1829,26 @@ async fn replay_a_repeated_stream_is_recognised_not_executed() {
     assert_eq!(second.json()["billed_nano_usd"], HEALTHY_ANSWER_COST);
     assert!(second.json()["original_request_id"].is_string());
     assert_eq!(provider.calls(), 1, "executed once");
-    assert_eq!(gw.spent("key-app").await, HEALTHY_ANSWER_COST, "billed once");
+    assert_eq!(
+        gw.spent("key-app").await,
+        HEALTHY_ANSWER_COST,
+        "billed once"
+    );
 }
 
 #[tokio::test]
 async fn replay_a_repeated_completion_is_served_from_the_ledger() {
     let provider = MockProvider::start(Provider::Healthy).await;
     let gw = Deployment::new(&provider).boot().await;
-    let send = || gw.send(with_key(reqwest::Client::new().post(gw.url("/v1/chat/complete")), "order-2").json(&standard_request()));
+    let send = || {
+        gw.send(
+            with_key(
+                reqwest::Client::new().post(gw.url("/v1/chat/complete")),
+                "order-2",
+            )
+            .json(&standard_request()),
+        )
+    };
 
     let first = send().await;
     assert_eq!(first.status, StatusCode::OK);
@@ -1490,14 +1857,26 @@ async fn replay_a_repeated_completion_is_served_from_the_ledger() {
     assert_eq!(replay.headers["idempotent-replayed"], "true");
     assert_eq!(replay.body, first.body, "the same answer, byte for byte");
     assert_eq!(provider.calls(), 1, "executed once");
-    assert_eq!(gw.spent("key-app").await, HEALTHY_ANSWER_COST, "billed once");
+    assert_eq!(
+        gw.spent("key-app").await,
+        HEALTHY_ANSWER_COST,
+        "billed once"
+    );
 }
 
 #[tokio::test]
 async fn replay_the_same_key_for_a_different_request_is_refused() {
     let provider = MockProvider::start(Provider::Healthy).await;
     let gw = Deployment::new(&provider).boot().await;
-    let send = |body: Value| gw.send(with_key(reqwest::Client::new().post(gw.url("/v1/chat/stream")), "order-3").json(&body));
+    let send = |body: Value| {
+        gw.send(
+            with_key(
+                reqwest::Client::new().post(gw.url("/v1/chat/stream")),
+                "order-3",
+            )
+            .json(&body),
+        )
+    };
 
     assert_eq!(send(standard_request()).await.status, StatusCode::OK);
     let mut other = standard_request();
@@ -1513,12 +1892,21 @@ async fn replay_a_retry_while_the_first_is_running_is_told_to_wait() {
     let provider = MockProvider::start(Provider::Gated).await;
     let gw = Arc::new(Deployment::new(&provider).boot().await);
     let send = |gw: Arc<Gateway>| async move {
-        gw.send(with_key(reqwest::Client::new().post(gw.url("/v1/chat/stream")), "order-4").json(&standard_request()))
-            .await
+        gw.send(
+            with_key(
+                reqwest::Client::new().post(gw.url("/v1/chat/stream")),
+                "order-4",
+            )
+            .json(&standard_request()),
+        )
+        .await
     };
 
     let first = tokio::spawn(send(Arc::clone(&gw)));
-    eventually("the first attempt reaches the provider", || provider.calls() == 1).await;
+    eventually("the first attempt reaches the provider", || {
+        provider.calls() == 1
+    })
+    .await;
     let retry = send(Arc::clone(&gw)).await;
     assert_eq!(retry.status, StatusCode::CONFLICT);
     assert_eq!(retry.code(), "request_in_progress");
@@ -1534,11 +1922,23 @@ async fn replay_a_refused_attempt_can_be_retried_under_its_key() {
     // honest retry after a provider refusal must reach the provider.
     let provider = MockProvider::start(Provider::Refusing).await;
     let gw = Deployment::new(&provider).boot().await;
-    let send = || gw.send(with_key(reqwest::Client::new().post(gw.url("/v1/chat/stream")), "order-5").json(&standard_request()));
+    let send = || {
+        gw.send(
+            with_key(
+                reqwest::Client::new().post(gw.url("/v1/chat/stream")),
+                "order-5",
+            )
+            .json(&standard_request()),
+        )
+    };
 
     assert_eq!(send().await.status, StatusCode::BAD_GATEWAY);
     assert_eq!(send().await.status, StatusCode::BAD_GATEWAY);
-    assert_eq!(provider.calls(), 2, "the retry was executed, not refused as a duplicate");
+    assert_eq!(
+        provider.calls(),
+        2,
+        "the retry was executed, not refused as a duplicate"
+    );
     assert_eq!(gw.spent("key-app").await, 0);
 }
 
@@ -1548,8 +1948,14 @@ async fn replay_without_a_key_cannot_be_recognised() {
     // legitimate requests. Tenants whose clients retry require the key.
     let provider = MockProvider::start(Provider::Healthy).await;
     let gw = Deployment::new(&provider).boot().await;
-    assert_eq!(gw.chat(Some("key-app"), standard_request()).await.status, StatusCode::OK);
-    assert_eq!(gw.chat(Some("key-app"), standard_request()).await.status, StatusCode::OK);
+    assert_eq!(
+        gw.chat(Some("key-app"), standard_request()).await.status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        gw.chat(Some("key-app"), standard_request()).await.status,
+        StatusCode::OK
+    );
     assert_eq!(provider.calls(), 2);
 }
 
@@ -1578,19 +1984,37 @@ async fn replay_a_tenant_can_require_the_key() {
 
 #[tokio::test]
 async fn shared_ledger_a_restart_keeps_todays_spend() {
-    let Some(url) = test_database_url() else { return };
+    let Some(url) = test_database_url() else {
+        return;
+    };
     let provider = MockProvider::start(Provider::Healthy).await;
     let deployment = Deployment::shared(&provider, &url);
 
     let first = deployment.boot().await;
-    assert_eq!(first.chat(Some("key-oneshot"), small_request()).await.status, StatusCode::OK);
-    eventually_async("the settlement is durable", || async { first.spent("key-oneshot").await == HEALTHY_ANSWER_COST }).await;
+    assert_eq!(
+        first
+            .chat(Some("key-oneshot"), small_request())
+            .await
+            .status,
+        StatusCode::OK
+    );
+    eventually_async("the settlement is durable", || async {
+        first.spent("key-oneshot").await == HEALTHY_ANSWER_COST
+    })
+    .await;
     drop(first); // crash
 
     let restarted = deployment.boot().await;
-    assert_eq!(restarted.spent("key-oneshot").await, HEALTHY_ANSWER_COST, "the ledger outlived the process");
     assert_eq!(
-        restarted.chat(Some("key-oneshot"), small_request()).await.status,
+        restarted.spent("key-oneshot").await,
+        HEALTHY_ANSWER_COST,
+        "the ledger outlived the process"
+    );
+    assert_eq!(
+        restarted
+            .chat(Some("key-oneshot"), small_request())
+            .await
+            .status,
         StatusCode::PAYMENT_REQUIRED,
         "an exhausted tenant stays exhausted after a restart"
     );
@@ -1599,13 +2023,21 @@ async fn shared_ledger_a_restart_keeps_todays_spend() {
 
 #[tokio::test]
 async fn shared_ledger_replicas_draw_on_one_budget() {
-    let Some(url) = test_database_url() else { return };
+    let Some(url) = test_database_url() else {
+        return;
+    };
     let provider = MockProvider::start(Provider::Healthy).await;
     let deployment = Deployment::shared(&provider, &url);
     let (a, b) = (deployment.boot().await, deployment.boot().await);
 
-    assert_eq!(a.chat(Some("key-oneshot"), small_request()).await.status, StatusCode::OK);
-    eventually_async("the settlement is durable", || async { b.spent("key-oneshot").await == HEALTHY_ANSWER_COST }).await;
+    assert_eq!(
+        a.chat(Some("key-oneshot"), small_request()).await.status,
+        StatusCode::OK
+    );
+    eventually_async("the settlement is durable", || async {
+        b.spent("key-oneshot").await == HEALTHY_ANSWER_COST
+    })
+    .await;
     assert_eq!(
         b.chat(Some("key-oneshot"), small_request()).await.status,
         StatusCode::PAYMENT_REQUIRED,
@@ -1618,10 +2050,15 @@ async fn shared_ledger_replicas_draw_on_one_budget() {
 async fn shared_ledger_a_burst_across_replicas_admits_exactly_what_fits() {
     // Twenty simultaneous requests alternating between two gateway processes,
     // against a budget with room for three. Separate books would admit six.
-    let Some(url) = test_database_url() else { return };
+    let Some(url) = test_database_url() else {
+        return;
+    };
     let provider = MockProvider::start(Provider::Gated).await;
     let deployment = Deployment::shared(&provider, &url);
-    let replicas = [Arc::new(deployment.boot().await), Arc::new(deployment.boot().await)];
+    let replicas = [
+        Arc::new(deployment.boot().await),
+        Arc::new(deployment.boot().await),
+    ];
 
     // Every answer that comes back before the gate opens is recorded, so a
     // refusal of the wrong kind names itself instead of looking like a hang.
@@ -1632,7 +2069,10 @@ async fn shared_ledger_a_burst_across_replicas_admits_exactly_what_fits() {
             tokio::spawn(async move {
                 let reply = gw.chat(Some("key-tight"), standard_request()).await;
                 if reply.status != StatusCode::OK {
-                    answered.lock().unwrap().push((reply.status, reply.body.clone()));
+                    answered
+                        .lock()
+                        .unwrap()
+                        .push((reply.status, reply.body.clone()));
                 }
                 reply.status
             })
@@ -1644,23 +2084,36 @@ async fn shared_ledger_a_burst_across_replicas_admits_exactly_what_fits() {
     .await;
     let answered = answered.lock().unwrap().clone();
     assert!(
-        answered.iter().all(|(status, _)| *status == StatusCode::PAYMENT_REQUIRED),
+        answered
+            .iter()
+            .all(|(status, _)| *status == StatusCode::PAYMENT_REQUIRED),
         "every refusal must be a budget refusal: {answered:#?}"
     );
     assert_eq!(provider.calls(), 3, "one budget across both replicas");
     provider.open_gate(20);
     let statuses = futures_util::future::join_all(burst).await;
-    assert_eq!(statuses.into_iter().filter(|s| *s.as_ref().unwrap() == StatusCode::OK).count(), 3);
+    assert_eq!(
+        statuses
+            .into_iter()
+            .filter(|s| *s.as_ref().unwrap() == StatusCode::OK)
+            .count(),
+        3
+    );
 }
 
 #[tokio::test]
 async fn shared_ledger_concurrency_is_one_cap_across_replicas() {
     // `capped` allows 3 streams at once. Twenty simultaneous requests split
     // across two replicas: exactly 3 reach the provider, not 3 per replica.
-    let Some(url) = test_database_url() else { return };
+    let Some(url) = test_database_url() else {
+        return;
+    };
     let provider = MockProvider::start(Provider::Gated).await;
     let deployment = Deployment::shared(&provider, &url);
-    let replicas = [Arc::new(deployment.boot().await), Arc::new(deployment.boot().await)];
+    let replicas = [
+        Arc::new(deployment.boot().await),
+        Arc::new(deployment.boot().await),
+    ];
 
     let answered: Arc<std::sync::Mutex<Vec<(StatusCode, String)>>> = Arc::default();
     let burst: Vec<_> = (0..20)
@@ -1678,10 +2131,16 @@ async fn shared_ledger_concurrency_is_one_cap_across_replicas() {
         provider.calls() as usize + answered.lock().unwrap().len() == 20
     })
     .await;
-    assert_eq!(provider.calls(), 3, "one concurrency cap across both replicas");
+    assert_eq!(
+        provider.calls(),
+        3,
+        "one concurrency cap across both replicas"
+    );
     let refusals = answered.lock().unwrap().clone();
     assert!(
-        refusals.iter().all(|(s, c)| *s == StatusCode::TOO_MANY_REQUESTS && c == "concurrency_limited"),
+        refusals
+            .iter()
+            .all(|(s, c)| *s == StatusCode::TOO_MANY_REQUESTS && c == "concurrency_limited"),
         "{refusals:?}"
     );
     provider.open_gate(20);
@@ -1693,8 +2152,12 @@ async fn shared_ledger_admissions_are_refused_while_settlements_back_up() {
     // Closings carry money and are never dropped, so when the writer falls
     // behind the bound is at the door: past the limit, admissions are refused
     // at once, without touching the database.
-    use llm_gateway::governance::ledger::{Closing, Ledger as _, NewReservation, Outcome, SharedLimits};
-    let Some(url) = test_database_url() else { return };
+    use llm_gateway::governance::ledger::{
+        Closing, Ledger as _, NewReservation, Outcome, SharedLimits,
+    };
+    let Some(url) = test_database_url() else {
+        return;
+    };
     let schema = format!("pressure_{}", uuid::Uuid::new_v4().simple());
     let ledger = llm_gateway::governance::ledger::PostgresLedger::connect(
         llm_gateway::governance::ledger::postgres::PostgresOptions {
@@ -1739,32 +2202,53 @@ async fn shared_ledger_admissions_are_refused_while_settlements_back_up() {
     };
     // Another session holds that reservation's row: its closing, first in
     // the writer's queue, waits on it, and so does everything behind it.
-    let outside = postgres_ledger(&url, &schema, false).await.expect("connect");
+    let outside = postgres_ledger(&url, &schema, false)
+        .await
+        .expect("connect");
     let mut lock = outside.pool().begin().await.unwrap();
-    sqlx::query("SELECT id FROM reservations WHERE id = $1 FOR UPDATE").bind(id).fetch_one(&mut *lock).await.unwrap();
+    sqlx::query("SELECT id FROM reservations WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .fetch_one(&mut *lock)
+        .await
+        .unwrap();
     ledger.close(close(id));
     ledger.close(close(uuid::Uuid::new_v4()));
     ledger.close(close(uuid::Uuid::new_v4()));
 
     let started = std::time::Instant::now();
     let refused = ledger.try_reserve(reservation()).await;
-    assert!(format!("{refused:?}").contains("settlements are waiting"), "{refused:?}");
-    assert!(started.elapsed() < Duration::from_millis(500), "refused at the door, not after waiting on the lock");
+    assert!(
+        format!("{refused:?}").contains("settlements are waiting"),
+        "{refused:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "refused at the door, not after waiting on the lock"
+    );
     assert_eq!(ledger.upkeep().backlog_refusals, 1);
     assert_eq!(ledger.upkeep().pending_closings, 3);
 
     lock.rollback().await.unwrap();
     ledger.flush().await;
     assert_eq!(ledger.upkeep().pending_closings, 0);
-    ledger.try_reserve(reservation()).await.expect("admitted once the writer caught up");
+    ledger
+        .try_reserve(reservation())
+        .await
+        .expect("admitted once the writer caught up");
 }
 
 #[tokio::test]
 async fn shared_ledger_closed_reservations_are_kept_for_their_retention_then_deleted() {
-    use llm_gateway::governance::ledger::{Closing, Ledger as _, NewReservation, Outcome, SharedLimits};
-    let Some(url) = test_database_url() else { return };
+    use llm_gateway::governance::ledger::{
+        Closing, Ledger as _, NewReservation, Outcome, SharedLimits,
+    };
+    let Some(url) = test_database_url() else {
+        return;
+    };
     let schema = format!("pressure_{}", uuid::Uuid::new_v4().simple());
-    let ledger = postgres_ledger(&url, &schema, false).await.expect("connect ledger");
+    let ledger = postgres_ledger(&url, &schema, false)
+        .await
+        .expect("connect ledger");
     let mut ids = Vec::new();
     for _ in 0..3 {
         let id = uuid::Uuid::new_v4();
@@ -1796,23 +2280,39 @@ async fn shared_ledger_closed_reservations_are_kept_for_their_retention_then_del
     }
     ledger.flush().await;
     let pool = ledger.pool();
-    sqlx::query("UPDATE reservations SET response = 'the answer'").execute(pool).await.unwrap();
+    sqlx::query("UPDATE reservations SET response = 'the answer'")
+        .execute(pool)
+        .await
+        .unwrap();
     for (id, days) in [(ids[0], 31), (ids[1], 2)] {
-        sqlx::query("UPDATE reservations SET closed_at = now() - make_interval(days => $2) WHERE id = $1")
-            .bind(id)
-            .bind(days)
-            .execute(pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE reservations SET closed_at = now() - make_interval(days => $2) WHERE id = $1",
+        )
+        .bind(id)
+        .bind(days)
+        .execute(pool)
+        .await
+        .unwrap();
     }
     // The background sweeper may get here first; the outcome is the same.
     ledger.apply_retention().await.unwrap();
     let rows: Vec<(uuid::Uuid, Option<String>)> =
-        sqlx::query_as("SELECT id, response FROM reservations").fetch_all(pool).await.unwrap();
-    let row = |id| rows.iter().find(|(r, _)| *r == id).map(|(_, resp)| resp.clone());
+        sqlx::query_as("SELECT id, response FROM reservations")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    let row = |id| {
+        rows.iter()
+            .find(|(r, _)| *r == id)
+            .map(|(_, resp)| resp.clone())
+    };
     assert_eq!(row(ids[0]), None, "deleted after 30 days");
     assert_eq!(row(ids[1]), Some(None), "kept, without its answer");
-    assert_eq!(row(ids[2]), Some(Some("the answer".to_string())), "recent: kept whole");
+    assert_eq!(
+        row(ids[2]),
+        Some(Some("the answer".to_string())),
+        "recent: kept whole"
+    );
 }
 
 #[tokio::test]
@@ -1828,9 +2328,13 @@ async fn shared_ledger_a_connection_left_inside_a_transaction_never_swallows_an_
     // way: a later admission is refused as `Unavailable`. The pool must
     // close the connection instead of reusing it.
     use llm_gateway::governance::ledger::{Ledger as _, NewReservation, SharedLimits};
-    let Some(url) = test_database_url() else { return };
+    let Some(url) = test_database_url() else {
+        return;
+    };
     let schema = format!("pressure_{}", uuid::Uuid::new_v4().simple());
-    let ledger = postgres_ledger(&url, &schema, false).await.expect("connect ledger");
+    let ledger = postgres_ledger(&url, &schema, false)
+        .await
+        .expect("connect ledger");
     {
         let mut conn = ledger.pool().acquire().await.unwrap();
         let tx = sqlx::Connection::begin(&mut *conn).await.unwrap();
@@ -1858,8 +2362,13 @@ async fn shared_ledger_a_connection_left_inside_a_transaction_never_swallows_an_
     }
     assert_eq!(ledger.upkeep().stuck_connections_closed, 1);
     // Every admission is committed and visible from another connection.
-    let reader = postgres_ledger(&url, &schema, false).await.expect("connect reader");
-    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM reservations").fetch_one(reader.pool()).await.unwrap();
+    let reader = postgres_ledger(&url, &schema, false)
+        .await
+        .expect("connect reader");
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM reservations")
+        .fetch_one(reader.pool())
+        .await
+        .unwrap();
     assert_eq!(rows, admitted, "every admission must be durable");
 }
 
@@ -1876,9 +2385,12 @@ async fn shared_ledger_a_reservation_that_commits_after_its_deadline_is_released
     // A loaded runner can shift the timing either way, so the test asserts
     // what must hold whatever happened, not the sequence: nothing is left
     // open or swept, and a refused request costs nothing.
-    let Some(url) = test_database_url() else { return };
+    let Some(url) = test_database_url() else {
+        return;
+    };
     let provider = MockProvider::start(Provider::Healthy).await;
-    let deployment = Deployment::shared(&provider, &url).with_ledger_deadline(Duration::from_millis(1000));
+    let deployment =
+        Deployment::shared(&provider, &url).with_ledger_deadline(Duration::from_millis(1000));
     let pool = deployment.ledger_pool().await;
     for ddl in [
         "CREATE FUNCTION slow_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.35); RETURN NEW; END $$",
@@ -1898,10 +2410,12 @@ async fn shared_ledger_a_reservation_that_commits_after_its_deadline_is_released
     // it has either landed or been rolled back.
     tokio::time::sleep(Duration::from_secs(2)).await;
     eventually_async("no reservation is left open or swept", || async {
-        let stuck: i64 = sqlx::query_scalar("SELECT count(*) FROM reservations WHERE state IN ('open', 'swept')")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let stuck: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM reservations WHERE state IN ('open', 'swept')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         stuck == 0
     })
     .await;
@@ -1909,12 +2423,28 @@ async fn shared_ledger_a_reservation_that_commits_after_its_deadline_is_released
         // The commit won after all; then it was an ordinary, billed request.
         assert_eq!(provider.calls(), 1);
     } else {
-        assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE, "{}", reply.body);
-        assert_eq!(provider.calls(), 0, "a refused request never reaches the provider");
-        assert_eq!(gw.spent("key-app").await, 0, "a refused request costs nothing");
+        assert_eq!(
+            reply.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            reply.body
+        );
+        assert_eq!(
+            provider.calls(),
+            0,
+            "a refused request never reaches the provider"
+        );
+        assert_eq!(
+            gw.spent("key-app").await,
+            0,
+            "a refused request costs nothing"
+        );
     }
     let metrics = gw.get("/metrics", "key-admin").await.body;
-    assert!(metrics.contains("gw_ledger_swept_reservations_total 0"), "{metrics}");
+    assert!(
+        metrics.contains("gw_ledger_swept_reservations_total 0"),
+        "{metrics}"
+    );
 }
 
 #[tokio::test]
@@ -1923,29 +2453,44 @@ async fn shared_ledger_settlements_racing_admissions_never_deadlock() {
     // admissions for the same tenant hold its day row. Both must take the
     // locks in one order, or Postgres aborts one of them and a healthy
     // request gets a 503.
-    let Some(url) = test_database_url() else { return };
+    let Some(url) = test_database_url() else {
+        return;
+    };
     let provider = MockProvider::start(Provider::Healthy).await;
     let deployment = Deployment::shared(&provider, &url);
-    let replicas = [Arc::new(deployment.boot().await), Arc::new(deployment.boot().await)];
+    let replicas = [
+        Arc::new(deployment.boot().await),
+        Arc::new(deployment.boot().await),
+    ];
     let burst: Vec<_> = (0..40)
         .map(|i| {
             let gw = Arc::clone(&replicas[i % 2]);
             tokio::spawn(async move { gw.chat(Some("key-app"), small_request()).await })
         })
         .collect();
-    let replies: Vec<Reply> = futures_util::future::join_all(burst).await.into_iter().map(Result::unwrap).collect();
+    let replies: Vec<Reply> = futures_util::future::join_all(burst)
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
     let failed: Vec<String> = replies
         .iter()
         .filter(|r| r.status != StatusCode::OK)
         .map(|r| format!("{} {}", r.status, r.body))
         .collect();
-    assert!(failed.is_empty(), "{} of 40 failed: {failed:#?}", failed.len());
+    assert!(
+        failed.is_empty(),
+        "{} of 40 failed: {failed:#?}",
+        failed.len()
+    );
 }
 
 #[tokio::test]
 async fn shared_ledger_the_rate_limit_is_one_window_across_replicas() {
     // `paced` allows 6 requests a minute, in total, across both replicas.
-    let Some(url) = test_database_url() else { return };
+    let Some(url) = test_database_url() else {
+        return;
+    };
     let provider = MockProvider::start(Provider::Healthy).await;
     let deployment = Deployment::shared(&provider, &url);
     let (a, b) = (deployment.boot().await, deployment.boot().await);
@@ -1960,19 +2505,30 @@ async fn shared_ledger_the_rate_limit_is_one_window_across_replicas() {
             other => panic!("unexpected {other}: {}", reply.body),
         }
     }
-    assert_eq!(admitted, 6, "one minute's quota across both replicas, not one per replica");
+    assert_eq!(
+        admitted, 6,
+        "one minute's quota across both replicas, not one per replica"
+    );
     assert_eq!(provider.calls(), 6);
 }
 
 #[tokio::test]
 async fn shared_ledger_a_repeated_key_is_recognised_across_replicas() {
-    let Some(url) = test_database_url() else { return };
+    let Some(url) = test_database_url() else {
+        return;
+    };
     let provider = MockProvider::start(Provider::Healthy).await;
     let deployment = Deployment::shared(&provider, &url);
     let (a, b) = (deployment.boot().await, deployment.boot().await);
     async fn send(gw: &Gateway) -> Reply {
-        gw.send(with_key(reqwest::Client::new().post(gw.url("/v1/chat/complete")), "order-7").json(&standard_request()))
-            .await
+        gw.send(
+            with_key(
+                reqwest::Client::new().post(gw.url("/v1/chat/complete")),
+                "order-7",
+            )
+            .json(&standard_request()),
+        )
+        .await
     }
 
     let first = send(&a).await;
@@ -1998,22 +2554,42 @@ async fn shared_ledger_a_repeated_key_is_recognised_across_replicas() {
 async fn shared_ledger_a_dead_ledger_fails_closed() {
     // The gateway reaches Postgres through a relay the test can cut. With the
     // ledger gone, nothing may reach the provider: 503, not a free pass.
-    let Some(url) = test_database_url() else { return };
+    let Some(url) = test_database_url() else {
+        return;
+    };
     let relay = relay::Relay::start(&url).await;
     let provider = MockProvider::start(Provider::Healthy).await;
     let gw = Deployment::shared(&provider, &relay.url).boot().await;
 
-    assert_eq!(gw.chat(Some("key-app"), standard_request()).await.status, StatusCode::OK);
+    assert_eq!(
+        gw.chat(Some("key-app"), standard_request()).await.status,
+        StatusCode::OK
+    );
     assert_eq!(provider.calls(), 1);
 
     relay.cut();
     let reply = gw.chat(Some("key-app"), standard_request()).await;
-    assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE, "{}", reply.body);
+    assert_eq!(
+        reply.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        reply.body
+    );
     assert_eq!(reply.code(), "ledger_unavailable");
     assert_eq!(reply.headers["retry-after"], "5");
-    assert_eq!(provider.calls(), 1, "the provider saw nothing while the ledger was down");
-    let ready = gw.send(reqwest::Client::new().get(gw.url("/health/ready"))).await;
-    assert_eq!(ready.status, StatusCode::SERVICE_UNAVAILABLE, "pulled from the load balancer");
+    assert_eq!(
+        provider.calls(),
+        1,
+        "the provider saw nothing while the ledger was down"
+    );
+    let ready = gw
+        .send(reqwest::Client::new().get(gw.url("/health/ready")))
+        .await;
+    assert_eq!(
+        ready.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "pulled from the load balancer"
+    );
     assert!(ready.body.contains("ledger"), "{}", ready.body);
 }
 
@@ -2021,19 +2597,33 @@ async fn shared_ledger_a_dead_ledger_fails_closed() {
 async fn shared_ledger_an_operator_action_that_cannot_be_recorded_does_not_happen() {
     // The reload would revoke `key-rotating`. With the ledger unreachable the
     // action cannot be recorded, so it must not take effect at all.
-    let Some(url) = test_database_url() else { return };
+    let Some(url) = test_database_url() else {
+        return;
+    };
     let relay = relay::Relay::start(&url).await;
     let provider = MockProvider::start(Provider::Healthy).await;
     let deployment = Deployment::shared(&provider, &relay.url);
     let gw = deployment.boot().await;
-    assert_eq!(gw.get("/v1/models", "key-rotating").await.status, StatusCode::OK);
+    assert_eq!(
+        gw.get("/v1/models", "key-rotating").await.status,
+        StatusCode::OK
+    );
 
     deployment.rewrite_tenants(&tenants_yaml(false));
     relay.cut();
     let reload = gw
-        .send(reqwest::Client::new().post(gw.url("/v1/admin/registry/reload")).header("x-api-key", "key-admin"))
+        .send(
+            reqwest::Client::new()
+                .post(gw.url("/v1/admin/registry/reload"))
+                .header("x-api-key", "key-admin"),
+        )
         .await;
-    assert_eq!(reload.status, StatusCode::SERVICE_UNAVAILABLE, "{}", reload.body);
+    assert_eq!(
+        reload.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        reload.body
+    );
     assert_eq!(
         gw.get("/v1/models", "key-rotating").await.status,
         StatusCode::OK,
@@ -2045,11 +2635,18 @@ async fn shared_ledger_an_operator_action_that_cannot_be_recorded_does_not_happe
 async fn shared_ledger_a_gateway_will_not_start_without_its_ledger() {
     // A configured ledger that cannot be reached is fatal at boot. Falling
     // back to memory would silently drop both guarantees.
-    let Some(url) = test_database_url() else { return };
+    let Some(url) = test_database_url() else {
+        return;
+    };
     let relay = relay::Relay::start(&url).await;
     relay.cut();
-    let err = postgres_ledger(&relay.url, "pressure_unreachable", true).await.unwrap_err();
-    assert!(!err.contains("gatewaytest"), "the error must not echo credentials: {err}");
+    let err = postgres_ledger(&relay.url, "pressure_unreachable", true)
+        .await
+        .unwrap_err();
+    assert!(
+        !err.contains("gatewaytest"),
+        "the error must not echo credentials: {err}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2057,8 +2654,14 @@ async fn shared_ledger_a_gateway_will_not_start_without_its_ledger() {
 // ---------------------------------------------------------------------------
 
 async fn complete_with_key(gw: &Gateway, key: &str) -> Reply {
-    gw.send(with_key(reqwest::Client::new().post(gw.url("/v1/chat/complete")), key).json(&standard_request()))
-        .await
+    gw.send(
+        with_key(
+            reqwest::Client::new().post(gw.url("/v1/chat/complete")),
+            key,
+        )
+        .json(&standard_request()),
+    )
+    .await
 }
 
 /// Replay `key` until the first attempt's settlement is durable, as a client
@@ -2085,34 +2688,59 @@ async fn stored_answer(deployment: &Deployment, key: &str) -> Option<String> {
 
 #[tokio::test]
 async fn shared_ledger_stored_answers_are_sealed() {
-    let Some(url) = test_database_url() else { return };
+    let Some(url) = test_database_url() else {
+        return;
+    };
     let provider = MockProvider::start(Provider::Healthy).await;
     let deployment = Deployment::shared(&provider, &url);
     let gw = deployment.boot().await;
 
-    assert_eq!(complete_with_key(&gw, "sealed-1").await.status, StatusCode::OK);
+    assert_eq!(
+        complete_with_key(&gw, "sealed-1").await.status,
+        StatusCode::OK
+    );
     let replay = settled_replay(&gw, "sealed-1").await;
     assert_eq!(replay.status, StatusCode::OK, "{}", replay.body);
-    assert!(replay.body.contains("Hello, world"), "the replay is the real answer");
+    assert!(
+        replay.body.contains("Hello, world"),
+        "the replay is the real answer"
+    );
 
-    let stored = stored_answer(&deployment, "sealed-1").await.expect("the answer is stored for replay");
+    let stored = stored_answer(&deployment, "sealed-1")
+        .await
+        .expect("the answer is stored for replay");
     assert!(stored.starts_with("v1:test-1:"), "{stored}");
-    assert!(!stored.contains("Hello"), "the answer must not be at rest in the clear: {stored}");
+    assert!(
+        !stored.contains("Hello"),
+        "the answer must not be at rest in the clear: {stored}"
+    );
 }
 
 #[tokio::test]
 async fn shared_ledger_without_a_key_stores_no_answer() {
-    let Some(url) = test_database_url() else { return };
+    let Some(url) = test_database_url() else {
+        return;
+    };
     let provider = MockProvider::start(Provider::Healthy).await;
     let deployment = Deployment::shared_with(&provider, &url, false);
     let gw = deployment.boot().await;
 
-    assert_eq!(complete_with_key(&gw, "unsealed-1").await.status, StatusCode::OK);
+    assert_eq!(
+        complete_with_key(&gw, "unsealed-1").await.status,
+        StatusCode::OK
+    );
     let replay = settled_replay(&gw, "unsealed-1").await;
     assert_eq!(replay.status, StatusCode::CONFLICT, "{}", replay.body);
-    assert_eq!(replay.code(), "duplicate_request", "recognised and billed once, but not replayed");
+    assert_eq!(
+        replay.code(),
+        "duplicate_request",
+        "recognised and billed once, but not replayed"
+    );
     assert_eq!(provider.calls(), 1);
-    assert!(stored_answer(&deployment, "unsealed-1").await.is_none(), "no key, no stored answer");
+    assert!(
+        stored_answer(&deployment, "unsealed-1").await.is_none(),
+        "no key, no stored answer"
+    );
 }
 
 #[tokio::test]
@@ -2120,13 +2748,21 @@ async fn shared_ledger_an_answer_moved_to_another_row_is_not_served() {
     // Someone with write access to the table copies one request's sealed
     // answer into another's row. The seal is bound to its row, so the copy
     // does not open, and the gateway refuses to replay rather than serve it.
-    let Some(url) = test_database_url() else { return };
+    let Some(url) = test_database_url() else {
+        return;
+    };
     let provider = MockProvider::start(Provider::Healthy).await;
     let deployment = Deployment::shared(&provider, &url);
     let gw = deployment.boot().await;
 
-    assert_eq!(complete_with_key(&gw, "moved-a").await.status, StatusCode::OK);
-    assert_eq!(complete_with_key(&gw, "moved-b").await.status, StatusCode::OK);
+    assert_eq!(
+        complete_with_key(&gw, "moved-a").await.status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        complete_with_key(&gw, "moved-b").await.status,
+        StatusCode::OK
+    );
     assert_eq!(settled_replay(&gw, "moved-a").await.status, StatusCode::OK);
     assert_eq!(settled_replay(&gw, "moved-b").await.status, StatusCode::OK);
 
@@ -2155,15 +2791,35 @@ async fn local_ledger_a_restart_keeps_todays_spend() {
     let provider = MockProvider::start(Provider::Healthy).await;
     let deployment = Deployment::new(&provider);
 
-    let first = deployment.boot_with(deployment.local_ledger("ledger.sqlite3", None)).await;
-    assert_eq!(first.chat(Some("key-oneshot"), small_request()).await.status, StatusCode::OK);
-    eventually_async("the settlement is durable", || async { first.spent("key-oneshot").await == HEALTHY_ANSWER_COST }).await;
+    let first = deployment
+        .boot_with(deployment.local_ledger("ledger.sqlite3", None))
+        .await;
+    assert_eq!(
+        first
+            .chat(Some("key-oneshot"), small_request())
+            .await
+            .status,
+        StatusCode::OK
+    );
+    eventually_async("the settlement is durable", || async {
+        first.spent("key-oneshot").await == HEALTHY_ANSWER_COST
+    })
+    .await;
     drop(first); // crash
 
-    let restarted = deployment.boot_with(deployment.local_ledger("ledger.sqlite3", None)).await;
-    assert_eq!(restarted.spent("key-oneshot").await, HEALTHY_ANSWER_COST, "the ledger outlived the process");
+    let restarted = deployment
+        .boot_with(deployment.local_ledger("ledger.sqlite3", None))
+        .await;
     assert_eq!(
-        restarted.chat(Some("key-oneshot"), small_request()).await.status,
+        restarted.spent("key-oneshot").await,
+        HEALTHY_ANSWER_COST,
+        "the ledger outlived the process"
+    );
+    assert_eq!(
+        restarted
+            .chat(Some("key-oneshot"), small_request())
+            .await
+            .status,
         StatusCode::PAYMENT_REQUIRED,
         "an exhausted tenant stays exhausted after a restart"
     );
@@ -2175,16 +2831,29 @@ async fn local_ledger_a_repeated_key_is_recognised_after_a_restart() {
     let provider = MockProvider::start(Provider::Healthy).await;
     let deployment = Deployment::new(&provider);
     async fn send(gw: &Gateway) -> Reply {
-        gw.send(with_key(reqwest::Client::new().post(gw.url("/v1/chat/stream")), "local-1").json(&standard_request()))
-            .await
+        gw.send(
+            with_key(
+                reqwest::Client::new().post(gw.url("/v1/chat/stream")),
+                "local-1",
+            )
+            .json(&standard_request()),
+        )
+        .await
     }
 
-    let first = deployment.boot_with(deployment.local_ledger("ledger.sqlite3", None)).await;
+    let first = deployment
+        .boot_with(deployment.local_ledger("ledger.sqlite3", None))
+        .await;
     assert_eq!(send(&first).await.status, StatusCode::OK);
-    eventually_async("the settlement is durable", || async { first.spent("key-app").await == HEALTHY_ANSWER_COST }).await;
+    eventually_async("the settlement is durable", || async {
+        first.spent("key-app").await == HEALTHY_ANSWER_COST
+    })
+    .await;
     drop(first);
 
-    let restarted = deployment.boot_with(deployment.local_ledger("ledger.sqlite3", None)).await;
+    let restarted = deployment
+        .boot_with(deployment.local_ledger("ledger.sqlite3", None))
+        .await;
     let replay = send(&restarted).await;
     assert_eq!(replay.status, StatusCode::CONFLICT, "{}", replay.body);
     assert_eq!(replay.code(), "duplicate_request");
@@ -2199,8 +2868,16 @@ async fn quota_split_a_burst_across_replicas_admits_exactly_the_shares() {
     let provider = MockProvider::start(Provider::Gated).await;
     let deployment = Deployment::new(&provider);
     let replicas = [
-        Arc::new(deployment.boot_with(deployment.local_ledger("replica-a.sqlite3", Some(2))).await),
-        Arc::new(deployment.boot_with(deployment.local_ledger("replica-b.sqlite3", Some(2))).await),
+        Arc::new(
+            deployment
+                .boot_with(deployment.local_ledger("replica-a.sqlite3", Some(2)))
+                .await,
+        ),
+        Arc::new(
+            deployment
+                .boot_with(deployment.local_ledger("replica-b.sqlite3", Some(2)))
+                .await,
+        ),
     ];
 
     let refused = Arc::new(AtomicU64::new(0));
@@ -2220,10 +2897,20 @@ async fn quota_split_a_burst_across_replicas_admits_exactly_the_shares() {
         provider.calls() + refused.load(Ordering::SeqCst) == 20
     })
     .await;
-    assert_eq!(provider.calls(), 2, "one share per replica, and the shares fit the budget");
+    assert_eq!(
+        provider.calls(),
+        2,
+        "one share per replica, and the shares fit the budget"
+    );
     provider.open_gate(20);
     let statuses = futures_util::future::join_all(burst).await;
-    assert_eq!(statuses.into_iter().filter(|s| *s.as_ref().unwrap() == StatusCode::OK).count(), 2);
+    assert_eq!(
+        statuses
+            .into_iter()
+            .filter(|s| *s.as_ref().unwrap() == StatusCode::OK)
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]
@@ -2231,17 +2918,40 @@ async fn quota_split_a_restarted_replica_keeps_its_spent_share() {
     let provider = MockProvider::start(Provider::Healthy).await;
     let deployment = Deployment::new(&provider);
 
-    let replica = deployment.boot_with(deployment.local_ledger("replica-a.sqlite3", Some(2))).await;
-    assert_eq!(replica.chat(Some("key-tight"), standard_request()).await.status, StatusCode::OK);
-    eventually_async("the settlement is durable", || async { replica.spent("key-tight").await == HEALTHY_ANSWER_COST }).await;
+    let replica = deployment
+        .boot_with(deployment.local_ledger("replica-a.sqlite3", Some(2)))
+        .await;
+    assert_eq!(
+        replica
+            .chat(Some("key-tight"), standard_request())
+            .await
+            .status,
+        StatusCode::OK
+    );
+    eventually_async("the settlement is durable", || async {
+        replica.spent("key-tight").await == HEALTHY_ANSWER_COST
+    })
+    .await;
     drop(replica);
 
-    let restarted = deployment.boot_with(deployment.local_ledger("replica-a.sqlite3", Some(2))).await;
+    let restarted = deployment
+        .boot_with(deployment.local_ledger("replica-a.sqlite3", Some(2)))
+        .await;
     let usage = restarted.get("/v1/usage", "key-tight").await.json();
-    assert_eq!(usage["spent_nano_usd"], HEALTHY_ANSWER_COST, "the share's spend survived");
-    assert_eq!(usage["daily_budget_nano_usd"], 3_500_000 / 2, "this replica enforces half");
+    assert_eq!(
+        usage["spent_nano_usd"], HEALTHY_ANSWER_COST,
+        "the share's spend survived"
+    );
+    assert_eq!(
+        usage["daily_budget_nano_usd"],
+        3_500_000 / 2,
+        "this replica enforces half"
+    );
     assert_eq!(usage["budget_scope"]["replica_share"]["replicas"], 2);
-    assert_eq!(usage["budget_scope"]["replica_share"]["tenant_budget_nano_usd"], 3_500_000);
+    assert_eq!(
+        usage["budget_scope"]["replica_share"]["tenant_budget_nano_usd"],
+        3_500_000
+    );
 }
 
 #[tokio::test]
@@ -2321,7 +3031,11 @@ async fn local_ledger_a_long_stream_is_never_swept_while_live() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let reserved: u64 = response.headers()["x-reserved-nano-usd"].to_str().unwrap().parse().unwrap();
+    let reserved: u64 = response.headers()["x-reserved-nano-usd"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
     tokio::time::sleep(Duration::from_secs(4)).await;
     provider.open_gate(1);
     let mut body = String::new();
@@ -2329,8 +3043,15 @@ async fn local_ledger_a_long_stream_is_never_swept_while_live() {
         body.push_str(&String::from_utf8_lossy(&chunk));
     }
     assert!(body.contains("event: end"), "{body}");
-    eventually_async("the settlement is durable", || async { gw.spent("key-app").await != reserved }).await;
-    assert_eq!(gw.spent("key-app").await, HEALTHY_ANSWER_COST, "billed its real usage, never swept");
+    eventually_async("the settlement is durable", || async {
+        gw.spent("key-app").await != reserved
+    })
+    .await;
+    assert_eq!(
+        gw.spent("key-app").await,
+        HEALTHY_ANSWER_COST,
+        "billed its real usage, never swept"
+    );
 }
 
 #[tokio::test]
@@ -2338,11 +3059,18 @@ async fn quota_split_divides_the_rate_limit_too() {
     // `paced` allows 6 requests a minute; each of 2 split replicas enforces 3.
     let provider = MockProvider::start(Provider::Healthy).await;
     let deployment = Deployment::new(&provider);
-    let replica = deployment.boot_with(deployment.local_ledger("paced-split.sqlite3", Some(2))).await;
+    let replica = deployment
+        .boot_with(deployment.local_ledger("paced-split.sqlite3", Some(2)))
+        .await;
     wait_for_mid_minute().await;
     let mut admitted = 0;
     for _ in 0..6 {
-        if replica.chat(Some("key-paced"), small_request()).await.status == StatusCode::OK {
+        if replica
+            .chat(Some("key-paced"), small_request())
+            .await
+            .status
+            == StatusCode::OK
+        {
             admitted += 1;
         }
     }
@@ -2369,12 +3097,16 @@ async fn readiness_names_the_ledger_consistency_scope() {
         scope(&memory).await,
         json!({ "backend": "memory", "durability": "ephemeral", "replica_mode": "single_process" })
     );
-    let local = deployment.boot_with(deployment.local_ledger("scope.sqlite3", None)).await;
+    let local = deployment
+        .boot_with(deployment.local_ledger("scope.sqlite3", None))
+        .await;
     assert_eq!(
         scope(&local).await,
         json!({ "backend": "sqlite", "durability": "persistent", "replica_mode": "single_instance_only" })
     );
-    let split = deployment.boot_with(deployment.local_ledger("scope-split.sqlite3", Some(3))).await;
+    let split = deployment
+        .boot_with(deployment.local_ledger("scope-split.sqlite3", Some(3)))
+        .await;
     assert_eq!(
         scope(&split).await,
         json!({ "backend": "sqlite", "durability": "persistent",
@@ -2416,7 +3148,10 @@ async fn held(gw: &Gateway, key: &str, body: Value) -> String {
     assert_eq!(json["hold"]["state"], "pending");
     let id = json["hold"]["id"].as_str().expect("hold id").to_string();
     assert_eq!(reply.headers["hold-id"], id.as_str());
-    assert_eq!(reply.headers["location"], format!("/v1/holds/{id}").as_str());
+    assert_eq!(
+        reply.headers["location"],
+        format!("/v1/holds/{id}").as_str()
+    );
     id
 }
 
@@ -2451,7 +3186,10 @@ async fn with_hold(gw: &Gateway, key: &str, id: &str, body: &Value) -> Reply {
 async fn hold_state(gw: &Gateway, key: &str, id: &str) -> String {
     let reply = gw.get(&format!("/v1/holds/{id}"), key).await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
-    reply.json()["hold"]["state"].as_str().unwrap_or_default().to_string()
+    reply.json()["hold"]["state"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
 }
 
 #[tokio::test]
@@ -2467,8 +3205,15 @@ async fn hold_a_held_request_never_reaches_the_provider() {
     assert_eq!(hold["state"], "pending");
     assert_eq!(hold["model"], "mock/other");
     assert_eq!(hold["requested_by"], "ak_guarded");
-    assert!(hold["reason"].as_str().unwrap().contains("mock/other"), "{hold}");
-    assert!(!reply.body.contains("please approve me"), "a hold never carries the prompt: {}", reply.body);
+    assert!(
+        hold["reason"].as_str().unwrap().contains("mock/other"),
+        "{hold}"
+    );
+    assert!(
+        !reply.body.contains("please approve me"),
+        "a hold never carries the prompt: {}",
+        reply.body
+    );
     // Asking again is asking again: a second hold, still nothing executed.
     let again = held(&gw, "key-guarded", held_request()).await;
     assert_ne!(again, id);
@@ -2481,12 +3226,18 @@ async fn hold_the_cost_rule_holds_only_what_is_above_the_threshold() {
     let gw = Deployment::new(&provider).boot().await;
 
     // 46,000 nano-USD at worst: under the threshold, so it runs.
-    assert_eq!(gw.chat(Some("key-guarded"), small_request()).await.status, StatusCode::OK);
+    assert_eq!(
+        gw.chat(Some("key-guarded"), small_request()).await.status,
+        StatusCode::OK
+    );
     assert_eq!(provider.calls(), 1);
     // ~1.03M at worst, the same model: above it, so it waits.
     let id = held(&gw, "key-guarded", standard_request()).await;
     let reply = gw.get(&format!("/v1/holds/{id}"), "key-guarded").await;
-    assert!(reply.json()["hold"]["reason"].as_str().unwrap().contains("above the approval threshold"));
+    assert!(reply.json()["hold"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("above the approval threshold"));
     assert_eq!(provider.calls(), 1, "the expensive request was held");
 }
 
@@ -2500,9 +3251,22 @@ async fn hold_an_approved_request_executes_exactly_once() {
 
     // Ten copies of the approved request at once: one runs.
     let body = held_request();
-    let replies = futures_util::future::join_all((0..10).map(|_| with_hold(&gw, "key-guarded", &id, &body))).await;
-    let ran = replies.iter().filter(|r| r.status == StatusCode::OK).count();
-    assert_eq!(ran, 1, "{:?}", replies.iter().map(|r| (r.status, r.body.clone())).collect::<Vec<_>>());
+    let replies =
+        futures_util::future::join_all((0..10).map(|_| with_hold(&gw, "key-guarded", &id, &body)))
+            .await;
+    let ran = replies
+        .iter()
+        .filter(|r| r.status == StatusCode::OK)
+        .count();
+    assert_eq!(
+        ran,
+        1,
+        "{:?}",
+        replies
+            .iter()
+            .map(|r| (r.status, r.body.clone()))
+            .collect::<Vec<_>>()
+    );
     for refused in replies.iter().filter(|r| r.status != StatusCode::OK) {
         assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.body);
         assert_eq!(refused.code(), "hold_consumed");
@@ -2543,13 +3307,21 @@ async fn hold_a_denied_or_revoked_hold_never_executes() {
     assert_eq!(reply.status, StatusCode::FORBIDDEN, "{}", reply.body);
     assert_eq!(reply.code(), "hold_denied");
     let late = decide(&gw, "key-approver", &denied, "approve").await;
-    assert_eq!(late.status, StatusCode::CONFLICT, "a denial is final: {}", late.body);
+    assert_eq!(
+        late.status,
+        StatusCode::CONFLICT,
+        "a denial is final: {}",
+        late.body
+    );
     assert_eq!(late.code(), "hold_not_decidable");
 
     // An approval can be taken back until it is used.
     let revoked = held(&gw, "key-guarded", held_request()).await;
     approve(&gw, &revoked).await;
-    assert_eq!(decide(&gw, "key-approver", &revoked, "deny").await.status, StatusCode::OK);
+    assert_eq!(
+        decide(&gw, "key-approver", &revoked, "deny").await.status,
+        StatusCode::OK
+    );
     let reply = with_hold(&gw, "key-guarded", &revoked, &held_request()).await;
     assert_eq!(reply.code(), "hold_denied");
     assert_eq!(provider.calls(), 0);
@@ -2570,7 +3342,12 @@ async fn hold_nobody_decides_their_own_request() {
     assert_eq!(hold_state(&gw, "key-guarded-lead", &id).await, "pending");
     // The same lead may decide a colleague's.
     let other = held(&gw, "key-guarded", held_request()).await;
-    assert_eq!(decide(&gw, "key-guarded-lead", &other, "approve").await.status, StatusCode::OK);
+    assert_eq!(
+        decide(&gw, "key-guarded-lead", &other, "approve")
+            .await
+            .status,
+        StatusCode::OK
+    );
     assert_eq!(provider.calls(), 0);
 }
 
@@ -2588,7 +3365,10 @@ async fn hold_deciding_needs_the_dedicated_scope() {
     let queue = gw.get("/v1/admin/holds?state=pending", "key-admin").await;
     assert_eq!(queue.status, StatusCode::OK, "{}", queue.body);
     assert_eq!(queue.json()["holds"][0]["id"], id.as_str());
-    assert_eq!(gw.get("/v1/admin/holds", "key-guarded").await.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        gw.get("/v1/admin/holds", "key-guarded").await.status,
+        StatusCode::FORBIDDEN
+    );
     let unauthenticated = decide(&gw, "not-a-key", &id, "approve").await;
     assert_eq!(unauthenticated.status, StatusCode::UNAUTHORIZED);
     assert_eq!(hold_state(&gw, "key-guarded", &id).await, "pending");
@@ -2610,7 +3390,12 @@ async fn hold_an_approval_covers_only_the_request_approved() {
     bigger["params"]["max_tokens"] = json!(6);
     for body in [&other_prompt, &bigger] {
         let reply = with_hold(&gw, "key-guarded", &id, body).await;
-        assert_eq!(reply.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", reply.body);
+        assert_eq!(
+            reply.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{}",
+            reply.body
+        );
         assert_eq!(reply.code(), "hold_mismatch");
     }
     let second_door = gw
@@ -2626,7 +3411,12 @@ async fn hold_an_approval_covers_only_the_request_approved() {
     assert_eq!(provider.calls(), 0);
 
     // The failed attempts did not use the approval up.
-    assert_eq!(with_hold(&gw, "key-guarded", &id, &held_request()).await.status, StatusCode::OK);
+    assert_eq!(
+        with_hold(&gw, "key-guarded", &id, &held_request())
+            .await
+            .status,
+        StatusCode::OK
+    );
     assert_eq!(provider.calls(), 1);
 }
 
@@ -2638,7 +3428,11 @@ async fn hold_a_hold_is_its_tenants_alone() {
     approve(&gw, &id).await;
 
     let peek = gw.get(&format!("/v1/holds/{id}"), "key-app").await;
-    assert_eq!(peek.status, StatusCode::NOT_FOUND, "another tenant's hold does not exist for acme");
+    assert_eq!(
+        peek.status,
+        StatusCode::NOT_FOUND,
+        "another tenant's hold does not exist for acme"
+    );
     let reply = with_hold(&gw, "key-app", &id, &held_request()).await;
     assert_eq!(reply.status, StatusCode::NOT_FOUND, "{}", reply.body);
     assert_eq!(reply.code(), "hold_not_found");
@@ -2687,16 +3481,24 @@ async fn hold_execution_rechecks_the_tenant_and_the_budget() {
     // Approved, then the tenant is switched off: nothing runs.
     let id = held(&gw, "key-guarded", held_request()).await;
     approve(&gw, &id).await;
-    deployment.rewrite_tenants(
-        &tenants_yaml(true).replace("tenant_id: guarded\n    enabled: true", "tenant_id: guarded\n    enabled: false"),
-    );
+    deployment.rewrite_tenants(&tenants_yaml(true).replace(
+        "tenant_id: guarded\n    enabled: true",
+        "tenant_id: guarded\n    enabled: false",
+    ));
     let reload = gw
-        .send(reqwest::Client::new().post(gw.url("/v1/admin/registry/reload")).header("x-api-key", "key-admin"))
+        .send(
+            reqwest::Client::new()
+                .post(gw.url("/v1/admin/registry/reload"))
+                .header("x-api-key", "key-admin"),
+        )
         .await;
     assert_eq!(reload.status, StatusCode::OK, "{}", reload.body);
     let reply = with_hold(&gw, "key-guarded", &id, &held_request()).await;
     assert!(
-        matches!(reply.status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN),
+        matches!(
+            reply.status,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ),
         "{} {}",
         reply.status,
         reply.body
@@ -2721,7 +3523,12 @@ async fn hold_a_provider_refusal_gives_the_approval_back() {
         async move { hold_state(gw, "key-guarded", id).await == "approved" }
     })
     .await;
-    assert_eq!(with_hold(&gw, "key-guarded", &id, &held_request()).await.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        with_hold(&gw, "key-guarded", &id, &held_request())
+            .await
+            .status,
+        StatusCode::BAD_GATEWAY
+    );
     assert_eq!(provider.calls(), 2, "usable again after the refusal");
 }
 
@@ -2733,10 +3540,18 @@ async fn hold_too_many_waiting_are_refused() {
     held(&gw, "key-queued", small_request()).await;
 
     let reply = gw.chat(Some("key-queued"), small_request()).await;
-    assert_eq!(reply.status, StatusCode::TOO_MANY_REQUESTS, "{}", reply.body);
+    assert_eq!(
+        reply.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "{}",
+        reply.body
+    );
     assert_eq!(reply.code(), "holds_pending_limit");
     // A decided hold no longer waits, and makes room.
-    assert_eq!(decide(&gw, "key-approver", &first, "deny").await.status, StatusCode::OK);
+    assert_eq!(
+        decide(&gw, "key-approver", &first, "deny").await.status,
+        StatusCode::OK
+    );
     held(&gw, "key-queued", small_request()).await;
     assert_eq!(provider.calls(), 0);
 }
@@ -2747,23 +3562,48 @@ async fn hold_every_transition_is_on_the_decision_record() {
     let gw = Deployment::new(&provider).boot().await;
     let id = held(&gw, "key-guarded", held_request()).await;
     approve(&gw, &id).await;
-    assert_eq!(with_hold(&gw, "key-guarded", &id, &held_request()).await.status, StatusCode::OK);
+    assert_eq!(
+        with_hold(&gw, "key-guarded", &id, &held_request())
+            .await
+            .status,
+        StatusCode::OK
+    );
 
-    let reply = gw.get("/v1/admin/decisions?tenant=guarded", "key-admin").await;
+    let reply = gw
+        .get("/v1/admin/decisions?tenant=guarded", "key-admin")
+        .await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
     let trail: Vec<(String, String)> = reply.json()["decisions"]
         .as_array()
         .unwrap()
         .iter()
         .filter(|d| d["request_id"] == id.as_str())
-        .map(|d| (d["code"].as_str().unwrap().to_string(), d["key_id"].as_str().unwrap().to_string()))
+        .map(|d| {
+            (
+                d["code"].as_str().unwrap().to_string(),
+                d["key_id"].as_str().unwrap().to_string(),
+            )
+        })
         .collect();
-    let expect = |code: &str, key: &str| assert!(trail.contains(&(code.into(), key.into())), "{code} by {key}: {trail:?}");
+    let expect = |code: &str, key: &str| {
+        assert!(
+            trail.contains(&(code.into(), key.into())),
+            "{code} by {key}: {trail:?}"
+        )
+    };
     expect("hold_requested", "ak_guarded");
     expect("hold_approved", "ak_approver");
     expect("hold_consumed", "ak_guarded");
-    assert!(reply.json()["decisions"].as_array().unwrap().iter().all(|d| d["kind"] == "hold"));
-    assert!(!reply.body.contains("please approve me"), "no prompt on the record: {}", reply.body);
+    assert!(reply.json()["decisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|d| d["kind"] == "hold"));
+    assert!(
+        !reply.body.contains("please approve me"),
+        "no prompt on the record: {}",
+        reply.body
+    );
 }
 
 #[tokio::test]
@@ -2795,29 +3635,59 @@ async fn local_ledger_a_hold_survives_a_restart() {
     let provider = MockProvider::start(Provider::Healthy).await;
     let deployment = Deployment::new(&provider);
     let id = {
-        let gw = deployment.boot_with(deployment.local_ledger("ledger.sqlite3", None)).await;
+        let gw = deployment
+            .boot_with(deployment.local_ledger("ledger.sqlite3", None))
+            .await;
         let id = held(&gw, "key-guarded", held_request()).await;
         approve(&gw, &id).await;
         id
     };
-    let gw = deployment.boot_with(deployment.local_ledger("ledger.sqlite3", None)).await;
-    assert_eq!(hold_state(&gw, "key-guarded", &id).await, "approved", "the approval survived the restart");
-    assert_eq!(with_hold(&gw, "key-guarded", &id, &held_request()).await.status, StatusCode::OK);
-    assert_eq!(with_hold(&gw, "key-guarded", &id, &held_request()).await.code(), "hold_consumed");
+    let gw = deployment
+        .boot_with(deployment.local_ledger("ledger.sqlite3", None))
+        .await;
+    assert_eq!(
+        hold_state(&gw, "key-guarded", &id).await,
+        "approved",
+        "the approval survived the restart"
+    );
+    assert_eq!(
+        with_hold(&gw, "key-guarded", &id, &held_request())
+            .await
+            .status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        with_hold(&gw, "key-guarded", &id, &held_request())
+            .await
+            .code(),
+        "hold_consumed"
+    );
     assert_eq!(provider.calls(), 1);
 }
 
 #[tokio::test]
 async fn shared_ledger_a_hold_is_one_hold_across_replicas() {
-    let Some(url) = test_database_url() else { return };
+    let Some(url) = test_database_url() else {
+        return;
+    };
     let provider = MockProvider::start(Provider::Healthy).await;
     let deployment = Deployment::shared(&provider, &url);
     let (a, b) = (deployment.boot().await, deployment.boot().await);
 
     // Held on one replica, approved on the other, visible on both.
     let id = held(&a, "key-guarded", held_request()).await;
-    let queue = b.get("/v1/admin/holds?state=pending&tenant=guarded", "key-approver").await;
-    assert_eq!(queue.json()["holds"][0]["id"], id.as_str(), "{}", queue.body);
+    let queue = b
+        .get(
+            "/v1/admin/holds?state=pending&tenant=guarded",
+            "key-approver",
+        )
+        .await;
+    assert_eq!(
+        queue.json()["holds"][0]["id"],
+        id.as_str(),
+        "{}",
+        queue.body
+    );
     approve(&b, &id).await;
     assert_eq!(hold_state(&a, "key-guarded", &id).await, "approved");
 
@@ -2827,15 +3697,31 @@ async fn shared_ledger_a_hold_is_one_hold_across_replicas() {
         (0..20).map(|i| with_hold(if i % 2 == 0 { &a } else { &b }, "key-guarded", &id, &body)),
     )
     .await;
-    let ran = replies.iter().filter(|r| r.status == StatusCode::OK).count();
-    assert_eq!(ran, 1, "{:?}", replies.iter().map(|r| (r.status, r.body.clone())).collect::<Vec<_>>());
-    assert!(replies.iter().filter(|r| r.status != StatusCode::OK).all(|r| r.code() == "hold_consumed"));
+    let ran = replies
+        .iter()
+        .filter(|r| r.status == StatusCode::OK)
+        .count();
+    assert_eq!(
+        ran,
+        1,
+        "{:?}",
+        replies
+            .iter()
+            .map(|r| (r.status, r.body.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert!(replies
+        .iter()
+        .filter(|r| r.status != StatusCode::OK)
+        .all(|r| r.code() == "hold_consumed"));
     assert_eq!(provider.calls(), 1, "executed once across both replicas");
 }
 
 #[tokio::test]
 async fn shared_ledger_lapsed_holds_are_expired_and_recorded() {
-    let Some(url) = test_database_url() else { return };
+    let Some(url) = test_database_url() else {
+        return;
+    };
     let provider = MockProvider::start(Provider::Healthy).await;
     let deployment = Deployment::shared(&provider, &url);
     let gw = deployment.boot().await;
@@ -2844,11 +3730,22 @@ async fn shared_ledger_lapsed_holds_are_expired_and_recorded() {
     approve(&gw, &unused).await;
     tokio::time::sleep(Duration::from_millis(4_200)).await;
 
-    let LedgerChoice::Shared { schema, .. } = &deployment.ledger else { unreachable!() };
-    let ledger = postgres_ledger(&url, schema, false).await.expect("connect ledger");
+    let LedgerChoice::Shared { schema, .. } = &deployment.ledger else {
+        unreachable!()
+    };
+    let ledger = postgres_ledger(&url, schema, false)
+        .await
+        .expect("connect ledger");
     assert_eq!(ledger.expire_holds().await.unwrap(), 2);
-    assert_eq!(ledger.expire_holds().await.unwrap(), 0, "each hold expires once");
-    let record = gw.get("/v1/admin/decisions?tenant=hasty", "key-admin").await.json();
+    assert_eq!(
+        ledger.expire_holds().await.unwrap(),
+        0,
+        "each hold expires once"
+    );
+    let record = gw
+        .get("/v1/admin/decisions?tenant=hasty", "key-admin")
+        .await
+        .json();
     let reason = |id: &str| {
         record["decisions"]
             .as_array()
@@ -2857,14 +3754,22 @@ async fn shared_ledger_lapsed_holds_are_expired_and_recorded() {
             .find(|d| d["request_id"] == id && d["code"] == "hold_expired")
             .map(|d| d["reason"].as_str().unwrap().to_string())
     };
-    assert_eq!(reason(&waiting).as_deref(), Some("nobody decided before the hold expired"));
-    assert_eq!(reason(&unused).as_deref(), Some("approved, but not used before the approval lapsed"));
+    assert_eq!(
+        reason(&waiting).as_deref(),
+        Some("nobody decided before the hold expired")
+    );
+    assert_eq!(
+        reason(&unused).as_deref(),
+        Some("approved, but not used before the approval lapsed")
+    );
     assert_eq!(provider.calls(), 0);
 }
 
 #[tokio::test]
 async fn shared_ledger_a_hold_decision_that_cannot_be_recorded_does_not_happen() {
-    let Some(url) = test_database_url() else { return };
+    let Some(url) = test_database_url() else {
+        return;
+    };
     let relay = relay::Relay::start(&url).await;
     let provider = MockProvider::start(Provider::Healthy).await;
     let deployment = Deployment::shared(&provider, &relay.url);
@@ -2873,15 +3778,31 @@ async fn shared_ledger_a_hold_decision_that_cannot_be_recorded_does_not_happen()
 
     relay.cut();
     let reply = decide(&gw, "key-approver", &id, "approve").await;
-    assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE, "{}", reply.body);
+    assert_eq!(
+        reply.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        reply.body
+    );
     // And a request the policy would hold is not let through either.
     let held = gw.chat(Some("key-guarded"), held_request()).await;
-    assert_eq!(held.status, StatusCode::SERVICE_UNAVAILABLE, "{}", held.body);
+    assert_eq!(
+        held.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        held.body
+    );
     assert_eq!(provider.calls(), 0);
 
     // Read through a connection of its own: the gateway's is cut.
-    let LedgerChoice::Shared { schema, .. } = &deployment.ledger else { unreachable!() };
-    let pool = postgres_ledger(&url, schema, false).await.expect("connect ledger").pool().clone();
+    let LedgerChoice::Shared { schema, .. } = &deployment.ledger else {
+        unreachable!()
+    };
+    let pool = postgres_ledger(&url, schema, false)
+        .await
+        .expect("connect ledger")
+        .pool()
+        .clone();
     let state: String = sqlx::query_scalar("SELECT state FROM holds WHERE id = $1")
         .bind(uuid::Uuid::parse_str(&id).unwrap())
         .fetch_one(&pool)
@@ -2903,23 +3824,43 @@ async fn gap_memory_ledger_a_restart_forgets_todays_spend() {
     let deployment = Deployment::new(&provider);
 
     let first = deployment.boot().await;
-    assert_eq!(first.chat(Some("key-oneshot"), small_request()).await.status, StatusCode::OK);
+    assert_eq!(
+        first
+            .chat(Some("key-oneshot"), small_request())
+            .await
+            .status,
+        StatusCode::OK
+    );
     assert_eq!(first.spent("key-oneshot").await, HEALTHY_ANSWER_COST);
     assert_eq!(
-        first.chat(Some("key-oneshot"), small_request()).await.status,
+        first
+            .chat(Some("key-oneshot"), small_request())
+            .await
+            .status,
         StatusCode::PAYMENT_REQUIRED,
         "the budget holds while the process lives"
     );
     drop(first); // crash
 
     let restarted = deployment.boot().await;
-    assert_eq!(restarted.spent("key-oneshot").await, 0, "GAP: the ledger died with the process");
     assert_eq!(
-        restarted.chat(Some("key-oneshot"), small_request()).await.status,
+        restarted.spent("key-oneshot").await,
+        0,
+        "GAP: the ledger died with the process"
+    );
+    assert_eq!(
+        restarted
+            .chat(Some("key-oneshot"), small_request())
+            .await
+            .status,
         StatusCode::OK,
         "GAP: an exhausted tenant spends again after a restart"
     );
-    assert_eq!(provider.calls(), 2, "two answers paid for against a budget for one");
+    assert_eq!(
+        provider.calls(),
+        2,
+        "two answers paid for against a budget for one"
+    );
 }
 
 #[tokio::test]
@@ -2928,8 +3869,14 @@ async fn gap_memory_ledger_replicas_each_enforce_the_full_budget() {
     let deployment = Deployment::new(&provider);
     let (a, b) = (deployment.boot().await, deployment.boot().await);
 
-    assert_eq!(a.chat(Some("key-oneshot"), small_request()).await.status, StatusCode::OK);
-    assert_eq!(a.chat(Some("key-oneshot"), small_request()).await.status, StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(
+        a.chat(Some("key-oneshot"), small_request()).await.status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        a.chat(Some("key-oneshot"), small_request()).await.status,
+        StatusCode::PAYMENT_REQUIRED
+    );
     assert_eq!(
         b.chat(Some("key-oneshot"), small_request()).await.status,
         StatusCode::OK,
@@ -2946,7 +3893,10 @@ where
 {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while !condition().await {
-        assert!(tokio::time::Instant::now() < deadline, "timed out waiting for: {what}");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for: {what}"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -2982,14 +3932,18 @@ mod relay {
                     let target = target.clone();
                     let pipe = tokio::spawn(async move {
                         if let Ok(mut outbound) = tokio::net::TcpStream::connect(&target).await {
-                            let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                            let _ =
+                                tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
                         }
                     });
                     registry.lock().unwrap().push(pipe);
                 }
             });
             tasks.lock().unwrap().push(accept);
-            Self { url: url.to_string(), tasks }
+            Self {
+                url: url.to_string(),
+                tasks,
+            }
         }
 
         /// Kill every connection and stop accepting: the database is gone.

@@ -78,6 +78,8 @@ pub struct UpkeepCounts {
     pub backlog_refusals: u64,
     /// Closings waiting to be written now. A gauge, not a counter.
     pub pending_closings: u64,
+    /// Reservations whose durable row is still open. A gauge, not a counter.
+    pub open_reservations: u64,
     /// Closed reservations deleted because they were older than the
     /// retention period.
     pub reservations_pruned: u64,
@@ -116,6 +118,7 @@ impl Upkeep {
             stuck_connections_closed: self.stuck_connections_closed.load(Ordering::Relaxed),
             backlog_refusals: self.backlog_refusals.load(Ordering::Relaxed),
             pending_closings: 0,
+            open_reservations: 0,
             reservations_pruned: self.reservations_pruned.load(Ordering::Relaxed),
         }
     }

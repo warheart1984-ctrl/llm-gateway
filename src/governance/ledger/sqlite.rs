@@ -30,17 +30,17 @@ use std::{
     future::Future,
     path::PathBuf,
     sync::{
-        Arc,
         atomic::{AtomicU64, Ordering},
+        Arc,
     },
     time::{Duration, Instant, SystemTime},
 };
 
 use dashmap::DashMap;
 use sqlx::{
-    Row, SqlitePool,
     error::ErrorKind,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
+    Row, SqlitePool,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -49,17 +49,21 @@ use tokio::{
 use uuid::Uuid;
 
 use super::{
-    Closing, CommitOutcome, Ledger, LedgerRefusal, NewReservation, Outcome, PRUNE_BATCH, PRUNE_BATCHES_PER_PASS,
-    Retention, Upkeep, UpkeepCounts, commit_within,
-    refuse_if_backlogged,
-    release_clean,
-    decisions::{DECISION_QUEUE, Decision, DecisionKind, DecisionQuery, DecisionRecord},
-    holds::{self, HoldClaim, HoldDecision, HoldProblem, HoldQuery, HoldRecord, HoldState, NewHold, Transition},
-    sealed::{ResponseSealer, binding},
+    commit_within,
+    decisions::{Decision, DecisionKind, DecisionQuery, DecisionRecord, DECISION_QUEUE},
+    holds::{
+        self, HoldClaim, HoldDecision, HoldProblem, HoldQuery, HoldRecord, HoldState, NewHold,
+        Transition,
+    },
+    refuse_if_backlogged, release_clean,
+    sealed::{binding, ResponseSealer},
+    Closing, CommitOutcome, Ledger, LedgerRefusal, NewReservation, Outcome, Retention, Upkeep,
+    UpkeepCounts, PRUNE_BATCH, PRUNE_BATCHES_PER_PASS,
 };
 
 const NOW: &str = "CAST(strftime('%s', 'now') AS INTEGER)";
 const TODAY: &str = "(CAST(strftime('%s', 'now') AS INTEGER) / 86400)";
+const CLOSE_BATCH_SIZE: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct SqliteOptions {
@@ -101,6 +105,7 @@ pub struct SqliteLedger {
     pool: SqlitePool,
     writer: mpsc::UnboundedSender<WriterMsg>,
     pending: Arc<AtomicU64>,
+    open_reservations: Arc<AtomicU64>,
     timeout: Duration,
     retention: Duration,
     sealer: Option<Arc<ResponseSealer>>,
@@ -175,7 +180,12 @@ impl SqliteLedger {
             })
             .connect_with(connect)
             .await
-            .map_err(|e| format!("cannot open the ledger database `{}`: {e}", opts.path.display()))?;
+            .map_err(|e| {
+                format!(
+                    "cannot open the ledger database `{}`: {e}",
+                    opts.path.display()
+                )
+            })?;
         sqlx::migrate!("./migrations/sqlite")
             .run(&pool)
             .await
@@ -183,31 +193,46 @@ impl SqliteLedger {
 
         let (writer, inbox) = mpsc::unbounded_channel();
         let pending = Arc::new(AtomicU64::new(0));
+        let open = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM reservations WHERE state = 'open'")
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| format!("cannot count open ledger reservations: {e}"))?;
+        let open_reservations = Arc::new(AtomicU64::new(open.max(0) as u64));
         let live: Arc<DashMap<Uuid, ()>> = Arc::default();
         tokio::spawn(run_writer(
             pool.clone(),
             inbox,
             Arc::clone(&pending),
+            Arc::clone(&open_reservations),
             opts.sealer.clone(),
             Arc::clone(&live),
         ));
-        let retention = Retention { answers: opts.idempotency_retention, reservations: opts.reservation_retention };
+        let retention = Retention {
+            answers: opts.idempotency_retention,
+            reservations: opts.reservation_retention,
+        };
         let sweeper = tokio::spawn(run_sweeper(
             pool.clone(),
             opts.sweep_interval,
             opts.decision_retention,
             retention,
             Arc::clone(&upkeep),
+            Arc::clone(&open_reservations),
         ));
         let renewer = tokio::spawn(run_renewer(pool.clone(), Arc::clone(&live), opts.lease));
         let (decision_queue, decision_inbox) = mpsc::channel(DECISION_QUEUE);
         let decisions_dropped = Arc::new(AtomicU64::new(0));
-        tokio::spawn(run_decision_writer(pool.clone(), decision_inbox, Arc::clone(&decisions_dropped)));
+        tokio::spawn(run_decision_writer(
+            pool.clone(),
+            decision_inbox,
+            Arc::clone(&decisions_dropped),
+        ));
 
         Ok(Arc::new(Self {
             pool,
             writer,
             pending,
+            open_reservations,
             timeout: opts.timeout,
             retention: opts.idempotency_retention,
             sealer: opts.sealer,
@@ -236,7 +261,9 @@ impl SqliteLedger {
     /// closed reservations past their retention, as the sweeper does on its
     /// interval. Returns how many reservations were deleted.
     pub async fn apply_retention(&self) -> Result<u64, String> {
-        let pruned = apply_retention(&self.pool, self.retention_policy).await.map_err(|e| e.to_string())?;
+        let pruned = apply_retention(&self.pool, self.retention_policy)
+            .await
+            .map_err(|e| e.to_string())?;
         self.upkeep.pruned(pruned);
         Ok(pruned)
     }
@@ -255,7 +282,10 @@ impl SqliteLedger {
 
     fn open_response(&self, tenant_id: &str, id: Uuid, stored: Option<String>) -> Option<String> {
         let stored = stored?;
-        let opened = self.sealer.as_ref().and_then(|s| s.open(&binding(tenant_id, id), &stored));
+        let opened = self
+            .sealer
+            .as_ref()
+            .and_then(|s| s.open(&binding(tenant_id, id), &stored));
         if opened.is_none() {
             tracing::warn!(
                 reservation = %id,
@@ -274,7 +304,11 @@ impl SqliteLedger {
     /// deepest, and a release that waited behind it could lose to the
     /// sweeper and become the full bill it exists to prevent. If the direct
     /// write keeps failing, the writer takes it, and retries until durable.
-    fn release_if_late(&self, r: &NewReservation<'_>, bucket: u64) -> impl Future<Output = ()> + Send + 'static {
+    fn release_if_late(
+        &self,
+        r: &NewReservation<'_>,
+        bucket: u64,
+    ) -> impl Future<Output = ()> + Send + 'static {
         let closing = Closing {
             id: r.id,
             tenant_id: Arc::from(r.tenant_id),
@@ -286,7 +320,11 @@ impl SqliteLedger {
             completion_tokens: 0,
         };
         let pool = self.pool.clone();
-        let (writer, pending, upkeep) = (self.writer.clone(), Arc::clone(&self.pending), Arc::clone(&self.upkeep));
+        let (writer, pending, upkeep) = (
+            self.writer.clone(),
+            Arc::clone(&self.pending),
+            Arc::clone(&self.upkeep),
+        );
         async move {
             upkeep.late_commit_released();
             tracing::warn!(
@@ -306,7 +344,9 @@ impl SqliteLedger {
             pending.fetch_add(1, Ordering::Relaxed);
             if writer.send(WriterMsg::Close(closing)).is_err() {
                 pending.fetch_sub(1, Ordering::Relaxed);
-                tracing::error!("ledger writer has stopped; the sweeper will bill this reservation in full");
+                tracing::error!(
+                    "ledger writer has stopped; the sweeper will bill this reservation in full"
+                );
             }
         }
     }
@@ -317,11 +357,14 @@ impl SqliteLedger {
     async fn decide(
         &self,
         r: &NewReservation<'_>,
-    ) -> Result<Result<(sqlx::Transaction<'static, sqlx::Sqlite>, i64), LedgerRefusal>, sqlx::Error> {
+    ) -> Result<Result<(sqlx::Transaction<'static, sqlx::Sqlite>, i64), LedgerRefusal>, sqlx::Error>
+    {
         // Dropping `tx` on any early return rolls back, including when the
         // caller's deadline cancels this future.
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let today: i64 = sqlx::query_scalar(&format!("SELECT {TODAY}")).fetch_one(&mut *tx).await?;
+        let today: i64 = sqlx::query_scalar(&format!("SELECT {TODAY}"))
+            .fetch_one(&mut *tx)
+            .await?;
 
         if let Some(claim) = &r.idempotency {
             let held = sqlx::query(&format!(
@@ -341,7 +384,10 @@ impl SqliteLedger {
                 let expired: i64 = row.get("expired");
                 if expired == 0 {
                     let fingerprint: Option<Vec<u8>> = row.get("fingerprint");
-                    if !fingerprint.as_deref().is_some_and(|stored| claim.matches(stored)) {
+                    if !fingerprint
+                        .as_deref()
+                        .is_some_and(|stored| claim.matches(stored))
+                    {
                         return Ok(Err(LedgerRefusal::IdempotencyKeyReused));
                     }
                     match row.get::<String, _>("state").as_str() {
@@ -372,11 +418,13 @@ impl SqliteLedger {
             return Ok(Err(LedgerRefusal::Hold(problem)));
         }
 
-        sqlx::query("INSERT INTO spend_days (tenant_id, day) VALUES (?1, ?2) ON CONFLICT DO NOTHING")
-            .bind(r.tenant_id)
-            .bind(today)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "INSERT INTO spend_days (tenant_id, day) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+        )
+        .bind(r.tenant_id)
+        .bind(today)
+        .execute(&mut *tx)
+        .await?;
         // `BEGIN IMMEDIATE` already holds the write lock, so counting here
         // cannot be raced by any other admission, in or out of this process.
         if r.limits.max_concurrent > 0 {
@@ -388,7 +436,9 @@ impl SqliteLedger {
             .fetch_one(&mut *tx)
             .await?;
             if live >= i64::from(r.limits.max_concurrent) {
-                return Ok(Err(LedgerRefusal::ConcurrencyLimited { limit: r.limits.max_concurrent }));
+                return Ok(Err(LedgerRefusal::ConcurrencyLimited {
+                    limit: r.limits.max_concurrent,
+                }));
             }
         }
         if let Some(refusal) = charge_rate(&mut tx, r).await? {
@@ -411,12 +461,13 @@ impl SqliteLedger {
         .fetch_optional(&mut *tx)
         .await?;
         if charged.is_none() {
-            let spent: i64 =
-                sqlx::query_scalar("SELECT spent_nano_usd FROM spend_days WHERE tenant_id = ?1 AND day = ?2")
-                    .bind(r.tenant_id)
-                    .bind(today)
-                    .fetch_one(&mut *tx)
-                    .await?;
+            let spent: i64 = sqlx::query_scalar(
+                "SELECT spent_nano_usd FROM spend_days WHERE tenant_id = ?1 AND day = ?2",
+            )
+            .bind(r.tenant_id)
+            .bind(today)
+            .fetch_one(&mut *tx)
+            .await?;
             let (spent, budget) = (spent.max(0) as u64, r.budget_nano_usd);
             return Ok(Err(if spent >= budget {
                 LedgerRefusal::BudgetExhausted { spent, budget }
@@ -501,7 +552,8 @@ async fn consume_hold(
     Ok(None)
 }
 
-const HOLD_COLUMNS: &str = "id, tenant_id, requested_by, endpoint, model, max_output_tokens, exposure_nano_usd,
+const HOLD_COLUMNS: &str =
+    "id, tenant_id, requested_by, endpoint, model, max_output_tokens, exposure_nano_usd,
     reason, state, created_at, expires_at, decided_by, decided_at, note, reservation_id";
 
 /// A hold's state as callers see it, in SQL.
@@ -516,10 +568,13 @@ fn hold_from_row(row: &sqlx::sqlite::SqliteRow) -> Option<HoldRecord> {
         requested_by: row.get("requested_by"),
         endpoint: row.get("endpoint"),
         model: row.get("model"),
-        max_output_tokens: row.get::<i64, _>("max_output_tokens").clamp(0, i64::from(u32::MAX)) as u32,
+        max_output_tokens: row
+            .get::<i64, _>("max_output_tokens")
+            .clamp(0, i64::from(u32::MAX)) as u32,
         exposure_nano_usd: row.get::<i64, _>("exposure_nano_usd").max(0) as u64,
         reason: row.get("reason"),
-        state: HoldState::parse(&row.get::<String, _>("state"))?.effective(row.get::<i64, _>("lapsed") != 0),
+        state: HoldState::parse(&row.get::<String, _>("state"))?
+            .effective(row.get::<i64, _>("lapsed") != 0),
         created_at: row.get("created_at"),
         expires_at: row.get("expires_at"),
         decided_by: row.get("decided_by"),
@@ -548,7 +603,9 @@ where
 /// step. The time is read once, so the record and the transition agree.
 async fn expire_holds(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-    let now: i64 = sqlx::query_scalar(&format!("SELECT {NOW}")).fetch_one(&mut *tx).await?;
+    let now: i64 = sqlx::query_scalar(&format!("SELECT {NOW}"))
+        .fetch_one(&mut *tx)
+        .await?;
     sqlx::query(
         "INSERT INTO decisions (request_id, tenant_id, key_id, kind, endpoint, model, code, reason, created_at)
          SELECT id, tenant_id, requested_by, 'hold', endpoint, model, ?2,
@@ -616,14 +673,24 @@ async fn charge_rate(
     .fetch_one(&mut **tx)
     .await?;
     Ok(Some(if rpm > 0 && requests >= rpm {
-        LedgerRefusal::RateLimited { done: requests as u32, limit: rpm as u32 }
+        LedgerRefusal::RateLimited {
+            done: requests as u32,
+            limit: rpm as u32,
+        }
     } else {
-        LedgerRefusal::TokenRateLimited { done: tokens as u32, requested: prompt as u32, limit: tpm as u32 }
+        LedgerRefusal::TokenRateLimited {
+            done: tokens as u32,
+            requested: prompt as u32,
+            limit: tpm as u32,
+        }
     }))
 }
 
-async fn apply_close(pool: &SqlitePool, c: &Closing, sealed_response: Option<&str>) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+async fn apply_close_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    c: &Closing,
+    sealed_response: Option<&str>,
+) -> Result<(), sqlx::Error> {
     let delta = clamp_delta(c.delta_nano_usd);
     let closed = sqlx::query(&format!(
         "UPDATE reservations
@@ -635,20 +702,22 @@ async fn apply_close(pool: &SqlitePool, c: &Closing, sealed_response: Option<&st
     .bind(c.outcome.as_str())
     .bind(delta)
     .bind(sealed_response)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
     let Some(row) = closed else {
-        return tx.commit().await;
+        return Ok(());
     };
     let tenant: String = row.get("tenant_id");
     let day: i64 = row.get("day");
-    let today: i64 = sqlx::query_scalar(&format!("SELECT {TODAY}")).fetch_one(&mut *tx).await?;
+    let today: i64 = sqlx::query_scalar(&format!("SELECT {TODAY}"))
+        .fetch_one(&mut **tx)
+        .await?;
     // Released: nothing was executed, so an approval it used can be used
     // again. Lock order: reservation, hold, day row, rate counters.
     if c.outcome == Outcome::Released {
         sqlx::query("UPDATE holds SET state = 'approved', reservation_id = NULL WHERE reservation_id = ?1 AND state = 'consumed'")
             .bind(c.id.to_string())
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
     }
 
@@ -661,19 +730,21 @@ async fn apply_close(pool: &SqlitePool, c: &Closing, sealed_response: Option<&st
         .bind(&tenant)
         .bind(day)
         .bind(delta)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     } else if delta > 0 {
-        sqlx::query("INSERT INTO spend_days (tenant_id, day) VALUES (?1, ?2) ON CONFLICT DO NOTHING")
-            .bind(&tenant)
-            .bind(today)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "INSERT INTO spend_days (tenant_id, day) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+        )
+        .bind(&tenant)
+        .bind(today)
+        .execute(&mut **tx)
+        .await?;
         sqlx::query("UPDATE spend_days SET spent_nano_usd = spent_nano_usd + ?3 WHERE tenant_id = ?1 AND day = ?2")
             .bind(&tenant)
             .bind(today)
             .bind(delta)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
     }
     // Lock order, the same as admission's: reservation, then the day row
@@ -687,8 +758,29 @@ async fn apply_close(pool: &SqlitePool, c: &Closing, sealed_response: Option<&st
         ))
         .bind(&tenant)
         .bind(i64::from(c.completion_tokens))
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
+    }
+    Ok(())
+}
+
+async fn apply_close(
+    pool: &SqlitePool,
+    c: &Closing,
+    sealed_response: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    apply_close_in_transaction(&mut tx, c, sealed_response).await?;
+    tx.commit().await
+}
+
+async fn apply_close_batch(
+    pool: &SqlitePool,
+    closings: &[(&Closing, Option<String>)],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    for (closing, sealed) in closings {
+        apply_close_in_transaction(&mut tx, closing, sealed.as_deref()).await?;
     }
     tx.commit().await
 }
@@ -697,6 +789,7 @@ async fn run_writer(
     pool: SqlitePool,
     mut inbox: mpsc::UnboundedReceiver<WriterMsg>,
     pending: Arc<AtomicU64>,
+    open_reservations: Arc<AtomicU64>,
     sealer: Option<Arc<ResponseSealer>>,
     live: Arc<DashMap<Uuid, ()>>,
 ) {
@@ -705,29 +798,53 @@ async fn run_writer(
             WriterMsg::Flush(done) => {
                 let _ = done.send(());
             }
-            WriterMsg::Close(closing) => {
-                let sealed = match (&sealer, &closing.response) {
-                    (Some(s), Some(answer)) => Some(s.seal(&binding(&closing.tenant_id, closing.id), answer)),
-                    _ => None,
-                };
+            WriterMsg::Close(first) => {
+                let mut closings = vec![first];
+                let mut flushes = Vec::new();
+                while closings.len() < CLOSE_BATCH_SIZE {
+                    match inbox.try_recv() {
+                        Ok(WriterMsg::Close(closing)) => closings.push(closing),
+                        Ok(WriterMsg::Flush(done)) => flushes.push(done),
+                        Err(mpsc::error::TryRecvError::Empty)
+                        | Err(mpsc::error::TryRecvError::Disconnected) => break,
+                    }
+                }
+                let sealed: Vec<Option<String>> = closings
+                    .iter()
+                    .map(|closing| match (&sealer, &closing.response) {
+                        (Some(s), Some(answer)) => {
+                            Some(s.seal(&binding(&closing.tenant_id, closing.id), answer))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let work: Vec<(&Closing, Option<String>)> = closings.iter().zip(sealed).collect();
                 let mut backoff = Duration::from_millis(100);
                 loop {
-                    match apply_close(&pool, &closing, sealed.as_deref()).await {
+                    match apply_close_batch(&pool, &work).await {
                         Ok(()) => break,
                         Err(error) => {
                             tracing::warn!(
-                                reservation = %closing.id,
+                                reservations = closings.len(),
                                 %error,
                                 retry_in_ms = backoff.as_millis() as u64,
-                                "ledger closing failed; retrying"
+                                "ledger closing batch failed; retrying"
                             );
                             tokio::time::sleep(backoff).await;
                             backoff = (backoff * 2).min(Duration::from_secs(5));
                         }
                     }
                 }
-                live.remove(&closing.id);
-                pending.fetch_sub(1, Ordering::Relaxed);
+                for closing in closings {
+                    live.remove(&closing.id);
+                    pending.fetch_sub(1, Ordering::Relaxed);
+                    open_reservations.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                        Some(value.saturating_sub(1))
+                    }).ok();
+                }
+                for done in flushes {
+                    let _ = done.send(());
+                }
             }
         }
     }
@@ -817,9 +934,11 @@ async fn sweep(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
     ))
     .execute(pool)
     .await?;
-    sqlx::query(&format!("DELETE FROM rate_minutes WHERE minute < {MINUTE} - 60"))
-        .execute(pool)
-        .await?;
+    sqlx::query(&format!(
+        "DELETE FROM rate_minutes WHERE minute < {MINUTE} - 60"
+    ))
+    .execute(pool)
+    .await?;
     Ok(swept.rows_affected())
 }
 
@@ -846,7 +965,11 @@ where
 
 /// Routine records: one attempt each. A failure drops and counts the record
 /// instead of retrying, so a struggling database never grows a backlog.
-async fn run_decision_writer(pool: SqlitePool, mut inbox: mpsc::Receiver<Decision>, dropped: Arc<AtomicU64>) {
+async fn run_decision_writer(
+    pool: SqlitePool,
+    mut inbox: mpsc::Receiver<Decision>,
+    dropped: Arc<AtomicU64>,
+) {
     while let Some(decision) = inbox.recv().await {
         if let Err(error) = insert_decision(&pool, &decision).await {
             dropped.fetch_add(1, Ordering::Relaxed);
@@ -861,14 +984,17 @@ async fn run_sweeper(
     decision_retention: Duration,
     retention: Retention,
     upkeep: Arc<Upkeep>,
+    open_reservations: Arc<AtomicU64>,
 ) {
     let mut ticker = tokio::time::interval(interval.max(Duration::from_secs(1)));
     loop {
         ticker.tick().await;
-        if let Err(error) = sqlx::query(&format!("DELETE FROM decisions WHERE created_at < {NOW} - ?1"))
-            .bind(decision_retention.as_secs() as i64)
-            .execute(&pool)
-            .await
+        if let Err(error) = sqlx::query(&format!(
+            "DELETE FROM decisions WHERE created_at < {NOW} - ?1"
+        ))
+        .bind(decision_retention.as_secs() as i64)
+        .execute(&pool)
+        .await
         {
             upkeep.sweep_failed();
             tracing::warn!(%error, "decision retention sweep failed; will retry");
@@ -899,6 +1025,9 @@ async fn run_sweeper(
             Ok(0) => {}
             Ok(n) => {
                 upkeep.swept(n);
+                open_reservations.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    Some(value.saturating_sub(n))
+                }).ok();
                 tracing::warn!(
                     reservations = n,
                     "swept reservations whose lease lapsed; each keeps its full reservation as the bill"
@@ -915,7 +1044,11 @@ async fn run_sweeper(
 #[async_trait::async_trait]
 impl Ledger for SqliteLedger {
     async fn try_reserve(&self, r: NewReservation<'_>) -> Result<u64, LedgerRefusal> {
-        refuse_if_backlogged(self.pending.load(Ordering::Relaxed), self.max_pending_closings, &self.upkeep)?;
+        refuse_if_backlogged(
+            self.pending.load(Ordering::Relaxed),
+            self.max_pending_closings,
+            &self.upkeep,
+        )?;
         // Deciding may be abandoned: running out drops the transaction before
         // its commit, which rolls it back and holds nothing. It keeps the
         // whole deadline, because under contention deciding is mostly queueing
@@ -936,10 +1069,14 @@ impl Ledger for SqliteLedger {
         // up to 1.25 times the deadline, and only under overload. One that
         // still overruns is refused like any timeout, but it is not abandoned:
         // if it lands, the reservation is released at once.
-        let committing = self.timeout.saturating_sub(started.elapsed()).max(self.timeout / 4);
+        let committing = self
+            .timeout
+            .saturating_sub(started.elapsed())
+            .max(self.timeout / 4);
         match commit_within(tx.commit(), committing, self.release_if_late(&r, bucket)).await {
             CommitOutcome::Committed => {
                 self.live.insert(r.id, ());
+                self.open_reservations.fetch_add(1, Ordering::Relaxed);
                 Ok(bucket)
             }
             CommitOutcome::Failed(error) => Err(unavailable("reserve", error)),
@@ -951,16 +1088,24 @@ impl Ledger for SqliteLedger {
         self.pending.fetch_add(1, Ordering::Relaxed);
         if self.writer.send(WriterMsg::Close(c)).is_err() {
             self.pending.fetch_sub(1, Ordering::Relaxed);
-            tracing::error!("ledger writer has stopped; the sweeper will bill this reservation in full");
+            tracing::error!(
+                "ledger writer has stopped; the sweeper will bill this reservation in full"
+            );
         }
     }
 
-    async fn snapshot(&self, tenant_id: &str, _now: SystemTime) -> Result<(u64, u64), LedgerRefusal> {
+    async fn snapshot(
+        &self,
+        tenant_id: &str,
+        _now: SystemTime,
+    ) -> Result<(u64, u64), LedgerRefusal> {
         let sql = format!(
             "SELECT {TODAY}, COALESCE(
                  (SELECT spent_nano_usd FROM spend_days WHERE tenant_id = ?1 AND day = {TODAY}), 0)"
         );
-        let query = sqlx::query_as::<_, (i64, i64)>(&sql).bind(tenant_id).fetch_one(&self.pool);
+        let query = sqlx::query_as::<_, (i64, i64)>(&sql)
+            .bind(tenant_id)
+            .fetch_one(&self.pool);
         match tokio::time::timeout(self.timeout, query).await {
             Ok(Ok((day, spent))) => Ok((day.max(0) as u64, spent.max(0) as u64)),
             Ok(Err(error)) => Err(unavailable("snapshot", error)),
@@ -1044,7 +1189,11 @@ impl Ledger for SqliteLedger {
     }
 
     fn upkeep(&self) -> UpkeepCounts {
-        UpkeepCounts { pending_closings: self.pending.load(Ordering::Relaxed), ..self.upkeep.counts() }
+        UpkeepCounts {
+            pending_closings: self.pending.load(Ordering::Relaxed),
+            open_reservations: self.open_reservations.load(Ordering::Relaxed),
+            ..self.upkeep.counts()
+        }
     }
 
     async fn create_hold(&self, h: NewHold) -> Result<HoldRecord, LedgerRefusal> {
@@ -1091,7 +1240,10 @@ async fn bounded<T>(
 }
 
 impl SqliteLedger {
-    async fn create_hold_tx(&self, h: &NewHold) -> Result<Result<HoldRecord, LedgerRefusal>, sqlx::Error> {
+    async fn create_hold_tx(
+        &self,
+        h: &NewHold,
+    ) -> Result<Result<HoldRecord, LedgerRefusal>, sqlx::Error> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let pending: i64 = sqlx::query_scalar(&format!(
             "SELECT count(*) FROM holds WHERE tenant_id = ?1 AND state = 'pending' AND expires_at > {NOW}"
@@ -1100,7 +1252,9 @@ impl SqliteLedger {
         .fetch_one(&mut *tx)
         .await?;
         if pending >= i64::from(h.max_pending) {
-            return Ok(Err(LedgerRefusal::TooManyHolds { limit: h.max_pending }));
+            return Ok(Err(LedgerRefusal::TooManyHolds {
+                limit: h.max_pending,
+            }));
         }
         sqlx::query(&format!(
             "INSERT INTO holds (id, tenant_id, requested_by, endpoint, model, max_output_tokens, exposure_nano_usd,
@@ -1118,7 +1272,7 @@ impl SqliteLedger {
         .bind(&h.fingerprint)
         .bind(lease_secs(h.approval_valid_for))
         .bind(lease_secs(h.expires_in))
-        .execute(&mut *tx)
+            .execute(&mut *tx)
         .await?;
         let requested = Decision {
             request_id: h.id,
@@ -1139,7 +1293,10 @@ impl SqliteLedger {
         Ok(Ok(record))
     }
 
-    async fn decide_hold_tx(&self, d: &HoldDecision) -> Result<Result<HoldRecord, LedgerRefusal>, sqlx::Error> {
+    async fn decide_hold_tx(
+        &self,
+        d: &HoldDecision,
+    ) -> Result<Result<HoldRecord, LedgerRefusal>, sqlx::Error> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let Some(current) = select_hold(&mut *tx, d.id).await? else {
             return Ok(Err(LedgerRefusal::Hold(HoldProblem::NotFound)));
@@ -1223,13 +1380,18 @@ mod tests {
         let ledger = open(&file).await;
         {
             let mut conn = ledger.pool().acquire().await.unwrap();
-            let tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await.unwrap();
+            let tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE")
+                .await
+                .unwrap();
             std::mem::forget(tx);
         }
         // Released asynchronously; let the pool take it back.
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let bucket = ledger.try_reserve(reservation("t", 100, 0)).await.expect("the ledger still admits");
+        let bucket = ledger
+            .try_reserve(reservation("t", 100, 0))
+            .await
+            .expect("the ledger still admits");
         ledger.close(closing(Uuid::new_v4(), "t", bucket, 0, Outcome::Released));
         ledger.flush().await;
         assert_eq!(ledger.upkeep().stuck_connections_closed, 1);
@@ -1249,11 +1411,16 @@ mod tests {
         // falls behind, the bound is at the door: past the limit, admissions
         // are refused at once, without touching the database.
         let file = TempFile::new();
-        let ledger = SqliteLedger::connect(SqliteOptions { max_pending_closings: 3, ..options(&file) })
+        let ledger = SqliteLedger::connect(SqliteOptions {
+            max_pending_closings: 3,
+            ..options(&file)
+        })
+        .await
+        .unwrap();
+        // Another process holds the write lock: no closing can be applied.
+        let outside = SqlitePool::connect_with(SqliteConnectOptions::new().filename(&file.0))
             .await
             .unwrap();
-        // Another process holds the write lock: no closing can be applied.
-        let outside = SqlitePool::connect_with(SqliteConnectOptions::new().filename(&file.0)).await.unwrap();
         let lock = outside.begin_with("BEGIN IMMEDIATE").await.unwrap();
         for _ in 0..3 {
             ledger.close(closing(Uuid::new_v4(), "t", 0, 0, Outcome::Released));
@@ -1265,14 +1432,20 @@ mod tests {
             matches!(refused, Err(LedgerRefusal::Unavailable(ref m)) if m.contains("settlements are waiting")),
             "{refused:?}"
         );
-        assert!(started.elapsed() < Duration::from_millis(500), "refused at the door, not after waiting on the lock");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "refused at the door, not after waiting on the lock"
+        );
         let upkeep = ledger.upkeep();
         assert_eq!((upkeep.pending_closings, upkeep.backlog_refusals), (3, 1));
 
         lock.rollback().await.unwrap();
         ledger.flush().await;
         assert_eq!(ledger.upkeep().pending_closings, 0);
-        ledger.try_reserve(reservation("t", 100, 0)).await.expect("admitted once the writer caught up");
+        ledger
+            .try_reserve(reservation("t", 100, 0))
+            .await
+            .expect("admitted once the writer caught up");
     }
 
     #[tokio::test]
@@ -1299,7 +1472,10 @@ mod tests {
               WHERE id = ?1"
         );
         let age = |id: Uuid, days: i64| {
-            sqlx::query(&aging).bind(id.to_string()).bind(days * 86_400 + 60).execute(ledger.pool())
+            sqlx::query(&aging)
+                .bind(id.to_string())
+                .bind(days * 86_400 + 60)
+                .execute(ledger.pool())
         };
         age(closed[0], 31).await.unwrap(); // past retention: deleted
         age(closed[1], 2).await.unwrap(); // past its key's retention: answer cleared
@@ -1309,11 +1485,21 @@ mod tests {
         // between it and this call, the outcome is the same.
         ledger.apply_retention().await.unwrap();
         let rows: Vec<(String, Option<String>)> =
-            sqlx::query_as("SELECT id, response FROM reservations").fetch_all(ledger.pool()).await.unwrap();
-        let row = |id: Uuid| rows.iter().find(|(r, _)| *r == id.to_string()).map(|(_, resp)| resp.clone());
+            sqlx::query_as("SELECT id, response FROM reservations")
+                .fetch_all(ledger.pool())
+                .await
+                .unwrap();
+        let row = |id: Uuid| {
+            rows.iter()
+                .find(|(r, _)| *r == id.to_string())
+                .map(|(_, resp)| resp.clone())
+        };
         assert_eq!(row(closed[0]), None, "deleted after 30 days");
         assert_eq!(row(closed[1]), Some(None), "kept, without its answer");
-        assert!(matches!(row(closed[2]), Some(Some(_))), "recent: kept whole");
+        assert!(
+            matches!(row(closed[2]), Some(Some(_))),
+            "recent: kept whole"
+        );
         assert_eq!(row(open_id), Some(None), "open: never pruned");
         assert_eq!(ledger.upkeep().reservations_pruned, 1);
     }
@@ -1335,7 +1521,10 @@ mod tests {
         // both count what they prune.
         ledger.apply_retention().await.unwrap();
         assert_eq!(ledger.upkeep().reservations_pruned, 2_500);
-        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM reservations").fetch_one(ledger.pool()).await.unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM reservations")
+            .fetch_one(ledger.pool())
+            .await
+            .unwrap();
         assert_eq!(left, 0);
     }
 
@@ -1401,10 +1590,19 @@ mod tests {
     async fn a_zero_cost_request_is_refused_at_exactly_the_budget() {
         let file = TempFile::new();
         let ledger = open(&file).await;
-        ledger.try_reserve(reservation("t", 1_000, 1_000)).await.unwrap();
+        ledger
+            .try_reserve(reservation("t", 1_000, 1_000))
+            .await
+            .unwrap();
         assert_eq!(
-            ledger.try_reserve(reservation("t", 0, 1_000)).await.unwrap_err(),
-            LedgerRefusal::BudgetExhausted { spent: 1_000, budget: 1_000 }
+            ledger
+                .try_reserve(reservation("t", 0, 1_000))
+                .await
+                .unwrap_err(),
+            LedgerRefusal::BudgetExhausted {
+                spent: 1_000,
+                budget: 1_000
+            }
         );
     }
 
@@ -1433,13 +1631,19 @@ mod tests {
             // Dropped without a closing: the process died mid-request.
         };
         let reopened = open(&file).await;
-        assert_eq!(spent(&reopened, "t").await, 1_000, "the reservation was durable before the crash");
+        assert_eq!(
+            spent(&reopened, "t").await,
+            1_000,
+            "the reservation was durable before the crash"
+        );
         // The dead process renewed nothing: its lease lapses.
-        sqlx::query(&format!("UPDATE reservations SET lease_expires_at = {NOW} - 1 WHERE id = ?1"))
-            .bind(id.to_string())
-            .execute(reopened.pool())
-            .await
-            .unwrap();
+        sqlx::query(&format!(
+            "UPDATE reservations SET lease_expires_at = {NOW} - 1 WHERE id = ?1"
+        ))
+        .bind(id.to_string())
+        .execute(reopened.pool())
+        .await
+        .unwrap();
         // The background sweeper also runs at boot and may get there first;
         // what matters is the end state, whoever swept it.
         assert!(reopened.sweep().await.unwrap() <= 1);
@@ -1449,7 +1653,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state, "swept");
-        assert_eq!(spent(&reopened, "t").await, 1_000, "swept keeps the full reservation as the bill");
+        assert_eq!(
+            spent(&reopened, "t").await,
+            1_000,
+            "swept keeps the full reservation as the bill"
+        );
         // A late closing from the dead process's peer changes nothing now.
         reopened.close(closing(id, "t", 0, -1_000, Outcome::Released));
         reopened.flush().await;
@@ -1460,7 +1668,10 @@ mod tests {
     async fn refunds_to_a_closed_day_are_dropped_and_overages_charged_today() {
         let file = TempFile::new();
         let ledger = open(&file).await;
-        let today: i64 = sqlx::query_scalar(&format!("SELECT {TODAY}")).fetch_one(ledger.pool()).await.unwrap();
+        let today: i64 = sqlx::query_scalar(&format!("SELECT {TODAY}"))
+            .fetch_one(ledger.pool())
+            .await
+            .unwrap();
         ledger.try_reserve(reservation("t", 500, 0)).await.unwrap();
         for (id, _) in [(Uuid::new_v4(), ()), (Uuid::new_v4(), ())] {
             sqlx::query(&format!(
@@ -1476,7 +1687,11 @@ mod tests {
             ledger.close(refund);
         }
         ledger.flush().await;
-        assert_eq!(spent(&ledger, "t").await, 500, "yesterday's refunds never reach today");
+        assert_eq!(
+            spent(&ledger, "t").await,
+            500,
+            "yesterday's refunds never reach today"
+        );
 
         let late = Uuid::new_v4();
         sqlx::query(&format!(
@@ -1490,14 +1705,22 @@ mod tests {
         .unwrap();
         ledger.close(closing(late, "t", (today - 1) as u64, 70, Outcome::Settled));
         ledger.flush().await;
-        assert_eq!(spent(&ledger, "t").await, 570, "an overage is real spend, charged today");
+        assert_eq!(
+            spent(&ledger, "t").await,
+            570,
+            "an overage is real spend, charged today"
+        );
     }
 
     #[tokio::test]
     async fn idempotency_rules_hold_on_disk() {
         let file = TempFile::new();
         let ledger = open(&file).await;
-        let claim = |fp: u8| IdempotencyClaim { key: "k", fingerprint: vec![fp; 32], also_matches: vec![] };
+        let claim = |fp: u8| IdempotencyClaim {
+            key: "k",
+            fingerprint: vec![fp; 32],
+            also_matches: vec![],
+        };
         let mut first = reservation("t", 1_000, 0);
         first.idempotency = Some(claim(1));
         let bucket = ledger.try_reserve(first.clone()).await.unwrap();
@@ -1506,25 +1729,38 @@ mod tests {
         again.idempotency = Some(claim(1));
         assert_eq!(
             ledger.try_reserve(again.clone()).await.unwrap_err(),
-            LedgerRefusal::InProgress { original: Some(first.id) }
+            LedgerRefusal::InProgress {
+                original: Some(first.id)
+            }
         );
         let mut other = reservation("t", 1_000, 0);
         other.idempotency = Some(claim(2));
-        assert_eq!(ledger.try_reserve(other).await.unwrap_err(), LedgerRefusal::IdempotencyKeyReused);
+        assert_eq!(
+            ledger.try_reserve(other).await.unwrap_err(),
+            LedgerRefusal::IdempotencyKeyReused
+        );
 
         let mut done = closing(first.id, "t", bucket, -200, Outcome::Settled);
         done.response = Some("the answer".into());
         ledger.close(done);
         ledger.flush().await;
         match ledger.try_reserve(again).await.unwrap_err() {
-            LedgerRefusal::Duplicate { original, billed_nano_usd, response } => {
+            LedgerRefusal::Duplicate {
+                original,
+                billed_nano_usd,
+                response,
+            } => {
                 assert_eq!(original, first.id);
                 assert_eq!(billed_nano_usd, 800);
                 assert_eq!(response.as_deref(), Some("the answer"));
             }
             other => panic!("expected a duplicate, got {other:?}"),
         }
-        assert_eq!(spent(&ledger, "t").await, 800, "the duplicate charged nothing");
+        assert_eq!(
+            spent(&ledger, "t").await,
+            800,
+            "the duplicate charged nothing"
+        );
 
         // The answer is sealed on disk.
         drop(ledger);
@@ -1532,14 +1768,21 @@ mod tests {
         let wal = std::fs::read(file.0.with_extension("sqlite3-wal")).unwrap_or_default();
         let needle = b"the answer";
         let contains = |hay: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
-        assert!(!contains(&bytes) && !contains(&wal), "the answer must not be on disk in the clear");
+        assert!(
+            !contains(&bytes) && !contains(&wal),
+            "the answer must not be on disk in the clear"
+        );
     }
 
     #[tokio::test]
     async fn a_released_attempt_frees_its_key() {
         let file = TempFile::new();
         let ledger = open(&file).await;
-        let claim = IdempotencyClaim { key: "k", fingerprint: vec![7; 32], also_matches: vec![] };
+        let claim = IdempotencyClaim {
+            key: "k",
+            fingerprint: vec![7; 32],
+            also_matches: vec![],
+        };
         let mut first = reservation("t", 1_000, 0);
         first.idempotency = Some(claim.clone());
         let bucket = ledger.try_reserve(first.clone()).await.unwrap();
@@ -1547,7 +1790,10 @@ mod tests {
         ledger.flush().await;
         let mut retry = reservation("t", 1_000, 0);
         retry.idempotency = Some(claim);
-        ledger.try_reserve(retry).await.expect("nothing ran, so the key may run again");
+        ledger
+            .try_reserve(retry)
+            .await
+            .expect("nothing ran, so the key may run again");
     }
 
     #[tokio::test]
@@ -1558,8 +1804,17 @@ mod tests {
         let (a, b) = (open(&file).await, open(&file).await);
         let tasks: Vec<_> = (0..40)
             .map(|i| {
-                let ledger = if i % 2 == 0 { Arc::clone(&a) } else { Arc::clone(&b) };
-                tokio::spawn(async move { ledger.try_reserve(reservation("t", 100, 1_050)).await.is_ok() })
+                let ledger = if i % 2 == 0 {
+                    Arc::clone(&a)
+                } else {
+                    Arc::clone(&b)
+                };
+                tokio::spawn(async move {
+                    ledger
+                        .try_reserve(reservation("t", 100, 1_050))
+                        .await
+                        .is_ok()
+                })
             })
             .collect();
         let admitted = futures_util::future::join_all(tasks)
@@ -1592,7 +1847,10 @@ mod tests {
     }
 
     fn limited<'a>(tenant: &'a str, limits: SharedLimits) -> NewReservation<'a> {
-        NewReservation { limits, ..reservation(tenant, 100, 0) }
+        NewReservation {
+            limits,
+            ..reservation(tenant, 100, 0)
+        }
     }
 
     async fn state_of(ledger: &SqliteLedger, id: Uuid) -> String {
@@ -1619,21 +1877,36 @@ mod tests {
         ledger.close(closing(r.id, "t", bucket, -700, Outcome::Settled));
         ledger.flush().await;
         assert_eq!(state_of(&ledger, r.id).await, "settled");
-        assert_eq!(spent(&ledger, "t").await, 300, "billed its real usage, not the reservation");
+        assert_eq!(
+            spent(&ledger, "t").await,
+            300,
+            "billed its real usage, not the reservation"
+        );
     }
 
     #[tokio::test]
     async fn concurrency_is_one_cap_across_processes() {
         let file = TempFile::new();
         let (a, b) = (open(&file).await, open(&file).await);
-        let caps = SharedLimits { max_concurrent: 3, ..Default::default() };
+        let caps = SharedLimits {
+            max_concurrent: 3,
+            ..Default::default()
+        };
         let tasks: Vec<_> = (0..12)
             .map(|i| {
-                let ledger = if i % 2 == 0 { Arc::clone(&a) } else { Arc::clone(&b) };
+                let ledger = if i % 2 == 0 {
+                    Arc::clone(&a)
+                } else {
+                    Arc::clone(&b)
+                };
                 tokio::spawn(async move { ledger.try_reserve(limited("t", caps)).await })
             })
             .collect();
-        let results: Vec<_> = futures_util::future::join_all(tasks).await.into_iter().map(Result::unwrap).collect();
+        let results: Vec<_> = futures_util::future::join_all(tasks)
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
         assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 3);
         assert!(results
             .iter()
@@ -1645,16 +1918,27 @@ mod tests {
     async fn requests_per_minute_is_exact_across_processes_and_refusals_are_free() {
         let file = TempFile::new();
         let (a, b) = (open(&file).await, open(&file).await);
-        let rate = SharedLimits { requests_per_minute: 5, ..Default::default() };
+        let rate = SharedLimits {
+            requests_per_minute: 5,
+            ..Default::default()
+        };
         // Far from a minute boundary, so all twenty land in one window.
         wait_for_mid_minute().await;
         let tasks: Vec<_> = (0..20)
             .map(|i| {
-                let ledger = if i % 2 == 0 { Arc::clone(&a) } else { Arc::clone(&b) };
+                let ledger = if i % 2 == 0 {
+                    Arc::clone(&a)
+                } else {
+                    Arc::clone(&b)
+                };
                 tokio::spawn(async move { ledger.try_reserve(limited("t", rate)).await })
             })
             .collect();
-        let results: Vec<_> = futures_util::future::join_all(tasks).await.into_iter().map(Result::unwrap).collect();
+        let results: Vec<_> = futures_util::future::join_all(tasks)
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
         assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 5);
         let counted: i64 = sqlx::query_scalar(&format!(
             "SELECT requests FROM rate_minutes WHERE tenant_id = 't' AND minute = {MINUTE}"
@@ -1669,7 +1953,11 @@ mod tests {
     async fn completion_tokens_count_against_the_minute_they_settle_in() {
         let file = TempFile::new();
         let ledger = open(&file).await;
-        let tpm = |prompt| SharedLimits { tokens_per_minute: 100, prompt_tokens: prompt, ..Default::default() };
+        let tpm = |prompt| SharedLimits {
+            tokens_per_minute: 100,
+            prompt_tokens: prompt,
+            ..Default::default()
+        };
         wait_for_mid_minute().await;
         let first = limited("t", tpm(30));
         let bucket = ledger.try_reserve(first.clone()).await.unwrap();
@@ -1679,10 +1967,17 @@ mod tests {
         ledger.flush().await;
         assert_eq!(
             ledger.try_reserve(limited("t", tpm(20))).await.unwrap_err(),
-            LedgerRefusal::TokenRateLimited { done: 90, requested: 20, limit: 100 },
+            LedgerRefusal::TokenRateLimited {
+                done: 90,
+                requested: 20,
+                limit: 100
+            },
             "30 prompt + 60 completion leaves room for 10, not 20"
         );
-        ledger.try_reserve(limited("t", tpm(10))).await.expect("exactly the room left");
+        ledger
+            .try_reserve(limited("t", tpm(10)))
+            .await
+            .expect("exactly the room left");
     }
 
     #[tokio::test]
@@ -1692,14 +1987,25 @@ mod tests {
         // limit at 12:00:59 and again at 12:01:00.
         let file = TempFile::new();
         let ledger = open(&file).await;
-        let rate = SharedLimits { requests_per_minute: 2, ..Default::default() };
+        let rate = SharedLimits {
+            requests_per_minute: 2,
+            ..Default::default()
+        };
         wait_for_mid_minute().await;
-        sqlx::query(&format!("INSERT INTO rate_minutes (tenant_id, minute, requests) VALUES ('t', {MINUTE} - 1, 2)"))
-            .execute(ledger.pool())
+        sqlx::query(&format!(
+            "INSERT INTO rate_minutes (tenant_id, minute, requests) VALUES ('t', {MINUTE} - 1, 2)"
+        ))
+        .execute(ledger.pool())
+        .await
+        .unwrap();
+        ledger
+            .try_reserve(limited("t", rate))
             .await
-            .unwrap();
-        ledger.try_reserve(limited("t", rate)).await.expect("last minute's full window is over");
-        ledger.try_reserve(limited("t", rate)).await.expect("two in this minute");
+            .expect("last minute's full window is over");
+        ledger
+            .try_reserve(limited("t", rate))
+            .await
+            .expect("two in this minute");
         assert_eq!(
             ledger.try_reserve(limited("t", rate)).await.unwrap_err(),
             LedgerRefusal::RateLimited { done: 2, limit: 2 }
@@ -1773,31 +2079,74 @@ mod tests {
         let ledger = open(&file).await;
         let hold = ledger.create_hold(new_hold("t", b"fp")).await.unwrap();
         assert_eq!(hold.state, HoldState::Pending);
-        let early = NewReservation { hold: Some(claim(hold.id, b"fp")), ..reservation("t", 1_000, 0) };
-        assert_eq!(ledger.try_reserve(early).await, Err(LedgerRefusal::Hold(HoldProblem::Pending)));
-        ledger.decide_hold(verdict(hold.id, holds::Verdict::Approve)).await.unwrap();
+        let early = NewReservation {
+            hold: Some(claim(hold.id, b"fp")),
+            ..reservation("t", 1_000, 0)
+        };
+        assert_eq!(
+            ledger.try_reserve(early).await,
+            Err(LedgerRefusal::Hold(HoldProblem::Pending))
+        );
+        ledger
+            .decide_hold(verdict(hold.id, holds::Verdict::Approve))
+            .await
+            .unwrap();
 
         // Refused for budget: rolled back, approval and all.
-        let poor = NewReservation { hold: Some(claim(hold.id, b"fp")), ..reservation("t", 1_000, 500) };
-        assert!(matches!(ledger.try_reserve(poor).await, Err(LedgerRefusal::BudgetWouldBeExceeded { .. })));
-        assert_eq!(ledger.hold(hold.id).await.unwrap().unwrap().state, HoldState::Approved);
+        let poor = NewReservation {
+            hold: Some(claim(hold.id, b"fp")),
+            ..reservation("t", 1_000, 500)
+        };
+        assert!(matches!(
+            ledger.try_reserve(poor).await,
+            Err(LedgerRefusal::BudgetWouldBeExceeded { .. })
+        ));
+        assert_eq!(
+            ledger.hold(hold.id).await.unwrap().unwrap().state,
+            HoldState::Approved
+        );
         // Another request presenting it: refused, approval untouched.
-        let other = NewReservation { hold: Some(claim(hold.id, b"other")), ..reservation("t", 1_000, 0) };
-        assert_eq!(ledger.try_reserve(other).await, Err(LedgerRefusal::Hold(HoldProblem::Mismatch)));
+        let other = NewReservation {
+            hold: Some(claim(hold.id, b"other")),
+            ..reservation("t", 1_000, 0)
+        };
+        assert_eq!(
+            ledger.try_reserve(other).await,
+            Err(LedgerRefusal::Hold(HoldProblem::Mismatch))
+        );
 
-        let used = NewReservation { hold: Some(claim(hold.id, b"fp")), ..reservation("t", 1_000, 0) };
+        let used = NewReservation {
+            hold: Some(claim(hold.id, b"fp")),
+            ..reservation("t", 1_000, 0)
+        };
         let used_id = used.id;
         ledger.try_reserve(used).await.unwrap();
         let after = ledger.hold(hold.id).await.unwrap().unwrap();
         assert_eq!(after.state, HoldState::Consumed);
         assert_eq!(after.reservation_id, Some(used_id));
-        let again = NewReservation { hold: Some(claim(hold.id, b"fp")), ..reservation("t", 1_000, 0) };
-        assert_eq!(ledger.try_reserve(again).await, Err(LedgerRefusal::Hold(HoldProblem::Consumed)));
+        let again = NewReservation {
+            hold: Some(claim(hold.id, b"fp")),
+            ..reservation("t", 1_000, 0)
+        };
+        assert_eq!(
+            ledger.try_reserve(again).await,
+            Err(LedgerRefusal::Hold(HoldProblem::Consumed))
+        );
         // Another tenant cannot even see it.
-        let stranger = NewReservation { hold: Some(claim(hold.id, b"fp")), ..reservation("u", 1_000, 0) };
-        assert_eq!(ledger.try_reserve(stranger).await, Err(LedgerRefusal::Hold(HoldProblem::NotFound)));
+        let stranger = NewReservation {
+            hold: Some(claim(hold.id, b"fp")),
+            ..reservation("u", 1_000, 0)
+        };
+        assert_eq!(
+            ledger.try_reserve(stranger).await,
+            Err(LedgerRefusal::Hold(HoldProblem::NotFound))
+        );
 
-        let codes: Vec<String> = codes_for(&ledger, hold.id).await.into_iter().map(|(c, _)| c).collect();
+        let codes: Vec<String> = codes_for(&ledger, hold.id)
+            .await
+            .into_iter()
+            .map(|(c, _)| c)
+            .collect();
         assert_eq!(codes, ["hold_requested", "hold_approved", "hold_consumed"]);
     }
 
@@ -1806,15 +2155,27 @@ mod tests {
         let file = TempFile::new();
         let ledger = open(&file).await;
         let hold = ledger.create_hold(new_hold("t", b"fp")).await.unwrap();
-        ledger.decide_hold(verdict(hold.id, holds::Verdict::Approve)).await.unwrap();
+        ledger
+            .decide_hold(verdict(hold.id, holds::Verdict::Approve))
+            .await
+            .unwrap();
 
-        let first = NewReservation { hold: Some(claim(hold.id, b"fp")), ..reservation("t", 1_000, 0) };
+        let first = NewReservation {
+            hold: Some(claim(hold.id, b"fp")),
+            ..reservation("t", 1_000, 0)
+        };
         let bucket = ledger.try_reserve(first.clone()).await.unwrap();
         ledger.close(closing(first.id, "t", bucket, -1_000, Outcome::Released));
         ledger.flush().await;
-        assert_eq!(ledger.hold(hold.id).await.unwrap().unwrap().state, HoldState::Approved);
+        assert_eq!(
+            ledger.hold(hold.id).await.unwrap().unwrap().state,
+            HoldState::Approved
+        );
 
-        let second = NewReservation { hold: Some(claim(hold.id, b"fp")), ..reservation("t", 1_000, 0) };
+        let second = NewReservation {
+            hold: Some(claim(hold.id, b"fp")),
+            ..reservation("t", 1_000, 0)
+        };
         let bucket = ledger.try_reserve(second.clone()).await.unwrap();
         ledger.close(closing(second.id, "t", bucket, 0, Outcome::Settled));
         ledger.flush().await;
@@ -1829,47 +2190,99 @@ mod tests {
         let ledger = open(&file).await;
         let waiting = ledger.create_hold(new_hold("t", b"a")).await.unwrap();
         let approved = ledger.create_hold(new_hold("t", b"b")).await.unwrap();
-        ledger.decide_hold(verdict(approved.id, holds::Verdict::Approve)).await.unwrap();
+        ledger
+            .decide_hold(verdict(approved.id, holds::Verdict::Approve))
+            .await
+            .unwrap();
         let denied = ledger.create_hold(new_hold("t", b"c")).await.unwrap();
-        ledger.decide_hold(verdict(denied.id, holds::Verdict::Deny)).await.unwrap();
+        ledger
+            .decide_hold(verdict(denied.id, holds::Verdict::Deny))
+            .await
+            .unwrap();
         sqlx::query(&format!("UPDATE holds SET expires_at = {NOW} - 1"))
             .execute(ledger.pool())
             .await
             .unwrap();
 
         // Expired to every reader at once, before any sweep runs.
-        assert_eq!(ledger.hold(waiting.id).await.unwrap().unwrap().state, HoldState::Expired);
+        assert_eq!(
+            ledger.hold(waiting.id).await.unwrap().unwrap().state,
+            HoldState::Expired
+        );
         // The background sweeper's first tick fires at boot and may run
         // between the backdating above and this call, expiring some or all
         // of the holds itself. Between the two, each lapsed hold is expired
         // exactly once, whoever gets there first.
-        assert!(ledger.expire_holds().await.unwrap() <= 2, "the denial is final and stays a denial");
-        assert_eq!(ledger.hold(denied.id).await.unwrap().unwrap().state, HoldState::Denied);
-        assert_eq!(ledger.hold(approved.id).await.unwrap().unwrap().state, HoldState::Expired);
+        assert!(
+            ledger.expire_holds().await.unwrap() <= 2,
+            "the denial is final and stays a denial"
+        );
+        assert_eq!(
+            ledger.hold(denied.id).await.unwrap().unwrap().state,
+            HoldState::Denied
+        );
+        assert_eq!(
+            ledger.hold(approved.id).await.unwrap().unwrap().state,
+            HoldState::Expired
+        );
         let expiries = |codes: Vec<(String, String)>| -> Vec<String> {
-            codes.into_iter().filter(|(c, _)| c == "hold_expired").map(|(_, r)| r).collect()
+            codes
+                .into_iter()
+                .filter(|(c, _)| c == "hold_expired")
+                .map(|(_, r)| r)
+                .collect()
         };
-        assert_eq!(expiries(codes_for(&ledger, waiting.id).await), vec![holds::EXPIRED_UNDECIDED]);
-        assert_eq!(expiries(codes_for(&ledger, approved.id).await), vec![holds::EXPIRED_UNUSED]);
-        assert!(expiries(codes_for(&ledger, denied.id).await).is_empty(), "a denial never expires");
+        assert_eq!(
+            expiries(codes_for(&ledger, waiting.id).await),
+            vec![holds::EXPIRED_UNDECIDED]
+        );
+        assert_eq!(
+            expiries(codes_for(&ledger, approved.id).await),
+            vec![holds::EXPIRED_UNUSED]
+        );
+        assert!(
+            expiries(codes_for(&ledger, denied.id).await).is_empty(),
+            "a denial never expires"
+        );
         assert_eq!(ledger.expire_holds().await.unwrap(), 0, "and only once");
-        let late = ledger.decide_hold(verdict(waiting.id, holds::Verdict::Approve)).await;
-        assert_eq!(late, Err(LedgerRefusal::HoldNotDecidable { state: HoldState::Expired }));
+        let late = ledger
+            .decide_hold(verdict(waiting.id, holds::Verdict::Approve))
+            .await;
+        assert_eq!(
+            late,
+            Err(LedgerRefusal::HoldNotDecidable {
+                state: HoldState::Expired
+            })
+        );
     }
 
     #[tokio::test]
     async fn the_pending_limit_holds_across_processes_sharing_the_file() {
         let file = TempFile::new();
         let (a, b) = (open(&file).await, open(&file).await);
-        let limited = |fp: u8| NewHold { max_pending: 3, ..new_hold("t", &[fp]) };
-        let attempts = futures_util::future::join_all(
-            (0..10u8).map(|i| if i % 2 == 0 { a.create_hold(limited(i)) } else { b.create_hold(limited(i)) }),
-        )
+        let limited = |fp: u8| NewHold {
+            max_pending: 3,
+            ..new_hold("t", &[fp])
+        };
+        let attempts = futures_util::future::join_all((0..10u8).map(|i| {
+            if i % 2 == 0 {
+                a.create_hold(limited(i))
+            } else {
+                b.create_hold(limited(i))
+            }
+        }))
         .await;
         assert_eq!(attempts.iter().filter(|r| r.is_ok()).count(), 3);
-        assert!(attempts.iter().filter_map(|r| r.as_ref().err()).all(|e| *e == LedgerRefusal::TooManyHolds { limit: 3 }));
+        assert!(attempts
+            .iter()
+            .filter_map(|r| r.as_ref().err())
+            .all(|e| *e == LedgerRefusal::TooManyHolds { limit: 3 }));
         let listed = a
-            .holds(HoldQuery { tenant_id: Some("t".into()), state: Some(HoldState::Pending), limit: 100 })
+            .holds(HoldQuery {
+                tenant_id: Some("t".into()),
+                state: Some(HoldState::Pending),
+                limit: 100,
+            })
             .await
             .unwrap();
         assert_eq!(listed.len(), 3);
