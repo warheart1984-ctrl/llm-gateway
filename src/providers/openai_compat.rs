@@ -85,6 +85,10 @@ impl ChatProvider for OpenAiCompatAdapter {
         Some(&self.spec.default_endpoint)
     }
 
+    fn route_ready(&self, _endpoint: Option<&str>) -> bool {
+        self.api_key.is_some()
+    }
+
     async fn stream_chat(&self, req: ProviderRequest) -> Result<ProviderStream, ProviderError> {
         let resp = self.post(&req, true).await?;
         Ok(decode(data_stream(resp, self.spec.quirks, self.max_response_bytes), self.spec.quirks))

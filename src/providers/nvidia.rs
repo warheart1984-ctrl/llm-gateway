@@ -78,6 +78,13 @@ impl ChatProvider for NvidiaAdapter {
         Some(CLOUD_ENDPOINT)
     }
 
+    fn route_ready(&self, endpoint: Option<&str>) -> bool {
+        // A model-specific endpoint is the explicit opt-in for a local NIM,
+        // which does not need NVIDIA_API_KEY. The default cloud endpoint still
+        // requires the key.
+        self.inner.route_ready(None) || endpoint.is_some()
+    }
+
     async fn stream_chat(&self, req: ProviderRequest) -> Result<ProviderStream, ProviderError> {
         self.inner.stream_chat(req).await
     }

@@ -1079,6 +1079,34 @@ async fn health_endpoints_do_not_require_credentials() {
 }
 
 #[tokio::test]
+async fn readiness_keeps_a_valid_fallback_when_another_model_is_unavailable() {
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let extra_models = r#"  unavailable/cloud:
+    provider: nvidia
+    upstream_model: cloud-model
+    cost:
+      input_per_mtok_usd: 1.0
+      output_per_mtok_usd: 1.0
+  unknown/model:
+    provider: unknown
+    upstream_model: unknown-model
+    cost:
+      input_per_mtok_usd: 1.0
+      output_per_mtok_usd: 1.0
+"#;
+    let gw = Gateway::start_with(&upstream, extra_models).await;
+
+    let (status, text) = gw.get("/health/ready", "").await;
+    assert_eq!(status, StatusCode::OK, "the mock route remains a fallback: {text}");
+    let ready: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(ready["routable_models"], 1, "mock/chat remains the fallback");
+    let unavailable = ready["unavailable_models"].as_array().unwrap();
+    assert_eq!(unavailable.len(), 2, "the cloud and unknown routes are reported");
+    assert!(unavailable.iter().any(|issue| issue.as_str().unwrap().contains("NVIDIA_API_KEY")));
+    assert!(unavailable.iter().any(|issue| issue.as_str().unwrap().contains("unknown to this gateway")));
+}
+
+#[tokio::test]
 async fn an_oversized_body_is_rejected_with_413() {
     let upstream = MockUpstream::start(Scenario::Happy).await;
     let gw = Gateway::start(&upstream).await;

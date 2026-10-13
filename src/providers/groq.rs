@@ -64,6 +64,10 @@ impl ChatProvider for GroqAdapter {
         Some(DEFAULT_ENDPOINT)
     }
 
+    fn route_ready(&self, endpoint: Option<&str>) -> bool {
+        self.inner.route_ready(endpoint)
+    }
+
     async fn stream_chat(&self, req: ProviderRequest) -> Result<ProviderStream, ProviderError> {
         self.inner.stream_chat(req).await
     }

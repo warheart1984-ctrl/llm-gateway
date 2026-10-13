@@ -6,7 +6,7 @@
 //! nature, so it is either admin-scoped on the public port or served only on
 //! the ops listener; see [`crate::api::ops_router`]. Health probes are open.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use axum::{
     extract::{Path, Query, State},
@@ -16,7 +16,54 @@ use axum::{
 };
 use serde_json::json;
 
-use crate::{governance::auth::Principal, state::AppState};
+use crate::{
+    governance::auth::Principal,
+    providers::credential_env_var,
+    router::{ProviderPool, RegistrySnapshot},
+    state::AppState,
+};
+
+struct RouteAssessment {
+    routable_models: usize,
+    routable_providers: HashSet<String>,
+    unavailable_models: Vec<String>,
+}
+
+fn assess_routes(snapshot: &RegistrySnapshot, providers: &ProviderPool) -> RouteAssessment {
+    let mut assessment = RouteAssessment {
+        routable_models: 0,
+        routable_providers: HashSet::new(),
+        unavailable_models: Vec::new(),
+    };
+
+    for id in snapshot.ids() {
+        let Some(cfg) = snapshot.by_id.get(id) else { continue };
+        let provider = cfg.provider.to_ascii_lowercase();
+        let Some(adapter) = providers.get(&provider) else {
+            let detail = credential_env_var(&provider)
+                .map(|env| format!("is not configured (set {env})"))
+                .unwrap_or_else(|| "is unknown to this gateway".to_string());
+            assessment
+                .unavailable_models
+                .push(format!("model `{id}` provider `{}` {detail}", cfg.provider));
+            continue;
+        };
+
+        if adapter.route_ready(cfg.endpoint.as_deref()) {
+            assessment.routable_models += 1;
+            assessment.routable_providers.insert(provider);
+        } else {
+            let detail = credential_env_var(&provider)
+                .map(|env| format!("is not configured (set {env})"))
+                .unwrap_or_else(|| "has no usable route".into());
+            assessment
+                .unavailable_models
+                .push(format!("model `{id}` provider `{}` {detail}", cfg.provider));
+        }
+    }
+
+    assessment
+}
 
 /// A handler's failure, described rather than pre-rendered.
 ///
@@ -317,12 +364,10 @@ pub async fn ready(State(state): State<Arc<AppState>>) -> Response {
     if !state.limits.ledger().healthy().await {
         issues.push(format!("the {} spend ledger is unreachable", state.limits.ledger().backend()));
     }
-    for id in snapshot.ids() {
-        if let Some(cfg) = snapshot.by_id.get(id)
-            && !state.providers.names().contains(&cfg.provider.to_ascii_lowercase())
-        {
-            issues.push(format!("model `{id}` names unknown provider `{}`", cfg.provider));
-        }
+    let routes = assess_routes(&snapshot, &state.providers);
+    if !snapshot.is_empty() && routes.routable_models == 0 {
+        issues.extend(routes.unavailable_models.iter().cloned());
+        issues.push("no model has a usable provider route".into());
     }
 
     if issues.is_empty() {
@@ -333,6 +378,9 @@ pub async fn ready(State(state): State<Arc<AppState>>) -> Response {
                 "uptime_seconds": state.uptime_secs(),
                 "models": snapshot.len(),
                 "providers": state.providers.names().len(),
+                "routable_models": routes.routable_models,
+                "routable_providers": routes.routable_providers.len(),
+                "unavailable_models": routes.unavailable_models,
                 "registry_generation": snapshot.generation,
                 "ledger": ledger_scope(&state),
             })),
@@ -341,7 +389,12 @@ pub async fn ready(State(state): State<Arc<AppState>>) -> Response {
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "status": "not_ready", "issues": issues, "ledger": ledger_scope(&state) })),
+            Json(json!({
+                "status": "not_ready",
+                "issues": issues,
+                "unavailable_models": routes.unavailable_models,
+                "ledger": ledger_scope(&state)
+            })),
         )
             .into_response()
     }
@@ -653,6 +706,81 @@ pub async fn not_found() -> Response {
             "message": "no route matches this path" } })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        providers::NvidiaAdapter,
+        router::{ModelConfig, ProviderPool},
+    };
+
+    fn model(provider: &str, endpoint: Option<&str>) -> Arc<ModelConfig> {
+        Arc::new(ModelConfig {
+            provider: provider.into(),
+            endpoint: endpoint.map(str::to_owned),
+            upstream_model: None,
+            display_name: None,
+            default_params: serde_json::Map::new(),
+            cost: Default::default(),
+            prompt_overhead_tokens: 0,
+            latency_slo_ms: None,
+            max_context_tokens: None,
+            max_output_tokens: None,
+            aliases: Vec::new(),
+            enabled: true,
+        })
+    }
+
+    fn snapshot(models: &[(&str, &str, Option<&str>)]) -> RegistrySnapshot {
+        let mut snapshot = RegistrySnapshot::empty();
+        for (id, provider, endpoint) in models {
+            snapshot.by_id.insert((*id).into(), model(provider, *endpoint));
+        }
+        snapshot
+    }
+
+    fn local_nvidia_pool() -> ProviderPool {
+        ProviderPool::new(vec![Arc::new(NvidiaAdapter::local().unwrap())])
+    }
+
+    #[test]
+    fn readiness_reports_missing_cloud_credentials() {
+        let snapshot = snapshot(&[("nvidia/cloud", "nvidia", None)]);
+        let assessment = assess_routes(&snapshot, &local_nvidia_pool());
+
+        assert_eq!(assessment.routable_models, 0);
+        assert_eq!(assessment.routable_providers.len(), 0);
+        assert!(assessment.unavailable_models.iter().any(|issue| {
+            issue.contains("NVIDIA_API_KEY") && issue.contains("nvidia/cloud")
+        }));
+    }
+
+    #[test]
+    fn readiness_distinguishes_unknown_provider() {
+        let snapshot = snapshot(&[("acme/model", "acme", None)]);
+        let assessment = assess_routes(&snapshot, &local_nvidia_pool());
+
+        assert_eq!(assessment.routable_models, 0);
+        assert!(assessment.unavailable_models.iter().any(|issue| {
+            issue.contains("acme/model") && issue.contains("unknown to this gateway")
+        }));
+    }
+
+    #[test]
+    fn readiness_keeps_a_valid_local_fallback_ready() {
+        let snapshot = snapshot(&[
+            ("acme/model", "acme", None),
+            ("nvidia/local", "nvidia", Some("http://127.0.0.1:8000/v1/chat/completions")),
+        ]);
+        let assessment = assess_routes(&snapshot, &local_nvidia_pool());
+
+        assert_eq!(assessment.routable_models, 1);
+        assert_eq!(assessment.routable_providers.len(), 1);
+        assert_eq!(assessment.unavailable_models.len(), 1);
+        assert!(assessment.unavailable_models[0].contains("acme/model"));
+    }
 }
 
 
