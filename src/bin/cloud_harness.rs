@@ -58,7 +58,7 @@ struct Config {
     model: String,
     max_tokens: u64,
     prompt: String,
-    max_requests: usize,
+    max_requests: Option<usize>,
     refusal_backoff_ms: u64,
     settlement_wait_ms: u64,
 }
@@ -197,7 +197,7 @@ struct Manifest {
     repetitions: usize,
     warmup_secs: u64,
     duration_secs: u64,
-    max_requests: usize,
+    max_requests: Option<usize>,
     refusal_backoff_ms: u64,
     settlement_wait_ms: u64,
     seed: u64,
@@ -217,7 +217,7 @@ async fn run() -> Result<(), String> {
     if cfg.direct_url.is_none() && cfg.gateway_url.is_none() {
         return Err("configure --direct-url and/or --gateway-url".into());
     }
-    fs::create_dir_all(&cfg.output).map_err(|e| format!("create output directory: {e}"))?;
+    prepare_output(&cfg.output)?;
     let run_id = cfg
         .output
         .file_name()
@@ -293,11 +293,20 @@ async fn run() -> Result<(), String> {
     for repetition in 0..cfg.repetitions {
         for concurrency in &cfg.concurrency {
             for variant in &variants {
+                run_warmup(&client, &cfg, variant, *concurrency).await?;
+                if !variant.direct {
+                    wait_for_settlement(
+                        &client,
+                        cfg.gateway_usage_url.as_deref(),
+                        cfg.gateway_metrics_url.as_deref(),
+                        cfg.gateway_key.as_deref(),
+                        cfg.settlement_wait_ms,
+                    )
+                    .await;
+                }
                 let upstream_before = if !variant.direct {
-                    run_warmup(&client, &cfg, variant, *concurrency).await?;
                     fetch_provider_count(&client, cfg.upstream_metrics_url.as_deref()).await
                 } else {
-                    run_warmup(&client, &cfg, variant, *concurrency).await?;
                     None
                 };
                 let usage_before = if !variant.direct {
@@ -372,9 +381,8 @@ async fn run() -> Result<(), String> {
                 };
                 summary.upstream_calls_after = upstream_after;
                 summary.gateway_usage_after_nano_usd = usage_after;
-                summary.gateway_metrics_before = metrics_before
-                    .as_deref()
-                    .map(parse_metrics_snapshot);
+                summary.gateway_metrics_before =
+                    metrics_before.as_deref().map(parse_metrics_snapshot);
                 let metrics_after = if !variant.direct {
                     fetch_gateway_metrics(
                         &client,
@@ -395,9 +403,8 @@ async fn run() -> Result<(), String> {
                         metrics,
                     )?;
                 }
-                summary.gateway_metrics_after = metrics_after
-                    .as_deref()
-                    .map(parse_metrics_snapshot);
+                summary.gateway_metrics_after =
+                    metrics_after.as_deref().map(parse_metrics_snapshot);
                 governance.extend(governance_for(&summary));
                 summaries.push(summary);
             }
@@ -462,8 +469,15 @@ impl Config {
                         .map_err(|_| format!("invalid {name} `{v}`"))
                 })
         };
-        let max_requests = parse("max-requests", "CLOUD_MAX_REQUESTS", 1000)? as usize;
-        if max_requests == 0 {
+        let max_requests = get("max-requests")
+            .or_else(|| env::var("CLOUD_MAX_REQUESTS").ok())
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid max-requests `{value}`"))
+            })
+            .transpose()?;
+        if max_requests == Some(0) {
             return Err("max-requests must be positive".into());
         }
         Ok(Self {
@@ -490,17 +504,31 @@ impl Config {
             prompt: get("prompt")
                 .unwrap_or_else(|| env_or("CLOUD_PROMPT", "cloud benchmark request")),
             max_requests,
-            refusal_backoff_ms: parse(
-                "refusal-backoff-ms",
-                "CLOUD_REFUSAL_BACKOFF_MS",
-                100,
-            )?,
-            settlement_wait_ms: parse(
-                "settlement-wait-ms",
-                "CLOUD_SETTLEMENT_WAIT_MS",
-                2000,
-            )?,
+            refusal_backoff_ms: parse("refusal-backoff-ms", "CLOUD_REFUSAL_BACKOFF_MS", 100)?,
+            settlement_wait_ms: parse("settlement-wait-ms", "CLOUD_SETTLEMENT_WAIT_MS", 2000)?,
         })
+    }
+}
+
+fn try_issue(issued: &AtomicUsize, max_requests: Option<usize>) -> bool {
+    let Some(limit) = max_requests else {
+        issued.fetch_add(1, Ordering::Relaxed);
+        return true;
+    };
+    let mut current = issued.load(Ordering::Relaxed);
+    loop {
+        if current >= limit {
+            return false;
+        }
+        match issued.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
     }
 }
 
@@ -528,10 +556,11 @@ async fn run_warmup(
             tokio::spawn(async move {
                 barrier.wait().await;
                 while Instant::now() < end {
-                    if issued.fetch_add(1, Ordering::Relaxed) >= cfg.max_requests {
+                    if !try_issue(&issued, cfg.max_requests) {
                         break;
                     }
-                    if let Ok(record) = request_once(&client, &variant, &request, key.as_deref()).await
+                    if let Ok(record) =
+                        request_once(&client, &variant, &request, key.as_deref()).await
                         && (record.status == 429 || (500..=599).contains(&record.status))
                         && cfg.refusal_backoff_ms > 0
                     {
@@ -641,7 +670,7 @@ async fn run_workload(
                 barrier.wait().await;
                 let end = Instant::now() + Duration::from_secs(cfg.duration_secs);
                 while Instant::now() < end {
-                    if issued.fetch_add(1, Ordering::Relaxed) >= cfg.max_requests {
+                    if !try_issue(&issued, cfg.max_requests) {
                         break;
                     }
                     let open = active.fetch_add(1, Ordering::Relaxed) + 1;
@@ -799,9 +828,7 @@ async fn request_once(
     while let Some(chunk) = body.next().await {
         let chunk = chunk.map_err(|e| e.to_string())?;
         response_bytes += chunk.len();
-        if buffer.len() < 8192 {
-            buffer.extend_from_slice(&chunk[..chunk.len().min(8192 - buffer.len())]);
-        }
+        append_scan_buffer(&mut buffer, &chunk);
         if !saw_done {
             done_probe.extend_from_slice(&chunk);
             saw_done = done_probe.windows(6).any(|window| window == b"[DONE]");
@@ -862,12 +889,64 @@ fn number_after(bytes: &[u8], marker: &[u8]) -> Option<u64> {
         .flatten()
 }
 
+const TOKEN_SCAN_BYTES: usize = 8192;
+
+fn append_scan_buffer(buffer: &mut Vec<u8>, chunk: &[u8]) {
+    if chunk.len() >= TOKEN_SCAN_BYTES {
+        buffer.clear();
+        buffer.extend_from_slice(&chunk[chunk.len() - TOKEN_SCAN_BYTES..]);
+        return;
+    }
+    buffer.extend_from_slice(chunk);
+    if buffer.len() > TOKEN_SCAN_BYTES {
+        let excess = buffer.len() - TOKEN_SCAN_BYTES;
+        buffer.drain(..excess);
+    }
+}
+
 fn token_marker(buffer: &[u8], variant: &Variant) -> bool {
     if variant.direct || variant.framing == Some("passthrough") {
-        buffer.windows(10).any(|w| w == br#""content":"#)
-            || buffer.windows(8).any(|w| w == br#""token":"#)
+        has_nonempty_json_field(buffer, br#""content""#)
+            || has_nonempty_json_field(buffer, br#""token""#)
     } else {
-        buffer.windows(8).any(|w| w == br#""token":"#)
+        has_nonempty_json_field(buffer, br#""token""#)
+    }
+}
+
+fn has_nonempty_json_field(buffer: &[u8], field: &[u8]) -> bool {
+    let mut search_from = 0;
+    while search_from + field.len() <= buffer.len() {
+        let Some(relative) = buffer[search_from..]
+            .windows(field.len())
+            .position(|window| window == field)
+        else {
+            return false;
+        };
+        let field_start = search_from + relative + field.len();
+        let Some(colon) = buffer[field_start..].iter().position(|byte| *byte == b':') else {
+            return false;
+        };
+        let value_start = field_start + colon + 1;
+        let mut deserializer = serde_json::Deserializer::from_slice(&buffer[value_start..]);
+        if let Ok(value) = Value::deserialize(&mut deserializer)
+            && json_value_has_text(&value)
+        {
+            return true;
+        }
+        search_from = field_start;
+    }
+    false
+}
+
+fn json_value_has_text(value: &Value) -> bool {
+    match value {
+        Value::String(text) => !text.is_empty(),
+        Value::Array(values) => values.iter().any(json_value_has_text),
+        Value::Object(fields) => ["content", "text", "token"]
+            .iter()
+            .filter_map(|key| fields.get(*key))
+            .any(json_value_has_text),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
     }
 }
 
@@ -1072,6 +1151,31 @@ async fn wait_for_settlement(
     }
 }
 
+fn prepare_output(dir: &Path) -> Result<(), String> {
+    match fs::metadata(dir) {
+        Ok(metadata) => {
+            if !metadata.is_dir() {
+                return Err(format!("output path is not a directory: {}", dir.display()));
+            }
+            let mut entries = fs::read_dir(dir)
+                .map_err(|e| format!("inspect output directory {}: {e}", dir.display()))?;
+            if entries.next().is_some() {
+                return Err(format!(
+                    "output directory is not empty: {}; choose a new path",
+                    dir.display()
+                ));
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir_all(dir)
+            .map_err(|e| format!("create output directory {}: {e}", dir.display())),
+        Err(error) => Err(format!(
+            "inspect output directory {}: {error}",
+            dir.display()
+        )),
+    }
+}
+
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     let file = File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
     serde_json::to_writer_pretty(file, value).map_err(|e| format!("write {}: {e}", path.display()))
@@ -1196,6 +1300,71 @@ fn shuffle<T>(values: &mut [T], mut seed: u64) {
 
 fn print_help() {
     println!(
-        "cloud-harness options:\n  --direct-url URL\n  --gateway-url URL\n  --concurrency 50,200,500,1000\n  --repetitions 3\n  --warmup-secs 60\n  --duration-secs 180\n  --max-requests 1000\n  --refusal-backoff-ms 100\n  --settlement-wait-ms 2000\n  --upstream-metrics-url URL\n  --gateway-usage-url URL\n  --gateway-metrics-url URL\n  --output DIR\n\nGateway credentials come from CLOUD_GATEWAY_API_KEY and are never written to evidence.\nRefused and 5xx responses back off and the workload is capped by --max-requests.\nThe settlement wait lets durable ledger corrections reach the usage endpoint before reconciliation."
+        "cloud-harness options:\n  --direct-url URL\n  --gateway-url URL\n  --concurrency 50,200,500,1000\n  --repetitions 3\n  --warmup-secs 60\n  --duration-secs 180\n  --max-requests N\n  --refusal-backoff-ms 100\n  --settlement-wait-ms 2000\n  --upstream-metrics-url URL\n  --gateway-usage-url URL\n  --gateway-metrics-url URL\n  --output DIR\n\nGateway credentials come from CLOUD_GATEWAY_API_KEY and are never written to evidence.\nThe workload runs for the requested duration unless --max-requests is supplied.\nRefused and 5xx responses back off; output directories must be empty or new.\nThe settlement wait lets durable ledger corrections reach the usage endpoint before reconciliation."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn variant(direct: bool, framing: Option<&'static str>) -> Variant {
+        Variant {
+            name: "test".into(),
+            framing,
+            url: "http://localhost".into(),
+            direct,
+        }
+    }
+
+    #[test]
+    fn capped_issue_slots_are_exact_and_unlimited_workloads_do_not_stop() {
+        let issued = AtomicUsize::new(0);
+        assert!(try_issue(&issued, Some(2)));
+        assert!(try_issue(&issued, Some(2)));
+        assert!(!try_issue(&issued, Some(2)));
+        assert!(try_issue(&issued, None));
+        assert_eq!(issued.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn ttft_requires_nonempty_content_or_token() {
+        let direct = variant(true, None);
+        let normalized = variant(false, Some("normalized"));
+        assert!(!token_marker(
+            br#"data: {"choices":[{"delta":{"role":"assistant","content":""}}]}"#,
+            &direct
+        ));
+        assert!(token_marker(
+            br#"data: {"choices":[{"delta":{"content":"hello"}}]}"#,
+            &direct
+        ));
+        assert!(!token_marker(br#"data: {"token":""}"#, &normalized));
+        assert!(token_marker(br#"data: {"token":"hello"}"#, &normalized));
+    }
+
+    #[test]
+    fn ttft_scan_keeps_the_tail_after_more_than_one_buffer() {
+        let variant = variant(false, Some("normalized"));
+        let mut buffer = Vec::new();
+        append_scan_buffer(&mut buffer, &vec![b'x'; TOKEN_SCAN_BYTES]);
+        append_scan_buffer(&mut buffer, br#"data: {"token":"late"}"#);
+        assert!(token_marker(&buffer, &variant));
+        assert!(buffer.len() <= TOKEN_SCAN_BYTES);
+    }
+
+    #[test]
+    fn output_directory_must_be_empty() {
+        let path = env::temp_dir().join(format!(
+            "llm-gateway-harness-output-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("create test output directory");
+        assert!(prepare_output(&path).is_ok());
+        fs::write(path.join("old.json"), b"stale").expect("write stale evidence");
+        let error = prepare_output(&path).expect_err("stale output must be rejected");
+        assert!(error.contains("not empty"));
+        fs::remove_dir_all(path).expect("remove test output directory");
+    }
 }

@@ -82,6 +82,11 @@ The runner never writes `CLOUD_GATEWAY_API_KEY`. It writes only sanitized
 request metadata and outcomes. Missing provider or usage endpoints are marked
 `not_measured`, not passed.
 
+When `--max-requests` is omitted, each workload runs for the full requested
+duration. Use the option only as an explicit safety cap for smoke tests or
+bounded pressure runs. The `--output` directory must be new or empty; this
+prevents stale metrics and evidence from being mixed into a fresh manifest.
+
 ## Full first experiment
 
 After the smoke bundle is inspected and its `SHA256SUMS` verifies, run the
