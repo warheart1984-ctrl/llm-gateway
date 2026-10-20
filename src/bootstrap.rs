@@ -237,7 +237,7 @@ fn open_receipts(
         }
         return Ok(None);
     }
-    let chain = crate::receipts::ReceiptChain::open(&settings.receipts.directory, settings.receipts.rotate_every)
+    let chain = crate::receipts::ReceiptChain::open(&settings.receipts.directory, settings.receipts.chain_options())
         .map_err(|err| BootError::Receipts(err.to_string()))?;
     tracing::info!(
         key_id = chain.key_id(),

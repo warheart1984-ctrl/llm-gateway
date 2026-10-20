@@ -141,9 +141,14 @@ quota_split_margin_percent = 100
 [receipts]
 enabled = false
 directory = "receipts"
-# Re-read and verify the log, then publish the head as an anchor, after this
-# many entries. A request only checks prev_hash against the in-memory head.
-rotate_every = 10000
+# Read back what was written since the last check and append a signed anchor
+# for the head after this many entries, or after anchor_interval_secs with
+# anything new, whichever comes first, and at shutdown. A request append never
+# reads the log. Copy anchor.jsonl somewhere this process cannot write (Wicket's
+# anchor publisher does this): a local anchor alone does not stop someone who
+# can edit both files.
+anchor_every = 1000
+anchor_interval_secs = 60
 
 [telemetry]
 service_name = "llm-gateway"
