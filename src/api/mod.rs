@@ -219,6 +219,7 @@ mod tests {
             ),
             providers: crate::router::ProviderPool::new(vec![]),
             limits: crate::governance::limits::LimitEngine::new(8, false),
+            receipts: None,
             metrics: crate::observability::Metrics::new(std::time::Instant::now()),
             started_at: std::time::Instant::now(),
             reload_lock: tokio::sync::Mutex::new(()),

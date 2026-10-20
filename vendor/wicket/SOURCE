@@ -1,0 +1,9 @@
+Vendored unchanged from https://github.com/warheart1984-ctrl/Wicket
+commit bcb0e23f386af61345adb0b1cc9ce72999c6307f
+
+  crates/infinity-kernel  -> vendor/wicket/infinity-kernel
+  verifier/ickverify.py   -> vendor/wicket/verifier/ickverify.py
+
+Do not edit these files. The tamper tests live in Wicket at
+tests/test_standalone_verifier.py and are not copied here, so this tree
+cannot change their bytes.

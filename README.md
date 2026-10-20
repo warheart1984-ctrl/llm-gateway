@@ -479,6 +479,78 @@ newest first.
 - Kept `decision_retention_days` (default 30), then deleted by the sweeper.
   Durable on `sqlite` and `postgres`; the last 10,000 in memory on `memory`.
 
+## Receipts
+
+A receipt is a Wicket chain entry: a signed, hash-linked record that a
+decision happened. It is separate from the decision row in Postgres. Postgres
+keeps quotas, holds, and decision rows. It does not keep the chain head.
+
+The kernel is the vendored `infinity-kernel` crate
+(`vendor/wicket/infinity-kernel`), called in-process. Receipt bytes are the
+kernel's. Nothing new is added to them. The verifier is the unchanged
+`vendor/wicket/verifier/ickverify.py` from
+`warheart1984-ctrl/Wicket` commit `bcb0e23f386af61345adb0b1cc9ce72999c6307f`.
+
+**One chain per process.** Each replica has its own Ed25519 key
+(`signing.priv`, mode 0600), its own `receipts.jsonl`, and its own
+`anchor.jsonl`, all under `[receipts] directory`. Two replicas must not share
+that directory. The public key is `signing.pub` next to the log.
+
+**What gets a receipt**, on `POST /v1/chat/stream` only, and only for a tenant
+with `receipts: true`:
+
+| Gateway event | Kernel verdict |
+|---|---|
+| Reservation (the request is admitted) | `allow` |
+| Any 4xx after authentication | `deny` |
+| Approval hold (`202`) | `await_human_approval` |
+| Stream end | `outcome` (`completed` or `failed`) |
+
+An outcome stores `sha256:` hashes of the request bytes and of the reply
+text (passthrough hashes the raw bytes it relayed). The prompt and the reply
+are not written. `/v1/chat/complete` does not write receipts in this slice.
+
+**Fail closed when receipts are on.** If the entry cannot be written, the
+gateway answers `503` `receipt_unavailable` and does not call the model.
+That is the default for every tenant with `receipts: true`. There is no
+fail-open switch. Tenants with `receipts: false` (the default) are unchanged:
+a full decision queue drops the row, counts it in `gw_decisions_dropped_total`,
+and still returns the refusal.
+
+**No rescan on the request path.** Startup verifies the whole chain once and
+keeps the latest entry in memory. An append checks that its `prev_hash` is
+that head, then writes. After `rotate_every` entries the process reads the
+log again, verifies it, and appends an anchor for the new head. The file is
+not split: the verifier requires a single chain whose first entry has no
+predecessor.
+
+```bash
+python3 vendor/wicket/verifier/ickverify.py \
+  /var/lib/llm-gateway/receipts/receipts.jsonl \
+  --anchor /var/lib/llm-gateway/receipts/anchor.jsonl \
+  --trusted-keys /var/lib/llm-gateway/receipts/signing.pub \
+  --require-signatures
+```
+
+Keep a copy of `signing.pub` and of the newest anchor somewhere the replica
+cannot change. A key and an anchor that sit next to the log do not catch a
+tail the replica itself deleted.
+
+```toml
+[receipts]
+enabled = true
+directory = "/var/lib/llm-gateway/receipts"
+rotate_every = 10000
+```
+
+```yaml
+# tenants.yaml
+receipts: true   # fail closed for this tenant
+```
+
+A tenant file with `receipts: true` while `[receipts] enabled` is false
+refuses to start.
+
 ## HOLD: requests that wait for approval
 
 Between GO and NO-GO there is a third decision. A tenant's policy can say

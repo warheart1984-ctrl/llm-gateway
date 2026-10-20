@@ -46,6 +46,7 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
@@ -65,6 +66,7 @@ use crate::{
     providers::{
         ChatMessage, ChatProvider, Completion, ProviderError, ProviderRequest, StreamEvent, Usage,
     },
+    receipts::{self, OpenReceipt, Subject},
     router::{self, estimate_cost_nano_usd, estimate_prompt_tokens, merge_params, validate_params},
     state::AppState,
 };
@@ -154,6 +156,10 @@ enum RequestError {
     Param(#[from] router::ParamViolation),
     #[error("{0}")]
     Provider(#[from] ProviderError),
+    /// Receipts are on for this tenant and the chain could not take the entry.
+    /// The reply is withheld.
+    #[error("the receipt could not be written")]
+    ReceiptUnavailable,
 }
 
 impl RequestError {
@@ -202,6 +208,7 @@ impl RequestError {
             }
             RequestError::Model(_) => StatusCode::BAD_REQUEST,
             RequestError::Provider(_) => StatusCode::BAD_GATEWAY,
+            RequestError::ReceiptUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -249,6 +256,7 @@ impl RequestError {
             RequestError::Model(_) => "invalid_model",
             RequestError::Param(_) => "invalid_parameter",
             RequestError::Provider(e) => e.code(),
+            RequestError::ReceiptUnavailable => "receipt_unavailable",
         }
     }
 
@@ -272,6 +280,7 @@ impl RequestError {
     fn retryable(&self) -> bool {
         match self {
             RequestError::Provider(e) => e.retryable(),
+            RequestError::ReceiptUnavailable => true,
             RequestError::Limit(
                 LimitError::LedgerUnavailable
                 | LimitError::RequestInProgress { .. }
@@ -289,6 +298,7 @@ impl RequestError {
             RequestError::Limit(LimitError::LedgerUnavailable) => Some("5"),
             RequestError::Limit(LimitError::RequestInProgress { .. }) => Some("1"),
             RequestError::Limit(LimitError::Hold(HoldProblem::Pending)) => Some("5"),
+            RequestError::ReceiptUnavailable => Some("1"),
             _ => None,
         }
     }
@@ -418,6 +428,10 @@ async fn handle(state: Arc<AppState>, headers: HeaderMap, body: Bytes, mode: Mod
             response
         }
         Err(err) => {
+            let err = match ensure_deny_receipt(&state, &span, &request_id, mode, &err) {
+                Ok(()) => err,
+                Err(receipt_err) => receipt_err,
+            };
             if let Some(kind) = err.rejection_kind() {
                 state.metrics.rejection(kind);
             }
@@ -497,6 +511,82 @@ fn record_decision(state: &AppState, span: &RequestSpan, request_id: &str, mode:
     state.limits.ledger().record_decision(decision);
 }
 
+/// The process chain, when this stream's tenant has receipts on.
+/// Completions are out of this slice. Receipts off returns `None` and the
+/// decision queue keeps today's best-effort behavior.
+fn stream_chain(
+    state: &AppState,
+    mode: Mode,
+    tenant_id: &str,
+) -> Result<Option<std::sync::Arc<receipts::ReceiptChain>>, RequestError> {
+    if mode != Mode::Stream || tenant_id.is_empty() {
+        return Ok(None);
+    }
+    let wants = state.current_tenants().get(tenant_id).is_some_and(|tenant| tenant.receipts);
+    if !wants {
+        return Ok(None);
+    }
+    state
+        .receipts
+        .clone()
+        .map(Some)
+        .ok_or(RequestError::ReceiptUnavailable)
+}
+
+/// 4xx for a tenant with receipts on is a kernel `deny`, written before the
+/// refusal is returned. A failed write replaces the refusal: the reply is
+/// withheld. The decision queue is still best-effort and is not this write.
+fn ensure_deny_receipt(
+    state: &AppState,
+    span: &RequestSpan,
+    request_id: &str,
+    mode: Mode,
+    err: &RequestError,
+) -> Result<(), RequestError> {
+    if matches!(
+        err,
+        RequestError::ReceiptUnavailable | RequestError::Auth(_) | RequestError::Held(_)
+    ) || !err.status().is_client_error()
+    {
+        return Ok(());
+    }
+    let Some(chain) = stream_chain(state, mode, &span.tenant_id)? else {
+        return Ok(());
+    };
+    chain
+        .deny(&Subject {
+            request_id: request_id.to_string(),
+            tenant_id: span.tenant_id.clone(),
+            key_id: span.key_id.clone(),
+            model: span.model.clone(),
+            action: err.code().to_string(),
+            request_sha256: None,
+        })
+        .map(|_| ())
+        .map_err(|_| RequestError::ReceiptUnavailable)
+}
+
+fn failed_outcome(open: &OpenReceipt) -> Result<(), RequestError> {
+    let empty = receipts::sha256_prefixed(b"");
+    open.chain
+        .outcome(&open.decision_receipt_id, "failed", &open.request_sha256, &empty)
+        .map(|_| ())
+        .map_err(|_| RequestError::ReceiptUnavailable)
+}
+
+fn reply_sha256(hasher: &Option<Sha256>) -> String {
+    match hasher {
+        Some(hasher) => format!("sha256:{:x}", hasher.clone().finalize()),
+        None => receipts::sha256_prefixed(b""),
+    }
+}
+
+fn absorb_reply(hasher: &mut Option<Sha256>, text: &str) {
+    if let Some(hasher) = hasher {
+        hasher.update(text.as_bytes());
+    }
+}
+
 /// The request's `Idempotency-Key`, if it sent one.
 fn idempotency_key(headers: &HeaderMap) -> Result<Option<&str>, RequestError> {
     let Some(raw) = headers.get("idempotency-key") else {
@@ -532,6 +622,9 @@ struct Admitted {
     max_output_tokens: u32,
     framing: Framing,
     metadata: Option<Map<String, Value>>,
+    /// Set for a stream whose tenant has receipts on, after the allow receipt
+    /// is durable. Absent for completions and for tenants with receipts off.
+    receipt: Option<OpenReceipt>,
 }
 
 /// Everything before the upstream connection: authenticate, parse, authorize,
@@ -694,7 +787,24 @@ async fn admit(
     } else {
         Value::Null
     };
+    let chain = if mode == Mode::Stream && decision.tenant.receipts {
+        Some(state.receipts.clone().ok_or(RequestError::ReceiptUnavailable)?)
+    } else {
+        None
+    };
     if let (Some(reason), Some(policy)) = (hold_reason, &decision.tenant.holds) {
+        if let Some(chain) = &chain {
+            chain
+                .await_approval(&Subject {
+                    request_id: request_id.to_string(),
+                    tenant_id: principal.tenant_id.to_string(),
+                    key_id: principal.key_id.to_string(),
+                    model: resolved.registry_id.clone(),
+                    action: "hold".into(),
+                    request_sha256: Some(receipts::sha256_prefixed(body)),
+                })
+                .map_err(|_| RequestError::ReceiptUnavailable)?;
+        }
         let fingerprint = state.limits.fingerprinter().encodings(scope, &value).remove(0);
         let hold = state
             .limits
@@ -726,7 +836,7 @@ async fn admit(
         key_id: principal.key_id.to_string(),
     });
     let idempotency = idempotency_key.map(|key| state.limits.fingerprinter().claim(key, scope, &value));
-    let reservation = state
+    let mut reservation = state
         .limits
         .admit_request(AdmitRequest {
             id: Uuid::parse_str(request_id).unwrap_or_else(|_| Uuid::new_v4()),
@@ -739,6 +849,29 @@ async fn admit(
             hold,
         })
         .await?;
+    let receipt = if let Some(chain) = &chain {
+        let request_sha256 = receipts::sha256_prefixed(body);
+        match chain.allow(&Subject {
+            request_id: request_id.to_string(),
+            tenant_id: principal.tenant_id.to_string(),
+            key_id: principal.key_id.to_string(),
+            model: resolved.registry_id.clone(),
+            action: "reserve".into(),
+            request_sha256: Some(request_sha256.clone()),
+        }) {
+            Ok(decision_receipt_id) => Some(OpenReceipt {
+                chain: std::sync::Arc::clone(chain),
+                decision_receipt_id,
+                request_sha256,
+            }),
+            Err(_) => {
+                reservation.release();
+                return Err(RequestError::ReceiptUnavailable);
+            }
+        }
+    } else {
+        None
+    };
 
     let framing = match &req.framing {
         Some(explicit) => Framing::parse(Some(explicit)),
@@ -766,6 +899,7 @@ async fn admit(
         max_output_tokens,
         framing,
         metadata: req.metadata,
+        receipt,
     })
 }
 
@@ -795,11 +929,15 @@ async fn normalized_response(
             // No 2xx, so the upstream processed nothing and bills nothing.
             admitted.reservation.release();
             state.metrics.stream_failed_to_start(&provider, &model);
+            if let Some(open) = &admitted.receipt {
+                failed_outcome(open)?;
+            }
             return Err(err.into());
         }
     };
 
     let headers = response_headers(span, &admitted.resolved, &admitted.principal, &admitted.reservation);
+    let reply_hash = admitted.receipt.as_ref().map(|_| Sha256::new());
     let stream = normalized_stream(NormalizedState {
         inner: upstream,
         span: span.clone(),
@@ -823,6 +961,8 @@ async fn normalized_response(
         finished: false,
         upstream_done: false,
         pending: Vec::new().into_iter(),
+        open_receipt: admitted.receipt,
+        reply_hash,
     });
 
     // axum's KeepAlive writes an SSE comment on an idle interval, which every
@@ -909,6 +1049,10 @@ struct NormalizedState {
     /// Client frames produced by one upstream frame but not yet yielded. A
     /// single upstream chunk can carry content, reasoning and a tool call.
     pending: std::vec::IntoIter<Event>,
+    open_receipt: Option<OpenReceipt>,
+    /// Running hash of the reply text actually handed to the client. Absent
+    /// when this stream has no receipt to close.
+    reply_hash: Option<Sha256>,
 }
 
 impl NormalizedState {
@@ -922,6 +1066,21 @@ impl NormalizedState {
         self.finished = true;
 
         let cost = self.settle();
+        if let Some(open) = &self.open_receipt {
+            let failed = extra.is_some() || self.summary.error_code.is_some();
+            let status = if failed { "failed" } else { "completed" };
+            let response_sha256 = reply_sha256(&self.reply_hash);
+            if open
+                .chain
+                .outcome(&open.decision_receipt_id, status, &open.request_sha256, &response_sha256)
+                .is_err()
+            {
+                // The successful close is the reply. Withhold it.
+                self.pending = vec![receipt_error_event(&self.request_id)].into_iter();
+                self.emit_summary();
+                return;
+            }
+        }
 
         let mut out: Vec<Event> = Vec::with_capacity(3);
         if let Some(event) = extra {
@@ -1095,6 +1254,7 @@ async fn next_frame(state: &mut NormalizedState) -> Option<Frame> {
                     StreamEvent::Delta { content, reasoning } => {
                         for text in [content, reasoning].into_iter().flatten() {
                             state.observe_output(text);
+                            absorb_reply(&mut state.reply_hash, text);
                         }
                         if let Some(token) = content {
                             out.push(Event::default().data(token_json(token)));
@@ -1110,6 +1270,7 @@ async fn next_frame(state: &mut NormalizedState) -> Option<Frame> {
                     StreamEvent::ToolCallDelta { index, id, name, arguments } => {
                         for text in [name, arguments].into_iter().flatten() {
                             state.observe_output(text);
+                            absorb_reply(&mut state.reply_hash, text);
                         }
                         out.push(
                             Event::default()
@@ -1145,8 +1306,18 @@ impl Drop for NormalizedState {
         // upstream connection. What was delivered is billed; the rest of the
         // completion reservation is refunded.
         if !self.finished {
+            self.finished = true;
             self.summary.aborted_by_client = true;
             self.settle();
+            if let Some(open) = &self.open_receipt {
+                let response_sha256 = reply_sha256(&self.reply_hash);
+                let _ = open.chain.outcome(
+                    &open.decision_receipt_id,
+                    "failed",
+                    &open.request_sha256,
+                    &response_sha256,
+                );
+            }
             self.emit_summary();
         }
         self.inflight
@@ -1211,6 +1382,20 @@ fn tool_json(index: u32, id: &Option<String>, name: &Option<String>, arguments: 
 
 /// The terminal `end` frame, carrying the numbers needed to reconcile a bill.
 /// Always followed by `[DONE]`.
+fn receipt_error_event(request_id: &str) -> Event {
+    Event::default().event("error").data(
+        json!({
+            "error": {
+                "code": "receipt_unavailable",
+                "message": "the receipt could not be written",
+                "retryable": true,
+            },
+            "request_id": request_id,
+        })
+        .to_string(),
+    )
+}
+
 fn end_event(
     summary: &StreamSummary,
     cost_nano_usd: u64,
@@ -1500,6 +1685,9 @@ async fn passthrough_response(
         Err(err) => {
             admitted.reservation.release();
             state.metrics.stream_failed_to_start(&provider_name, &model_id);
+            if let Some(open) = &admitted.receipt {
+                failed_outcome(open)?;
+            }
             return Err(err.into());
         }
     };
@@ -1510,6 +1698,7 @@ async fn passthrough_response(
         HeaderValue::from_static("passthrough"),
     );
 
+    let reply_hash = admitted.receipt.as_ref().map(|_| Sha256::new());
     let body = Body::from_stream(
         RawStream {
             inner: stream,
@@ -1528,6 +1717,9 @@ async fn passthrough_response(
             },
             first: true,
             finished: false,
+            open_receipt: admitted.receipt,
+            reply_hash,
+            receipt_broken: false,
         }
         .map(|res| res.map_err(std::io::Error::other)),
     );
@@ -1553,6 +1745,10 @@ struct RawStream {
     summary: StreamSummary,
     first: bool,
     finished: bool,
+    open_receipt: Option<OpenReceipt>,
+    /// Hash of the raw bytes relayed. Passthrough never parses them.
+    reply_hash: Option<Sha256>,
+    receipt_broken: bool,
 }
 
 impl Stream for RawStream {
@@ -1564,15 +1760,18 @@ impl Stream for RawStream {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => {
                 if !this.finished {
-                    this.finished = true;
-                    this.reservation.commit_reserved();
-                    this.emit();
+                    this.finish(false);
+                }
+                if this.receipt_broken {
+                    this.receipt_broken = false;
+                    return Poll::Ready(Some(Err(ProviderError::Stream(
+                        "the receipt could not be written".into(),
+                    ))));
                 }
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Err(err))) => {
                 if !this.finished {
-                    this.finished = true;
                     tracing::warn!(
                         request_id = %this.span.request_id,
                         tenant = %this.tenant,
@@ -1582,8 +1781,7 @@ impl Stream for RawStream {
                     );
                     this.summary.error_code = Some(err.code());
                     this.summary.error_retryable = err.retryable();
-                    this.reservation.commit_reserved();
-                    this.emit();
+                    this.finish(true);
                 }
                 Poll::Ready(Some(Err(err)))
             }
@@ -1591,6 +1789,9 @@ impl Stream for RawStream {
                 if this.first {
                     this.first = false;
                     this.span.mark_first_token();
+                }
+                if let Some(hasher) = this.reply_hash.as_mut() {
+                    hasher.update(&bytes);
                 }
                 this.metrics.bytes_to_client(bytes.len() as u64);
                 this.metrics.delta_events(1);
@@ -1605,8 +1806,7 @@ impl Drop for RawStream {
     fn drop(&mut self) {
         if !self.finished {
             self.summary.aborted_by_client = true;
-            self.reservation.commit_reserved();
-            self.emit();
+            self.finish(true);
         }
         self.inflight
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -1614,6 +1814,30 @@ impl Drop for RawStream {
 }
 
 impl RawStream {
+    fn finish(&mut self, failed: bool) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.reservation.commit_reserved();
+        if let Some(open) = &self.open_receipt {
+            let status = if failed || self.summary.error_code.is_some() || self.summary.aborted_by_client {
+                "failed"
+            } else {
+                "completed"
+            };
+            let response_sha256 = reply_sha256(&self.reply_hash);
+            if open
+                .chain
+                .outcome(&open.decision_receipt_id, status, &open.request_sha256, &response_sha256)
+                .is_err()
+            {
+                self.receipt_broken = true;
+            }
+        }
+        self.emit();
+    }
+
     fn emit(&self) {
         let mut summary = self.summary.clone();
         // Content is never parsed in this mode, so the bill is the full

@@ -134,6 +134,17 @@ sqlite_path = "ledger.sqlite3"
 quota_split_replicas = 0
 quota_split_margin_percent = 100
 
+# Per-replica Wicket receipt chain. Off by default: tenants keep today's
+# behavior, and a full decision queue does not fail a request. Turn it on
+# per process, then per tenant (`receipts: true` in tenants.yaml). Each
+# replica needs its own directory. Do not point two processes at one.
+[receipts]
+enabled = false
+directory = "receipts"
+# Re-read and verify the log, then publish the head as an anchor, after this
+# many entries. A request only checks prev_hash against the in-memory head.
+rotate_every = 10000
+
 [telemetry]
 service_name = "llm-gateway"
 service_version = "0.1.0"

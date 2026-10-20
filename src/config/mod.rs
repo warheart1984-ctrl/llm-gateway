@@ -38,6 +38,37 @@ pub struct Settings {
     /// Absent in older config files, which get the in-memory ledger.
     #[serde(default)]
     pub ledger: LedgerConfig,
+    /// Per-replica Wicket receipt chain. Off unless a deploy turns it on.
+    /// Absent in older config files, which write no receipts.
+    #[serde(default)]
+    pub receipts: ReceiptsConfig,
+}
+
+/// This process's Wicket receipt chain. The directory holds the log, the
+/// anchor, and the Ed25519 key. It is not shared with other replicas, and
+/// the chain head is not written to Postgres.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ReceiptsConfig {
+    /// Open the chain at startup. A tenant with `receipts: true` and this
+    /// left false fails closed: the gateway will not serve that tenant.
+    pub enabled: bool,
+    /// Directory for `receipts.jsonl`, `anchor.jsonl`, and `signing.priv`.
+    /// Relative paths resolve against the config directory.
+    pub directory: PathBuf,
+    /// After this many entries, verify the chain from disk and publish the
+    /// head as an anchor. A request append does not rescan the log.
+    pub rotate_every: u64,
+}
+
+impl Default for ReceiptsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            directory: PathBuf::from("receipts"),
+            rotate_every: 10_000,
+        }
+    }
 }
 
 /// Where spend and reservations live. See `governance::ledger`.
@@ -499,6 +530,9 @@ impl Settings {
         }
         if self.ledger.sqlite_path.is_relative() {
             self.ledger.sqlite_path = base_dir.join(&self.ledger.sqlite_path);
+        }
+        if self.receipts.directory.is_relative() {
+            self.receipts.directory = base_dir.join(&self.receipts.directory);
         }
         self
     }

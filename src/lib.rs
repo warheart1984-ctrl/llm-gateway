@@ -26,6 +26,7 @@ pub mod config;
 pub mod governance;
 pub mod observability;
 pub mod providers;
+pub mod receipts;
 pub mod router;
 pub mod state;
 

@@ -32,6 +32,9 @@ pub struct AppState {
     pub providers: RouterProviderPool,
     pub policy: PolicyEngine,
     pub limits: Arc<LimitEngine>,
+    /// This process's Wicket chain, when `[receipts] enabled` is set.
+    /// `None` means no tenant may write receipts.
+    pub receipts: Option<Arc<crate::receipts::ReceiptChain>>,
     pub metrics: SharedMetrics,
     pub started_at: std::time::Instant,
     /// Serializes administrative and hot reloads so a prepared generation
@@ -212,6 +215,7 @@ mod tests {
             providers: crate::router::ProviderPool::new(vec![]),
             policy: PolicyEngine::new(true, crate::config::DEFAULT_LIMITS),
             limits: LimitEngine::new(8, false),
+            receipts: None,
             metrics: crate::observability::Metrics::new(Instant::now()),
             started_at: Instant::now(),
             reload_lock: tokio::sync::Mutex::new(()),

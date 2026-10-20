@@ -75,6 +75,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 
 # ---- security ------------------------------------------------------------
 sha2 = "0.10"
+# Per-replica Ed25519 seed for the Wicket receipt chain. 0.2 matches the
+# copy already in the lockfile.
+getrandom = "0.2"
 libc = "0.2"
 hmac = "0.12"
 subtle = "2"
@@ -103,6 +106,9 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 dashmap = "6"
 anyhow = "1"
+
+# Vendored unchanged from warheart1984-ctrl/Wicket. In-process; no sidecar.
+infinity-kernel = { path = "vendor/wicket/infinity-kernel" }
 
 [dev-dependencies]
 # The integration tests drive the real router over real HTTP against a mock
