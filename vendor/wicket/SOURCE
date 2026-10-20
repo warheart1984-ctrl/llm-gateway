@@ -1,5 +1,8 @@
 Vendored unchanged from https://github.com/warheart1984-ctrl/Wicket
-commit bcb0e23f386af61345adb0b1cc9ce72999c6307f
+commit dc81c8835572690028843539578974da2b7b66d2
+(head of Wicket PR #44, which adds record_external_denial; re-vendor from
+main once it is merged. verifier/ickverify.py and the kernel's Cargo.toml
+are byte-identical to the previous pin, bcb0e23f.)
 
   crates/infinity-kernel  -> vendor/wicket/infinity-kernel
   verifier/ickverify.py   -> vendor/wicket/verifier/ickverify.py

@@ -35,8 +35,8 @@ use std::{
 
 use infinity_kernel::{
     Actor, ApprovalSet, LogEntry, POLICY_VERSION, PROPOSAL_VERSION, Policy, Proposal, Signer,
-    TrustedKeys, evaluate, issue_outcome, issue_receipt, verify_log, verify_outcome,
-    verify_receipt, verify_signatures,
+    TrustedKeys, evaluate, issue_outcome, issue_receipt, record_external_denial, verify_log,
+    verify_outcome, verify_receipt, verify_signatures,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -45,6 +45,10 @@ use tokio::sync::oneshot;
 /// Kernel policy id hashed into every gateway receipt. Stable so a reader can
 /// see that every entry was judged under the same rules.
 const POLICY_ID: &str = "llm-gateway.receipts.v1";
+/// Names the gateway as the authority behind a refusal it decided itself.
+const AUTHORITY: &str = "llm-gateway";
+/// Used when a refusal code is not in the kernel's code alphabet.
+const FALLBACK_REASON: &str = "GATEWAY_REFUSED";
 const ANCHOR_VERSION: &str = "infinity.anchor.v1";
 /// Most jobs written under one disk flush.
 const MAX_BATCH: usize = 512;
@@ -264,6 +268,11 @@ type Answer = Result<String, ReceiptError>;
 type Reply = oneshot::Sender<Answer>;
 
 enum Work {
+    /// A refusal the gateway decided: recorded as an external denial with
+    /// the gateway's own reason.
+    Deny {
+        subject: Subject,
+    },
     Judge {
         subject: Subject,
         effect: &'static str,
@@ -471,9 +480,12 @@ impl ReceiptChain {
         self.judge(subject, "read", false, "allow").await
     }
 
-    /// Governance refusal → kernel `deny`.
+    /// Governance refusal → `deny` with reason codes
+    /// `["EXTERNAL_DENY", <the refusal code in upper case>]`.
     pub async fn deny(&self, subject: &Subject) -> Answer {
-        self.judge(subject, "write", false, "deny").await
+        let (reply, answer) = oneshot::channel();
+        self.send(Work::Deny { subject: subject.clone() }, Some(reply));
+        wait(answer).await
     }
 
     /// Approval hold → kernel `await_human_approval`.
@@ -613,6 +625,15 @@ impl Writer {
     fn build(&self, work: Work, issued_at: String) -> Result<LogEntry, ReceiptError> {
         let previous = self.head.as_ref();
         match work {
+            Work::Deny { subject } => {
+                let proposal = proposal_for(&subject, "read", false);
+                let decision =
+                    record_external_denial(&proposal, &gateway_policy(), AUTHORITY, &reason_code(&subject.action))
+                        .map_err(io_err)?;
+                issue_receipt(&decision, previous, issued_at, subject.call_digest, Some(subject.key_id))
+                    .map(LogEntry::from)
+                    .map_err(io_err)
+            }
             Work::Judge { subject, effect, requires_approval, expect } => {
                 let proposal = proposal_for(&subject, effect, requires_approval);
                 let decision = evaluate(proposal, gateway_policy(), ApprovalSet::default()).map_err(io_err)?;
@@ -788,11 +809,23 @@ impl Writer {
 
 // ---- kernel inputs ------------------------------------------------------------------------
 
+/// `budget_exhausted` → `BUDGET_EXHAUSTED`. Gateway codes are lower-case
+/// ASCII with underscores; anything else becomes `GATEWAY_REFUSED`.
+fn reason_code(action: &str) -> String {
+    let code = action.to_ascii_uppercase();
+    let valid = code.len() <= 64
+        && code.bytes().next().is_some_and(|b| b.is_ascii_uppercase())
+        && code.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
+    if valid { code } else { FALLBACK_REASON.into() }
+}
+
+/// The kernel judges the gateway's `allow` and `await` under this policy.
+/// Refusals are the gateway's own and go through `record_external_denial`.
 fn gateway_policy() -> Policy {
     Policy {
         version: POLICY_VERSION.into(),
         policy_id: POLICY_ID.into(),
-        denied_effects: vec!["write".into()],
+        denied_effects: vec![],
         effects_requiring_approval: vec![],
         risks_requiring_approval: vec![],
         callers: None,
@@ -1140,6 +1173,7 @@ mod tests {
         assert_eq!(rows[1]["decision_receipt_id"], rows[0]["receipt_id"]);
         assert_eq!(rows[1]["response_sha256"], reply.finish());
         assert_eq!(rows[2]["verdict"], "deny");
+        assert_eq!(rows[2]["reason_codes"], json!(["EXTERNAL_DENY", "BUDGET_EXHAUSTED"]));
         assert_eq!(rows[3]["verdict"], "await_human_approval");
         if let Some(code) = ickverify(chain.log_path(), &chain, false) {
             assert_eq!(code, 0, "ickverify rejected the chain");
@@ -1314,6 +1348,15 @@ mod tests {
         let entries = read_entries(&text).unwrap();
         assert_eq!(entries.len(), 640);
         assert!(verify_log(&entries).unwrap(), "concurrent appends must still form one chain");
+    }
+
+    #[test]
+    fn refusal_codes_become_kernel_codes() {
+        assert_eq!(reason_code("budget_exhausted"), "BUDGET_EXHAUSTED");
+        assert_eq!(reason_code("rate_limited"), "RATE_LIMITED");
+        for odd in ["", "9lives", "has space", "dash-ed", &"x".repeat(65)] {
+            assert_eq!(reason_code(odd), FALLBACK_REASON, "{odd:?}");
+        }
     }
 
     #[test]

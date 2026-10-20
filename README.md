@@ -515,12 +515,13 @@ mismatched resubmission (`422`) and an unauthenticated request (`401`) are
 not decisions and leave no receipt. An approved hold, sent again, is admitted
 like any request and gets its own `allow`.
 
-**Known limit: a `deny` does not say why.** The vendored kernel can only
-issue a `deny` for a reason it decided itself, so every gateway refusal reads
-`POLICY_DENIED_EFFECT` in `reason_codes`. The gateway's own code (`budget_exhausted`,
-`rate_limited`, …) is hashed into the proposal but not readable from the log.
-The decision record (`/v1/admin/decisions`) still has the code. Recording it
-in the receipt needs a kernel function for verdicts made outside the kernel.
+**A `deny` says why.** The gateway decides its own refusals, so it records
+them with the kernel's `record_external_denial`: `reason_codes` are
+`["EXTERNAL_DENY", <code>]`, where the code is the refusal's `error.code` in
+upper case (`BUDGET_EXHAUSTED`, `RATE_LIMITED`, `MODEL_NOT_ALLOWED`, …).
+`EXTERNAL_DENY` marks it as decided outside the kernel; the kernel's own codes
+never start with it. `allow` and `await_human_approval` still come from the
+kernel's `evaluate`.
 
 **Hashes are salted.** The prompt and the reply are never written. Each
 admitted request gets 32 random bytes, returned to the caller once in the

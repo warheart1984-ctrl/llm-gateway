@@ -201,6 +201,8 @@ async fn stream_events_map_onto_kernel_receipts_an_auditor_can_verify() {
     // A model the tenant may not use is: a 403 becomes a kernel deny.
     let (status, text) = gateway.post(&stream_body("mock/denied")).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+    let refusal: Value = serde_json::from_str(&text).unwrap();
+    let refusal_code = refusal["error"]["code"].as_str().unwrap().to_ascii_uppercase();
 
     let (status, text) = gateway.post(&stream_body("mock/held")).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{text}");
@@ -227,6 +229,8 @@ async fn stream_events_map_onto_kernel_receipts_an_auditor_can_verify() {
     assert!(!log.contains(&unsalted), "{log}");
     assert!(rows[1].get("content").is_none());
     assert_eq!(rows[2]["verdict"], "deny");
+    // The receipt says why: the gateway's own code, marked as decided outside the kernel.
+    assert_eq!(rows[2]["reason_codes"], serde_json::json!(["EXTERNAL_DENY", refusal_code]));
     assert_eq!(rows[3]["verdict"], "await_human_approval");
 
     let Some(python) = llm_gateway::receipts::test_python() else {
