@@ -81,6 +81,12 @@ pub struct Tenant {
     /// `governance::ledger::holds`.
     #[serde(default)]
     pub holds: Option<HoldPolicy>,
+    /// Write a Wicket receipt for this tenant's stream decisions. Off by
+    /// default, which keeps today's behavior: a full decision queue does not
+    /// fail the request. On, a receipt that cannot be written withholds the
+    /// reply (fail closed).
+    #[serde(default)]
+    pub receipts: bool,
 }
 
 /// When a tenant's requests are held for approval instead of executed.
@@ -686,6 +692,7 @@ mod tests {
             model_params: HashMap::new(),
             require_idempotency_key: false,
             holds: None,
+            receipts: false,
         }
     }
 

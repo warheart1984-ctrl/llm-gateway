@@ -134,6 +134,22 @@ sqlite_path = "ledger.sqlite3"
 quota_split_replicas = 0
 quota_split_margin_percent = 100
 
+# Per-replica Wicket receipt chain. Off by default: tenants keep today's
+# behavior, and a full decision queue does not fail a request. Turn it on
+# per process, then per tenant (`receipts: true` in tenants.yaml). Each
+# replica needs its own directory. Do not point two processes at one.
+[receipts]
+enabled = false
+directory = "receipts"
+# Read back what was written since the last check and append a signed anchor
+# for the head after this many entries, or after anchor_interval_secs with
+# anything new, whichever comes first, and at shutdown. A request append never
+# reads the log. Copy anchor.jsonl somewhere this process cannot write (Wicket's
+# anchor publisher does this): a local anchor alone does not stop someone who
+# can edit both files.
+anchor_every = 1000
+anchor_interval_secs = 60
+
 [telemetry]
 service_name = "llm-gateway"
 service_version = "0.1.0"

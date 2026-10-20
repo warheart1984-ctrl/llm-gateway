@@ -65,6 +65,7 @@ use crate::{
     providers::{
         ChatMessage, ChatProvider, Completion, ProviderError, ProviderRequest, StreamEvent, Usage,
     },
+    receipts::{self, OpenReceipt, RawReplyDigest, ReceiptError, ReplyDigest, Subject},
     router::{self, estimate_cost_nano_usd, estimate_prompt_tokens, merge_params, validate_params},
     state::AppState,
 };
@@ -154,6 +155,10 @@ enum RequestError {
     Param(#[from] router::ParamViolation),
     #[error("{0}")]
     Provider(#[from] ProviderError),
+    /// Receipts are on for this tenant and the chain could not take the entry.
+    /// The reply is withheld.
+    #[error("the receipt could not be written")]
+    ReceiptUnavailable,
 }
 
 impl RequestError {
@@ -202,6 +207,7 @@ impl RequestError {
             }
             RequestError::Model(_) => StatusCode::BAD_REQUEST,
             RequestError::Provider(_) => StatusCode::BAD_GATEWAY,
+            RequestError::ReceiptUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -249,6 +255,7 @@ impl RequestError {
             RequestError::Model(_) => "invalid_model",
             RequestError::Param(_) => "invalid_parameter",
             RequestError::Provider(e) => e.code(),
+            RequestError::ReceiptUnavailable => "receipt_unavailable",
         }
     }
 
@@ -272,6 +279,7 @@ impl RequestError {
     fn retryable(&self) -> bool {
         match self {
             RequestError::Provider(e) => e.retryable(),
+            RequestError::ReceiptUnavailable => true,
             RequestError::Limit(
                 LimitError::LedgerUnavailable
                 | LimitError::RequestInProgress { .. }
@@ -289,6 +297,7 @@ impl RequestError {
             RequestError::Limit(LimitError::LedgerUnavailable) => Some("5"),
             RequestError::Limit(LimitError::RequestInProgress { .. }) => Some("1"),
             RequestError::Limit(LimitError::Hold(HoldProblem::Pending)) => Some("5"),
+            RequestError::ReceiptUnavailable => Some("1"),
             _ => None,
         }
     }
@@ -418,6 +427,10 @@ async fn handle(state: Arc<AppState>, headers: HeaderMap, body: Bytes, mode: Mod
             response
         }
         Err(err) => {
+            let err = match ensure_deny_receipt(&state, &span, &request_id, mode, &err).await {
+                Ok(()) => err,
+                Err(receipt_err) => receipt_err,
+            };
             if let Some(kind) = err.rejection_kind() {
                 state.metrics.rejection(kind);
             }
@@ -497,6 +510,94 @@ fn record_decision(state: &AppState, span: &RequestSpan, request_id: &str, mode:
     state.limits.ledger().record_decision(decision);
 }
 
+/// The process chain, when this stream's tenant has receipts on.
+/// Completions are out of this slice. Receipts off returns `None` and the
+/// decision queue keeps today's best-effort behavior.
+fn stream_chain(
+    state: &AppState,
+    mode: Mode,
+    tenant_id: &str,
+) -> Result<Option<std::sync::Arc<receipts::ReceiptChain>>, RequestError> {
+    if mode != Mode::Stream || tenant_id.is_empty() {
+        return Ok(None);
+    }
+    let wants = state.current_tenants().get(tenant_id).is_some_and(|tenant| tenant.receipts);
+    if !wants {
+        return Ok(None);
+    }
+    state
+        .receipts
+        .clone()
+        .map(Some)
+        .ok_or(RequestError::ReceiptUnavailable)
+}
+
+/// Governance refusals a receipt records as a kernel `deny`: out of budget
+/// (402), not allowed (403), over a rate or concurrency limit (429). A
+/// malformed or oversized body, a duplicate or a mismatched resubmission is
+/// a bad request, not a decision, and leaves no receipt.
+fn is_governance_refusal(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::PAYMENT_REQUIRED | StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
+    )
+}
+
+/// A governance refusal for a tenant with receipts on is a kernel `deny`,
+/// written before the refusal is returned. A failed write replaces the
+/// refusal: the reply is withheld. The decision queue is still best-effort
+/// and is not this write.
+async fn ensure_deny_receipt(
+    state: &AppState,
+    span: &RequestSpan,
+    request_id: &str,
+    mode: Mode,
+    err: &RequestError,
+) -> Result<(), RequestError> {
+    if matches!(
+        err,
+        RequestError::ReceiptUnavailable | RequestError::Auth(_) | RequestError::Held(_)
+    ) || !is_governance_refusal(err.status())
+    {
+        return Ok(());
+    }
+    let Some(chain) = stream_chain(state, mode, &span.tenant_id)? else {
+        return Ok(());
+    };
+    chain
+        .deny(&Subject {
+            request_id: request_id.to_string(),
+            tenant_id: span.tenant_id.clone(),
+            key_id: span.key_id.clone(),
+            model: span.model.clone(),
+            action: err.code().to_string(),
+            call_digest: None,
+        })
+        .await
+        .map(|_| ())
+        .map_err(|_| RequestError::ReceiptUnavailable)
+}
+
+/// The upstream refused before anything was relayed: close the allow with a
+/// `failed` outcome over an empty reply, and wait until it is durable.
+async fn failed_outcome(open: &OpenReceipt, empty_reply: String) -> Result<(), RequestError> {
+    open.chain
+        .outcome(open, "failed", empty_reply)
+        .await
+        .map(|_| ())
+        .map_err(|_| RequestError::ReceiptUnavailable)
+}
+
+/// `x-receipt-id` names the allow receipt; `x-receipt-salt` is the salt in
+/// the request and reply digests. Only the caller gets the salt, so only
+/// someone holding the request and reply can recompute either digest.
+fn insert_receipt_headers(headers: &mut HeaderMap, receipt: Option<&OpenReceipt>) {
+    if let Some(open) = receipt {
+        headers.insert(HeaderName::from_static("x-receipt-id"), header_value(&open.decision_receipt_id));
+        headers.insert(HeaderName::from_static("x-receipt-salt"), header_value(&open.salt.to_hex()));
+    }
+}
+
 /// The request's `Idempotency-Key`, if it sent one.
 fn idempotency_key(headers: &HeaderMap) -> Result<Option<&str>, RequestError> {
     let Some(raw) = headers.get("idempotency-key") else {
@@ -532,6 +633,9 @@ struct Admitted {
     max_output_tokens: u32,
     framing: Framing,
     metadata: Option<Map<String, Value>>,
+    /// Set for a stream whose tenant has receipts on, after the allow receipt
+    /// is durable. Absent for completions and for tenants with receipts off.
+    receipt: Option<OpenReceipt>,
 }
 
 /// Everything before the upstream connection: authenticate, parse, authorize,
@@ -694,7 +798,27 @@ async fn admit(
     } else {
         Value::Null
     };
+    let chain = if mode == Mode::Stream && decision.tenant.receipts {
+        Some(state.receipts.clone().ok_or(RequestError::ReceiptUnavailable)?)
+    } else {
+        None
+    };
     if let (Some(reason), Some(policy)) = (hold_reason, &decision.tenant.holds) {
+        if let Some(chain) = &chain {
+            chain
+                .await_approval(&Subject {
+                    request_id: request_id.to_string(),
+                    tenant_id: principal.tenant_id.to_string(),
+                    key_id: principal.key_id.to_string(),
+                    model: resolved.registry_id.clone(),
+                    action: "hold".into(),
+                    // No salt reaches the client on a 202, so no digest: the
+                    // approved resubmission gets its own allow with one.
+                    call_digest: None,
+                })
+                .await
+                .map_err(|_| RequestError::ReceiptUnavailable)?;
+        }
         let fingerprint = state.limits.fingerprinter().encodings(scope, &value).remove(0);
         let hold = state
             .limits
@@ -726,7 +850,7 @@ async fn admit(
         key_id: principal.key_id.to_string(),
     });
     let idempotency = idempotency_key.map(|key| state.limits.fingerprinter().claim(key, scope, &value));
-    let reservation = state
+    let mut reservation = state
         .limits
         .admit_request(AdmitRequest {
             id: Uuid::parse_str(request_id).unwrap_or_else(|_| Uuid::new_v4()),
@@ -739,6 +863,38 @@ async fn admit(
             hold,
         })
         .await?;
+    let receipt = if let Some(chain) = &chain {
+        let written: Result<OpenReceipt, ReceiptError> = async {
+            let salt = receipts::Salt::generate()?;
+            let request_digest = receipts::request_digest(&salt, body);
+            let decision_receipt_id = chain
+                .allow(&Subject {
+                    request_id: request_id.to_string(),
+                    tenant_id: principal.tenant_id.to_string(),
+                    key_id: principal.key_id.to_string(),
+                    model: resolved.registry_id.clone(),
+                    action: "reserve".into(),
+                    call_digest: Some(request_digest.clone()),
+                })
+                .await?;
+            Ok(OpenReceipt {
+                chain: std::sync::Arc::clone(chain),
+                decision_receipt_id,
+                request_digest,
+                salt,
+            })
+        }
+        .await;
+        match written {
+            Ok(open) => Some(open),
+            Err(_) => {
+                reservation.release();
+                return Err(RequestError::ReceiptUnavailable);
+            }
+        }
+    } else {
+        None
+    };
 
     let framing = match &req.framing {
         Some(explicit) => Framing::parse(Some(explicit)),
@@ -766,6 +922,7 @@ async fn admit(
         max_output_tokens,
         framing,
         metadata: req.metadata,
+        receipt,
     })
 }
 
@@ -795,11 +952,16 @@ async fn normalized_response(
             // No 2xx, so the upstream processed nothing and bills nothing.
             admitted.reservation.release();
             state.metrics.stream_failed_to_start(&provider, &model);
+            if let Some(open) = &admitted.receipt {
+                failed_outcome(open, ReplyDigest::new(open.salt.clone()).finish()).await?;
+            }
             return Err(err.into());
         }
     };
 
-    let headers = response_headers(span, &admitted.resolved, &admitted.principal, &admitted.reservation);
+    let mut headers = response_headers(span, &admitted.resolved, &admitted.principal, &admitted.reservation);
+    insert_receipt_headers(&mut headers, admitted.receipt.as_ref());
+    let reply_hash = admitted.receipt.as_ref().map(|open| ReplyDigest::new(open.salt.clone()));
     let stream = normalized_stream(NormalizedState {
         inner: upstream,
         span: span.clone(),
@@ -823,6 +985,8 @@ async fn normalized_response(
         finished: false,
         upstream_done: false,
         pending: Vec::new().into_iter(),
+        open_receipt: admitted.receipt,
+        reply_hash,
     });
 
     // axum's KeepAlive writes an SSE comment on an idle interval, which every
@@ -909,19 +1073,35 @@ struct NormalizedState {
     /// Client frames produced by one upstream frame but not yet yielded. A
     /// single upstream chunk can carry content, reasoning and a tool call.
     pending: std::vec::IntoIter<Event>,
+    open_receipt: Option<OpenReceipt>,
+    /// Running digest of the reply actually handed to the client. Absent
+    /// when this stream has no receipt to close.
+    reply_hash: Option<ReplyDigest>,
 }
 
 impl NormalizedState {
     /// Queue the closing sequence: an optional extra frame (an `error`, say),
     /// then `end`, then `[DONE]`. Idempotent, so a stream cannot emit two
     /// terminators.
-    fn emit_terminal(&mut self, extra: Option<Event>) {
+    async fn emit_terminal(&mut self, extra: Option<Event>) {
         if self.finished {
             return;
         }
         self.finished = true;
 
         let cost = self.settle();
+        if let Some(open) = self.open_receipt.clone() {
+            let failed = extra.is_some() || self.summary.error_code.is_some();
+            let status = if failed { "failed" } else { "completed" };
+            let response = self.reply_hash.as_ref().map(ReplyDigest::finish).unwrap_or_default();
+            // Waits on the receipt writer without holding a runtime thread.
+            if open.chain.outcome(&open, status, response).await.is_err() {
+                // The successful close is the reply. Withhold it.
+                self.pending = vec![receipt_error_event(&self.request_id)].into_iter();
+                self.emit_summary();
+                return;
+            }
+        }
 
         let mut out: Vec<Event> = Vec::with_capacity(3);
         if let Some(event) = extra {
@@ -1030,7 +1210,7 @@ async fn next_frame(state: &mut NormalizedState) -> Option<Frame> {
             // a client never has to distinguish "finished" from "closed".
             None => {
                 state.upstream_done = true;
-                state.emit_terminal(None);
+                state.emit_terminal(None).await;
             }
             Some(Err(err)) => {
                 // A failure after streaming began cannot change the status
@@ -1046,11 +1226,13 @@ async fn next_frame(state: &mut NormalizedState) -> Option<Frame> {
                 );
                 state.summary.error_code = Some(err.code());
                 state.summary.error_retryable = err.retryable();
-                state.emit_terminal(Some(
-                    Event::default()
-                        .event("error")
-                        .data(error_payload(&err, &state.request_id)),
-                ));
+                state
+                    .emit_terminal(Some(
+                        Event::default()
+                            .event("error")
+                            .data(error_payload(&err, &state.request_id)),
+                    ))
+                    .await;
             }
             Some(Ok(event)) => {
                 state.summary.events += 1;
@@ -1075,7 +1257,7 @@ async fn next_frame(state: &mut NormalizedState) -> Option<Frame> {
                         state.summary.finish_reason.clone_from(finish_reason);
                     }
                     state.upstream_done = true;
-                    state.emit_terminal(None);
+                    state.emit_terminal(None).await;
                     continue;
                 }
 
@@ -1096,6 +1278,14 @@ async fn next_frame(state: &mut NormalizedState) -> Option<Frame> {
                         for text in [content, reasoning].into_iter().flatten() {
                             state.observe_output(text);
                         }
+                        if let Some(reply) = state.reply_hash.as_mut() {
+                            if let Some(text) = content {
+                                reply.content(text);
+                            }
+                            if let Some(text) = reasoning {
+                                reply.reasoning(text);
+                            }
+                        }
                         if let Some(token) = content {
                             out.push(Event::default().data(token_json(token)));
                         }
@@ -1110,6 +1300,9 @@ async fn next_frame(state: &mut NormalizedState) -> Option<Frame> {
                     StreamEvent::ToolCallDelta { index, id, name, arguments } => {
                         for text in [name, arguments].into_iter().flatten() {
                             state.observe_output(text);
+                        }
+                        if let Some(reply) = state.reply_hash.as_mut() {
+                            reply.tool(*index, id.as_deref(), name.as_deref(), arguments.as_deref());
                         }
                         out.push(
                             Event::default()
@@ -1145,8 +1338,14 @@ impl Drop for NormalizedState {
         // upstream connection. What was delivered is billed; the rest of the
         // completion reservation is refunded.
         if !self.finished {
+            self.finished = true;
             self.summary.aborted_by_client = true;
             self.settle();
+            if let Some(open) = &self.open_receipt {
+                // Nobody is left to withhold from; the writer still records it.
+                let response = self.reply_hash.as_ref().map(ReplyDigest::finish).unwrap_or_default();
+                open.chain.outcome_detached(open, "failed", response);
+            }
             self.emit_summary();
         }
         self.inflight
@@ -1211,6 +1410,20 @@ fn tool_json(index: u32, id: &Option<String>, name: &Option<String>, arguments: 
 
 /// The terminal `end` frame, carrying the numbers needed to reconcile a bill.
 /// Always followed by `[DONE]`.
+fn receipt_error_event(request_id: &str) -> Event {
+    Event::default().event("error").data(
+        json!({
+            "error": {
+                "code": "receipt_unavailable",
+                "message": "the receipt could not be written",
+                "retryable": true,
+            },
+            "request_id": request_id,
+        })
+        .to_string(),
+    )
+}
+
 fn end_event(
     summary: &StreamSummary,
     cost_nano_usd: u64,
@@ -1500,6 +1713,9 @@ async fn passthrough_response(
         Err(err) => {
             admitted.reservation.release();
             state.metrics.stream_failed_to_start(&provider_name, &model_id);
+            if let Some(open) = &admitted.receipt {
+                failed_outcome(open, RawReplyDigest::new(&open.salt).finish()).await?;
+            }
             return Err(err.into());
         }
     };
@@ -1509,7 +1725,9 @@ async fn passthrough_response(
         HeaderName::from_static("x-gateway-framing"),
         HeaderValue::from_static("passthrough"),
     );
+    insert_receipt_headers(&mut headers, admitted.receipt.as_ref());
 
+    let reply_hash = admitted.receipt.as_ref().map(|open| RawReplyDigest::new(&open.salt));
     let body = Body::from_stream(
         RawStream {
             inner: stream,
@@ -1528,6 +1746,10 @@ async fn passthrough_response(
             },
             first: true,
             finished: false,
+            open_receipt: admitted.receipt,
+            reply_hash,
+            closing: None,
+            done: false,
         }
         .map(|res| res.map_err(std::io::Error::other)),
     );
@@ -1553,6 +1775,15 @@ struct RawStream {
     summary: StreamSummary,
     first: bool,
     finished: bool,
+    open_receipt: Option<OpenReceipt>,
+    /// Digest of the raw bytes relayed. Passthrough never parses them.
+    reply_hash: Option<RawReplyDigest>,
+    /// The `completed` outcome on its way to disk. The stream ends only once
+    /// it is durable; if it fails, the client gets an error instead of a
+    /// clean end.
+    closing: Option<tokio::sync::oneshot::Receiver<Result<String, ReceiptError>>>,
+    /// Nothing more to yield: never poll `inner` again.
+    done: bool,
 }
 
 impl Stream for RawStream {
@@ -1560,19 +1791,26 @@ impl Stream for RawStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        if this.closing.is_some() {
+            return this.poll_closing(cx);
+        }
+        if this.done {
+            return Poll::Ready(None);
+        }
         match this.inner.poll_next_unpin(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => {
                 if !this.finished {
-                    this.finished = true;
-                    this.reservation.commit_reserved();
-                    this.emit();
+                    this.finish(false);
                 }
+                if this.closing.is_some() {
+                    return this.poll_closing(cx);
+                }
+                this.done = true;
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Err(err))) => {
                 if !this.finished {
-                    this.finished = true;
                     tracing::warn!(
                         request_id = %this.span.request_id,
                         tenant = %this.tenant,
@@ -1582,8 +1820,7 @@ impl Stream for RawStream {
                     );
                     this.summary.error_code = Some(err.code());
                     this.summary.error_retryable = err.retryable();
-                    this.reservation.commit_reserved();
-                    this.emit();
+                    this.finish(true);
                 }
                 Poll::Ready(Some(Err(err)))
             }
@@ -1591,6 +1828,9 @@ impl Stream for RawStream {
                 if this.first {
                     this.first = false;
                     this.span.mark_first_token();
+                }
+                if let Some(reply) = this.reply_hash.as_mut() {
+                    reply.update(&bytes);
                 }
                 this.metrics.bytes_to_client(bytes.len() as u64);
                 this.metrics.delta_events(1);
@@ -1605,8 +1845,7 @@ impl Drop for RawStream {
     fn drop(&mut self) {
         if !self.finished {
             self.summary.aborted_by_client = true;
-            self.reservation.commit_reserved();
-            self.emit();
+            self.finish(true);
         }
         self.inflight
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -1614,6 +1853,48 @@ impl Drop for RawStream {
 }
 
 impl RawStream {
+    /// Wait for the `completed` outcome, then end cleanly, or end with an
+    /// error if it could not be written.
+    fn poll_closing(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Bytes, ProviderError>>> {
+        let Some(closing) = self.closing.as_mut() else {
+            return Poll::Ready(None);
+        };
+        match Pin::new(closing).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(answer) => {
+                self.closing = None;
+                self.done = true;
+                if matches!(answer, Ok(Ok(_))) {
+                    Poll::Ready(None)
+                } else {
+                    Poll::Ready(Some(Err(ProviderError::Stream(
+                        "the receipt could not be written".into(),
+                    ))))
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self, failed: bool) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.reservation.commit_reserved();
+        if let Some(open) = &self.open_receipt {
+            let failed = failed || self.summary.error_code.is_some() || self.summary.aborted_by_client;
+            let response = self.reply_hash.as_ref().map(RawReplyDigest::finish).unwrap_or_default();
+            if failed {
+                // Already ending in an error, or nobody is left: record it
+                // without waiting.
+                open.chain.outcome_detached(open, "failed", response);
+            } else {
+                self.closing = Some(open.chain.outcome_pending(open, "completed", response));
+            }
+        }
+        self.emit();
+    }
+
     fn emit(&self) {
         let mut summary = self.summary.clone();
         // Content is never parsed in this mode, so the bill is the full

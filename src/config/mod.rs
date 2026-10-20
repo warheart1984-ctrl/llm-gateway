@@ -38,6 +38,52 @@ pub struct Settings {
     /// Absent in older config files, which get the in-memory ledger.
     #[serde(default)]
     pub ledger: LedgerConfig,
+    /// Per-replica Wicket receipt chain. Off unless a deploy turns it on.
+    /// Absent in older config files, which write no receipts.
+    #[serde(default)]
+    pub receipts: ReceiptsConfig,
+}
+
+/// This process's Wicket receipt chain. The directory holds the log, the
+/// anchor, and the Ed25519 key. It is not shared with other replicas, and
+/// the chain head is not written to Postgres.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ReceiptsConfig {
+    /// Open the chain at startup. A tenant with `receipts: true` and this
+    /// left false fails closed: the gateway will not serve that tenant.
+    pub enabled: bool,
+    /// Directory for `receipts.jsonl`, `anchor.jsonl`, and `signing.priv`.
+    /// Relative paths resolve against the config directory.
+    pub directory: PathBuf,
+    /// Read back the entries written since the last check and anchor the
+    /// head after this many new entries. A request append never reads the
+    /// log. `rotate_every` is the older name.
+    #[serde(alias = "rotate_every")]
+    pub anchor_every: u64,
+    /// Also anchor when this many seconds have passed with anything new, so
+    /// the unanchored tail is bounded in time as well as in count.
+    pub anchor_interval_secs: u64,
+}
+
+impl ReceiptsConfig {
+    pub fn chain_options(&self) -> crate::receipts::ChainOptions {
+        crate::receipts::ChainOptions {
+            anchor_every: self.anchor_every,
+            anchor_interval: std::time::Duration::from_secs(self.anchor_interval_secs),
+        }
+    }
+}
+
+impl Default for ReceiptsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            directory: PathBuf::from("receipts"),
+            anchor_every: 1_000,
+            anchor_interval_secs: 60,
+        }
+    }
 }
 
 /// Where spend and reservations live. See `governance::ledger`.
@@ -499,6 +545,9 @@ impl Settings {
         }
         if self.ledger.sqlite_path.is_relative() {
             self.ledger.sqlite_path = base_dir.join(&self.ledger.sqlite_path);
+        }
+        if self.receipts.directory.is_relative() {
+            self.receipts.directory = base_dir.join(&self.receipts.directory);
         }
         self
     }

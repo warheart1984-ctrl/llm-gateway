@@ -16,3 +16,7 @@
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm
+
+# Per-replica Wicket receipt chain (log, anchor, signing key).
+/receipts/
+signing.priv

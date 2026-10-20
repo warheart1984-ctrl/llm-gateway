@@ -479,6 +479,139 @@ newest first.
 - Kept `decision_retention_days` (default 30), then deleted by the sweeper.
   Durable on `sqlite` and `postgres`; the last 10,000 in memory on `memory`.
 
+## Receipts
+
+A receipt is a Wicket chain entry: a signed, hash-linked record that a
+decision happened. It is separate from the decision row in Postgres. Postgres
+keeps quotas, holds, and decision rows. It does not keep the chain head.
+
+The kernel is the vendored `infinity-kernel` crate
+(`vendor/wicket/infinity-kernel`), called in-process. Receipt bytes are the
+kernel's. Nothing new is added to them. The verifier is the unchanged
+`vendor/wicket/verifier/ickverify.py` from
+`warheart1984-ctrl/Wicket` commit `bcb0e23f386af61345adb0b1cc9ce72999c6307f`.
+
+**One chain per process.** Each replica has its own Ed25519 key
+(`signing.priv`, mode 0600 on Unix), its own `receipts.jsonl`, and its own
+`anchor.jsonl`, all under `[receipts] directory`. The public key is
+`signing.pub` next to the log. A second process pointed at the same
+directory is refused at startup: the process holds a lock on
+`receipts.lock` for as long as it runs. The lock is on its own file, so the
+log stays readable by `ickverify.py` and backups while the gateway runs,
+on Windows too.
+
+**What gets a receipt**, on `POST /v1/chat/stream` only, and only for a tenant
+with `receipts: true`:
+
+| Gateway event | Kernel verdict |
+|---|---|
+| Reservation (the request is admitted) | `allow` |
+| Governance refusal: `402` budget, `403` not allowed, `429` rate or concurrency | `deny` |
+| Approval hold (`202`) | `await_human_approval` |
+| Stream end | `outcome` (`completed` or `failed`) |
+
+A malformed or oversized body (`400`, `413`), a duplicate (`409`), a
+mismatched resubmission (`422`) and an unauthenticated request (`401`) are
+not decisions and leave no receipt. An approved hold, sent again, is admitted
+like any request and gets its own `allow`.
+
+**A `deny` says why.** The gateway decides its own refusals, so it records
+them with the kernel's `record_external_denial`: `reason_codes` are
+`["EXTERNAL_DENY", <code>]`, where the code is the refusal's `error.code` in
+upper case (`BUDGET_EXHAUSTED`, `RATE_LIMITED`, `MODEL_NOT_ALLOWED`, …).
+`EXTERNAL_DENY` marks it as decided outside the kernel; the kernel's own codes
+never start with it. `allow` and `await_human_approval` still come from the
+kernel's `evaluate`.
+
+**Hashes are salted.** The prompt and the reply are never written. Each
+admitted request gets 32 random bytes, returned to the caller once in the
+`x-receipt-salt` response header (hex), next to `x-receipt-id`, the id of its
+`allow`. The gateway does not keep the salt. Someone who can read the log
+cannot test a guessed prompt against it; the caller, who has the request,
+the reply and the salt, can recompute both digests:
+
+```text
+request  = sha256( salt || "llm-gateway/request/v1\n" || request body as sent )
+reply    = sha256( salt || "llm-gateway/reply/v1\n"
+                   || sha256(content) || sha256(reasoning) || sha256(tools) )
+raw reply (passthrough)
+         = sha256( salt || "llm-gateway/raw-reply/v1\n" || every byte relayed )
+```
+
+`content` is every `token` concatenated and `reasoning` every `reasoning`
+concatenated. `tools` is, for each tool index in ascending order, the index
+in decimal, then `0x1F id 0x1F name 0x1F arguments 0x1E`, where `name` and
+`arguments` are that index's deltas concatenated and `id` is the first
+non-empty id sent for it. The `allow` carries the request digest as
+`call_digest`; the outcome carries both. Each is written `sha256:<hex>`.
+
+**Fail closed when receipts are on.** If the `allow` cannot be written, the
+reservation is released, the model is not called, and the caller gets `503`
+`receipt_unavailable`. If the closing outcome cannot be written, a normalized
+stream ends with an `error` event instead of `end`, and a passthrough stream
+ends with an error instead of a clean close: the text already sent cannot be
+recalled, and the log shows an `allow` without an outcome. A `deny` that
+cannot be written turns the refusal into a `503`. After any failed write the
+chain stops, and every request that needs a receipt gets `503` until the
+process restarts and the log verifies. There is no fail-open switch. Tenants
+with `receipts: false` (the default) are unchanged: a full decision queue
+drops the row, counts it in `gw_decisions_dropped_total`, and still returns
+the refusal.
+
+**Writing.** One writer thread owns the log. A request hands it the entry
+and waits without holding a runtime thread. The writer takes every entry
+waiting, appends them in order, flushes the disk once, and only then tells
+each request it was written. On one Windows desktop SSD, in a release build:
+about 320 receipts a second one at a time, 1,300 with 16 concurrent requests,
+and 3,000 with 128. A streamed request writes two (`allow` and outcome).
+`cargo test --release --lib receipt_throughput -- --ignored --nocapture`
+measures it on your disk.
+
+**Checking and anchoring.** Startup verifies the whole chain and every anchor
+once, then keeps the head in memory. A request never reads the log. After
+`anchor_every` new entries, after `anchor_interval_secs` with anything new,
+and at shutdown, the writer reads back only what it wrote since the last
+check, confirms each entry's hash, link and signature and that the disk ends
+at the head in memory, then appends a signed anchor for that head. A log that
+fails this check stops the chain. The file is never split: the verifier needs
+one chain whose first entry has no predecessor, so startup verification grows
+with the log (about 0.17 ms per entry measured, about three minutes per
+million entries). Archive the directory and start a new one, with a new key
+listed in your trusted keys, before that matters.
+
+```bash
+python3 vendor/wicket/verifier/ickverify.py \
+  /var/lib/llm-gateway/receipts/receipts.jsonl \
+  --anchor /var/lib/llm-gateway/receipts/anchor.jsonl \
+  --trusted-keys /var/lib/llm-gateway/receipts/signing.pub \
+  --require-signatures
+```
+
+**Anchors only help where the replica cannot reach them.** The local
+`anchor.jsonl` sits next to the log and the key, so it does not stop someone
+who can edit all three. Copy `signing.pub` once, and each new anchor line as
+it is written, to a place this process cannot write: Wicket's anchor
+publisher (`runtime/anchor_git.py`, run as another user) pushes them to a
+separate git repository. Entries newer than the last copied anchor can be
+removed without detection; `anchor_interval_secs` bounds how long that window
+stays open.
+
+```toml
+[receipts]
+enabled = true
+directory = "/var/lib/llm-gateway/receipts"
+anchor_every = 1000          # `rotate_every` is still accepted
+anchor_interval_secs = 60
+```
+
+```yaml
+# tenants.yaml
+receipts: true   # fail closed for this tenant
+```
+
+A tenant file with `receipts: true` while `[receipts] enabled` is false
+refuses to start.
+
 ## HOLD: requests that wait for approval
 
 Between GO and NO-GO there is a third decision. A tenant's policy can say

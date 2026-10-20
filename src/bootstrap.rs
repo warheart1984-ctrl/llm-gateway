@@ -39,6 +39,11 @@ pub enum BootError {
     Ledger(String),
     #[error("could not build an upstream HTTP client: {0}")]
     Provider(String),
+    /// The receipt chain failed verification, or a tenant asked for receipts
+    /// while the process chain is off. Either one refuses to start: serving
+    /// those tenants would have to fail every request closed.
+    #[error("receipts: {0}")]
+    Receipts(String),
 }
 
 /// Build the full object graph, with the ledger `settings.ledger` names.
@@ -188,6 +193,7 @@ pub async fn build_with_ledger(
         );
     }
 
+    let receipts = open_receipts(&settings, &tenants)?;
     let metrics = crate::observability::Metrics::new(std::time::Instant::now());
     let generation = Arc::new(RegistryGeneration {
         models: snapshot,
@@ -202,11 +208,44 @@ pub async fn build_with_ledger(
         providers,
         policy,
         limits,
+        receipts,
         metrics,
         started_at: std::time::Instant::now(),
         reload_lock: tokio::sync::Mutex::new(()),
         inflight: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     }))
+}
+
+/// Open this process's receipt chain, or leave receipts off.
+///
+/// A tenant file that turns receipts on while the process switch is off is a
+/// boot failure. Those requests would otherwise 503 on every call.
+fn open_receipts(
+    settings: &crate::config::Settings,
+    tenants: &TenantRegistry,
+) -> Result<Option<Arc<crate::receipts::ReceiptChain>>, BootError> {
+    let asked: Vec<&str> = tenants
+        .tenant_ids()
+        .into_iter()
+        .filter(|id| tenants.get(id).is_some_and(|tenant| tenant.receipts))
+        .collect();
+    if !settings.receipts.enabled {
+        if !asked.is_empty() {
+            return Err(BootError::Receipts(format!(
+                "tenants {asked:?} set receipts: true, but [receipts] enabled is false"
+            )));
+        }
+        return Ok(None);
+    }
+    let chain = crate::receipts::ReceiptChain::open(&settings.receipts.directory, settings.receipts.chain_options())
+        .map_err(|err| BootError::Receipts(err.to_string()))?;
+    tracing::info!(
+        key_id = chain.key_id(),
+        log = %chain.log_path().display(),
+        entries = chain.len(),
+        "receipt chain verified"
+    );
+    Ok(Some(Arc::new(chain)))
 }
 
 async fn build_ledger(
