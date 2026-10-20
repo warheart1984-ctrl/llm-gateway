@@ -19,7 +19,7 @@ use axum::{
 };
 use llm_gateway::{
     governance::ledger::decisions::{Decision, DecisionKind, DECISION_QUEUE},
-    receipts::ReceiptChain,
+    receipts::{ReceiptChain, ReplyDigest, Salt, request_digest},
 };
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -88,6 +88,15 @@ models:
     cost:
       input_per_mtok_usd: 1.0
       output_per_mtok_usd: 1.0
+  mock/denied:
+    provider: nvidia
+    endpoint: http://{upstream}/v1/chat/completions
+    upstream_model: mock-model
+    default_params:
+      max_tokens: 64
+    cost:
+      input_per_mtok_usd: 1.0
+      output_per_mtok_usd: 1.0
   mock/held:
     provider: nvidia
     endpoint: http://{upstream}/v1/chat/completions
@@ -114,7 +123,7 @@ models:
       - key_id: ak_test
         key: test-key-acme
         scopes: [chat:stream]
-    allowed_models: ["*"]
+    allowed_models: ["mock/chat", "mock/held"]
 "#
         );
         std::fs::write(dir.join("models.yaml"), models).unwrap();
@@ -129,7 +138,7 @@ models:
         settings.ledger.backend = llm_gateway::config::LedgerBackend::Memory;
         settings.receipts.enabled = receipts;
         settings.receipts.directory = receipt_dir;
-        settings.receipts.rotate_every = 100;
+        settings.receipts.anchor_every = 100;
         let state = llm_gateway::bootstrap::build(settings).await.expect("boot");
         let chain = state.receipts.clone();
         let app = llm_gateway::api::router(Arc::clone(&state));
@@ -142,6 +151,11 @@ models:
     }
 
     async fn post(&self, body: &str) -> (StatusCode, String) {
+        let (status, _, text) = self.post_with_headers(body).await;
+        (status, text)
+    }
+
+    async fn post_with_headers(&self, body: &str) -> (StatusCode, reqwest::header::HeaderMap, String) {
         let response = reqwest::Client::new()
             .post(format!("http://{}/v1/chat/stream", self.addr))
             .header("x-api-key", "test-key-acme")
@@ -151,8 +165,9 @@ models:
             .await
             .unwrap();
         let status = response.status();
+        let headers = response.headers().clone();
         let text = response.text().await.unwrap();
-        (status, text)
+        (status, headers, text)
     }
 }
 
@@ -169,14 +184,25 @@ async fn stream_events_map_onto_kernel_receipts_an_auditor_can_verify() {
     let (upstream, mock) = mock_upstream().await;
     let gateway = Gateway::boot(upstream, true, true, true).await;
 
-    let (status, text) = gateway.post(&stream_body("mock/chat")).await;
+    let body = stream_body("mock/chat");
+    let (status, headers, text) = gateway.post_with_headers(&body).await;
     assert_eq!(status, StatusCode::OK, "{text}");
     assert!(text.contains("Hello"), "{text}");
     assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
+    let salt = Salt::from_hex(headers["x-receipt-salt"].to_str().unwrap()).expect("a salt header");
+    let allow_id = headers["x-receipt-id"].to_str().unwrap().to_string();
 
+    // A malformed request is not a governance decision: no receipt.
     let (status, text) = gateway.post(r#"{"model":"mock/chat","stream":true,"messages":[]}"#).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
     assert!(text.contains("no_messages"), "{text}");
+    assert_eq!(gateway.chain.as_ref().unwrap().len(), 2, "a 400 writes no receipt");
+
+    // A model the tenant may not use is: a 403 becomes a kernel deny.
+    let (status, text) = gateway.post(&stream_body("mock/denied")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+    let refusal: Value = serde_json::from_str(&text).unwrap();
+    let refusal_code = refusal["error"]["code"].as_str().unwrap().to_ascii_uppercase();
 
     let (status, text) = gateway.post(&stream_body("mock/held")).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{text}");
@@ -189,22 +215,26 @@ async fn stream_events_map_onto_kernel_receipts_an_auditor_can_verify() {
     assert!(!log.contains("Hello, world"), "the log must not keep the reply: {log}");
     let rows: Vec<Value> = log.lines().filter(|line| !line.is_empty()).map(|line| serde_json::from_str(line).unwrap()).collect();
     assert_eq!(rows[0]["verdict"], "allow");
+    assert_eq!(rows[0]["receipt_id"], allow_id);
+    // The client can recompute both digests from what it sent and received.
+    assert_eq!(rows[0]["call_digest"], request_digest(&salt, body.as_bytes()));
     assert_eq!(rows[1]["version"], "infinity.outcome.v1");
     assert_eq!(rows[1]["status"], "completed");
-    assert_eq!(rows[1]["response_sha256"], llm_gateway::receipts::sha256_prefixed(b"Hello, world"));
-    assert!(rows[1]["request_sha256"].as_str().unwrap().starts_with("sha256:"));
+    assert_eq!(rows[1]["request_sha256"], request_digest(&salt, body.as_bytes()));
+    let mut reply = ReplyDigest::new(salt);
+    reply.content("Hello, world");
+    assert_eq!(rows[1]["response_sha256"], reply.finish());
+    // Someone with only the log cannot test a guessed prompt.
+    let unsalted = format!("sha256:{:x}", <sha2::Sha256 as sha2::Digest>::digest(body.as_bytes()));
+    assert!(!log.contains(&unsalted), "{log}");
     assert!(rows[1].get("content").is_none());
     assert_eq!(rows[2]["verdict"], "deny");
+    // The receipt says why: the gateway's own code, marked as decided outside the kernel.
+    assert_eq!(rows[2]["reason_codes"], serde_json::json!(["EXTERNAL_DENY", refusal_code]));
     assert_eq!(rows[3]["verdict"], "await_human_approval");
 
-    let python = if std::process::Command::new("python3")
-        .arg("--version")
-        .output()
-        .is_ok()
-    {
-        "python3"
-    } else {
-        "python"
+    let Some(python) = llm_gateway::receipts::test_python() else {
+        return;
     };
     let status = std::process::Command::new(python)
         .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/vendor/wicket/verifier/ickverify.py"))
@@ -250,9 +280,8 @@ async fn receipts_off_still_answers_when_the_decision_queue_is_full() {
     }
     assert_eq!(ledger.decisions_dropped(), 0);
     let before = gateway.chain.as_ref().unwrap().len();
-    let (status, text) = gateway.post(r#"{"model":"mock/chat","stream":true,"messages":[]}"#).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
-    assert!(text.contains("no_messages"), "{text}");
+    let (status, text) = gateway.post(&stream_body("mock/denied")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
     assert!(!text.contains("receipt_unavailable"), "{text}");
     assert!(ledger.decisions_dropped() >= 1, "the full queue drops the record");
     assert_eq!(gateway.chain.as_ref().unwrap().len(), before, "receipts off writes nothing");

@@ -1,5 +1,5 @@
 Vendored unchanged from https://github.com/warheart1984-ctrl/Wicket
-commit bcb0e23f386af61345adb0b1cc9ce72999c6307f
+commit b60606dc04347c3ddcfda90f3ff1fb388b0c935c (main, after PR #44)
 
   crates/infinity-kernel  -> vendor/wicket/infinity-kernel
   verifier/ickverify.py   -> vendor/wicket/verifier/ickverify.py

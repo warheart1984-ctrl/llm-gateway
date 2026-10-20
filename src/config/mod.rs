@@ -56,9 +56,23 @@ pub struct ReceiptsConfig {
     /// Directory for `receipts.jsonl`, `anchor.jsonl`, and `signing.priv`.
     /// Relative paths resolve against the config directory.
     pub directory: PathBuf,
-    /// After this many entries, verify the chain from disk and publish the
-    /// head as an anchor. A request append does not rescan the log.
-    pub rotate_every: u64,
+    /// Read back the entries written since the last check and anchor the
+    /// head after this many new entries. A request append never reads the
+    /// log. `rotate_every` is the older name.
+    #[serde(alias = "rotate_every")]
+    pub anchor_every: u64,
+    /// Also anchor when this many seconds have passed with anything new, so
+    /// the unanchored tail is bounded in time as well as in count.
+    pub anchor_interval_secs: u64,
+}
+
+impl ReceiptsConfig {
+    pub fn chain_options(&self) -> crate::receipts::ChainOptions {
+        crate::receipts::ChainOptions {
+            anchor_every: self.anchor_every,
+            anchor_interval: std::time::Duration::from_secs(self.anchor_interval_secs),
+        }
+    }
 }
 
 impl Default for ReceiptsConfig {
@@ -66,7 +80,8 @@ impl Default for ReceiptsConfig {
         Self {
             enabled: false,
             directory: PathBuf::from("receipts"),
-            rotate_every: 10_000,
+            anchor_every: 1_000,
+            anchor_interval_secs: 60,
         }
     }
 }
