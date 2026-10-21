@@ -20,6 +20,8 @@ use crate::state::AppState;
 
 pub const ROUTE_CHAT_STREAM: &str = "/v1/chat/stream";
 pub const ROUTE_CHAT_COMPLETE: &str = "/v1/chat/complete";
+/// OpenAI Chat Completions, for OpenAI SDKs pointed at this gateway.
+pub const ROUTE_OPENAI_CHAT_COMPLETIONS: &str = "/v1/chat/completions";
 pub const ROUTE_MODELS: &str = "/v1/models";
 pub const ROUTE_USAGE: &str = "/v1/usage";
 pub const ROUTE_RELOAD: &str = "/v1/admin/registry/reload";
@@ -48,6 +50,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let mut api = Router::new()
         .route(ROUTE_CHAT_STREAM, post(chat::chat_stream))
         .route(ROUTE_CHAT_COMPLETE, post(chat::chat_complete))
+        .route(ROUTE_OPENAI_CHAT_COMPLETIONS, post(chat::openai_chat_completions))
         .route(ROUTE_MODELS, get(system::list_models))
         .route(ROUTE_USAGE, get(system::get_usage))
         .route(ROUTE_HOLD, get(system::get_hold))

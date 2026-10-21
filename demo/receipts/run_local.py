@@ -101,6 +101,16 @@ def main(argv: list[str] | None = None) -> int:
             env=env,
         )
         code = walkthrough.returncode
+        try:
+            import openai  # noqa: F401
+        except ImportError:
+            print("openai package not installed: skipping the OpenAI SDK check (pip install openai)")
+        else:
+            if code == 0:
+                code = subprocess.run(
+                    [sys.executable, str(HERE / "openai_sdk_check.py"), "--base-url", f"http://127.0.0.1:{port}/v1"],
+                    env=env,
+                ).returncode
     finally:
         for process in processes:
             process.terminate()

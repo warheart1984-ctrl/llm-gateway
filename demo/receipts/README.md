@@ -47,6 +47,11 @@ fails.
    local anchors, still verifies. Checked against the published anchor, it is
    `NOT VERIFIED`: the log is shorter than what was anchored.
 
+Then the official OpenAI Python SDK, with only its `base_url` changed, calls
+`/v1/chat/completions`: a completion, a stream with usage, the receipt id in
+the response headers, and refusals raised as the SDK's own exceptions.
+(`run_local.py` skips this step if the `openai` package is not installed.)
+
 ## What it does not show
 
 That the model's answer was right, or anything that never went through the
