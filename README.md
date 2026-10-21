@@ -648,10 +648,14 @@ python3 vendor/wicket/verifier/ickverify.py \
 
 **Anchors only help where the replica cannot reach them.** The local
 `anchor.jsonl` sits next to the log and the key, so it does not stop someone
-who can edit all three. Copy `signing.pub` once, and each new anchor line as
-it is written, to a place this process cannot write: Wicket's anchor
-publisher (`runtime/anchor_git.py`, run as another user) pushes them to a
-separate git repository. Entries newer than the last copied anchor can be
+who can edit all three. `tools/anchor_publisher.py`, run as a separate
+account, pushes each tenant's anchors and public key to a git repository the
+gateway operator cannot write, never force-pushes, refuses to publish over a
+rewritten anchor or key, and stops if the published history is rewritten;
+its `verify` command checks a log against what was published.
+[docs/anchoring.md](docs/anchoring.md) sets out the accounts, the credential
+and the repository protection that make that boundary real, and what it
+still does not cover. Entries newer than the last copied anchor can be
 removed without detection; `anchor_interval_secs` bounds how long that window
 stays open.
 
