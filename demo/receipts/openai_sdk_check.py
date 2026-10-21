@@ -52,6 +52,12 @@ def main() -> int:
     check(bool(text) and finish is not None, f"streaming works: {len(text)} characters, finish_reason={finish}")
     check(usage is not None and usage.total_tokens > 0, "the final usage chunk arrives with stream_options.include_usage")
 
+    models = client.models.list()
+    check(any(m.id == "mock/chat" for m in models.data), "models.list returns mock/chat")
+    check(all(m.object == "model" for m in models.data), "every model entry has object model")
+    check(all(m.created is not None for m in models.data), "every model entry has created")
+    check(all(m.owned_by for m in models.data), "every model entry has owned_by")
+
     try:
         openai.OpenAI(base_url=args.base_url, api_key="not-a-key").chat.completions.create(
             model="mock/chat", messages=messages, max_tokens=8)

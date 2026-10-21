@@ -659,6 +659,29 @@ and 3,000 with 128. A streamed request writes two (`allow` and outcome).
 `cargo test --release --lib receipt_throughput -- --ignored --nocapture`
 measures it on your disk.
 
+**Visibility.** The chain's state is visible in metrics and health. Counters,
+all labelled by the configured tenant id:
+
+- `gw_receipts_written_total{tenant}` — entries this process durably wrote
+  (entries already in the log at startup are in `gw_receipt_entries`).
+- `gw_receipt_write_failures_total{tenant}` — jobs answered `Unavailable`:
+  their write failed, or the chain had already stopped.
+- `gw_receipt_recoveries_total{tenant}` — torn tails quarantined at startup.
+
+Gauges, also labelled by tenant:
+
+- `gw_receipt_chain_stopped{tenant}` — `0`/`1`, whether the chain refused
+  further appends.
+- `gw_receipt_entries{tenant}` — entries in the log.
+- `gw_receipt_anchor_age_seconds{tenant}` — seconds since the last anchor
+  this process wrote; `-1` before the first.
+
+`GET /health/ready` gains a `receipts` object:
+`{ "enabled": true, "tenants": 3, "stopped": ["acme"] }` (or just
+`{ "enabled": false }` when receipts are off). A stopped chain does not make
+the whole gateway unready — other tenants still work — but it is listed, and
+the writer logs a warning once when a chain stops.
+
 **Checking and anchoring.** Startup verifies the whole chain and every anchor
 once, then keeps the head in memory. A request never reads the log. After
 `anchor_every` new entries, after `anchor_interval_secs` with anything new,
@@ -670,6 +693,14 @@ one chain whose first entry has no predecessor, so startup verification grows
 with the log (about 0.17 ms per entry measured, about three minutes per
 million entries). Archive the directory and start a new one, with a new key
 listed in your trusted keys, before that matters.
+
+`[receipts] startup_verify` controls how much startup checks: `full` (the
+default) verifies every entry; `since_anchor` only re-verifies entries
+written after the newest local anchor, so startup stays bounded for a large
+log. Tampering before that anchor is not caught at startup — it is still
+caught by `ickverify.py` against the published anchor, and by
+`startup_verify = "full"`. Neither weakens protection against someone who
+holds the signing key, since they could re-sign either way.
 
 **After a crash.** A kill can interrupt a write, leaving the log or the anchor
 file ending part-way through a line. Startup handles that by one fixed rule,

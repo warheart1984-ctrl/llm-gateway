@@ -14,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+use crate::receipts::StartupVerify;
 use serde::{Deserialize, Serialize};
 
 /// Env var that points at the directory holding `default.toml`, `models.yaml`
@@ -64,6 +65,11 @@ pub struct ReceiptsConfig {
     /// Also anchor when this many seconds have passed with anything new, so
     /// the unanchored tail is bounded in time as well as in count.
     pub anchor_interval_secs: u64,
+    /// How much of the log startup verifies: `full` (the default, checks
+    /// every entry) or `since_anchor` (only re-checks entries written after
+    /// the newest local anchor, so startup stays bounded for a large log).
+    #[serde(default)]
+    pub startup_verify: StartupVerify,
 }
 
 impl ReceiptsConfig {
@@ -71,6 +77,7 @@ impl ReceiptsConfig {
         crate::receipts::ChainOptions {
             anchor_every: self.anchor_every,
             anchor_interval: std::time::Duration::from_secs(self.anchor_interval_secs),
+            startup_verify: self.startup_verify,
         }
     }
 }
@@ -82,6 +89,7 @@ impl Default for ReceiptsConfig {
             directory: PathBuf::from("receipts"),
             anchor_every: 1_000,
             anchor_interval_secs: 60,
+            startup_verify: StartupVerify::default(),
         }
     }
 }

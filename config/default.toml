@@ -149,6 +149,13 @@ directory = "receipts"
 # can edit both files.
 anchor_every = 1000
 anchor_interval_secs = 60
+# How much of the log startup verifies: "full" (the default) re-checks every
+# entry, so startup time grows with the log; "since_anchor" only re-checks
+# entries written after the newest local anchor, keeping startup bounded for a
+# large log. Tampering before that anchor is not caught at startup (it is
+# still caught by ickverify.py against the published anchor, and by
+# startup_verify = "full").
+startup_verify = "full"
 
 [telemetry]
 service_name = "llm-gateway"

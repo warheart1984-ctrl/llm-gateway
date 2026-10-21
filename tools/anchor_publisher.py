@@ -88,11 +88,13 @@ class RewriteDetected(Exception):
 
 class Publisher:
     def __init__(self, source: Path, repo: str, replica: str, state: Path, work: Path, branch: str = DEFAULT_BRANCH,
-                 author: str = "llm-gateway anchor publisher <anchors@invalid>") -> None:
+                 author: str = "llm-gateway anchor publisher <anchors@invalid>",
+                 status: Path | None = None) -> None:
         if not safe_name(replica):
             raise ValueError(f"replica name {replica!r} must be 1-64 of letters, digits, '.', '_', '-'")
         self.source, self.repo, self.replica = source, repo, replica
         self.state, self.work, self.branch = state, work, branch
+        self.status_path = status
         name, _, email = author.partition(" <")
         self.identity = ["-c", f"user.name={name}", "-c", f"user.email={email.rstrip('>')}"]
 
@@ -193,6 +195,7 @@ class Publisher:
             self.sync()
             lines = self.stage(report)
             if not lines:
+                self.write_status(report)
                 return report
             git("add", "--all", self.replica, cwd=self.work)
             message = f"anchors from {self.replica}\n\n" + "\n".join(lines)
@@ -204,11 +207,49 @@ class Publisher:
                 report.commit = commit
                 for line in lines:
                     print(f"anchor-publisher: {self.replica}/{line}", flush=True)
+                self.write_status(report)
                 return report
             # Someone else pushed first. Start again from the remote's state;
             # never push over it.
             time.sleep(0.2)
         raise GitError(f"push to {self.repo} kept being refused after {attempts} attempts")
+
+    def write_status(self, report: Report | None, error: str | None = None) -> None:
+        """Atomically write a JSON summary of this pass to --status, if any.
+
+        `report` is None when the pass failed before it had one; `error` then
+        says why. The last push is carried over from passes that pushed
+        nothing, so a quiet pass does not read as "never pushed".
+        """
+        if self.status_path is None:
+            return
+        checked_at = int(time.time())
+        refused = report.refused if report is not None else {}
+        if error is None and refused:
+            error = "refused " + "; ".join(f"{tenant}: {why}" for tenant, why in sorted(refused.items()))
+        last_push = (report.commit if report is not None else None) or self.last_pushed()
+        if report is not None and report.commit:
+            last_push_at = checked_at
+        else:
+            try:
+                previous = json.loads(self.status_path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, ValueError):
+                previous = {}
+            same = isinstance(previous, dict) and previous.get("last_push") == last_push
+            last_push_at = previous.get("last_push_at", 0) if same else 0
+        status = {
+            "checked_at": checked_at,
+            "ok": error is None,
+            "last_push": last_push,
+            "last_push_at": last_push_at,
+            "published": report.published if report is not None else {},
+            "refused": refused,
+            "error": " ".join(error.split()) if error is not None else None,
+        }
+        self.status_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.status_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(status), encoding="utf-8")
+        os.replace(tmp, self.status_path)
 
 
 def verify(repo: str, replica: str, tenant: str, log: Path, verifier: Path, branch: str = DEFAULT_BRANCH) -> int:
@@ -240,6 +281,7 @@ def main(argv: list[str] | None = None) -> int:
     pub.add_argument("--work", type=Path, help="working copy (default: next to --state)")
     pub.add_argument("--branch", default=DEFAULT_BRANCH)
     pub.add_argument("--watch", type=float, metavar="SECONDS", help="keep publishing at this interval")
+    pub.add_argument("--status", type=Path, help="write a JSON summary of each pass to this file")
     ver = sub.add_parser("verify", help="check a tenant's log against the published anchor and key")
     ver.add_argument("--repo", required=True)
     ver.add_argument("--replica", required=True)
@@ -254,19 +296,24 @@ def main(argv: list[str] | None = None) -> int:
         return verify(args.repo, args.replica, args.tenant, args.log, args.verifier, args.branch)
 
     publisher = Publisher(args.source, args.repo, args.replica, args.state,
-                          args.work or args.state.parent / "anchor-repo", args.branch)
+                          args.work or args.state.parent / "anchor-repo", args.branch,
+                          status=args.status)
     while True:
         try:
             report = publisher.publish_once()
-            status = 2 if report.refused else 0
         except RewriteDetected as rewrite:
             print(f"anchor-publisher: ALERT {rewrite}; nothing is published until a person looks", file=sys.stderr, flush=True)
+            publisher.write_status(None, str(rewrite))
             return 2
         except GitError as error:
             print(f"anchor-publisher: {error}", file=sys.stderr, flush=True)
-            status = 1
+            publisher.write_status(None, str(error))
+            if args.watch is None:
+                return 1
+            time.sleep(args.watch)
+            continue
         if args.watch is None:
-            return status
+            return 2 if report.refused else 0
         time.sleep(args.watch)
 
 

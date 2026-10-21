@@ -168,6 +168,11 @@ pub async fn list_models(
         .ok_or(ApiError::TenantUnknown)?;
     let snapshot = Arc::clone(&generation.models);
 
+    let created = snapshot
+        .loaded_at
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let mut models: Vec<_> = snapshot
         .ids()
         .into_iter()
@@ -181,6 +186,9 @@ pub async fn list_models(
             }
             Some(json!({
                 "id": id,
+                "object": "model",
+                "created": created,
+                "owned_by": cfg.provider,
                 "display_name": cfg.display_name,
                 "provider": cfg.provider,
                 "upstream_model": cfg.upstream_model_name(id),
@@ -369,6 +377,26 @@ pub async fn ready(State(state): State<Arc<AppState>>) -> Response {
         issues.push("no model has a usable provider route".into());
     }
 
+    // A stopped chain does not make the whole replica unready: other tenants
+    // still work. It is listed here so an operator sees it, and Writer::fail
+    // already logs once when a chain stops.
+    let receipts_enabled = state.settings.receipts.enabled;
+    let receipts = if receipts_enabled {
+        let book = state.receipts.as_ref();
+        let tenants = book.map(|b| b.tenants().len()).unwrap_or(0);
+        let mut stopped = Vec::new();
+        if let Some(b) = book {
+            for id in b.tenants() {
+                if b.open_chain(&id).is_some_and(|chain| chain.is_failed()) {
+                    stopped.push(id);
+                }
+            }
+        }
+        json!({ "enabled": true, "tenants": tenants, "stopped": stopped })
+    } else {
+        json!({ "enabled": false })
+    };
+
     if issues.is_empty() {
         (
             StatusCode::OK,
@@ -382,6 +410,7 @@ pub async fn ready(State(state): State<Arc<AppState>>) -> Response {
                 "unavailable_models": routes.unavailable_models,
                 "registry_generation": snapshot.generation,
                 "ledger": ledger_scope(&state),
+                "receipts": receipts,
             })),
         )
             .into_response()
@@ -392,7 +421,8 @@ pub async fn ready(State(state): State<Arc<AppState>>) -> Response {
                 "status": "not_ready",
                 "issues": issues,
                 "unavailable_models": routes.unavailable_models,
-                "ledger": ledger_scope(&state)
+                "ledger": ledger_scope(&state),
+                "receipts": receipts,
             })),
         )
             .into_response()

@@ -44,6 +44,7 @@ that person's honesty. Say so to the customer rather than implying otherwise.
      --repo git@github.com:example-auditor/llm-gateway-anchors.git \
      --replica eu-1 \
      --state /home/anchors/eu-1/state.json \
+     --status /home/anchors/eu-1/status.json \
      --watch 60
    ```
 
@@ -51,6 +52,23 @@ that person's honesty. Say so to the customer rather than implying otherwise.
    its `signing.pub` (copied once, at first sight) to `eu-1/<tenant>/`.
    `anchor_interval_secs` on the gateway and `--watch` here together bound how
    long a new entry can go unanchored.
+
+   Each pass also writes a JSON status summary to `--status` (atomically, via
+   a temp file and `os.replace`):
+
+   ```json
+   { "checked_at": 1792500000, "ok": true, "last_push": "<sha or null>",
+     "last_push_at": 1792499990, "published": {"acme": 2}, "refused": {},
+     "error": null }
+   ```
+
+   `ok` is false when a rewrite was detected, a tenant was refused, or git
+   failed; `error` then holds a one-line reason. Times are unix seconds.
+   `last_push` and `last_push_at` stay at the most recent push across passes
+   that push nothing or fail (`last_push_at` is `0` when this status file has
+   not seen that push, for example after a restart). The
+   file is valid JSON after every pass, so an operator or monitor can read it
+   without parsing stderr.
 
 5. **Verify.** Anyone with read access to the repository checks a tenant's log
    against what was published, with the unchanged Wicket verifier:
