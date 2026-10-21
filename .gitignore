@@ -20,3 +20,6 @@
 # Per-replica Wicket receipt chain (log, anchor, signing key).
 /receipts/
 signing.priv
+
+# Python bytecode from tools/ and demo scripts
+__pycache__/

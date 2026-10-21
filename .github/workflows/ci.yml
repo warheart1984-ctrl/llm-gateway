@@ -134,6 +134,23 @@ jobs:
         working-directory: demo
         run: docker compose logs gateway
 
+  anchor-publisher:
+    # tools/anchor_publisher.py against real git repositories: append-only
+    # publishing, refusing rewritten anchors and keys, detecting a rewritten
+    # or deleted branch, and `verify`.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Publisher tests
+        run: python -m unittest discover -s tools/tests -v
+
   receipts-demo:
     # The receipts demo, end to end: a gateway with receipts on, a publisher
     # copying anchors out, and a client that checks every claim and then
