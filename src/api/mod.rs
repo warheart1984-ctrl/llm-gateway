@@ -25,6 +25,9 @@ pub const ROUTE_USAGE: &str = "/v1/usage";
 pub const ROUTE_RELOAD: &str = "/v1/admin/registry/reload";
 pub const ROUTE_DECISIONS: &str = "/v1/admin/decisions";
 pub const ROUTE_HOLD: &str = "/v1/holds/{id}";
+pub const ROUTE_RECEIPTS_LOG: &str = "/v1/receipts/log";
+pub const ROUTE_RECEIPTS_ANCHOR: &str = "/v1/receipts/anchor";
+pub const ROUTE_RECEIPTS_KEY: &str = "/v1/receipts/key";
 pub const ROUTE_HOLDS: &str = "/v1/admin/holds";
 pub const ROUTE_HOLD_APPROVE: &str = "/v1/admin/holds/{id}/approve";
 pub const ROUTE_HOLD_DENY: &str = "/v1/admin/holds/{id}/deny";
@@ -47,7 +50,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(ROUTE_CHAT_COMPLETE, post(chat::chat_complete))
         .route(ROUTE_MODELS, get(system::list_models))
         .route(ROUTE_USAGE, get(system::get_usage))
-        .route(ROUTE_HOLD, get(system::get_hold));
+        .route(ROUTE_HOLD, get(system::get_hold))
+        .route(ROUTE_RECEIPTS_LOG, get(system::receipt_log))
+        .route(ROUTE_RECEIPTS_ANCHOR, get(system::receipt_anchor))
+        .route(ROUTE_RECEIPTS_KEY, get(system::receipt_key));
     if !separate_ops {
         api = operator_routes(api);
     }

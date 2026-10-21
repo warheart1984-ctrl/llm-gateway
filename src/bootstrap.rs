@@ -216,14 +216,16 @@ pub async fn build_with_ledger(
     }))
 }
 
-/// Open this process's receipt chain, or leave receipts off.
+/// Open every receipt-enabled tenant's chain, or leave receipts off.
 ///
 /// A tenant file that turns receipts on while the process switch is off is a
-/// boot failure. Those requests would otherwise 503 on every call.
+/// boot failure. Those requests would otherwise 503 on every call. Every
+/// tenant's chain is verified now; a tenant added later by a reload is
+/// opened and verified on its first request.
 fn open_receipts(
     settings: &crate::config::Settings,
     tenants: &TenantRegistry,
-) -> Result<Option<Arc<crate::receipts::ReceiptChain>>, BootError> {
+) -> Result<Option<Arc<crate::receipts::ReceiptBook>>, BootError> {
     let asked: Vec<&str> = tenants
         .tenant_ids()
         .into_iter()
@@ -237,15 +239,13 @@ fn open_receipts(
         }
         return Ok(None);
     }
-    let chain = crate::receipts::ReceiptChain::open(&settings.receipts.directory, settings.receipts.chain_options())
-        .map_err(|err| BootError::Receipts(err.to_string()))?;
-    tracing::info!(
-        key_id = chain.key_id(),
-        log = %chain.log_path().display(),
-        entries = chain.len(),
-        "receipt chain verified"
-    );
-    Ok(Some(Arc::new(chain)))
+    let book = crate::receipts::ReceiptBook::open(
+        &settings.receipts.directory,
+        settings.receipts.chain_options(),
+        asked.iter().copied(),
+    )
+    .map_err(|err| BootError::Receipts(err.to_string()))?;
+    Ok(Some(Arc::new(book)))
 }
 
 async fn build_ledger(

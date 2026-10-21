@@ -32,9 +32,9 @@ pub struct AppState {
     pub providers: RouterProviderPool,
     pub policy: PolicyEngine,
     pub limits: Arc<LimitEngine>,
-    /// This process's Wicket chain, when `[receipts] enabled` is set.
-    /// `None` means no tenant may write receipts.
-    pub receipts: Option<Arc<crate::receipts::ReceiptChain>>,
+    /// Every receipt-enabled tenant's chain on this replica, when
+    /// `[receipts] enabled` is set. `None` means no tenant may write receipts.
+    pub receipts: Option<Arc<crate::receipts::ReceiptBook>>,
     pub metrics: SharedMetrics,
     pub started_at: std::time::Instant,
     /// Serializes administrative and hot reloads so a prepared generation

@@ -1168,6 +1168,126 @@ fn rfc3339_from_unix(secs: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
+// ---- one chain per tenant ----------------------------------------------------------------
+
+/// Every tenant's chain on this replica.
+///
+/// Each tenant with receipts on has its own directory under the replica's
+/// `[receipts] directory`, `<directory>/<tenant_id>/`, holding its own log,
+/// anchor, Ed25519 key and lock. A tenant's evidence is therefore complete on
+/// its own: it can be handed to that customer, or checked, without anyone
+/// else's entries in it, and nothing about other tenants (their key ids,
+/// their traffic) is in it.
+///
+/// The replica holds `replica.lock` in the root for as long as it runs, so
+/// two processes never share a root.
+pub struct ReceiptBook {
+    root: PathBuf,
+    options: ChainOptions,
+    chains: Mutex<std::collections::HashMap<String, Arc<ReceiptChain>>>,
+    _lock: File,
+}
+
+/// A tenant id is used as a directory name, so it is held to a safe shape:
+/// 1 to 64 of letters, digits, `.`, `_` and `-`, starting with a letter or
+/// digit. Nothing else ever becomes a path.
+pub fn valid_tenant_dir(tenant_id: &str) -> bool {
+    let mut bytes = tenant_id.bytes();
+    bytes.next().is_some_and(|b| b.is_ascii_alphanumeric())
+        && tenant_id.len() <= 64
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+impl ReceiptBook {
+    /// Lock the root and open (verifying each in full) the chain of every
+    /// tenant named. Any one that does not verify refuses the whole start,
+    /// the same as a single chain did.
+    pub fn open<'a>(
+        root: &Path,
+        options: ChainOptions,
+        tenants: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Self, ReceiptError> {
+        fs::create_dir_all(root).map_err(io_err)?;
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(root.join("replica.lock"))
+            .map_err(io_err)?;
+        lock_exclusive(&lock)?;
+        if root.join("receipts.jsonl").exists() {
+            tracing::warn!(
+                root = %root.display(),
+                "a shared receipt chain from an earlier version is in the receipts directory; it is no longer \
+                 written. Each tenant now has its own chain under <directory>/<tenant_id>/. Archive the old files."
+            );
+        }
+        let book = Self {
+            root: root.to_path_buf(),
+            options,
+            chains: Mutex::new(std::collections::HashMap::new()),
+            _lock: lock,
+        };
+        for tenant in tenants {
+            book.chain(tenant)?;
+        }
+        Ok(book)
+    }
+
+    /// This tenant's chain, opened and verified on first use. A tenant added
+    /// by a reload is opened here, on its first request.
+    pub fn chain(&self, tenant_id: &str) -> Result<Arc<ReceiptChain>, ReceiptError> {
+        if !valid_tenant_dir(tenant_id) {
+            return Err(ReceiptError::Io(format!(
+                "tenant id {tenant_id:?} cannot name a receipt directory: use letters, digits, '.', '_' or '-'"
+            )));
+        }
+        let mut chains = self.chains.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(chain) = chains.get(tenant_id) {
+            return Ok(Arc::clone(chain));
+        }
+        let chain = Arc::new(ReceiptChain::open(&self.root.join(tenant_id), self.options)?);
+        tracing::info!(
+            tenant = tenant_id,
+            key_id = chain.key_id(),
+            entries = chain.len(),
+            "tenant receipt chain verified"
+        );
+        chains.insert(tenant_id.to_string(), Arc::clone(&chain));
+        Ok(chain)
+    }
+
+    /// The chain if it is already open, without opening it.
+    pub fn open_chain(&self, tenant_id: &str) -> Option<Arc<ReceiptChain>> {
+        self.chains.lock().unwrap_or_else(|p| p.into_inner()).get(tenant_id).cloned()
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Tenants whose chains are open, sorted.
+    pub fn tenants(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.chains.lock().unwrap_or_else(|p| p.into_inner()).keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+}
+
+/// The bytes of an evidence file up to its last complete line: a reader
+/// never sees an entry the writer is half-way through.
+pub fn complete_lines_of(path: &Path) -> Result<Vec<u8>, ReceiptError> {
+    match fs::read(path) {
+        Ok(mut bytes) => {
+            let keep = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+            bytes.truncate(keep);
+            Ok(bytes)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(err) => Err(io_err(err)),
+    }
+}
+
 /// The interpreter that runs `ickverify.py`, for tests. `None` means skip,
 /// except under CI, where a missing interpreter fails the test instead of
 /// quietly skipping the verifier.
@@ -1602,6 +1722,60 @@ mod tests {
         }
         fs::write(&anchor, &good).unwrap();
         ReceiptChain::open(&dir, options(2)).expect("the undamaged anchor opens");
+    }
+
+    #[tokio::test]
+    async fn each_tenant_has_its_own_complete_chain() {
+        let root = scratch("book");
+        let book = ReceiptBook::open(&root, options(100), ["acme", "globex"]).unwrap();
+        let salt = Salt::generate().unwrap();
+        let acme = book.chain("acme").unwrap();
+        let globex = book.chain("globex").unwrap();
+        acme.allow(&subject("reserve", &salt)).await.unwrap();
+        acme.allow(&subject("reserve", &salt)).await.unwrap();
+        globex.deny(&subject("rate_limited", &salt)).await.unwrap();
+        assert_eq!((acme.len(), globex.len()), (2, 1));
+        assert_ne!(acme.key_id(), globex.key_id(), "each tenant chain has its own key");
+        assert_eq!(acme.log_path(), root.join("acme").join("receipts.jsonl"));
+        // Each chain stands alone: its first entry has no predecessor and the
+        // unchanged verifier accepts it with only that tenant's key.
+        for chain in [&acme, &globex] {
+            let first: Value = serde_json::from_str(&lines(chain.log_path())[0]).unwrap();
+            assert!(first["previous_receipt_hash"].is_null());
+            if let Some(code) = ickverify(chain.log_path(), chain, false) {
+                assert_eq!(code, 0);
+            }
+        }
+        assert!(Arc::ptr_eq(&acme, &book.chain("acme").unwrap()), "one chain per tenant");
+        assert_eq!(book.tenants(), vec!["acme".to_string(), "globex".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_tenant_id_never_becomes_an_unsafe_path() {
+        let root = scratch("book-names");
+        let book = ReceiptBook::open(&root, options(100), []).unwrap();
+        for bad in ["", "..", "../acme", "a/b", "a\\b", ".hidden", "-x", &"a".repeat(65), "C:x"] {
+            assert!(book.chain(bad).is_err(), "{bad:?}");
+        }
+        assert!(book.chain("acme-2.eu_west").is_ok());
+        let made: Vec<_> = fs::read_dir(&root).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(made.len(), 2, "only replica.lock and the one valid tenant: {made:?}");
+    }
+
+    #[tokio::test]
+    async fn a_second_replica_on_the_same_root_is_refused() {
+        let root = scratch("book-lock");
+        let _book = ReceiptBook::open(&root, options(100), ["acme"]).unwrap();
+        assert!(ReceiptBook::open(&root, options(100), []).is_err());
+    }
+
+    #[test]
+    fn a_reader_never_sees_a_half_written_entry() {
+        let dir = scratch("complete-lines");
+        let path = dir.join("receipts.jsonl");
+        fs::write(&path, "{\"a\":1}\n{\"b\":").unwrap();
+        assert_eq!(complete_lines_of(&path).unwrap(), b"{\"a\":1}\n");
+        assert!(complete_lines_of(&dir.join("missing")).unwrap().is_empty());
     }
 
     #[tokio::test]

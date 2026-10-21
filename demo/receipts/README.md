@@ -33,10 +33,13 @@ fails.
 5. **A failure part-way through is recorded.** A model that fails after a
    few words gets a `failed` outcome whose reply digest matches exactly the
    partial answer the client received.
-6. **The anchor leaves the gateway.** The publisher copies the anchor and the
-   public key out.
-7. **The unchanged Wicket verifier says `VERIFIED`** for the log against the
-   published anchor and key.
+6. **Each tenant's evidence is its own, and its anchor leaves the gateway.**
+   The two tenants' chains share no entries. The publisher copies each
+   tenant's anchor and public key out.
+7. **The customer audits its own evidence.** It downloads its log, anchor and
+   key from `GET /v1/receipts/*` (the client has no access to the gateway's
+   disk), checks the served key against the one published at first sight, and
+   the unchanged Wicket verifier says `VERIFIED` against the published anchor.
 8. **An edited refusal is caught.** A copy of the log with one `deny` turned
    into `allow` is `NOT VERIFIED`.
 9. **A quiet deletion is caught, but only by the published anchor.** A copy
@@ -57,7 +60,7 @@ publisher and a separate git repository.
 | File | Role |
 |---|---|
 | `config/` | Gateway config: receipts on, anchoring every second, two tenants with receipts on |
-| `publisher.py` | Copies new anchor lines and the public key out; never rewrites what it published |
+| `publisher.py` | Copies each tenant's new anchor lines and public key out; never rewrites what it published |
 | `walkthrough.py` | The client and auditor; standard library only |
 | `run_local.py` | Builds and runs everything without Docker |
 | `compose.yaml` | The same, in containers |

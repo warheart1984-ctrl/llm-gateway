@@ -1,6 +1,7 @@
 # Two tenants, both with receipts on: every admitted stream, governance
-# refusal and hold goes on this replica's signed chain, and a receipt that
-# cannot be written withholds the reply.
+# refusal and hold goes on that tenant's own signed chain on this replica,
+# and a receipt that cannot be written withholds the reply. `receipts:read`
+# lets each tenant download its own evidence from /v1/receipts/*.
 #
 # Keys come from environment variables the demo sets. They are demo
 # placeholders, not credentials for anything.
@@ -13,7 +14,7 @@ tenants:
     credentials:
       - key_id: ak_demo
         key_env: RECEIPTS_DEMO_KEY
-        scopes: [chat:stream, models:read]
+        scopes: [chat:stream, models:read, receipts:read]
     allowed_models: ["mock/*"]
     default_model: mock/chat
     limits:
@@ -35,7 +36,7 @@ tenants:
     credentials:
       - key_id: ak_shoestring
         key_env: RECEIPTS_SHOESTRING_KEY
-        scopes: [chat:stream, models:read]
+        scopes: [chat:stream, models:read, receipts:read]
     allowed_models: ["mock/*"]
     default_model: mock/chat
     limits:

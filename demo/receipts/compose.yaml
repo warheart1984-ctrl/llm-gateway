@@ -59,13 +59,13 @@ services:
       - python
       - /demo/walkthrough.py
       - --gateway=http://gateway:8080
-      - --gateway-dir=/gateway/receipts
       - --published-dir=/published
       - --verifier=/verifier/ickverify.py
     volumes:
       - ./walkthrough.py:/demo/walkthrough.py:ro
       - ../../vendor/wicket/verifier:/verifier:ro
-      - gateway-data:/gateway:ro
+      # The client reads evidence from the API, as a customer would; it has
+      # no access to the gateway's disk.
       - published:/published:ro
 
 volumes:
