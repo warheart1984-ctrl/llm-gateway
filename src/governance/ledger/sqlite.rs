@@ -1332,11 +1332,17 @@ mod tests {
         .await
         .unwrap();
         // The background sweeper runs once at boot and may get here first;
-        // both count what they prune.
+        // both count what they prune. It can still be finishing a batch when
+        // this pass returns, so wait for its count to land rather than read
+        // it the instant this pass is done.
         ledger.apply_retention().await.unwrap();
-        assert_eq!(ledger.upkeep().reservations_pruned, 2_500);
         let left: i64 = sqlx::query_scalar("SELECT count(*) FROM reservations").fetch_one(ledger.pool()).await.unwrap();
         assert_eq!(left, 0);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while ledger.upkeep().reservations_pruned < 2_500 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(ledger.upkeep().reservations_pruned, 2_500);
     }
 
     fn options(file: &TempFile) -> SqliteOptions {
