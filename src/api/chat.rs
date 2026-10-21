@@ -81,6 +81,70 @@ enum Mode {
     Complete,
 }
 
+/// The wire format a request arrived in, and is answered in. Governance,
+/// billing and receipts are the same for both; only parsing and the shape
+/// of the answer differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dialect {
+    /// `/v1/chat/stream` and `/v1/chat/complete`: the frozen v1 contract.
+    Gateway,
+    /// `/v1/chat/completions`: OpenAI's Chat Completions format, so an
+    /// OpenAI SDK works by changing only its base URL.
+    OpenAi,
+}
+
+/// What an OpenAI-format answer needs to label itself.
+#[derive(Debug, Clone)]
+struct OpenAiReply {
+    /// `chatcmpl-<request id>`.
+    id: String,
+    /// Unix seconds when the request was admitted.
+    created: u64,
+    /// The registry model id that answered.
+    model: String,
+    /// `stream_options.include_usage`: send a final usage chunk.
+    include_usage: bool,
+}
+
+impl OpenAiReply {
+    fn chunk(&self, delta: Value, finish_reason: Option<&str>) -> Event {
+        Event::default().data(
+            json!({
+                "id": self.id,
+                "object": "chat.completion.chunk",
+                "created": self.created,
+                "model": self.model,
+                "choices": [{ "index": 0, "delta": delta, "finish_reason": finish_reason }],
+            })
+            .to_string(),
+        )
+    }
+
+    fn usage_chunk(&self, summary: &StreamSummary) -> Event {
+        Event::default().data(
+            json!({
+                "id": self.id,
+                "object": "chat.completion.chunk",
+                "created": self.created,
+                "model": self.model,
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": summary.prompt_tokens,
+                    "completion_tokens": summary.completion_tokens,
+                    "total_tokens": summary.prompt_tokens + summary.completion_tokens,
+                },
+            })
+            .to_string(),
+        )
+    }
+
+    /// OpenAI reports a failure inside a stream as a data line with an
+    /// `error` object, which its SDKs raise.
+    fn error(code: &str, message: &str) -> Event {
+        Event::default().data(json!({ "error": { "message": message, "type": code, "code": code } }).to_string())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Framing {
     Normalized,
@@ -159,6 +223,9 @@ enum RequestError {
     /// The reply is withheld.
     #[error("the receipt could not be written")]
     ReceiptUnavailable,
+    /// A request field this gateway does not support.
+    #[error("{0}")]
+    Unsupported(&'static str),
 }
 
 impl RequestError {
@@ -173,6 +240,7 @@ impl RequestError {
             | RequestError::InvalidIdempotencyKey
             | RequestError::IdempotencyKeyRequired
             | RequestError::InvalidHoldId
+            | RequestError::Unsupported(_)
             | RequestError::Param(_) => StatusCode::BAD_REQUEST,
             RequestError::Held(_) => StatusCode::ACCEPTED,
             RequestError::Limit(LimitError::Hold(problem)) => match problem {
@@ -256,6 +324,7 @@ impl RequestError {
             RequestError::Param(_) => "invalid_parameter",
             RequestError::Provider(e) => e.code(),
             RequestError::ReceiptUnavailable => "receipt_unavailable",
+            RequestError::Unsupported(_) => "unsupported_parameter",
         }
     }
 
@@ -339,7 +408,7 @@ pub async fn chat_stream(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    handle(state, headers, body, Mode::Stream).await
+    handle(state, headers, body, Mode::Stream, Dialect::Gateway).await
 }
 
 /// `POST /v1/chat/complete`: the same request body and the same governance
@@ -356,10 +425,29 @@ pub async fn chat_complete(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    handle(state, headers, body, Mode::Complete).await
+    handle(state, headers, body, Mode::Complete, Dialect::Gateway).await
 }
 
-async fn handle(state: Arc<AppState>, headers: HeaderMap, body: Bytes, mode: Mode) -> Response {
+/// `POST /v1/chat/completions`: OpenAI's Chat Completions format, answered
+/// in that format, streamed when the request says `"stream": true`. Auth,
+/// allowlists, limits, budgets, holds and receipts are the same code as the
+/// gateway's own endpoints, so an OpenAI SDK pointed at this base URL is
+/// governed exactly like a native client.
+#[axum::debug_handler]
+pub async fn openai_chat_completions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let stream = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| v.get("stream").and_then(Value::as_bool))
+        .unwrap_or(false);
+    let mode = if stream { Mode::Stream } else { Mode::Complete };
+    handle(state, headers, body, mode, Dialect::OpenAi).await
+}
+
+async fn handle(state: Arc<AppState>, headers: HeaderMap, body: Bytes, mode: Mode, dialect: Dialect) -> Response {
     let request_id = Uuid::new_v4().to_string();
     let mut span = RequestSpan::new(request_id.clone());
     state.metrics.request_observed();
@@ -367,7 +455,7 @@ async fn handle(state: Arc<AppState>, headers: HeaderMap, body: Bytes, mode: Mod
     // Returns `Response` rather than `Result<Response, RequestError>` so every
     // rejection is a fully-formed response with its own headers, built in one
     // place below.
-    let outcome = match admit(&state, &headers, &body, &mut span, &request_id, mode).await {
+    let outcome = match admit(&state, &headers, &body, &mut span, &request_id, mode, dialect).await {
         Err(err) => Err(err),
         Ok(admitted) => match (mode, admitted.framing) {
             (Mode::Complete, _) => complete_response(&state, admitted, &span).await,
@@ -631,6 +719,8 @@ struct Admitted {
     /// Set for a stream whose tenant has receipts on, after the allow receipt
     /// is durable. Absent for completions and for tenants with receipts off.
     receipt: Option<OpenReceipt>,
+    /// Set for `/v1/chat/completions`: answer in OpenAI's format.
+    openai: Option<OpenAiReply>,
 }
 
 /// Everything before the upstream connection: authenticate, parse, authorize,
@@ -643,6 +733,7 @@ async fn admit(
     span: &mut RequestSpan,
     request_id: &str,
     mode: Mode,
+    dialect: Dialect,
 ) -> Result<Admitted, RequestError> {
     // 0. Body cap, checked before any parsing or authentication work. The
     //    extractor's own limit returns 413 without reaching the handler, so
@@ -660,18 +751,25 @@ async fn admit(
     span.scheme = principal.scheme.to_string();
 
     // 2. Parse. Bounded upstream by the body-limit layer.
-    let req: ChatRequest = serde_json::from_slice(body)
-        .map_err(|e| RequestError::BadJson(e.to_string()))?;
+    let (req, include_usage) = match dialect {
+        Dialect::Gateway => (
+            serde_json::from_slice::<ChatRequest>(body).map_err(|e| RequestError::BadJson(e.to_string()))?,
+            false,
+        ),
+        Dialect::OpenAi => openai_request(body)?,
+    };
     if req.model.trim().is_empty() {
         return Err(RequestError::MissingModel);
     }
     if req.messages.is_empty() {
         return Err(RequestError::NoMessages);
     }
-    match (mode, req.stream) {
-        (Mode::Stream, Some(false)) => return Err(RequestError::StreamRequired),
-        (Mode::Complete, Some(true)) => return Err(RequestError::StreamNotAllowed),
-        _ => {}
+    if dialect == Dialect::Gateway {
+        match (mode, req.stream) {
+            (Mode::Stream, Some(false)) => return Err(RequestError::StreamRequired),
+            (Mode::Complete, Some(true)) => return Err(RequestError::StreamNotAllowed),
+            _ => {}
+        }
     }
     let idempotency_key = idempotency_key(headers)?;
     let hold_id = hold_id(headers)?;
@@ -774,9 +872,13 @@ async fn admit(
     if decision.tenant.require_idempotency_key && idempotency_key.is_none() {
         return Err(RequestError::IdempotencyKeyRequired);
     }
-    let scope = match mode {
-        Mode::Stream => "stream",
-        Mode::Complete => "complete",
+    // The idempotency and hold scope. Each dialect has its own, so a key
+    // reused across formats never replays an answer in the wrong shape.
+    let scope = match (dialect, mode) {
+        (Dialect::Gateway, Mode::Stream) => "stream",
+        (Dialect::Gateway, Mode::Complete) => "complete",
+        (Dialect::OpenAi, Mode::Stream) => "openai-stream",
+        (Dialect::OpenAi, Mode::Complete) => "openai-complete",
     };
     //    HOLD comes before admission. A request the tenant's policy says must
     //    wait is recorded as a hold instead: no reservation, no charge, no
@@ -892,10 +994,22 @@ async fn admit(
         None
     };
 
-    let framing = match &req.framing {
-        Some(explicit) => Framing::parse(Some(explicit)),
-        None => Framing::parse(headers.get("x-gateway-framing").and_then(|v| v.to_str().ok())),
+    // OpenAI clients always get the normalized stream, re-labelled as
+    // OpenAI chunks; passthrough would hand them a vendor's own dialect.
+    let framing = match (dialect, &req.framing) {
+        (Dialect::OpenAi, _) => Framing::Normalized,
+        (Dialect::Gateway, Some(explicit)) => Framing::parse(Some(explicit)),
+        (Dialect::Gateway, None) => Framing::parse(headers.get("x-gateway-framing").and_then(|v| v.to_str().ok())),
     };
+    let openai = (dialect == Dialect::OpenAi).then(|| OpenAiReply {
+        id: format!("chatcmpl-{request_id}"),
+        created: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default(),
+        model: resolved.registry_id.clone(),
+        include_usage,
+    });
 
     let request = ProviderRequest {
         request_id: Uuid::parse_str(request_id).unwrap_or_else(|_| Uuid::new_v4()),
@@ -919,7 +1033,50 @@ async fn admit(
         framing,
         metadata: req.metadata,
         receipt,
+        openai,
     })
+}
+
+/// Read an OpenAI Chat Completions request. `messages` already uses
+/// OpenAI's shape. `stream_options.include_usage` decides whether a final
+/// usage chunk is sent. `n` above 1 is refused, and `store` / `metadata`
+/// (OpenAI's own storage options) are not forwarded. Every other field
+/// becomes a parameter, so `max_tokens`, `temperature`, `tools` and the
+/// rest are governed and forwarded exactly as on `/v1/chat/stream`.
+fn openai_request(body: &[u8]) -> Result<(ChatRequest, bool), RequestError> {
+    let value: Value = serde_json::from_slice(body).map_err(|e| RequestError::BadJson(e.to_string()))?;
+    let Value::Object(mut fields) = value else {
+        return Err(RequestError::BadJson("the request body must be a JSON object".into()));
+    };
+    let model = match fields.remove("model") {
+        Some(Value::String(model)) => model,
+        _ => String::new(),
+    };
+    let messages: Vec<ChatMessage> = match fields.remove("messages") {
+        Some(messages) => serde_json::from_value(messages).map_err(|e| RequestError::BadJson(e.to_string()))?,
+        None => Vec::new(),
+    };
+    let stream = fields.remove("stream").and_then(|v| v.as_bool());
+    let include_usage = fields
+        .remove("stream_options")
+        .and_then(|o| o.get("include_usage").and_then(Value::as_bool))
+        .unwrap_or(false);
+    if let Some(n) = fields.remove("n")
+        && n.as_u64() != Some(1)
+    {
+        return Err(RequestError::Unsupported("only `n: 1` is supported"));
+    }
+    fields.remove("store");
+    fields.remove("metadata");
+    let request = ChatRequest {
+        model,
+        messages,
+        stream,
+        params: Some(fields),
+        framing: None,
+        metadata: None,
+    };
+    Ok((request, include_usage))
 }
 
 // ---------------------------------------------------------------------------
@@ -983,6 +1140,7 @@ async fn normalized_response(
         pending: Vec::new().into_iter(),
         open_receipt: admitted.receipt,
         reply_hash,
+        openai: admitted.openai,
     });
 
     // axum's KeepAlive writes an SSE comment on an idle interval, which every
@@ -1073,6 +1231,9 @@ struct NormalizedState {
     /// Running digest of the reply actually handed to the client. Absent
     /// when this stream has no receipt to close.
     reply_hash: Option<ReplyDigest>,
+    /// Set when the client spoke OpenAI's format: frames go out as
+    /// `chat.completion.chunk` data lines instead of the v1 events.
+    openai: Option<OpenAiReply>,
 }
 
 impl NormalizedState {
@@ -1093,13 +1254,33 @@ impl NormalizedState {
             // Waits on the receipt writer without holding a runtime thread.
             if open.chain.outcome(&open, status, response).await.is_err() {
                 // The successful close is the reply. Withhold it.
-                self.pending = vec![receipt_error_event(&self.request_id)].into_iter();
+                let event = match &self.openai {
+                    Some(_) => OpenAiReply::error("receipt_unavailable", "the receipt could not be written"),
+                    None => receipt_error_event(&self.request_id),
+                };
+                self.pending = vec![event].into_iter();
                 self.emit_summary();
                 return;
             }
         }
 
         let mut out: Vec<Event> = Vec::with_capacity(3);
+        if let Some(openai) = &self.openai {
+            match extra {
+                Some(event) => out.push(event),
+                None => {
+                    let finish = self.summary.finish_reason.clone().unwrap_or_else(|| "stop".to_string());
+                    out.push(openai.chunk(json!({}), Some(&finish)));
+                }
+            }
+            if openai.include_usage {
+                out.push(openai.usage_chunk(&self.summary));
+            }
+            out.push(Event::default().data("[DONE]"));
+            self.pending = out.into_iter();
+            self.emit_summary();
+            return;
+        }
         if let Some(event) = extra {
             out.push(event);
         }
@@ -1191,6 +1372,9 @@ async fn next_frame(state: &mut NormalizedState) -> Option<Frame> {
         // client can render metadata without waiting on the model.
         if !state.emitted_start {
             state.emitted_start = true;
+            if let Some(openai) = &state.openai {
+                return Some(Ok(openai.chunk(json!({ "role": "assistant", "content": "" }), None)));
+            }
             return Some(Ok(start_event(
                 &state.request_id,
                 &state.model,
@@ -1222,13 +1406,13 @@ async fn next_frame(state: &mut NormalizedState) -> Option<Frame> {
                 );
                 state.summary.error_code = Some(err.code());
                 state.summary.error_retryable = err.retryable();
-                state
-                    .emit_terminal(Some(
-                        Event::default()
-                            .event("error")
-                            .data(error_payload(&err, &state.request_id)),
-                    ))
-                    .await;
+                let event = match &state.openai {
+                    Some(_) => OpenAiReply::error(err.code(), &err.client_message()),
+                    None => Event::default()
+                        .event("error")
+                        .data(error_payload(&err, &state.request_id)),
+                };
+                state.emit_terminal(Some(event)).await;
             }
             Some(Ok(event)) => {
                 state.summary.events += 1;
@@ -1264,11 +1448,14 @@ async fn next_frame(state: &mut NormalizedState) -> Option<Frame> {
                     StreamEvent::Started { upstream_id, upstream_model } => {
                         state.summary.upstream_id.clone_from(upstream_id);
                         state.summary.upstream_model.clone_from(upstream_model);
-                        out.push(
-                            Event::default()
-                                .event("meta")
-                                .data(meta_payload(upstream_id, upstream_model)),
-                        );
+                        // OpenAI's format has no place for upstream ids.
+                        if state.openai.is_none() {
+                            out.push(
+                                Event::default()
+                                    .event("meta")
+                                    .data(meta_payload(upstream_id, upstream_model)),
+                            );
+                        }
                     }
                     StreamEvent::Delta { content, reasoning } => {
                         for text in [content, reasoning].into_iter().flatten() {
@@ -1282,15 +1469,26 @@ async fn next_frame(state: &mut NormalizedState) -> Option<Frame> {
                                 reply.reasoning(text);
                             }
                         }
-                        if let Some(token) = content {
-                            out.push(Event::default().data(token_json(token)));
-                        }
-                        if let Some(think) = reasoning {
-                            out.push(
-                                Event::default()
-                                    .event("reasoning")
-                                    .data(reasoning_json(think)),
-                            );
+                        if let Some(openai) = &state.openai {
+                            // Reasoning goes in `reasoning_content`, the field
+                            // OpenAI-compatible providers use for it.
+                            if let Some(token) = content {
+                                out.push(openai.chunk(json!({ "content": token }), None));
+                            }
+                            if let Some(think) = reasoning {
+                                out.push(openai.chunk(json!({ "reasoning_content": think }), None));
+                            }
+                        } else {
+                            if let Some(token) = content {
+                                out.push(Event::default().data(token_json(token)));
+                            }
+                            if let Some(think) = reasoning {
+                                out.push(
+                                    Event::default()
+                                        .event("reasoning")
+                                        .data(reasoning_json(think)),
+                                );
+                            }
                         }
                     }
                     StreamEvent::ToolCallDelta { index, id, name, arguments } => {
@@ -1300,11 +1498,26 @@ async fn next_frame(state: &mut NormalizedState) -> Option<Frame> {
                         if let Some(reply) = state.reply_hash.as_mut() {
                             reply.tool(*index, id.as_deref(), name.as_deref(), arguments.as_deref());
                         }
-                        out.push(
-                            Event::default()
-                                .event("tool")
-                                .data(tool_json(*index, id, name, arguments)),
-                        );
+                        if let Some(openai) = &state.openai {
+                            let mut call = json!({ "index": index, "function": {} });
+                            if let Some(id) = id {
+                                call["id"] = json!(id);
+                                call["type"] = json!("function");
+                            }
+                            if let Some(name) = name {
+                                call["function"]["name"] = json!(name);
+                            }
+                            if let Some(arguments) = arguments {
+                                call["function"]["arguments"] = json!(arguments);
+                            }
+                            out.push(openai.chunk(json!({ "tool_calls": [call] }), None));
+                        } else {
+                            out.push(
+                                Event::default()
+                                    .event("tool")
+                                    .data(tool_json(*index, id, name, arguments)),
+                            );
+                        }
                     }
                     StreamEvent::Finished { .. } => unreachable!("handled above"),
                 }
@@ -1605,7 +1818,10 @@ async fn complete_response(
     s.upstream_id.clone_from(&completion.upstream_id);
     s.upstream_model.clone_from(&completion.upstream_model);
     s.events = 1;
-    let payload = completion_payload(&completion, &usage, cost, &guard, admitted.metadata.as_ref());
+    let payload = match &admitted.openai {
+        Some(openai) => openai_completion_payload(&completion, &usage, openai),
+        None => completion_payload(&completion, &usage, cost, &guard, admitted.metadata.as_ref()),
+    };
     // The outcome is durable before the answer goes anywhere: if it cannot
     // be written the answer is withheld, and it is not kept for an
     // idempotent replay either, so a retry cannot fetch what was withheld.
@@ -1642,6 +1858,40 @@ async fn complete_response(
     headers.remove(HeaderName::from_static("x-accel-buffering"));
     *response.headers_mut() = headers;
     Ok(response)
+}
+
+/// The answer in OpenAI's `chat.completion` shape. `content` is null when
+/// the model answered with tool calls only, as OpenAI's is; reasoning, when
+/// there is any, is in `reasoning_content`.
+fn openai_completion_payload(completion: &Completion, usage: &Usage, openai: &OpenAiReply) -> String {
+    let mut message = json!({
+        "role": "assistant",
+        "content": if completion.content.is_empty() && !completion.tool_calls.is_empty() {
+            Value::Null
+        } else {
+            json!(completion.content)
+        },
+    });
+    if !completion.tool_calls.is_empty() {
+        message["tool_calls"] = json!(completion.tool_calls);
+    }
+    if let Some(reasoning) = &completion.reasoning {
+        message["reasoning_content"] = json!(reasoning);
+    }
+    json!({
+        "id": openai.id,
+        "object": "chat.completion",
+        "created": openai.created,
+        "model": openai.model,
+        "choices": [{ "index": 0, "message": message, "finish_reason": completion.finish_reason }],
+        "usage": {
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens,
+            "completion_tokens_details": { "reasoning_tokens": usage.reasoning_tokens.unwrap_or(0) },
+        },
+    })
+    .to_string()
 }
 
 /// Usage to bill: what the upstream reported, else an estimate from the

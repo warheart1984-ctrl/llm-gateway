@@ -92,6 +92,7 @@ data: [DONE]
 |---|---|---|
 | `POST` | `/v1/chat/stream` | SSE chat completion |
 | `POST` | `/v1/chat/complete` | The same request, answered as one JSON document |
+| `POST` | `/v1/chat/completions` | OpenAI Chat Completions format, streamed or not, for OpenAI SDKs |
 | `GET` | `/v1/models` | Catalogue, filtered to the caller's allowlist |
 | `GET` | `/v1/usage` | Caller's own quota and spend |
 | `GET` | `/v1/holds/{id}` | A held request's state, for the tenant that made it |
@@ -144,6 +145,50 @@ The answer carries what the stream's `start`, token, `reasoning`, `tool` and
 `end` frames carry. Reasoning stays out of `content`, and a tool-call-only
 answer has `content: ""`. Errors use the same statuses and error body as the
 stream endpoint, and the same `x-*` response headers are set.
+
+## OpenAI-compatible: `/v1/chat/completions`
+
+An application written for OpenAI's API switches to the gateway by changing
+only its base URL:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="https://gateway.example.com/v1", api_key="gwk_live_...")
+client.chat.completions.create(model="groq/gpt-oss-120b", messages=[...], max_tokens=200)
+```
+
+The request is OpenAI's Chat Completions body; `"stream": true` streams it.
+The answer is OpenAI's shape: a `chat.completion` document, or
+`chat.completion.chunk` data lines ending in `data: [DONE]`, with a final
+usage chunk when `stream_options.include_usage` is set. Tool calls come back
+as OpenAI `tool_calls`; reasoning, when a model sends it, as
+`reasoning_content`. Errors use the gateway's error body, which OpenAI SDKs
+read as their own (`AuthenticationError` for 401, `BadRequestError` for 400,
+and so on); a failure after streaming began is a `data: {"error": ...}` line.
+
+Underneath it is the same code as `/v1/chat/stream` and `/v1/chat/complete`:
+the key (`Authorization: Bearer` works), the allowlist, limits, budget
+reservation, holds and receipts all apply unchanged, and `x-receipt-id` /
+`x-receipt-salt` come back in the response headers. Differences to know:
+
+- `max_tokens` (or `max_completion_tokens`) must be resolvable, from the
+  request or the registry's `default_params`, as on every endpoint: the
+  gateway reserves cost before calling the model. Set a default per model if
+  your clients leave it out.
+- `n` above 1 is refused (`400 unsupported_parameter`). `store` and
+  `metadata`, OpenAI's own storage options, are not forwarded. Every other
+  field is forwarded as a parameter.
+- A held request answers `202` with the hold, as on the other endpoints; an
+  OpenAI SDK does not know that shape, so tenants with holds need a client
+  that handles it.
+- An `Idempotency-Key` is scoped to the format, so a key reused across
+  `/v1/chat/complete` and `/v1/chat/completions` is never answered with the
+  other format's stored reply.
+- For a receipt's reply digest, `content` is the concatenated
+  `delta.content`, `reasoning` the concatenated `delta.reasoning_content`,
+  and tool calls are assembled per `index` as for the native stream.
+
+The receipts demo drives this endpoint with the official OpenAI Python SDK.
 
 ## Framing
 

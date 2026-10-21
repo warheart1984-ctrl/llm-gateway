@@ -55,14 +55,19 @@ services:
       RECEIPTS_DEMO_KEY: demo-receipts-key-not-a-secret
       RECEIPTS_SHOESTRING_KEY: shoestring-receipts-key-not-a-secret
       FORCE_COLOR: "1"
+    # The walkthrough is standard library only; the second step installs the
+    # official OpenAI SDK and drives /v1/chat/completions with it.
     command:
-      - python
-      - /demo/walkthrough.py
-      - --gateway=http://gateway:8080
-      - --published-dir=/published
-      - --verifier=/verifier/ickverify.py
+      - sh
+      - -c
+      - >-
+        python /demo/walkthrough.py --gateway=http://gateway:8080 --published-dir=/published
+        --verifier=/verifier/ickverify.py
+        && pip install --quiet --disable-pip-version-check openai==3.13.0
+        && python /demo/openai_sdk_check.py --base-url=http://gateway:8080/v1
     volumes:
       - ./walkthrough.py:/demo/walkthrough.py:ro
+      - ./openai_sdk_check.py:/demo/openai_sdk_check.py:ro
       - ../../vendor/wicket/verifier:/verifier:ro
       # The client reads evidence from the API, as a customer would; it has
       # no access to the gateway's disk.
