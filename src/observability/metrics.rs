@@ -983,6 +983,7 @@ mod tests {
                 crate::receipts::ChainOptions {
                     anchor_every: 1_000_000,
                     anchor_interval: std::time::Duration::from_secs(3600),
+                    startup_verify: crate::receipts::StartupVerify::Full,
                 },
                 ["acme"],
             )
@@ -1012,6 +1013,7 @@ mod tests {
                 crate::receipts::ChainOptions {
                     anchor_every: 1_000_000,
                     anchor_interval: std::time::Duration::from_secs(3600),
+                    startup_verify: crate::receipts::StartupVerify::Full,
                 },
                 ["acme"],
             )

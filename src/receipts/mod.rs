@@ -1209,8 +1209,8 @@ fn check_anchors(entries: &[LogEntry], text: &str, keys: &TrustedKeys) -> Result
 /// * Running it again is a no-op: the file now ends in a newline, the
 ///   quarantine name is the fragment's hash, and a recovery line already
 ///   written for the same cut is not written twice.
-/// True when a fragment was quarantined and the file was cut. False when
-/// there was nothing to recover (empty, or already ending in a newline).
+///
+/// True when a fragment was quarantined and the file was cut; false when there was nothing to recover (empty, or already ending in a newline).
 fn recover_torn_tail(path: &Path, directory: &Path, anchored_entries: u64) -> Result<bool, ReceiptError> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -2236,7 +2236,7 @@ mod tests {
             };
             let proposal = proposal_for(&subject, "read", false);
             let decision = evaluate(proposal, gateway_policy(), ApprovalSet::default()).unwrap();
-            let mut receipt = issue_receipt(
+            let receipt = issue_receipt(
                 &decision, previous.as_ref(), issued_at_now().unwrap(),
                 Some(call_digest.clone()), Some(signer.key_id().to_string()),
             ).unwrap();
@@ -2339,7 +2339,7 @@ mod tests {
     #[tokio::test]
     async fn since_anchor_refuses_an_anchor_whose_head_does_not_match_the_log() {
         let dir = scratch("since-anchor-head-mismatch");
-        let (_, ids) = sealed_log(&dir, 20, 10);
+        let (_, _ids) = sealed_log(&dir, 20, 10);
         let anchor = dir.join("anchor.jsonl");
         let text = fs::read_to_string(&anchor).unwrap();
         let mut record: serde_json::Value = serde_json::from_str(&text).unwrap();
