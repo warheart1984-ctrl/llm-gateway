@@ -1,0 +1,28 @@
+schema_version: 1
+
+# Both models are the demo's mock provider. `mock/approval` exists so a
+# tenant's hold rule has something to match.
+models:
+  mock/chat:
+    provider: nvidia
+    display_name: Mock chat model
+    endpoint: http://mock:9000/v1/chat/completions
+    upstream_model: mock-model
+    default_params:
+      max_tokens: 64
+    cost:
+      input_per_mtok_usd: 2.0
+      output_per_mtok_usd: 8.0
+    max_output_tokens: 1024
+
+  mock/approval:
+    provider: nvidia
+    display_name: Mock model that needs a person's approval
+    endpoint: http://mock:9000/v1/chat/completions
+    upstream_model: mock-model
+    default_params:
+      max_tokens: 64
+    cost:
+      input_per_mtok_usd: 2.0
+      output_per_mtok_usd: 8.0
+    max_output_tokens: 1024

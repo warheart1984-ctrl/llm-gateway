@@ -133,3 +133,18 @@ jobs:
         if: always()
         working-directory: demo
         run: docker compose logs gateway
+
+  receipts-demo:
+    # The receipts demo, end to end: a gateway with receipts on, a publisher
+    # copying anchors out, and a client that checks every claim and then
+    # audits the log with the unchanged Wicket verifier.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the receipts demo
+        working-directory: demo/receipts
+        run: docker compose up --build --abort-on-container-exit --exit-code-from client
+      - name: Gateway and publisher logs
+        if: always()
+        working-directory: demo/receipts
+        run: docker compose logs gateway publisher
