@@ -2116,6 +2116,26 @@ mod tests {
         assert_eq!(chain.verifies(), before, "no rescan on the second failure");
     }
 
+    #[tokio::test]
+    async fn a_stopped_chain_reopens_and_appends_again() {
+        // Phase 1 acceptance: reopening the directory after a real disk failure
+        // verifies the log and accepts appends again.
+        let dir = scratch("disk-reopen");
+        let chain = ReceiptChain::open(&dir, options(100)).unwrap();
+        let salt = Salt::generate().unwrap();
+        chain.fail_disk_writes_from_now(1);
+        assert!(matches!(
+            chain.allow(&subject("reserve", &salt)).await,
+            Err(ReceiptError::Unavailable)
+        ));
+        assert!(chain.is_failed(), "a real write error stops the chain");
+        drop(chain);
+        let reopened = ReceiptChain::open(&dir, options(100)).unwrap();
+        assert!(!reopened.is_failed(), "a reopened chain is not failed");
+        reopened.allow(&subject("reserve", &salt)).await.unwrap();
+        assert_eq!(reopened.len(), 1, "appends are accepted after reopen");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_appends_share_flushes_and_stay_one_chain() {
         let dir = scratch("concurrent");

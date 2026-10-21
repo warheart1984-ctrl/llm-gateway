@@ -769,6 +769,7 @@ fn escape(v: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn exposition_includes_type_and_help() {
@@ -1024,5 +1025,68 @@ mod tests {
         assert!(!text.contains("tenant=\"evil\""), "{text}");
         // acme's chain is open, so it is listed even with no entries.
         assert!(text.contains("tenant=\"acme\""), "{text}");
+    }
+
+    #[tokio::test]
+    async fn two_allows_and_one_outcome_record_three_written_and_three_entries() {
+        let m = Metrics::new(std::time::Instant::now());
+        let dir = std::env::temp_dir().join(format!(
+            "llm-gw-metrics-written-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = Arc::new(
+            crate::receipts::ReceiptBook::open(
+                &dir,
+                crate::receipts::ChainOptions {
+                    anchor_every: 1_000_000,
+                    anchor_interval: std::time::Duration::from_secs(3600),
+                    startup_verify: crate::receipts::StartupVerify::Full,
+                },
+                ["acme"],
+            )
+            .unwrap(),
+        );
+        let chain = book.chain("acme").unwrap();
+        let salt = crate::receipts::Salt::generate().unwrap();
+        let digest = crate::receipts::request_digest(&salt, b"request-bytes");
+        let subject = crate::receipts::Subject {
+            request_id: "req-1".into(),
+            tenant_id: "acme".into(),
+            key_id: "ak".into(),
+            model: "mock/chat".into(),
+            action: "reserve".into(),
+            call_digest: Some(digest.clone()),
+        };
+        chain.allow(&subject).await.unwrap();
+        let mut subject2 = subject.clone();
+        subject2.request_id = "req-2".into();
+        chain.allow(&subject2).await.unwrap();
+        let open = crate::receipts::OpenReceipt {
+            chain: std::sync::Arc::clone(&chain),
+            decision_receipt_id: "receipt:id".into(),
+            request_digest: digest,
+            salt,
+        };
+        let response_digest = format!(
+            "sha256:{:x}",
+            Sha256::digest(b"the answer")
+        );
+        chain
+            .outcome(&open, "completed", Some(response_digest))
+            .await
+            .unwrap();
+
+        m.set_receipts(Some(Arc::clone(&book)));
+        let text = m.render();
+        assert!(
+            text.contains("gw_receipts_written_total{tenant=\"acme\"} 3"),
+            "{text}"
+        );
+        assert!(
+            text.contains("gw_receipt_entries{tenant=\"acme\"} 3"),
+            "{text}"
+        );
     }
 }
