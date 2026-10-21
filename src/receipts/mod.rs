@@ -19,8 +19,13 @@
 //! recompute both digests, and someone who can only read the log cannot
 //! test a guessed prompt against them.
 
+use serde::Deserialize;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use tokio::sync::oneshot;
+
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -35,12 +40,9 @@ use std::{
 
 use infinity_kernel::{
     Actor, ApprovalSet, LogEntry, POLICY_VERSION, PROPOSAL_VERSION, Policy, Proposal, Signer,
-    TrustedKeys, evaluate, issue_outcome, issue_receipt, record_external_denial, verify_log,
-    verify_outcome, verify_receipt, verify_signatures,
+    TrustedKeys, evaluate, issue_outcome, issue_receipt, record_external_denial,
+    verify_log, verify_outcome, verify_receipt, verify_signatures,
 };
-use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use tokio::sync::oneshot;
 
 /// Kernel policy id hashed into every gateway receipt. Stable so a reader can
 /// see that every entry was judged under the same rules.
@@ -246,6 +248,23 @@ fn io_err(err: impl std::fmt::Display) -> ReceiptError {
     ReceiptError::Io(err.to_string())
 }
 
+/// How much of the log startup verifies.
+///
+/// `full` re-checks every entry and anchor (today's behaviour; startup time
+/// grows with the log). `since_anchor` only re-checks entries written after
+/// the newest local anchor, so startup stays bounded even for a large log:
+/// tampering before that anchor is not caught at startup, but it is still
+/// caught by `ickverify.py` against the published anchor, and by
+/// `startup_verify = "full"`. Neither weakens protection against someone who
+/// holds the signing key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupVerify {
+    #[default]
+    Full,
+    SinceAnchor,
+}
+
 /// How often the writer re-checks what it wrote and anchors the head.
 #[derive(Debug, Clone, Copy)]
 pub struct ChainOptions {
@@ -253,6 +272,8 @@ pub struct ChainOptions {
     pub anchor_every: u64,
     /// Anchor when this much time has passed and there is anything new.
     pub anchor_interval: Duration,
+    /// How much of the log startup verifies.
+    pub startup_verify: StartupVerify,
 }
 
 impl Default for ChainOptions {
@@ -260,6 +281,7 @@ impl Default for ChainOptions {
         Self {
             anchor_every: 1_000,
             anchor_interval: Duration::from_secs(60),
+            startup_verify: StartupVerify::default(),
         }
     }
 }
@@ -307,12 +329,14 @@ struct Shared {
     fail_disk_write: AtomicU64,
     /// `sync_data` calls left to fail, through commit()'s real path.
     fail_disk_sync: AtomicU64,
-    /// Jobs answered Unavailable because the disk write failed.
+    /// Jobs answered Unavailable because a disk write failed.
     write_failures: AtomicU64,
     /// Torn tails quarantined at startup.
     recoveries: AtomicU64,
     /// Unix seconds when this process last wrote an anchor; 0 means never.
     last_anchor_secs: AtomicU64,
+    /// How many entries the last startup verify checked.
+    startup_entries_checked: AtomicU64,
 }
 
 impl Shared {
@@ -417,7 +441,8 @@ impl ReceiptChain {
         let anchor_text = fs::read_to_string(&anchor_path).unwrap_or_default();
         recoveries += recover_torn_tail(&log_path, directory, anchored_entries(&anchor_text))? as u64;
         let text = read_from(&mut log, 0)?;
-        let entries = verify_snapshot(&text, &anchor_text, &signer)?;
+        let (entries, entries_checked) =
+            verify_snapshot(&text, &anchor_text, &signer, options.startup_verify)?;
         let anchored_count = anchored_entries(&anchor_text);
 
         let anchor = OpenOptions::new()
@@ -432,8 +457,18 @@ impl ReceiptChain {
         let shared = Arc::new(Shared::default());
         shared.count.store(count, Ordering::SeqCst);
         shared.recoveries.store(recoveries, Ordering::SeqCst);
+        shared.startup_entries_checked.store(entries_checked, Ordering::SeqCst);
         shared.verifies.store(1, Ordering::SeqCst);
         *shared.head.lock().unwrap_or_else(|p| p.into_inner()) = head_id.clone();
+        tracing::info!(
+            key_id = signer.key_id(),
+            log = %log_path.display(),
+            anchor = %anchor_path.display(),
+            entries = entries.len(),
+            entries_checked,
+            startup_verify = ?options.startup_verify,
+            "receipt chain verified at startup"
+        );
 
         let key_id = signer.key_id().to_string();
         let writer = Writer {
@@ -529,6 +564,11 @@ impl ReceiptChain {
     /// Unix seconds when this process last wrote an anchor; 0 means never.
     pub fn last_anchor_secs(&self) -> u64 {
         self.shared.last_anchor_secs.load(Ordering::SeqCst)
+    }
+
+    /// How many entries the last startup verify checked.
+    pub fn startup_entries_checked(&self) -> u64 {
+        self.shared.startup_entries_checked.load(Ordering::SeqCst)
     }
 
     /// Test hook: the next `n` appends fail before they touch the log.
@@ -955,17 +995,148 @@ fn proposal_for(subject: &Subject, effect: &str, requires_approval: bool) -> Pro
 
 // ---- startup verification -----------------------------------------------------------------
 
-fn verify_snapshot(log_text: &str, anchor_text: &str, signer: &Signer) -> Result<Vec<LogEntry>, ReceiptError> {
+fn verify_snapshot(
+    log_text: &str,
+    anchor_text: &str,
+    signer: &Signer,
+    mode: StartupVerify,
+) -> Result<(Vec<LogEntry>, u64), ReceiptError> {
     let entries = read_entries(log_text)?;
-    if !verify_log(&entries).map_err(|err| ReceiptError::Unverified(err.to_string()))? {
+    let checked = match mode {
+        StartupVerify::Full => {
+            verify_full(&entries, anchor_text, signer)?;
+            entries.len() as u64
+        }
+        StartupVerify::SinceAnchor => verify_since_anchor(&entries, anchor_text, signer)?,
+    };
+    Ok((entries, checked))
+}
+
+/// Today's behaviour: verify every entry and every anchor.
+fn verify_full(entries: &[LogEntry], anchor_text: &str, signer: &Signer) -> Result<(), ReceiptError> {
+    if !verify_log(entries).map_err(|err| ReceiptError::Unverified(err.to_string()))? {
         return Err(ReceiptError::Unverified(
             "a receipt hash, link, or outcome does not verify".into(),
         ));
     }
     let keys = TrustedKeys::from_signer(signer);
-    verify_signatures(&entries, &keys, true).map_err(|err| ReceiptError::Unverified(err.to_string()))?;
-    check_anchors(&entries, anchor_text, &keys)?;
-    Ok(entries)
+    verify_signatures(entries, &keys, true).map_err(|err| ReceiptError::Unverified(err.to_string()))?;
+    check_anchors(entries, anchor_text, &keys)?;
+    Ok(())
+}
+
+/// Check only the region written after the newest local anchor. Everything
+/// before that anchor is accepted on trust here: it is still caught by
+/// `ickverify.py` against the published anchor and by `startup_verify =
+/// "full"`. Returns the number of entries checked (those after the anchor).
+fn verify_since_anchor(entries: &[LogEntry], anchor_text: &str, signer: &Signer) -> Result<u64, ReceiptError> {
+    let keys = TrustedKeys::from_signer(signer);
+
+    // The newest local anchor is the trusted point where checking begins.
+    let mut newest: Option<Value> = None;
+    for line in anchor_text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        newest = Some(
+            serde_json::from_str(line)
+                .map_err(|err| ReceiptError::Unverified(format!("anchor line: {err}")))?,
+        );
+    }
+    let Some(anchor) = newest else {
+        // No anchor: there is no trusted point to start from, so fall back to
+        // checking the whole chain.
+        verify_full(entries, anchor_text, signer)?;
+        return Ok(entries.len() as u64);
+    };
+
+    let version = anchor.get("version").and_then(Value::as_str);
+    let count = anchor.get("count").and_then(Value::as_u64).unwrap_or(0);
+    let head = anchor.get("head_receipt_id").and_then(Value::as_str).unwrap_or("");
+    if version != Some(ANCHOR_VERSION) || count == 0 || head.is_empty() {
+        return Err(ReceiptError::Unverified("the newest anchor line is malformed".into()));
+    }
+    let key_id = anchor.get("key_id").and_then(Value::as_str);
+    let signature = anchor.get("signature").and_then(Value::as_str);
+    let (Some(key_id), Some(signature)) = (key_id, signature) else {
+        return Err(ReceiptError::Unverified("the newest anchor line is unsigned".into()));
+    };
+    if !keys.verify_anchor(key_id, count, head, signature) {
+        return Err(ReceiptError::Unverified("the newest anchor signature does not verify".into()));
+    }
+
+    let count_usize = count as usize;
+    if count_usize > entries.len() {
+        return Err(ReceiptError::Unverified(format!(
+            "the anchor expects {count} entries but the log only has {}",
+            entries.len()
+        )));
+    }
+    // Anchors count entries from 1: entry number `count` is entries[count - 1].
+    let Some(entry) = entries.get(count_usize - 1) else {
+        return Err(ReceiptError::Unverified("the anchor's entry is missing from the log".into()));
+    };
+    if entry.receipt_id() != head {
+        return Err(ReceiptError::Unverified("the anchor head does not match the log".into()));
+    }
+
+    // Check every entry written after the anchor: hash, link to the previous
+    // entry, and a signature by this replica's key.
+    let mut previous = head.to_string();
+    for (index, entry) in entries.iter().enumerate().skip(count_usize) {
+        let number = index + 1;
+        let hash_ok = match entry {
+            LogEntry::Decision(receipt) => verify_receipt(receipt),
+            LogEntry::Outcome(outcome) => verify_outcome(outcome),
+        }
+        .map_err(|err| ReceiptError::Unverified(err.to_string()))?;
+        if !hash_ok {
+            return Err(ReceiptError::Unverified(format!("entry {number} has the wrong hash")));
+        }
+        if entry.previous_receipt_hash() != Some(previous.as_str()) {
+            return Err(ReceiptError::Unverified(format!(
+                "entry {number} does not link to the entry before it"
+            )));
+        }
+        let signed = match (entry.key_id(), entry.signature()) {
+            (Some(key_id), Some(signature)) => keys.verify_entry(key_id, entry.receipt_id(), signature),
+            _ => false,
+        };
+        if !signed {
+            return Err(ReceiptError::Unverified(format!(
+                "entry {number} is not signed by this replica"
+            )));
+        }
+        previous = entry.receipt_id().to_string();
+    }
+
+    // An outcome answering an allow before the anchor cannot be checked here
+    // (the full check still does). An outcome answering an allow after the
+    // anchor must find that allow and must be the only outcome for it.
+    let mut allow_ids: BTreeSet<String> = BTreeSet::new();
+    let mut outcome_count: BTreeMap<String, u64> = BTreeMap::new();
+    for entry in entries.iter().skip(count_usize) {
+        match entry {
+            LogEntry::Decision(receipt) => {
+                if receipt.verdict == "allow" {
+                    allow_ids.insert(receipt.receipt_id.clone());
+                }
+            }
+            LogEntry::Outcome(outcome) => {
+                let decision_id = outcome.decision_receipt_id.clone();
+                if allow_ids.contains(&decision_id) {
+                    *outcome_count.entry(decision_id.clone()).or_insert(0) += 1;
+                    if outcome_count[&decision_id] > 1 {
+                        return Err(ReceiptError::Unverified(format!(
+                            "more than one outcome answers allow {decision_id}"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((entries.len() - count_usize) as u64)
 }
 
 fn read_entries(text: &str) -> Result<Vec<LogEntry>, ReceiptError> {
@@ -1416,6 +1587,7 @@ mod tests {
         ChainOptions {
             anchor_every,
             anchor_interval: Duration::from_secs(3600),
+            startup_verify: StartupVerify::Full,
         }
     }
 
@@ -1594,6 +1766,7 @@ mod tests {
             ChainOptions {
                 anchor_every: 1_000_000,
                 anchor_interval: Duration::from_millis(50),
+                startup_verify: StartupVerify::Full,
             },
         )
         .unwrap();
@@ -2038,5 +2211,199 @@ mod tests {
             let reopened = ReceiptChain::open(&dir, ChainOptions::default()).unwrap();
             println!("     reopen and verify {} entries: {:?}", reopened.len(), started.elapsed());
         }
+    }
+
+    /// Build a log of `n` signed `allow` entries and, when `anchor_at` is
+    /// non-zero, an anchor covering the first `anchor_at` entries. Returns
+    /// the salt and the receipt ids in order.
+    fn sealed_log(dir: &Path, n: usize, anchor_at: u64) -> (Salt, Vec<String>) {
+        let signer = Signer::from_seed([7u8; 32]);
+        fs::write(dir.join("signing.priv"), format!("{}\n", signer.private_key_text())).unwrap();
+        fs::write(dir.join("signing.pub"), format!("{}\n", signer.public_key_text())).unwrap();
+        let salt = Salt::generate().unwrap();
+        let call_digest = request_digest(&salt, b"request-bytes");
+        let mut previous: Option<LogEntry> = None;
+        let mut ids = Vec::new();
+        let mut lines = Vec::new();
+        for i in 0..n {
+            let subject = Subject {
+                request_id: format!("req-{i}"),
+                tenant_id: "acme".into(),
+                key_id: "ak".into(),
+                model: "mock/chat".into(),
+                action: "reserve".into(),
+                call_digest: Some(call_digest.clone()),
+            };
+            let proposal = proposal_for(&subject, "read", false);
+            let decision = evaluate(proposal, gateway_policy(), ApprovalSet::default()).unwrap();
+            let mut receipt = issue_receipt(
+                &decision, previous.as_ref(), issued_at_now().unwrap(),
+                Some(call_digest.clone()), Some(signer.key_id().to_string()),
+            ).unwrap();
+            let mut entry = LogEntry::from(receipt);
+            entry.sign(&signer);
+            ids.push(entry.receipt_id().to_string());
+            lines.push(serde_json::to_string(&entry).unwrap());
+            previous = Some(entry);
+        }
+        fs::write(dir.join("receipts.jsonl"), lines.join("\n") + "\n").unwrap();
+        if anchor_at > 0 {
+            let head = &ids[anchor_at as usize - 1];
+            let signature = signer.sign_anchor(anchor_at, head);
+            let anchor = json!({
+                "version": ANCHOR_VERSION,
+                "count": anchor_at,
+                "head_receipt_id": head,
+                "key_id": signer.key_id(),
+                "signature": signature,
+            });
+            fs::write(dir.join("anchor.jsonl"), serde_json::to_string(&anchor).unwrap() + "\n").unwrap();
+        }
+        (salt, ids)
+    }
+
+    /// Replace the `issued_at` year of one log line with `1999`: the line still
+    /// parses as JSON, but its hash no longer verifies.
+    fn damage_issued_at(log_text: &str, index: usize) -> String {
+        let mut lines: Vec<String> = log_text.lines().map(str::to_string).collect();
+        let line = lines.get_mut(index).unwrap();
+        let at = line.find("\"issued_at\":\"").unwrap() + "\"issued_at\":\"".len();
+        line.replace_range(at..at + 4, "1999");
+        lines.join("\n") + "\n"
+    }
+
+    #[tokio::test]
+    async fn since_anchor_checks_only_entries_after_the_anchor() {
+        let dir = scratch("since-anchor-fewer");
+        sealed_log(&dir, 20_000, 19_990);
+        let chain = ReceiptChain::open(&dir, ChainOptions {
+            anchor_every: 1_000,
+            anchor_interval: Duration::from_secs(3600),
+            startup_verify: StartupVerify::SinceAnchor,
+        }).unwrap();
+        // Only the ten entries written after the anchor are checked.
+        assert_eq!(chain.startup_entries_checked(), 10);
+    }
+
+    #[tokio::test]
+    async fn full_checks_every_entry() {
+        let dir = scratch("full-check");
+        sealed_log(&dir, 200, 0);
+        let chain = ReceiptChain::open(&dir, ChainOptions {
+            anchor_every: 1_000,
+            anchor_interval: Duration::from_secs(3600),
+            startup_verify: StartupVerify::Full,
+        }).unwrap();
+        assert_eq!(chain.startup_entries_checked(), 200);
+    }
+
+    #[tokio::test]
+    async fn since_anchor_refuses_a_damaged_entry_after_the_anchor() {
+        let dir = scratch("since-anchor-damage-after");
+        let (_, _) = sealed_log(&dir, 20, 10);
+        let log = dir.join("receipts.jsonl");
+        let text = fs::read_to_string(&log).unwrap();
+        // Entry 11 (index 10) is after the anchor at 10.
+        fs::write(&log, damage_issued_at(&text, 10)).unwrap();
+        assert!(matches!(
+            ReceiptChain::open(&dir, ChainOptions {
+                anchor_every: 1_000,
+                anchor_interval: Duration::from_secs(3600),
+                startup_verify: StartupVerify::SinceAnchor,
+            }),
+            Err(ReceiptError::Unverified(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn since_anchor_refuses_a_damaged_anchor_line() {
+        let dir = scratch("since-anchor-damage-anchor");
+        let (_, _) = sealed_log(&dir, 20, 10);
+        let anchor = dir.join("anchor.jsonl");
+        let text = fs::read_to_string(&anchor).unwrap();
+        let mut damaged = text.clone();
+        let at = damaged.find("\"signature\":\"").unwrap() + "\"signature\":\"".len();
+        let flip = if &damaged[at..at + 1] == "0" { "1" } else { "0" };
+        damaged.replace_range(at..at + 1, flip);
+        fs::write(&anchor, &damaged).unwrap();
+        assert!(matches!(
+            ReceiptChain::open(&dir, ChainOptions {
+                anchor_every: 1_000,
+                anchor_interval: Duration::from_secs(3600),
+                startup_verify: StartupVerify::SinceAnchor,
+            }),
+            Err(ReceiptError::Unverified(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn since_anchor_refuses_an_anchor_whose_head_does_not_match_the_log() {
+        let dir = scratch("since-anchor-head-mismatch");
+        let (_, ids) = sealed_log(&dir, 20, 10);
+        let anchor = dir.join("anchor.jsonl");
+        let text = fs::read_to_string(&anchor).unwrap();
+        let mut record: serde_json::Value = serde_json::from_str(&text).unwrap();
+        record["head_receipt_id"] = serde_json::json!("receipt:sha3-256:0000000000000000000000000000000000000000000000000000000000000000");
+        fs::write(&anchor, format!("{record}\n")).unwrap();
+        assert!(matches!(
+            ReceiptChain::open(&dir, ChainOptions {
+                anchor_every: 1_000,
+                anchor_interval: Duration::from_secs(3600),
+                startup_verify: StartupVerify::SinceAnchor,
+            }),
+            Err(ReceiptError::Unverified(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn since_anchor_opens_a_damaged_entry_before_the_anchor() {
+        // Documented gap: tampering before the newest local anchor is not
+        // caught at startup, but ickverify.py against the published anchor
+        // still reports NOT VERIFIED.
+        let dir = scratch("since-anchor-damage-before");
+        let (_, _) = sealed_log(&dir, 20, 10);
+        let log = dir.join("receipts.jsonl");
+        let text = fs::read_to_string(&log).unwrap();
+        // Entry 3 (index 2) is before the anchor at 10.
+        fs::write(&log, damage_issued_at(&text, 2)).unwrap();
+        let chain = ReceiptChain::open(&dir, ChainOptions {
+            anchor_every: 1_000,
+            anchor_interval: Duration::from_secs(3600),
+            startup_verify: StartupVerify::SinceAnchor,
+        }).unwrap();
+        assert_eq!(chain.startup_entries_checked(), 10);
+        let Some(python) = crate::receipts::test_python() else {
+            return;
+        };
+        let code = std::process::Command::new(python)
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/vendor/wicket/verifier/ickverify.py"))
+            .arg(chain.log_path())
+            .arg("--anchor")
+            .arg(chain.anchor_path())
+            .arg("--trusted-keys")
+            .arg(chain.public_key_path())
+            .arg("--require-signatures")
+            .status()
+            .unwrap()
+            .code()
+            .unwrap_or(-1);
+        assert_eq!(code, 1, "ickverify must report the pre-anchor damage");
+    }
+
+    #[tokio::test]
+    async fn since_anchor_with_no_anchor_falls_back_to_full() {
+        let dir = scratch("since-anchor-no-anchor");
+        sealed_log(&dir, 20, 0);
+        let log = dir.join("receipts.jsonl");
+        let text = fs::read_to_string(&log).unwrap();
+        fs::write(&log, damage_issued_at(&text, 5)).unwrap();
+        assert!(matches!(
+            ReceiptChain::open(&dir, ChainOptions {
+                anchor_every: 1_000,
+                anchor_interval: Duration::from_secs(3600),
+                startup_verify: StartupVerify::SinceAnchor,
+            }),
+            Err(ReceiptError::Unverified(_))
+        ));
     }
 }
