@@ -173,59 +173,59 @@ added. Commit per phase.
 
 ### Phase 1: real disk failure
 Tests (in `src/receipts/mod.rs` tests and `tests/receipts.rs`):
-- [ ] With the hook set, the next `allow` returns `Unavailable`, `is_failed()`
+- [x] With the hook set, the next `allow` returns `Unavailable`, `is_failed()`
       is true, the log on disk has no partial line from that job, and a
       following `allow` also returns `Unavailable` without touching the disk.
-- [ ] Through HTTP: with the hook set, a stream request gets `503
+- [x] Through HTTP: with the hook set, a stream request gets `503
       receipt_unavailable`, the mock provider is **not** called, and a second
       request also gets `503`.
-- [ ] Reopening the directory after the failure (new `ReceiptChain::open`)
+- [x] Reopening the directory after the failure (new `ReceiptChain::open`)
       verifies and accepts appends again.
-- [ ] Same for a failure on `sync_data` (not just `write_all`).
+- [x] Same for a failure on `sync_data` (not just `write_all`).
 
 ### Phase 2: metrics and readiness
-- [ ] After two allows and one outcome for tenant `acme`,
+- [x] After two allows and one outcome for tenant `acme`,
       `gw_receipts_written_total{tenant="acme"} 3` and
       `gw_receipt_entries{tenant="acme"} 3` appear in `/metrics`.
-- [ ] After the Phase 1 hook stops `acme`'s chain:
+- [x] After the Phase 1 hook stops `acme`'s chain:
       `gw_receipt_chain_stopped{tenant="acme"} 1`, a nonzero
       `gw_receipt_write_failures_total`, and `/health/ready` lists `acme` under
       `receipts.stopped` while still answering `200` if everything else is
       healthy.
-- [ ] A torn tail at startup increments `gw_receipt_recoveries_total`.
-- [ ] Unknown tenant ids from requests never create a series (extend the
+- [x] A torn tail at startup increments `gw_receipt_recoveries_total`.
+- [x] Unknown tenant ids from requests never create a series (extend the
       existing cardinality test).
 
 ### Phase 3: bounded startup
-- [ ] `since_anchor` opens a 20,000-entry chain with an anchor at 19,990
+- [x] `since_anchor` opens a 20,000-entry chain with an anchor at 19,990
       checking about 10 entries (assert the count from a test hook or the INFO
       log), and noticeably faster than `full` (assert it checks fewer entries,
       not wall time).
-- [ ] With `since_anchor`: a damaged entry **after** the newest anchor refuses
+- [x] With `since_anchor`: a damaged entry **after** the newest anchor refuses
       to open; a damaged **anchor** line refuses to open; an anchor whose head
       does not match the log refuses to open.
-- [ ] With `since_anchor`: a damaged entry **before** the newest anchor opens
+- [x] With `since_anchor`: a damaged entry **before** the newest anchor opens
       (documented gap), and `ickverify.py` against the published anchor still
       reports NOT VERIFIED for that log.
-- [ ] With `full` (default), every existing startup test behaves as today.
-- [ ] No anchor at all: behaves exactly like `full`.
+- [x] With `full` (default), every existing startup test behaves as today.
+- [x] No anchor at all: behaves exactly like `full`.
 
 ### Phase 4: models list
-- [ ] `/v1/models` entries carry `object: "model"`, `created` (number) and
+- [x] `/v1/models` entries carry `object: "model"`, `created` (number) and
       `owned_by`, and every field that was there before.
-- [ ] `demo/receipts/openai_sdk_check.py` gains a check that
+- [x] `demo/receipts/openai_sdk_check.py` gains a check that
       `client.models.list()` returns `mock/chat`.
 
 ### Phase 5: publisher status
-- [ ] `tools/tests/test_anchor_publisher.py`: status after a successful push
+- [x] `tools/tests/test_anchor_publisher.py`: status after a successful push
       (`ok: true`, `last_push` set); after a refused tenant (`ok: false`,
       tenant listed under `refused`); after a detected rewrite (`ok: false`,
       `error` set). The file is valid JSON after every pass.
 
 ### Phase 6: docs
-- [ ] README "Receipts": the metrics, the readiness field, `startup_verify`
+- [x] README "Receipts": the metrics, the readiness field, `startup_verify`
       with the trade-off in plain words. `docs/anchoring.md`: `--status`.
-- [ ] `config/default.toml`: `startup_verify = "full"` with a comment.
+- [x] `config/default.toml`: `startup_verify = "full"` with a comment.
 
 ---
 
