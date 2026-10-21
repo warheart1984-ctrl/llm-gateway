@@ -1,0 +1,48 @@
+# Two tenants, both with receipts on: every admitted stream, governance
+# refusal and hold goes on this replica's signed chain, and a receipt that
+# cannot be written withholds the reply.
+#
+# Keys come from environment variables the demo sets. They are demo
+# placeholders, not credentials for anything.
+
+tenants:
+  - tenant_id: demo
+    display_name: Demo
+    enabled: true
+    receipts: true
+    credentials:
+      - key_id: ak_demo
+        key_env: RECEIPTS_DEMO_KEY
+        scopes: [chat:stream, models:read]
+    allowed_models: ["mock/*"]
+    default_model: mock/chat
+    limits:
+      requests_per_minute: 120
+      tokens_per_minute: 200000
+      max_concurrent_streams: 8
+      max_output_tokens: 1024
+      daily_budget_nano_usd: 1000000000   # 1 USD
+    holds:
+      models: ["mock/approval"]
+      expiry_secs: 900
+      approval_valid_secs: 300
+      max_pending: 20
+
+  - tenant_id: shoestring
+    display_name: Shoestring (tiny budget)
+    enabled: true
+    receipts: true
+    credentials:
+      - key_id: ak_shoestring
+        key_env: RECEIPTS_SHOESTRING_KEY
+        scopes: [chat:stream, models:read]
+    allowed_models: ["mock/*"]
+    default_model: mock/chat
+    limits:
+      requests_per_minute: 120
+      tokens_per_minute: 200000
+      max_concurrent_streams: 8
+      max_output_tokens: 1024
+      # 0.001 USD: a few 64-token requests fit, then the next reservation
+      # does not, and the gateway refuses with 402 before calling the model.
+      daily_budget_nano_usd: 1000000

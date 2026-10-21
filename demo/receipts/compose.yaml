@@ -1,0 +1,73 @@
+# The receipts demo: mock provider + gateway with receipts on + an anchor
+# publisher that copies anchors out + a client that plays the auditor.
+#
+#   cd demo/receipts && docker compose up --build --abort-on-container-exit --exit-code-from client
+#
+# Without Docker: `python demo/receipts/run_local.py` from the repository root.
+
+name: llm-gateway-receipts-demo
+
+services:
+  mock:
+    build: { context: ../.., dockerfile: demo/Dockerfile }
+    image: llm-gateway-demo
+    entrypoint: ["/usr/local/bin/mock_upstream"]
+    environment:
+      MOCK_ADDR: 0.0.0.0:9000
+      MOCK_TOKEN_DELAY_MS: "20"
+
+  gateway:
+    build: { context: ../.., dockerfile: demo/Dockerfile }
+    image: llm-gateway-demo
+    depends_on: [mock]
+    environment:
+      LLM_GATEWAY_CONFIG_DIR: /etc/llm-gateway
+      # Demo placeholders, not credentials for anything.
+      RECEIPTS_DEMO_KEY: demo-receipts-key-not-a-secret
+      RECEIPTS_SHOESTRING_KEY: shoestring-receipts-key-not-a-secret
+    volumes:
+      - ./config:/etc/llm-gateway:ro
+      # The replica's own disk: ledger, receipt log, local anchor, key.
+      - gateway-data:/var/lib/llm-gateway
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health/ready"]
+      interval: 2s
+      retries: 30
+
+  # Stands in for a separate account: it can read the replica's directory
+  # but the gateway cannot write where it publishes.
+  publisher:
+    image: python:3.12-slim
+    command: ["python", "/demo/publisher.py", "--source", "/gateway/receipts", "--dest", "/published", "--interval", "0.5"]
+    volumes:
+      - ./publisher.py:/demo/publisher.py:ro
+      - gateway-data:/gateway:ro
+      - published:/published
+
+  client:
+    image: python:3.12-slim
+    depends_on:
+      gateway: { condition: service_healthy }
+      publisher: { condition: service_started }
+    environment:
+      RECEIPTS_DEMO_KEY: demo-receipts-key-not-a-secret
+      RECEIPTS_SHOESTRING_KEY: shoestring-receipts-key-not-a-secret
+      FORCE_COLOR: "1"
+    command:
+      - python
+      - /demo/walkthrough.py
+      - --gateway=http://gateway:8080
+      - --gateway-dir=/gateway/receipts
+      - --published-dir=/published
+      - --verifier=/verifier/ickverify.py
+    volumes:
+      - ./walkthrough.py:/demo/walkthrough.py:ro
+      - ../../vendor/wicket/verifier:/verifier:ro
+      - gateway-data:/gateway:ro
+      - published:/published:ro
+
+volumes:
+  gateway-data:
+  published:

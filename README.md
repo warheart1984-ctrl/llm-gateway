@@ -481,6 +481,9 @@ newest first.
 
 ## Receipts
 
+To see all of this end to end, run the receipts demo: `python demo/receipts/run_local.py`,
+or `docker compose up` in `demo/receipts` (see its [README](demo/receipts/README.md)).
+
 A receipt is a Wicket chain entry: a signed, hash-linked record that a
 decision happened. It is separate from the decision row in Postgres. Postgres
 keeps quotas, holds, and decision rows. It does not keep the chain head.
