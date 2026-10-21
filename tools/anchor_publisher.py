@@ -88,11 +88,13 @@ class RewriteDetected(Exception):
 
 class Publisher:
     def __init__(self, source: Path, repo: str, replica: str, state: Path, work: Path, branch: str = DEFAULT_BRANCH,
-                 author: str = "llm-gateway anchor publisher <anchors@invalid>") -> None:
+                 author: str = "llm-gateway anchor publisher <anchors@invalid>",
+                 status: Path | None = None) -> None:
         if not safe_name(replica):
             raise ValueError(f"replica name {replica!r} must be 1-64 of letters, digits, '.', '_', '-'")
         self.source, self.repo, self.replica = source, repo, replica
         self.state, self.work, self.branch = state, work, branch
+        self.status_path = status
         name, _, email = author.partition(" <")
         self.identity = ["-c", f"user.name={name}", "-c", f"user.email={email.rstrip('>')}"]
 
@@ -192,7 +194,11 @@ class Publisher:
             report = Report()
             self.sync()
             lines = self.stage(report)
+            checked_at = int(time.time())
+            ok = not report.refused
+            error = ", ".join(sorted(report.refused)) if report.refused else None
             if not lines:
+                self.write_status(report, ok, error, checked_at)
                 return report
             git("add", "--all", self.replica, cwd=self.work)
             message = f"anchors from {self.replica}\n\n" + "\n".join(lines)
@@ -204,11 +210,32 @@ class Publisher:
                 report.commit = commit
                 for line in lines:
                     print(f"anchor-publisher: {self.replica}/{line}", flush=True)
+                self.write_status(report, ok, error, checked_at)
                 return report
             # Someone else pushed first. Start again from the remote's state;
             # never push over it.
             time.sleep(0.2)
         raise GitError(f"push to {self.repo} kept being refused after {attempts} attempts")
+
+    def write_status(self, report: Report | None, ok: bool, error: str | None, checked_at: int) -> None:
+        """Atomically write a JSON summary of this pass to --status, if any."""
+        if self.status_path is None:
+            return
+        last_push = report.commit if report is not None else self.last_pushed()
+        last_push_at = checked_at if report is not None and report.commit else 0
+        status = {
+            "checked_at": checked_at,
+            "ok": ok,
+            "last_push": last_push,
+            "last_push_at": last_push_at,
+            "published": report.published if report is not None else {},
+            "refused": report.refused if report is not None else {},
+            "error": error,
+        }
+        self.status_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.status_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(status), encoding="utf-8")
+        os.replace(tmp, self.status_path)
 
 
 def verify(repo: str, replica: str, tenant: str, log: Path, verifier: Path, branch: str = DEFAULT_BRANCH) -> int:
@@ -240,6 +267,7 @@ def main(argv: list[str] | None = None) -> int:
     pub.add_argument("--work", type=Path, help="working copy (default: next to --state)")
     pub.add_argument("--branch", default=DEFAULT_BRANCH)
     pub.add_argument("--watch", type=float, metavar="SECONDS", help="keep publishing at this interval")
+    pub.add_argument("--status", type=Path, help="write a JSON summary of each pass to this file")
     ver = sub.add_parser("verify", help="check a tenant's log against the published anchor and key")
     ver.add_argument("--repo", required=True)
     ver.add_argument("--replica", required=True)
@@ -254,19 +282,32 @@ def main(argv: list[str] | None = None) -> int:
         return verify(args.repo, args.replica, args.tenant, args.log, args.verifier, args.branch)
 
     publisher = Publisher(args.source, args.repo, args.replica, args.state,
-                          args.work or args.state.parent / "anchor-repo", args.branch)
+                          args.work or args.state.parent / "anchor-repo", args.branch,
+                          status=args.status)
     while True:
+        checked_at = int(time.time())
         try:
             report = publisher.publish_once()
-            status = 2 if report.refused else 0
         except RewriteDetected as rewrite:
+            ok = False
+            error = str(rewrite)
             print(f"anchor-publisher: ALERT {rewrite}; nothing is published until a person looks", file=sys.stderr, flush=True)
+            publisher.write_status(None, ok, error, checked_at)
             return 2
         except GitError as error:
+            ok = False
+            error = str(error)
             print(f"anchor-publisher: {error}", file=sys.stderr, flush=True)
-            status = 1
+            publisher.write_status(None, ok, error, checked_at)
+            if args.watch is None:
+                return 1
+            time.sleep(args.watch)
+            continue
+        ok = not report.refused
+        error = ", ".join(sorted(report.refused)) if report.refused else None
+        publisher.write_status(report, ok, error, checked_at)
         if args.watch is None:
-            return status
+            return 2 if report.refused else 0
         time.sleep(args.watch)
 
 

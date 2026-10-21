@@ -202,5 +202,67 @@ class Verifying(Case):
         self.assertEqual(code, 2)
 
 
+class StatusReporting(Case):
+    def status_path(self) -> Path:
+        return self.tmp / "status.json"
+
+    def status(self) -> dict:
+        return json.loads(self.status_path().read_text(encoding="utf-8"))
+
+    def test_status_after_successful_push(self) -> None:
+        self.tenant("acme", [1, 2])
+        publisher = self.publisher()
+        publisher.status_path = self.status_path()
+        report = publisher.publish_once()
+        self.assertEqual(report.published, {"acme": 2})
+        got = self.status()
+        self.assertTrue(got["ok"])
+        self.assertIsNotNone(got["last_push"])
+        self.assertEqual(got["published"], {"acme": 2})
+        self.assertEqual(got["refused"], {})
+        self.assertIsNone(got["error"])
+        self.assertIsInstance(got["checked_at"], int)
+
+    def test_status_after_refused_tenant(self) -> None:
+        self.tenant("acme", [1, 2])
+        self.tenant("globex", [1])
+        publisher = self.publisher()
+        publisher.status_path = self.status_path()
+        publisher.publish_once()
+        # Rewrite acme's anchor so it no longer starts with what was published.
+        (self.root / "acme" / "anchor.jsonl").write_text(anchor(1) + "\n", encoding="utf-8")
+        report = publisher.publish_once()
+        self.assertIn("acme", report.refused)
+        got = self.status()
+        self.assertFalse(got["ok"])
+        self.assertIn("acme", got["refused"])
+        self.assertIsNotNone(got["error"])
+
+    def test_status_after_detected_rewrite(self) -> None:
+        self.tenant("acme", [1, 2])
+        publisher = self.publisher()
+        publisher.status_path = self.status_path()
+        publisher.publish_once()
+        # Force-push rewritten history to the remote.
+        other = self.tmp / "other"
+        run("clone", "--quiet", str(self.remote), str(other))
+        run("checkout", "--quiet", "--orphan", "fake", cwd=other)
+        run("rm", "-r", "--quiet", "--ignore-unmatch", ".", cwd=other)
+        (other / "r1").mkdir(exist_ok=True)
+        (other / "r1" / "note").write_text("nothing to see\n", encoding="utf-8")
+        run("add", "r1", cwd=other)
+        run(*ID, "commit", "--quiet", "-m", "rewritten", cwd=other)
+        run("push", "--quiet", "--force", "origin", f"HEAD:{ap.DEFAULT_BRANCH}", cwd=other)
+        code = ap.main(["publish", "--source", str(self.root), "--repo", str(self.remote),
+                        "--replica", "r1", "--state", str(self.tmp / "state-r1" / "state.json"),
+                        "--work", str(self.tmp / "work-r1"), "--status", str(self.status_path())])
+        self.assertEqual(code, 2)
+        got = self.status()
+        self.assertFalse(got["ok"])
+        self.assertIsNotNone(got["error"])
+        # The file is valid JSON after every pass, even on failure.
+        json.loads(self.status_path().read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()
