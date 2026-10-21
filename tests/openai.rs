@@ -323,3 +323,70 @@ async fn an_idempotency_key_never_replays_an_answer_across_formats() {
     let text = response.text().await.unwrap();
     assert_ne!(status, StatusCode::OK, "a gateway-shaped answer must not be replayed to an OpenAI client: {text}");
 }
+
+#[tokio::test]
+async fn mode_fields_of_the_wrong_type_are_refused_not_guessed() {
+    let gw = boot().await;
+    let with = |patch: Value| {
+        let mut body = ask("mock/chat");
+        for (k, v) in patch.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        body
+    };
+    for body in [
+        with(json!({"stream": "true"})),
+        with(json!({"stream": 1})),
+        with(json!({"stream_options": {"include_usage": true}})),
+        with(json!({"stream": false, "stream_options": {"include_usage": true}})),
+        with(json!({"stream": true, "stream_options": "yes"})),
+        with(json!({"stream": true, "stream_options": {"include_usage": "yes"}})),
+        with(json!({"n": 1.5})),
+    ] {
+        let (status, _, text) = gw.call("test-key-acme", &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body} -> {text}");
+        let error: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(error["error"]["type"], "invalid_request_error", "{text}");
+    }
+    // The valid forms still work.
+    // `null` means "not set", as on OpenAI's API.
+    for body in [
+        with(json!({"stream": false})),
+        with(json!({"stream": null})),
+        with(json!({"n": 1})),
+        with(json!({"n": null})),
+        with(json!({"stream_options": null})),
+        with(json!({"stream": true, "stream_options": {}})),
+    ] {
+        let (status, _, text) = gw.call("test-key-acme", &body).await;
+        assert_eq!(status, StatusCode::OK, "{body} -> {text}");
+    }
+}
+
+#[tokio::test]
+async fn a_replayed_completion_still_points_at_its_receipt() {
+    let gw = boot().await;
+    for path in ["/v1/chat/completions", "/v1/chat/complete"] {
+        let key = format!("replay-{}", Uuid::new_v4().simple());
+        let send = || async {
+            let response = reqwest::Client::new()
+                .post(format!("http://{}{path}", gw.addr))
+                .bearer_auth("test-key-acme")
+                .header("idempotency-key", &key)
+                .json(&ask("mock/chat"))
+                .send()
+                .await
+                .unwrap();
+            let headers = response.headers().clone();
+            (response.status(), headers, response.text().await.unwrap())
+        };
+        let (status, first, first_body) = send().await;
+        assert_eq!(status, StatusCode::OK, "{path}: {first_body}");
+        let (status, replay, replay_body) = send().await;
+        assert_eq!(status, StatusCode::OK, "{path}: {replay_body}");
+        assert_eq!(replay["idempotent-replayed"], "true", "{path}");
+        assert_eq!(replay_body, first_body, "{path}: the stored answer, unchanged");
+        assert_eq!(replay.get("x-receipt-id"), first.get("x-receipt-id"), "{path}: the replay names the original receipt");
+        assert_eq!(replay.get("x-receipt-salt"), first.get("x-receipt-salt"), "{path}: and its salt, so the digests can be checked");
+    }
+}

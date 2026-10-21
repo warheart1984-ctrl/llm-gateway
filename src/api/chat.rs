@@ -226,6 +226,9 @@ enum RequestError {
     /// A request field this gateway does not support.
     #[error("{0}")]
     Unsupported(&'static str),
+    /// A request field of the wrong type or in the wrong combination.
+    #[error("{0}")]
+    InvalidField(&'static str),
 }
 
 impl RequestError {
@@ -241,6 +244,7 @@ impl RequestError {
             | RequestError::IdempotencyKeyRequired
             | RequestError::InvalidHoldId
             | RequestError::Unsupported(_)
+            | RequestError::InvalidField(_)
             | RequestError::Param(_) => StatusCode::BAD_REQUEST,
             RequestError::Held(_) => StatusCode::ACCEPTED,
             RequestError::Limit(LimitError::Hold(problem)) => match problem {
@@ -325,6 +329,7 @@ impl RequestError {
             RequestError::Provider(e) => e.code(),
             RequestError::ReceiptUnavailable => "receipt_unavailable",
             RequestError::Unsupported(_) => "unsupported_parameter",
+            RequestError::InvalidField(_) => "invalid_parameter",
         }
     }
 
@@ -478,12 +483,19 @@ async fn handle(state: Arc<AppState>, headers: HeaderMap, body: Bytes, mode: Mod
                 original = %original,
                 "idempotent replay served from the ledger"
             );
-            let mut response = (StatusCode::OK, stored).into_response();
+            let (body, receipt) = unwrap_stored(stored);
+            let mut response = (StatusCode::OK, body).into_response();
             let h = response.headers_mut();
             h.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
             h.insert("x-request-id", header_value(&request_id));
             h.insert("idempotent-replayed", HeaderValue::from_static("true"));
             h.insert("x-original-request-id", header_value(&original.to_string()));
+            // The original receipt: a replay writes none of its own, so it
+            // points at the one that covers this answer.
+            if let Some((receipt_id, salt)) = receipt {
+                h.insert(HeaderName::from_static("x-receipt-id"), header_value(&receipt_id));
+                h.insert(HeaderName::from_static("x-receipt-salt"), header_value(&salt));
+            }
             response
         }
         // Held for approval. Not a refusal, so neither a rejection metric nor
@@ -669,6 +681,36 @@ async fn failed_outcome(open: &OpenReceipt) -> Result<(), RequestError> {
         .await
         .map(|_| ())
         .map_err(|_| RequestError::ReceiptUnavailable)
+}
+
+/// Marks a stored answer that carries its receipt. Never a field of an
+/// answer itself, so a stored answer without it is returned as it is.
+const STORED_WITH_RECEIPT: &str = "llm_gateway_stored_with_receipt";
+
+/// The answer kept for idempotent replay, with the id and salt of the
+/// receipt that covers it.
+fn stored_with_receipt(payload: &str, open: &OpenReceipt) -> String {
+    json!({
+        STORED_WITH_RECEIPT: 1,
+        "receipt_id": open.decision_receipt_id,
+        "receipt_salt": open.salt.to_hex(),
+        "body": payload,
+    })
+    .to_string()
+}
+
+/// A stored answer and, when it was kept with one, its receipt id and salt.
+/// Answers stored before receipts, or for tenants without them, come back
+/// unchanged.
+fn unwrap_stored(stored: String) -> (String, Option<(String, String)>) {
+    if let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(&stored)
+        && fields.get(STORED_WITH_RECEIPT) == Some(&json!(1))
+        && let (Some(Value::String(body)), Some(Value::String(id)), Some(Value::String(salt))) =
+            (fields.get("body"), fields.get("receipt_id"), fields.get("receipt_salt"))
+    {
+        return (body.clone(), Some((id.clone(), salt.clone())));
+    }
+    (stored, None)
 }
 
 /// `x-receipt-id` names the allow receipt; `x-receipt-salt` is the salt in
@@ -1056,15 +1098,35 @@ fn openai_request(body: &[u8]) -> Result<(ChatRequest, bool), RequestError> {
         Some(messages) => serde_json::from_value(messages).map_err(|e| RequestError::BadJson(e.to_string()))?,
         None => Vec::new(),
     };
-    let stream = fields.remove("stream").and_then(|v| v.as_bool());
-    let include_usage = fields
-        .remove("stream_options")
-        .and_then(|o| o.get("include_usage").and_then(Value::as_bool))
-        .unwrap_or(false);
-    if let Some(n) = fields.remove("n")
-        && n.as_u64() != Some(1)
-    {
-        return Err(RequestError::Unsupported("only `n: 1` is supported"));
+    // The fields that decide what kind of answer is sent are checked, not
+    // coerced: a wrong type is a 400, as on OpenAI's API, never a guess.
+    // `null` means "not set" there, and here.
+    let stream = match fields.remove("stream") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(stream)) => Some(stream),
+        Some(_) => return Err(RequestError::InvalidField("`stream` must be true or false")),
+    };
+    let include_usage = match fields.remove("stream_options") {
+        None | Some(Value::Null) => false,
+        Some(Value::Object(options)) => {
+            if stream != Some(true) {
+                return Err(RequestError::InvalidField("`stream_options` is only allowed when `stream` is true"));
+            }
+            match options.get("include_usage") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(include)) => *include,
+                Some(_) => {
+                    return Err(RequestError::InvalidField("`stream_options.include_usage` must be true or false"));
+                }
+            }
+        }
+        Some(_) => return Err(RequestError::InvalidField("`stream_options` must be an object")),
+    };
+    match fields.remove("n") {
+        None | Some(Value::Null) => {}
+        Some(n) if n.as_u64() == Some(1) => {}
+        Some(n) if n.as_u64().is_some() => return Err(RequestError::Unsupported("only `n: 1` is supported")),
+        Some(_) => return Err(RequestError::InvalidField("`n` must be a whole number")),
     }
     fields.remove("store");
     fields.remove("metadata");
@@ -1845,8 +1907,14 @@ async fn complete_response(
         }
     }
     // The answer goes into the ledger with the settlement, so a repeat under
-    // the same Idempotency-Key is served from there.
-    guard.reservation.keep_response(payload.clone());
+    // the same Idempotency-Key is served from there. With receipts on, the
+    // receipt id and salt are kept with it (sealed at rest like the answer),
+    // so the replay can name the receipt that covers it.
+    let stored = match &receipt {
+        Some(open) => stored_with_receipt(&payload, open),
+        None => payload.clone(),
+    };
+    guard.reservation.keep_response(stored);
     guard.reservation.settle(usage, &guard.cost_model);
     guard.summary.bytes_out = payload.len() as u64;
     state.metrics.bytes_to_client(payload.len() as u64);

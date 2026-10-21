@@ -175,6 +175,10 @@ reservation, holds and receipts all apply unchanged, and `x-receipt-id` /
   request or the registry's `default_params`, as on every endpoint: the
   gateway reserves cost before calling the model. Set a default per model if
   your clients leave it out.
+- `stream`, `stream_options` and `n` are checked, not coerced: a wrong type
+  (`"stream": "true"`, a non-boolean `include_usage`, `stream_options`
+  without `"stream": true`) is `400 invalid_parameter`, as on OpenAI's API;
+  `null` means not set.
 - `n` above 1 is refused (`400 unsupported_parameter`). `store` and
   `metadata`, OpenAI's own storage options, are not forwarded. Every other
   field is forwarded as a parameter.
@@ -589,7 +593,9 @@ An `allow` with no outcome means the gateway cannot say how the call ended,
 and the log says exactly that: `ickverify.py` reports "N allowed calls have no
 outcome". A repeat of a finished completion under the same `Idempotency-Key`
 is served from the ledger without calling the model and writes nothing new;
-the original `allow` and outcome cover it.
+the original `allow` and outcome cover it, and the replay returns that
+`allow`'s `x-receipt-id` and `x-receipt-salt` (kept with the stored answer,
+sealed at rest like it) so the caller can still check the digests.
 
 A malformed or oversized body (`400`, `413`), a duplicate (`409`), a
 mismatched resubmission (`422`) and an unauthenticated request (`401`) are
