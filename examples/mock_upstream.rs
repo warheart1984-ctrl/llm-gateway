@@ -8,6 +8,9 @@
 //!
 //! It never calls anything and costs nothing, so the gateway's governance can
 //! be exercised end to end without a provider account.
+//!
+//! The upstream model `mock-broken` streams its first few words and then fails
+//! with an in-band error, the way a provider can fail part-way through.
 
 use std::{
     convert::Infallible, net::SocketAddr, sync::{
@@ -101,6 +104,28 @@ async fn completions(Json(body): Json<Value>, delay: Duration) -> Response {
             "usage": usage
         }))
         .into_response();
+    }
+
+    if model == "mock-broken" {
+        let mut frames: Vec<String> = words
+            .into_iter()
+            .take(4)
+            .map(|w| frame(json!({
+                "id": "mock-1", "object": "chat.completion.chunk", "model": model,
+                "choices": [{ "index": 0, "delta": { "content": w } }]
+            })))
+            .collect();
+        frames.push(frame(json!({ "error": { "message": "the mock model failed part-way through" } })));
+        let stream = futures_util::stream::unfold(frames.into_iter(), move |mut frames| async move {
+            let next = frames.next()?;
+            tokio::time::sleep(delay).await;
+            Some((Ok::<_, Infallible>(next), frames))
+        });
+        let mut response = Response::new(Body::from_stream(stream));
+        response
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("text/event-stream"));
+        return response;
     }
 
     let mut frames: Vec<String> = words

@@ -245,14 +245,26 @@ def run(args: argparse.Namespace) -> None:
     newest = read_log(replica)[-1]
     check(newest.get("verdict") == "await_human_approval", "the newest receipt is await_human_approval")
 
-    step("5. The anchor leaves the gateway")
+    step("5. A failure part-way through is recorded with exactly what the client got")
+    status, headers, text = post(gateway, demo_key, chat_body("mock/broken"))
+    check(status == 200, f"HTTP {status}: the stream started")
+    content, reasoning, tools, events = parse_sse(text)
+    check("error" in events, f"then an `error` event after: {content!r}")
+    salt = bytes.fromhex(headers["x-receipt-salt"])
+    log = read_log(replica)
+    outcome = next((e for e in log if e.get("decision_receipt_id") == headers["x-receipt-id"]), None)
+    check(outcome is not None and outcome["status"] == "failed", "its outcome is `failed`")
+    check(outcome["response_sha256"] == reply_digest(salt, content, reasoning, tools),
+          "and its reply digest matches the partial answer the client received")
+
+    step("6. The anchor leaves the gateway")
     total = len(read_log(replica))
     wait_for("the publisher to copy an anchor covering every entry",
              lambda: anchor_count(published / "anchor.jsonl") >= total and (published / "signing.pub").exists())
     check(True, f"published anchor covers all {total} entries; the public key was copied once")
     say("in production this copy lives where the gateway has no write access (a separate account or repository)")
 
-    step("6. An auditor checks the log with the unchanged Wicket verifier")
+    step("7. An auditor checks the log with the unchanged Wicket verifier")
     keys = published / "signing.pub"
     code, report = ickverify(args.verifier, replica / "receipts.jsonl", keys, published / "anchor.jsonl")
     first_lines(report)
@@ -260,7 +272,7 @@ def run(args: argparse.Namespace) -> None:
 
     work = Path(tempfile.mkdtemp(prefix="receipts-audit-"))
     try:
-        step("7. Editing a refusal into an allow is caught")
+        step("8. Editing a refusal into an allow is caught")
         raw_lines = (replica / "receipts.jsonl").read_text(encoding="utf-8").splitlines()
         index = max(i for i, line in enumerate(raw_lines) if '"verdict":"deny"' in line)
         edited = list(raw_lines)
@@ -270,7 +282,7 @@ def run(args: argparse.Namespace) -> None:
         first_lines(report, 2)
         check(code == 1, f"NOT VERIFIED: entry {index + 1} no longer matches its id")
 
-        step("8. Quietly deleting the newest receipts")
+        step("9. Quietly deleting the newest receipts")
         keep = len(raw_lines) - 3
         (work / "rolled-back.jsonl").write_text("\n".join(raw_lines[:keep]) + "\n", encoding="utf-8")
         local = [line for line in (replica / "anchor.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -288,8 +300,8 @@ def run(args: argparse.Namespace) -> None:
         shutil.rmtree(work, ignore_errors=True)
 
     print(f"\n{paint('1;32', 'All checks passed.')}")
-    print("What this shows: every model call, refusal and hold left a signed, chained receipt; the caller can")
-    print("prove which request and reply each one covers; edits are caught; and deleting the newest entries is")
+    print("What this shows: every model call, refusal, hold and failure left a signed, chained receipt; the")
+    print("caller can prove which request and reply each one covers; edits are caught; and deleting the newest entries is")
     print("caught as long as the anchor was copied somewhere the gateway cannot write.")
     print("What it does not show: that the model's answer was correct, or anything the gateway was never asked.")
 

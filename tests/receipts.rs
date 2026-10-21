@@ -1,5 +1,11 @@
-//! Receipts on the stream path: kernel verdicts, fail-closed, and the
-//! decision queue staying best-effort when receipts are off.
+//! Receipts end to end: kernel verdicts on both endpoints, what every
+//! failure path writes, fail-closed, and the decision queue staying
+//! best-effort when receipts are off.
+//!
+//! The mock provider picks its behaviour from the upstream model name:
+//! `mock-model` answers, `mock-refuse` returns 500 before streaming,
+//! `mock-break` sends "Hello" then an in-band error, and `mock-slow` sends
+//! "partial" and then nothing more (as a completion, nothing at all).
 
 use std::{
     net::SocketAddr,
@@ -13,13 +19,14 @@ use axum::{
     body::Body,
     extract::State,
     http::StatusCode,
-    response::Response,
+    response::{IntoResponse, Response},
     routing::post,
     Json, Router,
 };
+use futures_util::StreamExt;
 use llm_gateway::{
     governance::ledger::decisions::{Decision, DecisionKind, DECISION_QUEUE},
-    receipts::{ReceiptChain, ReplyDigest, Salt, request_digest},
+    receipts::{RawReplyDigest, ReceiptChain, ReplyDigest, Salt, request_digest},
 };
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -43,18 +50,50 @@ async fn mock_upstream() -> (SocketAddr, Mock) {
     (addr, state)
 }
 
-async fn handle(State(state): State<Mock>, Json(_body): Json<Value>) -> Response {
+async fn handle(State(state): State<Mock>, Json(body): Json<Value>) -> Response {
     state.calls.fetch_add(1, Ordering::SeqCst);
-    let frames = [
-        sse(r#"{"choices":[{"index":0,"delta":{"content":"Hello"}}]}"#),
-        sse(r#"{"choices":[{"index":0,"delta":{"content":", "}}]}"#),
-        sse(r#"{"choices":[{"index":0,"delta":{"content":"world"}}]}"#),
-        sse(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#),
-        "data: [DONE]\n\n".to_string(),
-    ];
-    let body = Body::from_stream(futures_util::stream::iter(frames.into_iter().map(|frame| {
-        Ok::<_, std::io::Error>(frame)
-    })));
+    let model = body["model"].as_str().unwrap_or_default().to_string();
+    if model == "mock-refuse" {
+        let mut response = Response::new(Body::from(r#"{"error":{"message":"refused"}}"#));
+        *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+        return response;
+    }
+    if body["stream"] != Value::Bool(true) {
+        if model == "mock-slow" {
+            std::future::pending::<()>().await;
+        }
+        return Json(serde_json::json!({
+            "id": "c1", "object": "chat.completion", "model": "mock-model",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "Hello, world"}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
+        }))
+        .into_response();
+    }
+    let frames: Vec<String> = match model.as_str() {
+        "mock-break" => vec![
+            sse(r#"{"choices":[{"index":0,"delta":{"content":"Hello"}}]}"#),
+            sse(r#"{"error":{"message":"boom"}}"#),
+        ],
+        "mock-slow" => vec![sse(r#"{"choices":[{"index":0,"delta":{"content":"partial"}}]}"#)],
+        _ => vec![
+            sse(r#"{"choices":[{"index":0,"delta":{"content":"Hello"}}]}"#),
+            sse(r#"{"choices":[{"index":0,"delta":{"content":", "}}]}"#),
+            sse(r#"{"choices":[{"index":0,"delta":{"content":"world"}}]}"#),
+            sse(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#),
+            "data: [DONE]\n\n".to_string(),
+        ],
+    };
+    let slow = model == "mock-slow";
+    let stream = futures_util::stream::iter(frames.into_iter().map(Ok::<_, std::io::Error>)).chain(
+        futures_util::stream::once(async move {
+            if slow {
+                std::future::pending::<()>().await;
+            }
+            Ok(String::new())
+        }),
+    );
+    let body = Body::from_stream(stream);
     let mut response = Response::new(body);
     response
         .headers_mut()
@@ -97,6 +136,33 @@ models:
     cost:
       input_per_mtok_usd: 1.0
       output_per_mtok_usd: 1.0
+  mock/refuse:
+    provider: nvidia
+    endpoint: http://{upstream}/v1/chat/completions
+    upstream_model: mock-refuse
+    default_params:
+      max_tokens: 64
+    cost:
+      input_per_mtok_usd: 1.0
+      output_per_mtok_usd: 1.0
+  mock/break:
+    provider: nvidia
+    endpoint: http://{upstream}/v1/chat/completions
+    upstream_model: mock-break
+    default_params:
+      max_tokens: 64
+    cost:
+      input_per_mtok_usd: 1.0
+      output_per_mtok_usd: 1.0
+  mock/slow:
+    provider: nvidia
+    endpoint: http://{upstream}/v1/chat/completions
+    upstream_model: mock-slow
+    default_params:
+      max_tokens: 64
+    cost:
+      input_per_mtok_usd: 1.0
+      output_per_mtok_usd: 1.0
   mock/held:
     provider: nvidia
     endpoint: http://{upstream}/v1/chat/completions
@@ -122,8 +188,8 @@ models:
 {holds_yaml}    credentials:
       - key_id: ak_test
         key: test-key-acme
-        scopes: [chat:stream]
-    allowed_models: ["mock/chat", "mock/held"]
+        scopes: [chat:stream, chat:complete]
+    allowed_models: ["mock/chat", "mock/held", "mock/refuse", "mock/break", "mock/slow"]
 "#
         );
         std::fs::write(dir.join("models.yaml"), models).unwrap();
@@ -156,14 +222,24 @@ models:
     }
 
     async fn post_with_headers(&self, body: &str) -> (StatusCode, reqwest::header::HeaderMap, String) {
-        let response = reqwest::Client::new()
-            .post(format!("http://{}/v1/chat/stream", self.addr))
+        self.request("/v1/chat/stream", body, &[]).await
+    }
+
+    async fn request(
+        &self,
+        path: &str,
+        body: &str,
+        extra: &[(&str, &str)],
+    ) -> (StatusCode, reqwest::header::HeaderMap, String) {
+        let mut builder = reqwest::Client::new()
+            .post(format!("http://{}{path}", self.addr))
             .header("x-api-key", "test-key-acme")
             .header("content-type", "application/json")
-            .body(body.to_string())
-            .send()
-            .await
-            .unwrap();
+            .body(body.to_string());
+        for (name, value) in extra {
+            builder = builder.header(*name, *value);
+        }
+        let response = builder.send().await.unwrap();
         let status = response.status();
         let headers = response.headers().clone();
         let text = response.text().await.unwrap();
@@ -311,4 +387,259 @@ async fn receipts_on_a_tenant_without_a_process_chain_refuses_to_boot() {
         Err(err) => assert!(err.to_string().contains("receipts"), "{err}"),
         Ok(_) => panic!("a tenant with receipts on must not boot without a process chain"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Every failure path, with receipts on
+// ---------------------------------------------------------------------------
+
+fn rows(gateway: &Gateway) -> Vec<Value> {
+    let chain = gateway.chain.as_ref().unwrap();
+    std::fs::read_to_string(chain.log_path())
+        .unwrap()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn salt_of(headers: &reqwest::header::HeaderMap) -> Salt {
+    Salt::from_hex(headers["x-receipt-salt"].to_str().unwrap()).expect("a salt header")
+}
+
+fn outcome_for<'a>(rows: &'a [Value], allow: &Value) -> Option<&'a Value> {
+    rows.iter().find(|row| row["decision_receipt_id"] == allow["receipt_id"])
+}
+
+fn assert_verifies(gateway: &Gateway) {
+    let chain = gateway.chain.as_ref().unwrap();
+    let Some(python) = llm_gateway::receipts::test_python() else {
+        return;
+    };
+    let out = std::process::Command::new(python)
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/vendor/wicket/verifier/ickverify.py"))
+        .arg(chain.log_path())
+        .arg("--trusted-keys")
+        .arg(chain.public_key_path())
+        .arg("--require-signatures")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+}
+
+#[tokio::test]
+async fn a_provider_refusal_closes_the_allow_with_a_failed_outcome_and_no_reply() {
+    let (upstream, _mock) = mock_upstream().await;
+    let gateway = Gateway::boot(upstream, true, true, false).await;
+    let (status, _, text) = gateway.post_with_headers(&stream_body("mock/refuse")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{text}");
+    let rows = rows(&gateway);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0]["verdict"], "allow");
+    let outcome = outcome_for(&rows, &rows[0]).expect("an outcome");
+    assert_eq!(outcome["status"], "failed");
+    assert!(outcome["response_sha256"].is_null(), "nothing came back, so no reply digest: {outcome}");
+    assert_verifies(&gateway);
+}
+
+#[tokio::test]
+async fn a_mid_stream_error_records_exactly_what_was_delivered() {
+    let (upstream, _mock) = mock_upstream().await;
+    let gateway = Gateway::boot(upstream, true, true, false).await;
+    let (status, headers, text) = gateway.post_with_headers(&stream_body("mock/break")).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    // The gateway's contract: an in-band `error` event, then the usual `end`.
+    assert!(text.contains("event: error"), "{text}");
+    let rows = rows(&gateway);
+    let outcome = outcome_for(&rows, &rows[0]).expect("an outcome");
+    assert_eq!(outcome["status"], "failed");
+    let mut delivered = ReplyDigest::new(salt_of(&headers));
+    delivered.content("Hello");
+    assert_eq!(outcome["response_sha256"], delivered.finish(), "the digest covers what the client got");
+    assert_verifies(&gateway);
+}
+
+#[tokio::test]
+async fn a_client_hanging_up_mid_stream_records_a_failed_outcome() {
+    let (upstream, _mock) = mock_upstream().await;
+    let gateway = Gateway::boot(upstream, true, true, false).await;
+    let body = stream_body("mock/slow");
+    let mut response = reqwest::Client::new()
+        .post(format!("http://{}/v1/chat/stream", gateway.addr))
+        .header("x-api-key", "test-key-acme")
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    let salt = salt_of(response.headers());
+    let mut seen = String::new();
+    while !seen.contains("partial") {
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(10), response.chunk())
+            .await
+            .expect("the first token arrives")
+            .unwrap()
+            .expect("the stream is open");
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    drop(response);
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let outcome = loop {
+        let rows = rows(&gateway);
+        if let Some(outcome) = outcome_for(&rows, &rows[0]) {
+            break outcome.clone();
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no outcome after the hang-up: {rows:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(outcome["status"], "failed");
+    let mut delivered = ReplyDigest::new(salt);
+    delivered.content("partial");
+    assert_eq!(outcome["response_sha256"], delivered.finish());
+    assert_verifies(&gateway);
+}
+
+#[tokio::test]
+async fn a_passthrough_digest_covers_the_raw_bytes_relayed() {
+    let (upstream, _mock) = mock_upstream().await;
+    let gateway = Gateway::boot(upstream, true, true, false).await;
+    let body = stream_body("mock/chat");
+    let (status, headers, text) =
+        gateway.request("/v1/chat/stream", &body, &[("x-gateway-framing", "passthrough")]).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let rows = rows(&gateway);
+    let outcome = outcome_for(&rows, &rows[0]).expect("an outcome");
+    assert_eq!(outcome["status"], "completed");
+    let mut raw = RawReplyDigest::new(&salt_of(&headers));
+    raw.update(text.as_bytes());
+    assert_eq!(outcome["response_sha256"], raw.finish());
+    assert_eq!(outcome["request_sha256"], request_digest(&salt_of(&headers), body.as_bytes()));
+}
+
+#[tokio::test]
+async fn a_stream_whose_outcome_cannot_be_written_ends_in_an_error_not_a_clean_end() {
+    let (upstream, mock) = mock_upstream().await;
+    let gateway = Gateway::boot(upstream, true, true, false).await;
+    let chain = gateway.chain.as_ref().unwrap();
+    chain.fail_appends_after(1, 1);
+    let (status, _, text) = gateway.post_with_headers(&stream_body("mock/chat")).await;
+    assert_eq!(status, StatusCode::OK, "headers were already out: {text}");
+    assert!(text.contains("receipt_unavailable"), "{text}");
+    assert!(!text.contains("event: end"), "no clean end without the outcome: {text}");
+    assert_eq!(chain.len(), 1, "the allow, and no outcome");
+    assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
+    // The test hook fails one write without a disk error, so the chain goes
+    // on; a real write error also stops the chain until restart.
+    let (status, _, _) = gateway.post_with_headers(&stream_body("mock/chat")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(chain.len(), 3, "the unanswered allow stays in the log as it is");
+    assert_verifies(&gateway);
+}
+
+// ---------------------------------------------------------------------------
+// /v1/chat/complete
+// ---------------------------------------------------------------------------
+
+fn complete_body(model: &str) -> String {
+    format!(r#"{{"model":"{model}","messages":[{{"role":"user","content":"{PROMPT}"}}],"params":{{"max_tokens":16}}}}"#)
+}
+
+#[tokio::test]
+async fn a_completion_gets_an_allow_and_an_outcome_the_caller_can_check() {
+    let (upstream, _mock) = mock_upstream().await;
+    let gateway = Gateway::boot(upstream, true, true, false).await;
+    let body = complete_body("mock/chat");
+    let (status, headers, text) = gateway.request("/v1/chat/complete", &body, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let answer: Value = serde_json::from_str(&text).unwrap();
+    let salt = salt_of(&headers);
+    let rows = rows(&gateway);
+    assert_eq!(rows[0]["verdict"], "allow");
+    assert_eq!(rows[0]["receipt_id"], headers["x-receipt-id"].to_str().unwrap());
+    assert_eq!(rows[0]["call_digest"], request_digest(&salt, body.as_bytes()));
+    let outcome = outcome_for(&rows, &rows[0]).expect("an outcome");
+    assert_eq!(outcome["status"], "completed");
+    // Recomputed from the JSON answer alone.
+    let mut reply = ReplyDigest::new(salt);
+    reply.content(answer["content"].as_str().unwrap());
+    reply.reasoning(answer["reasoning"].as_str().unwrap_or_default());
+    for (index, call) in answer["tool_calls"].as_array().unwrap().iter().enumerate() {
+        reply.tool(
+            index as u32,
+            call["id"].as_str(),
+            call["function"]["name"].as_str(),
+            call["function"]["arguments"].as_str(),
+        );
+    }
+    assert_eq!(outcome["response_sha256"], reply.finish());
+    assert!(!std::fs::read_to_string(gateway.chain.as_ref().unwrap().log_path()).unwrap().contains(PROMPT));
+
+    // A governance refusal on this endpoint is a deny too.
+    let (status, _, _) = gateway.request("/v1/chat/complete", &complete_body("mock/denied"), &[]).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let rows = self::rows(&gateway);
+    assert_eq!(rows.last().unwrap()["verdict"], "deny");
+    assert_verifies(&gateway);
+}
+
+#[tokio::test]
+async fn a_completion_refused_upstream_closes_with_a_failed_outcome() {
+    let (upstream, _mock) = mock_upstream().await;
+    let gateway = Gateway::boot(upstream, true, true, false).await;
+    let (status, _, text) = gateway.request("/v1/chat/complete", &complete_body("mock/refuse"), &[]).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{text}");
+    let rows = rows(&gateway);
+    let outcome = outcome_for(&rows, &rows[0]).expect("an outcome");
+    assert_eq!(outcome["status"], "failed");
+    assert!(outcome["response_sha256"].is_null());
+}
+
+#[tokio::test]
+async fn a_completion_whose_outcome_cannot_be_written_is_withheld_and_not_replayable() {
+    let (upstream, mock) = mock_upstream().await;
+    let gateway = Gateway::boot(upstream, true, true, false).await;
+    let chain = gateway.chain.as_ref().unwrap();
+    chain.fail_appends_after(1, 1);
+    let key = [("idempotency-key", "withheld-1")];
+    let (status, _, text) = gateway.request("/v1/chat/complete", &complete_body("mock/chat"), &key).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{text}");
+    assert!(text.contains("receipt_unavailable"), "{text}");
+    assert!(!text.contains("Hello"), "the answer is withheld: {text}");
+    assert_eq!(mock.calls.load(Ordering::SeqCst), 1, "the model did answer");
+
+    // The same key must not fetch the withheld answer from the ledger.
+    let (status, _, text) = gateway.request("/v1/chat/complete", &complete_body("mock/chat"), &key).await;
+    assert_ne!(status, StatusCode::OK, "{text}");
+    assert!(!text.contains("Hello"), "a retry must not replay what was withheld: {text}");
+}
+
+#[tokio::test]
+async fn a_client_hanging_up_on_a_pending_completion_leaves_the_allow_open() {
+    let (upstream, mock) = mock_upstream().await;
+    let gateway = Gateway::boot(upstream, true, true, false).await;
+    let url = format!("http://{}/v1/chat/complete", gateway.addr);
+    let pending = tokio::spawn(
+        reqwest::Client::new()
+            .post(url)
+            .header("x-api-key", "test-key-acme")
+            .header("content-type", "application/json")
+            .body(complete_body("mock/slow"))
+            .send(),
+    );
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while mock.calls.load(Ordering::SeqCst) == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "the provider never got the request");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    pending.abort();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let rows = rows(&gateway);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["verdict"], "allow");
+    assert!(
+        outcome_for(&rows, &rows[0]).is_none(),
+        "whether the provider finished is unknown, so no outcome is invented"
+    );
+    assert_verifies(&gateway);
 }

@@ -12,6 +12,12 @@
 //! unrecorded provider call, and an open reservation is billed in full once
 //! it is swept.
 //!
+//! With receipts on, the same kills must leave the receipt chain honest: the
+//! `allow` is durable before the provider call, so a kill leaves an allow
+//! with no outcome, which the verifier reports, and the restarted gateway
+//! verifies the chain and keeps appending to it. A write torn by the kill is
+//! quarantined on restart, never silently lost.
+//!
 //! Not covered: a kill after the answer completes but before its settlement
 //! is written. That window is milliseconds wide and cannot be hit on purpose.
 //! Its outcome is the same as the kills below (the reservation stays open and
@@ -105,10 +111,20 @@ async fn start_provider(behaviour: Provider) -> (SocketAddr, Arc<AtomicU64>) {
 /// from it, as a host's disk is.
 struct Install {
     dir: PathBuf,
+    receipts: bool,
 }
 
 impl Install {
     fn new(provider: SocketAddr) -> Self {
+        Self::build(provider, false)
+    }
+
+    /// The same install with the receipt chain on for the tenant.
+    fn with_receipts(provider: SocketAddr) -> Self {
+        Self::build(provider, true)
+    }
+
+    fn build(provider: SocketAddr, receipts: bool) -> Self {
         let dir = std::env::temp_dir().join(format!("llm-gateway-crash-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         // The shipped config, so the binary runs exactly as installed; the
@@ -124,10 +140,42 @@ impl Install {
         .unwrap();
         std::fs::write(
             dir.join("tenants.yaml"),
-            "tenants:\n  - tenant_id: acme\n    enabled: true\n    credentials:\n      - key_id: ak_app\n        key: key-app\n        scopes: [chat:stream]\n    allowed_models: [\"mock/*\"]\n    limits:\n      requests_per_minute: 1000\n      tokens_per_minute: 10000000\n      max_concurrent_streams: 16\n      max_output_tokens: 4096\n      daily_budget_nano_usd: 100000000000\n",
+            format!("tenants:\n  - tenant_id: acme\n    enabled: true\n    receipts: {receipts}\n    credentials:\n      - key_id: ak_app\n        key: key-app\n        scopes: [chat:stream]\n    allowed_models: [\"mock/*\"]\n    limits:\n      requests_per_minute: 1000\n      tokens_per_minute: 10000000\n      max_concurrent_streams: 16\n      max_output_tokens: 4096\n      daily_budget_nano_usd: 100000000000\n"),
         )
         .unwrap();
-        Self { dir }
+        Self { dir, receipts }
+    }
+
+    fn receipts_dir(&self) -> PathBuf {
+        self.dir.join("receipts")
+    }
+
+    /// The receipt log, read directly, one JSON value per entry.
+    fn receipts(&self) -> Vec<Value> {
+        std::fs::read_to_string(self.receipts_dir().join("receipts.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// The unchanged Wicket verifier over the replica's log, key and anchor.
+    /// `None` when there is no python outside CI.
+    fn ickverify(&self) -> Option<(i32, String)> {
+        let python = llm_gateway::receipts::test_python()?;
+        let dir = self.receipts_dir();
+        let out = Command::new(python)
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/wicket/verifier/ickverify.py"))
+            .arg(dir.join("receipts.jsonl"))
+            .arg("--anchor")
+            .arg(dir.join("anchor.jsonl"))
+            .arg("--trusted-keys")
+            .arg(dir.join("signing.pub"))
+            .arg("--require-signatures")
+            .output()
+            .expect("run ickverify.py");
+        Some((out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned()))
     }
 
     /// Start `llm-gateway` from this install and wait until it is ready.
@@ -149,6 +197,9 @@ impl Install {
             .env("LLM_GATEWAY__LEDGER__SWEEP_INTERVAL_SECS", "1")
             .env("LLM_GATEWAY__LEDGER__TIMEOUT_MS", "5000")
             .env("LLM_GATEWAY__TELEMETRY__LOG_FILTER", "warn")
+            .env("LLM_GATEWAY__RECEIPTS__ENABLED", self.receipts.to_string())
+            .env("LLM_GATEWAY__RECEIPTS__DIRECTORY", self.receipts_dir())
+            .env("LLM_GATEWAY__RECEIPTS__ANCHOR_INTERVAL_SECS", "1")
             .env("RUST_BACKTRACE", "1")
             // Its logs (stdout) and any panic (stderr) are kept, and shown if
             // the test fails: a gateway that errors mid-test is otherwise
@@ -227,10 +278,14 @@ impl Process {
     }
 
     fn chat(&self, idempotency_key: Option<&str>) -> reqwest::RequestBuilder {
+        self.chat_model("mock/chat", idempotency_key)
+    }
+
+    fn chat_model(&self, model: &str, idempotency_key: Option<&str>) -> reqwest::RequestBuilder {
         let mut request = reqwest::Client::new()
             .post(format!("{}/v1/chat/stream", self.base))
             .header("x-api-key", "key-app")
-            .json(&json!({ "model": "mock/chat", "messages": [{ "role": "user", "content": "hi" }] }));
+            .json(&json!({ "model": model, "messages": [{ "role": "user", "content": "hi" }] }));
         if let Some(key) = idempotency_key {
             request = request.header("idempotency-key", key);
         }
@@ -369,4 +424,107 @@ async fn a_retry_across_a_kill_is_never_executed_twice() {
     let body: Value = after.json().await.unwrap();
     assert_eq!(body["error"]["code"], "duplicate_request", "{body}");
     assert_eq!(calls.load(Ordering::SeqCst), 1, "executed exactly once across the crash");
+}
+
+// ---------------------------------------------------------------------------
+// Kill points, with receipts on
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_kill_after_the_allow_leaves_it_without_an_outcome_and_the_chain_continues() {
+    let (provider, calls) = start_provider(Provider::Silent).await;
+    let install = Install::with_receipts(provider);
+    let gw = install.start().await;
+
+    let pending = tokio::spawn(gw.chat(None).send());
+    until("the provider has the request", || calls.load(Ordering::SeqCst) == 1).await;
+    gw.kill();
+    pending.abort();
+
+    let entries = install.receipts();
+    assert_eq!(entries.len(), 1, "the allow was durable before the call: {entries:?}");
+    assert_eq!(entries[0]["verdict"], "allow");
+
+    // The restarted gateway verifies the chain and appends to it.
+    let restarted = install.start().await;
+    let refused = restarted.chat_model("other/model", None).send().await.unwrap();
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    let entries = install.receipts();
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    assert_eq!(entries[1]["verdict"], "deny");
+    assert_eq!(entries[1]["previous_receipt_hash"], entries[0]["receipt_id"]);
+    assert!(
+        entries.iter().all(|e| e.get("decision_receipt_id").is_none()),
+        "no outcome was invented for the killed call"
+    );
+    if let Some((code, report)) = install.ickverify() {
+        assert_eq!(code, 0, "{report}");
+        assert!(report.contains("1 allowed calls have no outcome"), "the verifier names the gap: {report}");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "never re-executed");
+}
+
+#[tokio::test]
+async fn a_kill_mid_stream_leaves_an_allow_without_an_outcome() {
+    let (provider, _calls) = start_provider(Provider::StallsAfterFirstToken).await;
+    let install = Install::with_receipts(provider);
+    let gw = install.start().await;
+
+    let mut response = gw.chat(None).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut seen = String::new();
+    while !seen.contains("partial") {
+        let chunk = tokio::time::timeout(Duration::from_secs(10), response.chunk())
+            .await
+            .expect("the first token arrives")
+            .unwrap()
+            .expect("the stream is open");
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    gw.kill();
+    drop(response);
+
+    let _restarted = install.start().await;
+    let entries = install.receipts();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0]["verdict"], "allow");
+    if let Some((code, report)) = install.ickverify() {
+        assert_eq!(code, 0, "{report}");
+        assert!(report.contains("1 allowed calls have no outcome"), "{report}");
+    }
+}
+
+#[tokio::test]
+async fn a_write_torn_by_a_kill_is_quarantined_on_restart_and_the_rest_verifies() {
+    let (provider, calls) = start_provider(Provider::Silent).await;
+    let install = Install::with_receipts(provider);
+    let gw = install.start().await;
+    let pending = tokio::spawn(gw.chat(None).send());
+    until("the provider has the request", || calls.load(Ordering::SeqCst) == 1).await;
+    gw.kill();
+    pending.abort();
+
+    // What a kill in the middle of the next write leaves: the start of an
+    // entry with no end.
+    let log = install.receipts_dir().join("receipts.jsonl");
+    let committed = std::fs::read(&log).unwrap();
+    let fragment = br#"{"version":"infinity.outcome.v1","receipt_id":"receipt:sha3-256:00"#;
+    std::fs::write(&log, [committed.as_slice(), fragment].concat()).unwrap();
+
+    let restarted = install.start().await;
+    assert_eq!(std::fs::read(&log).unwrap(), committed, "only the fragment was cut");
+    let quarantine: Vec<_> = std::fs::read_dir(install.receipts_dir().join("quarantine"))
+        .expect("a quarantine folder")
+        .map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
+        .collect();
+    assert_eq!(quarantine, vec![fragment.to_vec()], "the fragment is kept, not destroyed");
+    let recovery = std::fs::read_to_string(install.receipts_dir().join("recovery.jsonl")).unwrap();
+    assert_eq!(recovery.lines().count(), 1, "{recovery}");
+
+    let refused = restarted.chat_model("other/model", None).send().await.unwrap();
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    assert_eq!(install.receipts().len(), 2);
+    if let Some((code, report)) = install.ickverify() {
+        assert_eq!(code, 0, "{report}");
+    }
 }

@@ -503,15 +503,32 @@ directory is refused at startup: the process holds a lock on
 log stays readable by `ickverify.py` and backups while the gateway runs,
 on Windows too.
 
-**What gets a receipt**, on `POST /v1/chat/stream` only, and only for a tenant
-with `receipts: true`:
+**What gets a receipt**, on `POST /v1/chat/stream` and `POST /v1/chat/complete`,
+for a tenant with `receipts: true`:
 
 | Gateway event | Kernel verdict |
 |---|---|
 | Reservation (the request is admitted) | `allow` |
 | Governance refusal: `402` budget, `403` not allowed, `429` rate or concurrency | `deny` |
 | Approval hold (`202`) | `await_human_approval` |
-| Stream end | `outcome` (`completed` or `failed`) |
+| The answer ends, one way or another (below) | `outcome` (`completed` or `failed`) |
+
+**How each ending is recorded.** Every one of these is tested end to end:
+
+| What happened | Outcome | Reply digest |
+|---|---|---|
+| Answer delivered in full | `completed` | of the whole answer |
+| Provider refused before answering (`502`) | `failed` | none: nothing came back |
+| Provider failed part-way (stream gets an `error` event, then `end`) | `failed` | of exactly what the client received |
+| Client hung up mid-stream | `failed` | of what was produced before the hang-up |
+| Client hung up while a completion was pending | none: the `allow` stays open | — |
+| Gateway killed after the `allow` | none: the `allow` stays open | — |
+
+An `allow` with no outcome means the gateway cannot say how the call ended,
+and the log says exactly that: `ickverify.py` reports "N allowed calls have no
+outcome". A repeat of a finished completion under the same `Idempotency-Key`
+is served from the ledger without calling the model and writes nothing new;
+the original `allow` and outcome cover it.
 
 A malformed or oversized body (`400`, `413`), a duplicate (`409`), a
 mismatched resubmission (`422`) and an unauthenticated request (`401`) are
@@ -545,16 +562,21 @@ raw reply (passthrough)
 concatenated. `tools` is, for each tool index in ascending order, the index
 in decimal, then `0x1F id 0x1F name 0x1F arguments 0x1E`, where `name` and
 `arguments` are that index's deltas concatenated and `id` is the first
-non-empty id sent for it. The `allow` carries the request digest as
-`call_digest`; the outcome carries both. Each is written `sha256:<hex>`.
+non-empty id sent for it. For `/v1/chat/complete`, the same pieces come from
+the JSON answer: `content`, `reasoning` (empty if null), and `tool_calls` with
+each call's position in the array as its index. The `allow` carries the
+request digest as `call_digest`; the outcome carries both. Each is written
+`sha256:<hex>`.
 
 **Fail closed when receipts are on.** If the `allow` cannot be written, the
 reservation is released, the model is not called, and the caller gets `503`
 `receipt_unavailable`. If the closing outcome cannot be written, a normalized
 stream ends with an `error` event instead of `end`, and a passthrough stream
 ends with an error instead of a clean close: the text already sent cannot be
-recalled, and the log shows an `allow` without an outcome. A `deny` that
-cannot be written turns the refusal into a `503`. After any failed write the
+recalled, and the log shows an `allow` without an outcome. A completion
+whose outcome cannot be written is withheld (`503`) and is not kept for an
+idempotent replay, so a retry cannot fetch it; the provider's usage is still
+billed. A `deny` that cannot be written turns the refusal into a `503`. After any failed write the
 chain stops, and every request that needs a receipt gets `503` until the
 process restarts and the log verifies. There is no fail-open switch. Tenants
 with `receipts: false` (the default) are unchanged: a full decision queue
@@ -581,6 +603,24 @@ one chain whose first entry has no predecessor, so startup verification grows
 with the log (about 0.17 ms per entry measured, about three minutes per
 million entries). Archive the directory and start a new one, with a new key
 listed in your trusted keys, before that matters.
+
+**After a crash.** A kill can interrupt a write, leaving the log or the anchor
+file ending part-way through a line. Startup handles that by one fixed rule,
+and refuses to start in every other case:
+
+- Only an unterminated last line is considered. A file ending in a newline is
+  never changed; a complete line that does not verify refuses to start.
+- That fragment was never acknowledged: the writer answers only after the
+  whole batch, newlines included, is on disk, and anchors cover only entries
+  read back complete.
+- A fragment that parses as a whole JSON record is not removed (it could be a
+  committed entry that lost only its newline): startup refuses.
+- If an anchor counts more entries than are complete on disk, an anchored
+  entry is damaged: startup refuses without changing anything.
+- Nothing is deleted. The fragment is moved to
+  `quarantine/<file>.<hash>.fragment`, and `recovery.jsonl` records the file,
+  the bytes kept, and the fragment's size, hash and quarantine name, before
+  the file is cut. Running it again changes nothing and records nothing twice.
 
 ```bash
 python3 vendor/wicket/verifier/ickverify.py \

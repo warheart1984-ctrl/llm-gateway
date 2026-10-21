@@ -30,13 +30,16 @@ fails.
    `reason_codes ["EXTERNAL_DENY", "BUDGET_EXHAUSTED"]`.
 4. **A held request is recorded.** A model that needs a person's approval
    gets `202`, no model call, and an `await_human_approval` receipt.
-5. **The anchor leaves the gateway.** The publisher copies the anchor and the
+5. **A failure part-way through is recorded.** A model that fails after a
+   few words gets a `failed` outcome whose reply digest matches exactly the
+   partial answer the client received.
+6. **The anchor leaves the gateway.** The publisher copies the anchor and the
    public key out.
-6. **The unchanged Wicket verifier says `VERIFIED`** for the log against the
+7. **The unchanged Wicket verifier says `VERIFIED`** for the log against the
    published anchor and key.
-7. **An edited refusal is caught.** A copy of the log with one `deny` turned
+8. **An edited refusal is caught.** A copy of the log with one `deny` turned
    into `allow` is `NOT VERIFIED`.
-8. **A quiet deletion is caught, but only by the published anchor.** A copy
+9. **A quiet deletion is caught, but only by the published anchor.** A copy
    with the newest three entries removed, checked against equally doctored
    local anchors, still verifies. Checked against the published anchor, it is
    `NOT VERIFIED`: the log is shorter than what was anchored.

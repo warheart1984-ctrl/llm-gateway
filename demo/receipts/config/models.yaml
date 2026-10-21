@@ -26,3 +26,15 @@ models:
       input_per_mtok_usd: 2.0
       output_per_mtok_usd: 8.0
     max_output_tokens: 1024
+
+  mock/broken:
+    provider: nvidia
+    display_name: Mock model that fails part-way through
+    endpoint: http://mock:9000/v1/chat/completions
+    upstream_model: mock-broken
+    default_params:
+      max_tokens: 64
+    cost:
+      input_per_mtok_usd: 2.0
+      output_per_mtok_usd: 8.0
+    max_output_tokens: 1024
