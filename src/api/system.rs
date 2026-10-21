@@ -168,6 +168,11 @@ pub async fn list_models(
         .ok_or(ApiError::TenantUnknown)?;
     let snapshot = Arc::clone(&generation.models);
 
+    let created = snapshot
+        .loaded_at
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let mut models: Vec<_> = snapshot
         .ids()
         .into_iter()
@@ -181,6 +186,9 @@ pub async fn list_models(
             }
             Some(json!({
                 "id": id,
+                "object": "model",
+                "created": created,
+                "owned_by": cfg.provider,
                 "display_name": cfg.display_name,
                 "provider": cfg.provider,
                 "upstream_model": cfg.upstream_model_name(id),
