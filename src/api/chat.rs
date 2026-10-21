@@ -524,11 +524,8 @@ fn tenant_chain(
     if !wants {
         return Ok(None);
     }
-    state
-        .receipts
-        .clone()
-        .map(Some)
-        .ok_or(RequestError::ReceiptUnavailable)
+    let book = state.receipts.as_ref().ok_or(RequestError::ReceiptUnavailable)?;
+    book.chain(tenant_id).map(Some).map_err(|_| RequestError::ReceiptUnavailable)
 }
 
 /// Governance refusals a receipt records as a kernel `deny`: out of budget
@@ -797,7 +794,8 @@ async fn admit(
         Value::Null
     };
     let chain = if decision.tenant.receipts {
-        Some(state.receipts.clone().ok_or(RequestError::ReceiptUnavailable)?)
+        let book = state.receipts.as_ref().ok_or(RequestError::ReceiptUnavailable)?;
+        Some(book.chain(&principal.tenant_id).map_err(|_| RequestError::ReceiptUnavailable)?)
     } else {
         None
     };

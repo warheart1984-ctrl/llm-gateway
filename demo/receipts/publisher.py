@@ -11,7 +11,10 @@ It never rewrites what it already published. If the replica's anchor file
 stops starting with what was published, or its key changes, it says so and
 keeps the published copy as it is: that copy is the evidence.
 
-    python publisher.py --source <replica receipts dir> --dest <published dir>
+    python publisher.py --source <replica receipts root> --dest <published dir>
+
+Each tenant's chain is a folder under the replica's receipts root, and is
+published to the folder of the same name under `--dest`.
 
 Standard library only.
 """
@@ -75,18 +78,39 @@ class Publisher:
         new = theirs[len(mine):]
         if new:
             append(self.dest / "anchor.jsonl", new)
-            print(f"publisher: published {len(new)} anchor line(s), {len(mine) + len(new)} in total", flush=True)
+            print(f"publisher: {self.source.name}: published {len(new)} anchor line(s), {len(mine) + len(new)} in total", flush=True)
         return len(new)
+
+
+class Replica:
+    """One publisher per tenant folder, found as tenants appear."""
+
+    def __init__(self, source: Path, dest: Path) -> None:
+        self.source = source
+        self.dest = dest
+        self.tenants: dict[str, Publisher] = {}
+
+    def sync(self) -> int:
+        added = 0
+        if self.source.is_dir():
+            for folder in sorted(self.source.iterdir()):
+                if not folder.is_dir() or not ((folder / "signing.pub").exists() or (folder / "anchor.jsonl").exists()):
+                    continue
+                if folder.name not in self.tenants:
+                    self.tenants[folder.name] = Publisher(folder, self.dest / folder.name)
+                    print(f"publisher: publishing tenant {folder.name}", flush=True)
+                added += self.tenants[folder.name].sync()
+        return added
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--source", type=Path, required=True, help="the replica's receipts directory (read only)")
+    parser.add_argument("--source", type=Path, required=True, help="the replica's receipts root (read only)")
     parser.add_argument("--dest", type=Path, required=True, help="where published anchors are kept")
     parser.add_argument("--interval", type=float, default=0.5, help="seconds between checks")
     parser.add_argument("--once", action="store_true", help="publish once and exit")
     args = parser.parse_args(argv)
-    publisher = Publisher(args.source, args.dest)
+    publisher = Replica(args.source, args.dest)
     print(f"publisher: watching {args.source}, publishing to {args.dest}", flush=True)
     while True:
         publisher.sync()

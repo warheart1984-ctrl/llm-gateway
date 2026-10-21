@@ -95,6 +95,7 @@ data: [DONE]
 | `GET` | `/v1/models` | Catalogue, filtered to the caller's allowlist |
 | `GET` | `/v1/usage` | Caller's own quota and spend |
 | `GET` | `/v1/holds/{id}` | A held request's state, for the tenant that made it |
+| `GET` | `/v1/receipts/log`, `/anchor`, `/key` | The caller's own tenant's receipt evidence (`receipts:read`) |
 | `POST` | `/v1/admin/registry/reload` | Re-read `models.yaml` / `tenants.yaml` (admin scope) |
 | `GET` | `/v1/admin/decisions` | The decision record (admin scope) |
 | `GET` | `/v1/admin/holds` | Held requests; `?state=pending` is the approval queue (`approve:holds` or admin) |
@@ -494,14 +495,29 @@ kernel's. Nothing new is added to them. The verifier is the unchanged
 `vendor/wicket/verifier/ickverify.py` from
 `warheart1984-ctrl/Wicket` commit `bcb0e23f386af61345adb0b1cc9ce72999c6307f`.
 
-**One chain per process.** Each replica has its own Ed25519 key
-(`signing.priv`, mode 0600 on Unix), its own `receipts.jsonl`, and its own
-`anchor.jsonl`, all under `[receipts] directory`. The public key is
-`signing.pub` next to the log. A second process pointed at the same
-directory is refused at startup: the process holds a lock on
-`receipts.lock` for as long as it runs. The lock is on its own file, so the
-log stays readable by `ickverify.py` and backups while the gateway runs,
-on Windows too.
+**One chain per tenant, per replica.** Each tenant with receipts on has its
+own folder, `<[receipts] directory>/<tenant_id>/`, with its own
+`receipts.jsonl`, `anchor.jsonl`, Ed25519 key (`signing.priv`, mode 0600 on
+Unix; `signing.pub` next to it) and lock. A tenant's evidence is complete on
+its own: it can be handed to that customer, and checked, with nothing of any
+other tenant in it, not their entries, key ids or traffic. Every tenant's
+chain is verified at startup; one added by a reload is opened and verified on
+its first request. A tenant id becomes a folder name only if it is 1 to 64
+letters, digits, `.`, `_` or `-`, starting with a letter or digit; otherwise
+its requests get `503 receipt_unavailable`. The replica holds `replica.lock`
+in the root, so a second process pointed at the same root is refused. Locks
+are on their own files, so logs stay readable while the gateway runs, on
+Windows too. A shared chain left in the root by an earlier version is no
+longer written; the gateway warns at startup until it is archived.
+
+**A tenant downloads its own evidence.** `GET /v1/receipts/log`,
+`/v1/receipts/anchor` and `/v1/receipts/key` return the caller's tenant's
+files as stored, up to their last complete line, for a credential with the
+`receipts:read` scope. The tenant comes from the credential, never from the
+request, so no request can name another tenant's files. A tenant without
+receipts gets `404 receipts_not_enabled`. The key served here is only as
+trustworthy as where it came from: compare it with the copy published at
+first sight (below).
 
 **What gets a receipt**, on `POST /v1/chat/stream` and `POST /v1/chat/complete`,
 for a tenant with `receipts: true`:
@@ -624,9 +640,9 @@ and refuses to start in every other case:
 
 ```bash
 python3 vendor/wicket/verifier/ickverify.py \
-  /var/lib/llm-gateway/receipts/receipts.jsonl \
-  --anchor /var/lib/llm-gateway/receipts/anchor.jsonl \
-  --trusted-keys /var/lib/llm-gateway/receipts/signing.pub \
+  /var/lib/llm-gateway/receipts/acme/receipts.jsonl \
+  --anchor /var/lib/llm-gateway/receipts/acme/anchor.jsonl \
+  --trusted-keys /var/lib/llm-gateway/receipts/acme/signing.pub \
   --require-signatures
 ```
 

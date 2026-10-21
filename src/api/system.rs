@@ -784,3 +784,73 @@ mod tests {
 
 
 
+
+// ---------------------------------------------------------------------------
+// Receipt evidence, for the tenant it belongs to
+// ---------------------------------------------------------------------------
+
+/// Which evidence file a tenant asked for.
+#[derive(Clone, Copy)]
+enum Evidence {
+    Log,
+    Anchor,
+    Key,
+}
+
+/// `GET /v1/receipts/{log,anchor,key}`: this tenant's own chain on this
+/// replica, as stored, so the tenant can check it with `ickverify.py` without
+/// asking the operator. Only the caller's tenant is ever read: the path comes
+/// from the authenticated credential, never from the request. Needs
+/// `receipts:read`. The log and anchor stop at their last complete line.
+///
+/// A replica's public key is only worth trusting if it came from somewhere
+/// the operator cannot change; compare this one with the published copy.
+async fn evidence(state: &Arc<AppState>, headers: &axum::http::HeaderMap, what: Evidence) -> Result<Response, ApiError> {
+    let principal = caller(state, headers).await?;
+    if !principal.has_scope(crate::governance::auth::SCOPE_RECEIPTS_READ) {
+        return Err(ApiError::Forbidden("this credential lacks the receipts:read scope"));
+    }
+    let not_on = || ApiError::Refused {
+        status: StatusCode::NOT_FOUND,
+        code: "receipts_not_enabled",
+        message: "this tenant does not have receipts on".to_string(),
+    };
+    let wants = state.current_tenants().get(&principal.tenant_id).is_some_and(|t| t.receipts);
+    let book = state.receipts.as_ref().filter(|_| wants).ok_or_else(not_on)?;
+    let chain = book.chain(&principal.tenant_id).map_err(|_| ApiError::Refused {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "receipt_unavailable",
+        message: "this tenant's receipt chain could not be opened".to_string(),
+    })?;
+    let (path, content_type) = match what {
+        Evidence::Log => (chain.log_path().to_path_buf(), "application/x-ndjson"),
+        Evidence::Anchor => (chain.anchor_path().to_path_buf(), "application/x-ndjson"),
+        Evidence::Key => (chain.public_key_path().to_path_buf(), "text/plain; charset=utf-8"),
+    };
+    let body = crate::receipts::complete_lines_of(&path).map_err(|_| ApiError::Refused {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "receipt_unavailable",
+        message: "the receipt file could not be read".to_string(),
+    })?;
+    let mut response = (StatusCode::OK, body).into_response();
+    let h = response.headers_mut();
+    h.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    h.insert(axum::http::header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if let Ok(value) = HeaderValue::from_str(chain.key_id()) {
+        h.insert("x-receipt-key-id", value);
+    }
+    h.insert("x-receipt-entries", HeaderValue::from(chain.len()));
+    Ok(response)
+}
+
+pub async fn receipt_log(State(state): State<Arc<AppState>>, headers: axum::http::HeaderMap) -> Result<Response, ApiError> {
+    evidence(&state, &headers, Evidence::Log).await
+}
+
+pub async fn receipt_anchor(State(state): State<Arc<AppState>>, headers: axum::http::HeaderMap) -> Result<Response, ApiError> {
+    evidence(&state, &headers, Evidence::Anchor).await
+}
+
+pub async fn receipt_key(State(state): State<Arc<AppState>>, headers: axum::http::HeaderMap) -> Result<Response, ApiError> {
+    evidence(&state, &headers, Evidence::Key).await
+}

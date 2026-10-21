@@ -146,8 +146,14 @@ impl Install {
         Self { dir, receipts }
     }
 
-    fn receipts_dir(&self) -> PathBuf {
+    /// The replica's receipts root; each tenant's chain is a folder in it.
+    fn receipts_root(&self) -> PathBuf {
         self.dir.join("receipts")
+    }
+
+    /// Tenant `acme`'s chain.
+    fn receipts_dir(&self) -> PathBuf {
+        self.receipts_root().join("acme")
     }
 
     /// The receipt log, read directly, one JSON value per entry.
@@ -198,7 +204,7 @@ impl Install {
             .env("LLM_GATEWAY__LEDGER__TIMEOUT_MS", "5000")
             .env("LLM_GATEWAY__TELEMETRY__LOG_FILTER", "warn")
             .env("LLM_GATEWAY__RECEIPTS__ENABLED", self.receipts.to_string())
-            .env("LLM_GATEWAY__RECEIPTS__DIRECTORY", self.receipts_dir())
+            .env("LLM_GATEWAY__RECEIPTS__DIRECTORY", self.receipts_root())
             .env("LLM_GATEWAY__RECEIPTS__ANCHOR_INTERVAL_SECS", "1")
             .env("RUST_BACKTRACE", "1")
             // Its logs (stdout) and any panic (stderr) are kept, and shown if

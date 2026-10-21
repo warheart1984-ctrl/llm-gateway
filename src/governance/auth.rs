@@ -28,6 +28,8 @@ pub const SCOPE_ADMIN: &str = "admin";
 /// Approve or deny held requests. Granted only by name: see
 /// [`Principal::has_explicit_scope`].
 pub const SCOPE_APPROVE_HOLDS: &str = "approve:holds";
+/// Download this tenant's own receipt evidence (`/v1/receipts/*`).
+pub const SCOPE_RECEIPTS_READ: &str = "receipts:read";
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {

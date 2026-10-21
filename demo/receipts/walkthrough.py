@@ -3,10 +3,11 @@
 It plays a client and then an auditor. Every step says what it shows and
 checks it; a failed check exits non-zero, which is what CI keys off.
 
-    python walkthrough.py --gateway URL --gateway-dir DIR --published-dir DIR --verifier ickverify.py
+    python walkthrough.py --gateway URL --published-dir DIR --verifier ickverify.py
 
-`--gateway-dir` is the replica's receipts directory (read only here).
-`--published-dir` is where the publisher copies anchors and the public key.
+Each tenant has its own receipt chain. The client reads its tenant's evidence
+the way a customer would, from `GET /v1/receipts/{log,anchor,key}`, and checks
+it against what the publisher copied to `--published-dir/<tenant>/`.
 Keys come from RECEIPTS_DEMO_KEY and RECEIPTS_SHOESTRING_KEY.
 
 Standard library only. The digest recipes are the ones in the README.
@@ -136,11 +137,15 @@ def parse_sse(text: str) -> tuple[str, str, dict[int, dict[str, str]], list[str]
 
 # ---- the log, as an auditor sees it -----------------------------------------------------------
 
-def read_log(directory: Path) -> list[dict]:
-    path = directory / "receipts.jsonl"
-    if not path.exists():
-        return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+def evidence(gateway: str, key: str, what: str) -> bytes:
+    """This tenant's own `log`, `anchor` or `key`, from the gateway's API."""
+    request = urllib.request.Request(f"{gateway}/v1/receipts/{what}", headers={"x-api-key": key})
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return response.read()
+
+
+def parse_log(raw: bytes) -> list[dict]:
+    return [json.loads(line) for line in raw.decode().splitlines() if line.strip()]
 
 
 def anchor_count(path: Path) -> int:
@@ -176,7 +181,6 @@ def first_lines(text: str, n: int = 3) -> None:
 
 def run(args: argparse.Namespace) -> None:
     gateway = args.gateway.rstrip("/")
-    replica = args.gateway_dir
     published = args.published_dir
     demo_key = os.environ["RECEIPTS_DEMO_KEY"]
     shoestring_key = os.environ["RECEIPTS_SHOESTRING_KEY"]
@@ -204,10 +208,14 @@ def run(args: argparse.Namespace) -> None:
     check(len(salt_hex) == 64, "x-receipt-salt: 32 random bytes, given only to this caller")
     salt = bytes.fromhex(salt_hex)
 
-    log = read_log(replica)
+    def log_of(key: str) -> list[dict]:
+        return parse_log(evidence(gateway, key, "log"))
+
+    log = log_of(demo_key)
     by_id = {entry["receipt_id"]: entry for entry in log}
     allow = by_id.get(receipt_id)
-    check(allow is not None and allow.get("verdict") == "allow", "the log has that allow receipt, signed by this replica")
+    check(allow is not None and allow.get("verdict") == "allow",
+          "the tenant's log (fetched from GET /v1/receipts/log) has that allow receipt")
     outcome = next((e for e in log if e.get("decision_receipt_id") == receipt_id), None)
     check(outcome is not None and outcome["status"] == "completed", "and an outcome that closes it: completed")
 
@@ -217,13 +225,13 @@ def run(args: argparse.Namespace) -> None:
     check(outcome["request_sha256"] == mine, "and the outcome")
     theirs = reply_digest(salt, content, reasoning, tools)
     check(outcome["response_sha256"] == theirs, "reply digest recomputed from the stream received matches the outcome")
-    raw = (replica / "receipts.jsonl").read_text(encoding="utf-8")
+    raw = evidence(gateway, demo_key, "log").decode()
     check(PROMPT not in raw and ANSWER_FRAGMENT not in raw, "the log holds neither the prompt nor the answer")
     plain = "sha256:" + hashlib.sha256(body).hexdigest()
     check(plain not in raw, "nor a plain hash of the prompt: without the salt, a guess cannot be tested against it")
 
     step("3. A refusal is recorded with its reason")
-    before = len(read_log(replica))
+    before = len(log_of(shoestring_key))
     refusal = None
     for attempt in range(1, 30):
         status, _, text = post(gateway, shoestring_key, chat_body("mock/chat"))
@@ -233,16 +241,16 @@ def run(args: argparse.Namespace) -> None:
             break
         check(status == 200, f"request {attempt}: 200 (within budget)")
     check(refusal == "budget_exhausted", "the tiny budget ran out: 402 before the model was called")
-    newest = read_log(replica)[-1]
-    check(newest.get("verdict") == "deny", "the newest receipt is a deny")
+    newest = log_of(shoestring_key)[-1]
+    check(newest.get("verdict") == "deny", "the newest receipt in shoestring's own chain is a deny")
     check(newest.get("reason_codes") == ["EXTERNAL_DENY", "BUDGET_EXHAUSTED"],
           f"reason_codes {newest.get('reason_codes')}: decided by the gateway, and why")
-    say(f"{len(read_log(replica)) - before} receipts for this tenant's requests, refusal included")
+    say(f"{len(log_of(shoestring_key)) - before} receipts for this tenant's requests, refusal included")
 
     step("4. A request that needs a person waits, and that is recorded too")
     status, headers, text = post(gateway, demo_key, chat_body("mock/approval"))
     check(status == 202, f"HTTP {status}: held for approval, model not called")
-    newest = read_log(replica)[-1]
+    newest = log_of(demo_key)[-1]
     check(newest.get("verdict") == "await_human_approval", "the newest receipt is await_human_approval")
 
     step("5. A failure part-way through is recorded with exactly what the client got")
@@ -251,41 +259,60 @@ def run(args: argparse.Namespace) -> None:
     content, reasoning, tools, events = parse_sse(text)
     check("error" in events, f"then an `error` event after: {content!r}")
     salt = bytes.fromhex(headers["x-receipt-salt"])
-    log = read_log(replica)
+    log = log_of(demo_key)
     outcome = next((e for e in log if e.get("decision_receipt_id") == headers["x-receipt-id"]), None)
     check(outcome is not None and outcome["status"] == "failed", "its outcome is `failed`")
     check(outcome["response_sha256"] == reply_digest(salt, content, reasoning, tools),
           "and its reply digest matches the partial answer the client received")
 
-    step("6. The anchor leaves the gateway")
-    total = len(read_log(replica))
-    wait_for("the publisher to copy an anchor covering every entry",
-             lambda: anchor_count(published / "anchor.jsonl") >= total and (published / "signing.pub").exists())
-    check(True, f"published anchor covers all {total} entries; the public key was copied once")
+    step("6. Each tenant's evidence is its own, and its anchor leaves the gateway")
+    demo_log, shoe_log = log_of(demo_key), log_of(shoestring_key)
+    demo_ids = {e["receipt_id"] for e in demo_log}
+    check(not demo_ids & {e["receipt_id"] for e in shoe_log}, "the two tenants' chains share no entries")
+    check("ak_shoestring" not in evidence(gateway, demo_key, "log").decode(),
+          "and demo's evidence names nothing of shoestring's")
+    for tenant, entries in (("demo", demo_log), ("shoestring", shoe_log)):
+        folder = published / tenant
+        wait_for(f"the publisher to copy {tenant}'s anchor",
+                 lambda: anchor_count(folder / "anchor.jsonl") >= len(entries) and (folder / "signing.pub").exists())
+        check(True, f"{tenant}: published anchor covers all {len(entries)} entries, public key copied once")
     say("in production this copy lives where the gateway has no write access (a separate account or repository)")
-
-    step("7. An auditor checks the log with the unchanged Wicket verifier")
-    keys = published / "signing.pub"
-    code, report = ickverify(args.verifier, replica / "receipts.jsonl", keys, published / "anchor.jsonl")
-    first_lines(report)
-    check(code == 0, "VERIFIED against the published anchor and key")
 
     work = Path(tempfile.mkdtemp(prefix="receipts-audit-"))
     try:
+        def download(tenant: str, key: str) -> Path:
+            folder = work / tenant
+            folder.mkdir()
+            for what, name in (("log", "receipts.jsonl"), ("anchor", "anchor.jsonl"), ("key", "signing.pub")):
+                (folder / name).write_bytes(evidence(gateway, key, what))
+            return folder
+
+        step("7. The customer audits its own evidence with the unchanged Wicket verifier")
+        mine = download("demo", demo_key)
+        check((mine / "signing.pub").read_bytes().strip() == (published / "demo" / "signing.pub").read_bytes().strip(),
+              "the key the gateway serves is the key published at first sight")
+        keys = published / "demo" / "signing.pub"
+        code, report = ickverify(args.verifier, mine / "receipts.jsonl", keys, published / "demo" / "anchor.jsonl")
+        first_lines(report)
+        check(code == 0, "VERIFIED against the published anchor and key, with nothing from other tenants")
+
         step("8. Editing a refusal into an allow is caught")
-        raw_lines = (replica / "receipts.jsonl").read_text(encoding="utf-8").splitlines()
+        theirs = download("shoestring", shoestring_key)
+        raw_lines = (theirs / "receipts.jsonl").read_text(encoding="utf-8").splitlines()
         index = max(i for i, line in enumerate(raw_lines) if '"verdict":"deny"' in line)
         edited = list(raw_lines)
         edited[index] = edited[index].replace('"verdict":"deny"', '"verdict":"allow"')
         (work / "edited.jsonl").write_text("\n".join(edited) + "\n", encoding="utf-8")
-        code, report = ickverify(args.verifier, work / "edited.jsonl", keys, published / "anchor.jsonl")
+        code, report = ickverify(args.verifier, work / "edited.jsonl", published / "shoestring" / "signing.pub",
+                                 published / "shoestring" / "anchor.jsonl")
         first_lines(report, 2)
         check(code == 1, f"NOT VERIFIED: entry {index + 1} no longer matches its id")
 
         step("9. Quietly deleting the newest receipts")
+        raw_lines = (mine / "receipts.jsonl").read_text(encoding="utf-8").splitlines()
         keep = len(raw_lines) - 3
         (work / "rolled-back.jsonl").write_text("\n".join(raw_lines[:keep]) + "\n", encoding="utf-8")
-        local = [line for line in (replica / "anchor.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+        local = [line for line in (mine / "anchor.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
         doctored = [line for line in local if json.loads(line)["count"] <= keep]
         (work / "doctored-anchor.jsonl").write_text("".join(line + "\n" for line in doctored), encoding="utf-8")
         say(f"someone with the gateway's disk drops the last 3 of {len(raw_lines)} entries, and the local anchors that mention them")
@@ -293,7 +320,7 @@ def run(args: argparse.Namespace) -> None:
                                  work / "doctored-anchor.jsonl" if doctored else None)
         first_lines(report, 1)
         check(code == 0, "against the gateway's own (doctored) files it still verifies: the deletion is invisible there")
-        code, report = ickverify(args.verifier, work / "rolled-back.jsonl", keys, published / "anchor.jsonl")
+        code, report = ickverify(args.verifier, work / "rolled-back.jsonl", keys, published / "demo" / "anchor.jsonl")
         first_lines(report, 2)
         check(code == 1, "against the published anchor: NOT VERIFIED, the log is shorter than what was anchored")
     finally:
@@ -309,7 +336,6 @@ def run(args: argparse.Namespace) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--gateway", default="http://gateway:8080")
-    parser.add_argument("--gateway-dir", type=Path, required=True)
     parser.add_argument("--published-dir", type=Path, required=True)
     parser.add_argument("--verifier", type=Path, required=True)
     args = parser.parse_args(argv)

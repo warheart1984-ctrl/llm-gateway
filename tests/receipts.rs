@@ -180,6 +180,7 @@ models:
             ""
         };
         let flag = if tenant_receipts { "true" } else { "false" };
+        let others = if receipts { "true" } else { "false" };
         let tenants = format!(
             r#"tenants:
   - tenant_id: acme
@@ -188,8 +189,26 @@ models:
 {holds_yaml}    credentials:
       - key_id: ak_test
         key: test-key-acme
-        scopes: [chat:stream, chat:complete]
+        scopes: [chat:stream, chat:complete, receipts:read]
+      - key_id: ak_chat_only
+        key: test-key-acme-chat-only
+        scopes: [chat:stream]
     allowed_models: ["mock/chat", "mock/held", "mock/refuse", "mock/break", "mock/slow"]
+  - tenant_id: globex
+    enabled: true
+    receipts: {others}
+    credentials:
+      - key_id: gk_test
+        key: test-key-globex
+        scopes: [chat:stream, receipts:read]
+    allowed_models: ["mock/chat"]
+  - tenant_id: plain
+    enabled: true
+    credentials:
+      - key_id: pk_test
+        key: test-key-plain
+        scopes: [chat:stream, receipts:read]
+    allowed_models: ["mock/chat"]
 "#
         );
         std::fs::write(dir.join("models.yaml"), models).unwrap();
@@ -206,7 +225,8 @@ models:
         settings.receipts.directory = receipt_dir;
         settings.receipts.anchor_every = 100;
         let state = llm_gateway::bootstrap::build(settings).await.expect("boot");
-        let chain = state.receipts.clone();
+        // The tests below speak as tenant `acme`; its chain is its own.
+        let chain = state.receipts.as_ref().map(|book| book.chain("acme").unwrap());
         let app = llm_gateway::api::router(Arc::clone(&state));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -214,6 +234,29 @@ models:
             let _ = axum::serve(listener, app).await;
         });
         Self { addr, chain, state }
+    }
+
+    async fn get(&self, path: &str, key: Option<&str>) -> (StatusCode, reqwest::header::HeaderMap, Vec<u8>) {
+        let mut builder = reqwest::Client::new().get(format!("http://{}{path}", self.addr));
+        if let Some(key) = key {
+            builder = builder.header("x-api-key", key);
+        }
+        let response = builder.send().await.unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        (status, headers, response.bytes().await.unwrap().to_vec())
+    }
+
+    async fn post_as(&self, key: &str, body: &str) -> StatusCode {
+        reqwest::Client::new()
+            .post(format!("http://{}/v1/chat/stream", self.addr))
+            .header("x-api-key", key)
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap()
+            .status()
     }
 
     async fn post(&self, body: &str) -> (StatusCode, String) {
@@ -642,4 +685,85 @@ async fn a_client_hanging_up_on_a_pending_completion_leaves_the_allow_open() {
         "whether the provider finished is unknown, so no outcome is invented"
     );
     assert_verifies(&gateway);
+}
+
+// ---------------------------------------------------------------------------
+// Per-tenant evidence
+// ---------------------------------------------------------------------------
+
+fn ids(log: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(log)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str::<Value>(line).unwrap()["receipt_id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_tenant_downloads_only_its_own_evidence_and_can_verify_it_alone() {
+    let (upstream, _mock) = mock_upstream().await;
+    let gateway = Gateway::boot(upstream, true, true, false).await;
+    assert_eq!(gateway.post_as("test-key-acme", &stream_body("mock/chat")).await, StatusCode::OK);
+    assert_eq!(gateway.post_as("test-key-globex", &stream_body("mock/held")).await, StatusCode::FORBIDDEN);
+
+    let (status, headers, acme_log) = gateway.get("/v1/receipts/log", Some("test-key-acme")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["x-receipt-entries"], "2");
+    let (_, _, globex_log) = gateway.get("/v1/receipts/log", Some("test-key-globex")).await;
+    let (acme_ids, globex_ids) = (ids(&acme_log), ids(&globex_log));
+    assert_eq!(acme_ids.len(), 2, "acme's allow and outcome");
+    assert_eq!(globex_ids.len(), 1, "globex's refusal");
+    assert!(acme_ids.iter().all(|id| !globex_ids.contains(id)));
+    let acme_text = String::from_utf8_lossy(&acme_log);
+    let globex_text = String::from_utf8_lossy(&globex_log);
+    assert!(!acme_text.contains("gk_test") && !globex_text.contains("ak_test"), "no other tenant's key id");
+    assert!(globex_text.contains("EXTERNAL_DENY"));
+
+    // Everything a customer needs, from the API alone, verifies on its own.
+    let (_, _, key) = gateway.get("/v1/receipts/key", Some("test-key-acme")).await;
+    let (_, _, anchor) = gateway.get("/v1/receipts/anchor", Some("test-key-acme")).await;
+    let chain = gateway.chain.as_ref().unwrap();
+    assert_eq!(key, std::fs::read(chain.public_key_path()).unwrap());
+    let out = std::env::temp_dir().join(format!("llm-gw-export-{}", Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(out.join("receipts.jsonl"), &acme_log).unwrap();
+    std::fs::write(out.join("anchor.jsonl"), &anchor).unwrap();
+    std::fs::write(out.join("signing.pub"), &key).unwrap();
+    if let Some(python) = llm_gateway::receipts::test_python() {
+        let status = std::process::Command::new(python)
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/vendor/wicket/verifier/ickverify.py"))
+            .arg(out.join("receipts.jsonl"))
+            .arg("--trusted-keys")
+            .arg(out.join("signing.pub"))
+            .arg("--require-signatures")
+            .output()
+            .unwrap()
+            .status;
+        assert!(status.success(), "the exported evidence must verify by itself");
+    }
+}
+
+#[tokio::test]
+async fn evidence_needs_a_credential_with_receipts_read() {
+    let (upstream, _mock) = mock_upstream().await;
+    let gateway = Gateway::boot(upstream, true, true, false).await;
+    for path in ["/v1/receipts/log", "/v1/receipts/anchor", "/v1/receipts/key"] {
+        let (status, _, _) = gateway.get(path, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+        let (status, _, _) = gateway.get(path, Some("test-key-acme-chat-only")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+        let (status, _, _) = gateway.get(path, Some("not-a-key")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn a_tenant_without_receipts_has_no_evidence_to_fetch() {
+    let (upstream, _mock) = mock_upstream().await;
+    let gateway = Gateway::boot(upstream, true, true, false).await;
+    let (status, _, body) = gateway.get("/v1/receipts/log", Some("test-key-plain")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(String::from_utf8_lossy(&body).contains("receipts_not_enabled"));
+    let book = gateway.state.receipts.as_ref().unwrap();
+    assert!(book.open_chain("plain").is_none(), "no chain is created for a tenant without receipts");
 }

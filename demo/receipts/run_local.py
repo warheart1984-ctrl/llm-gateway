@@ -96,7 +96,6 @@ def main(argv: list[str] | None = None) -> int:
         walkthrough = subprocess.run(
             [sys.executable, str(HERE / "walkthrough.py"),
              "--gateway", f"http://127.0.0.1:{port}",
-             "--gateway-dir", str(data / "receipts"),
              "--published-dir", str(published),
              "--verifier", str(ROOT / "vendor" / "wicket" / "verifier" / "ickverify.py")],
             env=env,
@@ -115,7 +114,7 @@ def main(argv: list[str] | None = None) -> int:
     if code != 0:
         print(f"\ngateway log: {work / 'gateway.log'}")
     print(f"\nfiles kept in {work}")
-    print("  gateway-data/receipts/  the replica's log, anchor and key (the gateway's own disk)")
+    print("  gateway-data/receipts/  each tenant's log, anchor and key (the gateway's own disk)")
     print("  published/              the anchors and key the publisher copied out")
     return code
 
