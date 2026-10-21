@@ -194,11 +194,8 @@ class Publisher:
             report = Report()
             self.sync()
             lines = self.stage(report)
-            checked_at = int(time.time())
-            ok = not report.refused
-            error = ", ".join(sorted(report.refused)) if report.refused else None
             if not lines:
-                self.write_status(report, ok, error, checked_at)
+                self.write_status(report)
                 return report
             git("add", "--all", self.replica, cwd=self.work)
             message = f"anchors from {self.replica}\n\n" + "\n".join(lines)
@@ -210,27 +207,44 @@ class Publisher:
                 report.commit = commit
                 for line in lines:
                     print(f"anchor-publisher: {self.replica}/{line}", flush=True)
-                self.write_status(report, ok, error, checked_at)
+                self.write_status(report)
                 return report
             # Someone else pushed first. Start again from the remote's state;
             # never push over it.
             time.sleep(0.2)
         raise GitError(f"push to {self.repo} kept being refused after {attempts} attempts")
 
-    def write_status(self, report: Report | None, ok: bool, error: str | None, checked_at: int) -> None:
-        """Atomically write a JSON summary of this pass to --status, if any."""
+    def write_status(self, report: Report | None, error: str | None = None) -> None:
+        """Atomically write a JSON summary of this pass to --status, if any.
+
+        `report` is None when the pass failed before it had one; `error` then
+        says why. The last push is carried over from passes that pushed
+        nothing, so a quiet pass does not read as "never pushed".
+        """
         if self.status_path is None:
             return
-        last_push = report.commit if report is not None else self.last_pushed()
-        last_push_at = checked_at if report is not None and report.commit else 0
+        checked_at = int(time.time())
+        refused = report.refused if report is not None else {}
+        if error is None and refused:
+            error = "refused " + "; ".join(f"{tenant}: {why}" for tenant, why in sorted(refused.items()))
+        last_push = (report.commit if report is not None else None) or self.last_pushed()
+        if report is not None and report.commit:
+            last_push_at = checked_at
+        else:
+            try:
+                previous = json.loads(self.status_path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, ValueError):
+                previous = {}
+            same = isinstance(previous, dict) and previous.get("last_push") == last_push
+            last_push_at = previous.get("last_push_at", 0) if same else 0
         status = {
             "checked_at": checked_at,
-            "ok": ok,
+            "ok": error is None,
             "last_push": last_push,
             "last_push_at": last_push_at,
             "published": report.published if report is not None else {},
-            "refused": report.refused if report is not None else {},
-            "error": error,
+            "refused": refused,
+            "error": " ".join(error.split()) if error is not None else None,
         }
         self.status_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.status_path.with_suffix(".tmp")
@@ -285,27 +299,19 @@ def main(argv: list[str] | None = None) -> int:
                           args.work or args.state.parent / "anchor-repo", args.branch,
                           status=args.status)
     while True:
-        checked_at = int(time.time())
         try:
             report = publisher.publish_once()
         except RewriteDetected as rewrite:
-            ok = False
-            error = str(rewrite)
             print(f"anchor-publisher: ALERT {rewrite}; nothing is published until a person looks", file=sys.stderr, flush=True)
-            publisher.write_status(None, ok, error, checked_at)
+            publisher.write_status(None, str(rewrite))
             return 2
         except GitError as error:
-            ok = False
-            error = str(error)
             print(f"anchor-publisher: {error}", file=sys.stderr, flush=True)
-            publisher.write_status(None, ok, error, checked_at)
+            publisher.write_status(None, str(error))
             if args.watch is None:
                 return 1
             time.sleep(args.watch)
             continue
-        ok = not report.refused
-        error = ", ".join(sorted(report.refused)) if report.refused else None
-        publisher.write_status(report, ok, error, checked_at)
         if args.watch is None:
             return 2 if report.refused else 0
         time.sleep(args.watch)

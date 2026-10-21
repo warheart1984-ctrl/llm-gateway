@@ -263,6 +263,47 @@ class StatusReporting(Case):
         # The file is valid JSON after every pass, even on failure.
         json.loads(self.status_path().read_text(encoding="utf-8"))
 
+    def test_a_quiet_pass_keeps_the_last_push(self) -> None:
+        self.tenant("acme", [1, 2])
+        publisher = self.publisher()
+        publisher.status_path = self.status_path()
+        publisher.publish_once()
+        pushed = self.status()
+        self.assertIsNone(publisher.publish_once().commit)
+        got = self.status()
+        self.assertTrue(got["ok"])
+        self.assertEqual(got["last_push"], pushed["last_push"])
+        self.assertEqual(got["last_push_at"], pushed["last_push_at"])
+        self.assertEqual(got["published"], {})
+
+    def test_a_git_failure_is_one_line_and_keeps_the_last_push(self) -> None:
+        self.tenant("acme", [1])
+        state = self.tmp / "state-r1" / "state.json"
+        args = ["publish", "--source", str(self.root), "--replica", "r1", "--state", str(state),
+                "--status", str(self.status_path())]
+        self.assertEqual(ap.main([*args, "--repo", str(self.remote), "--work", str(self.tmp / "work-r1")]), 0)
+        pushed = self.status()
+        # A fresh working copy has to clone, and the repository is not there.
+        self.assertEqual(ap.main([*args, "--repo", str(self.tmp / "missing.git"),
+                                  "--work", str(self.tmp / "work-missing")]), 1)
+        got = self.status()
+        self.assertFalse(got["ok"])
+        self.assertIsNotNone(got["error"])
+        self.assertNotIn("\n", got["error"])
+        self.assertEqual(got["last_push"], pushed["last_push"])
+        self.assertEqual(got["last_push_at"], pushed["last_push_at"])
+
+    def test_a_refusal_names_the_tenant_and_why_on_one_line(self) -> None:
+        self.tenant("acme", [1, 2])
+        publisher = self.publisher()
+        publisher.status_path = self.status_path()
+        publisher.publish_once()
+        (self.root / "acme" / "anchor.jsonl").write_text(anchor(1) + "\n", encoding="utf-8")
+        publisher.publish_once()
+        got = self.status()
+        self.assertTrue(got["error"].startswith("refused acme: "), got["error"])
+        self.assertNotIn("\n", got["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

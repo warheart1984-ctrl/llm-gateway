@@ -662,9 +662,10 @@ measures it on your disk.
 **Visibility.** The chain's state is visible in metrics and health. Counters,
 all labelled by the configured tenant id:
 
-- `gw_receipts_written_total{tenant}` — entries durably written.
-- `gw_receipt_write_failures_total{tenant}` — jobs answered `Unavailable` or
-  `Io` because a receipt write failed.
+- `gw_receipts_written_total{tenant}` — entries this process durably wrote
+  (entries already in the log at startup are in `gw_receipt_entries`).
+- `gw_receipt_write_failures_total{tenant}` — jobs answered `Unavailable`:
+  their write failed, or the chain had already stopped.
 - `gw_receipt_recoveries_total{tenant}` — torn tails quarantined at startup.
 
 Gauges, also labelled by tenant:

@@ -19,11 +19,6 @@
 //! recompute both digests, and someone who can only read the log cannot
 //! test a guessed prompt against them.
 
-use serde::Deserialize;
-use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use tokio::sync::oneshot;
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
@@ -40,9 +35,13 @@ use std::{
 
 use infinity_kernel::{
     Actor, ApprovalSet, LogEntry, POLICY_VERSION, PROPOSAL_VERSION, Policy, Proposal, Signer,
-    TrustedKeys, evaluate, issue_outcome, issue_receipt, record_external_denial,
-    verify_log, verify_outcome, verify_receipt, verify_signatures,
+    TrustedKeys, evaluate, issue_outcome, issue_receipt, record_external_denial, verify_log,
+    verify_outcome, verify_receipt, verify_signatures,
 };
+use serde::Deserialize;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use tokio::sync::oneshot;
 
 /// Kernel policy id hashed into every gateway receipt. Stable so a reader can
 /// see that every entry was judged under the same rules.
@@ -329,7 +328,10 @@ struct Shared {
     fail_disk_write: AtomicU64,
     /// `sync_data` calls left to fail, through commit()'s real path.
     fail_disk_sync: AtomicU64,
-    /// Jobs answered Unavailable because a disk write failed.
+    /// Entries this process durably wrote (flushed and synced).
+    written: AtomicU64,
+    /// Jobs answered Unavailable: their batch failed to reach the disk, or
+    /// the chain had already stopped.
     write_failures: AtomicU64,
     /// Torn tails quarantined at startup.
     recoveries: AtomicU64,
@@ -551,7 +553,14 @@ impl ReceiptChain {
         self.shared.failed.load(Ordering::SeqCst)
     }
 
-    /// Jobs answered Unavailable because a disk write failed.
+    /// Entries this process durably wrote. Unlike `len()`, entries found in
+    /// the log at startup are not counted.
+    pub fn written(&self) -> u64 {
+        self.shared.written.load(Ordering::SeqCst)
+    }
+
+    /// Jobs answered Unavailable: their batch failed to reach the disk, or
+    /// the chain had already stopped.
     pub fn write_failures(&self) -> u64 {
         self.shared.write_failures.load(Ordering::SeqCst)
     }
@@ -792,6 +801,7 @@ impl Writer {
         let mut written: Vec<(Option<Reply>, String)> = Vec::with_capacity(batch.len());
         for job in batch {
             if self.shared.failed.load(Ordering::SeqCst) || self.shared.take_failure() {
+                self.shared.write_failures.fetch_add(1, Ordering::SeqCst);
                 answer(job.reply, Err(ReceiptError::Unavailable));
                 continue;
             }
@@ -839,6 +849,7 @@ impl Writer {
         match flushed {
             Ok(()) => {
                 self.shared.count.store(self.count, Ordering::SeqCst);
+                self.shared.written.fetch_add(written.len() as u64, Ordering::SeqCst);
                 *self.shared.head.lock().unwrap_or_else(|p| p.into_inner()) =
                     self.head.as_ref().map(|entry| entry.receipt_id().to_string());
                 for (reply, id) in written {
@@ -847,7 +858,7 @@ impl Writer {
             }
             Err(err) => {
                 let err = io_err(err);
-                self.shared.write_failures.fetch_add(1, Ordering::SeqCst);
+                self.shared.write_failures.fetch_add(written.len() as u64, Ordering::SeqCst);
                 self.fail(&err);
                 self.head = start_head;
                 self.count = start_count;
@@ -1110,27 +1121,38 @@ fn verify_since_anchor(entries: &[LogEntry], anchor_text: &str, signer: &Signer)
         previous = entry.receipt_id().to_string();
     }
 
-    // An outcome answering an allow before the anchor cannot be checked here
-    // (the full check still does). An outcome answering an allow after the
-    // anchor must find that allow and must be the only outcome for it.
-    let mut allow_ids: BTreeSet<String> = BTreeSet::new();
-    let mut outcome_count: BTreeMap<String, u64> = BTreeMap::new();
-    for entry in entries.iter().skip(count_usize) {
+    // Every outcome after the anchor must answer an earlier `allow`, as in
+    // `verify_log`. An allow before the anchor is only parsed, not checked,
+    // and outcomes before the anchor are not counted against it (the full
+    // check still does both). Two outcomes after the anchor for one allow are
+    // refused either way.
+    let allows_before: BTreeSet<&str> = entries[..count_usize]
+        .iter()
+        .filter_map(|entry| match entry {
+            LogEntry::Decision(receipt) if receipt.verdict == "allow" => Some(receipt.receipt_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut allows_after: BTreeSet<&str> = BTreeSet::new();
+    let mut answered: BTreeSet<&str> = BTreeSet::new();
+    for (index, entry) in entries.iter().enumerate().skip(count_usize) {
         match entry {
-            LogEntry::Decision(receipt) => {
-                if receipt.verdict == "allow" {
-                    allow_ids.insert(receipt.receipt_id.clone());
-                }
+            LogEntry::Decision(receipt) if receipt.verdict == "allow" => {
+                allows_after.insert(&receipt.receipt_id);
             }
+            LogEntry::Decision(_) => {}
             LogEntry::Outcome(outcome) => {
-                let decision_id = outcome.decision_receipt_id.clone();
-                if allow_ids.contains(&decision_id) {
-                    *outcome_count.entry(decision_id.clone()).or_insert(0) += 1;
-                    if outcome_count[&decision_id] > 1 {
-                        return Err(ReceiptError::Unverified(format!(
-                            "more than one outcome answers allow {decision_id}"
-                        )));
-                    }
+                let decision_id = outcome.decision_receipt_id.as_str();
+                if !allows_after.contains(decision_id) && !allows_before.contains(decision_id) {
+                    return Err(ReceiptError::Unverified(format!(
+                        "entry {} answers no earlier allow",
+                        index + 1
+                    )));
+                }
+                if !answered.insert(decision_id) {
+                    return Err(ReceiptError::Unverified(format!(
+                        "more than one outcome answers allow {decision_id}"
+                    )));
                 }
             }
         }
@@ -1210,7 +1232,8 @@ fn check_anchors(entries: &[LogEntry], text: &str, keys: &TrustedKeys) -> Result
 ///   quarantine name is the fragment's hash, and a recovery line already
 ///   written for the same cut is not written twice.
 ///
-/// True when a fragment was quarantined and the file was cut; false when there was nothing to recover (empty, or already ending in a newline).
+/// Returns true when a fragment was quarantined and the file cut, false when
+/// there was nothing to recover.
 fn recover_torn_tail(path: &Path, directory: &Path, anchored_entries: u64) -> Result<bool, ReceiptError> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -1268,13 +1291,13 @@ fn recover_torn_tail(path: &Path, directory: &Path, anchored_entries: u64) -> Re
     }
     let file = OpenOptions::new().write(true).open(path).map_err(io_err)?;
     file.set_len(keep as u64).and_then(|()| file.sync_all()).map_err(io_err)?;
-        tracing::warn!(
-            file = %path.display(),
-            fragment_bytes = fragment.len(),
-            quarantined_as = %kept_at.display(),
-            "moved an unterminated last line left by an interrupted write to quarantine; see recovery.jsonl"
-        );
-        Ok(true)
+    tracing::warn!(
+        file = %path.display(),
+        fragment_bytes = fragment.len(),
+        quarantined_as = %kept_at.display(),
+        "moved an unterminated last line left by an interrupted write to quarantine; see recovery.jsonl"
+    );
+    Ok(true)
 }
 
 /// The highest entry count any well-formed anchor line claims. Recovery
@@ -2239,6 +2262,12 @@ mod tests {
     fn sealed_log(dir: &Path, n: usize, anchor_at: u64) -> (Salt, Vec<String>) {
         let signer = Signer::from_seed([7u8; 32]);
         fs::write(dir.join("signing.priv"), format!("{}\n", signer.private_key_text())).unwrap();
+        // The chain refuses a key that group or other can read.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir.join("signing.priv"), fs::Permissions::from_mode(0o600)).unwrap();
+        }
         fs::write(dir.join("signing.pub"), format!("{}\n", signer.public_key_text())).unwrap();
         let salt = Salt::generate().unwrap();
         let call_digest = request_digest(&salt, b"request-bytes");
@@ -2425,5 +2454,135 @@ mod tests {
             }),
             Err(ReceiptError::Unverified(_))
         ));
+    }
+
+    fn since_anchor() -> ChainOptions {
+        ChainOptions {
+            anchor_every: 1_000_000,
+            anchor_interval: Duration::from_secs(3600),
+            startup_verify: StartupVerify::SinceAnchor,
+        }
+    }
+
+    fn open_for(chain: &Arc<ReceiptChain>, decision_receipt_id: String) -> OpenReceipt {
+        let salt = Salt::generate().unwrap();
+        OpenReceipt {
+            chain: Arc::clone(chain),
+            request_digest: request_digest(&salt, b"request-bytes"),
+            decision_receipt_id,
+            salt,
+        }
+    }
+
+    /// Two allows, then whatever `tail` writes in a second run. Each run's
+    /// closing anchor would cover the tail, so the anchor file is cut back to
+    /// its first line: the newest anchor is at 2 and `tail` comes after it.
+    async fn anchored_at_two(dir: &Path, tail: impl AsyncFnOnce(&Arc<ReceiptChain>)) {
+        let salt = Salt::generate().unwrap();
+        {
+            let chain = ReceiptChain::open(dir, options(1_000_000)).unwrap();
+            chain.allow(&subject("one", &salt)).await.unwrap();
+            chain.allow(&subject("two", &salt)).await.unwrap();
+        }
+        {
+            let chain = Arc::new(ReceiptChain::open(dir, options(1_000_000)).unwrap());
+            tail(&chain).await;
+        }
+        let anchor = dir.join("anchor.jsonl");
+        let text = fs::read_to_string(&anchor).unwrap();
+        fs::write(&anchor, format!("{}\n", text.lines().next().unwrap())).unwrap();
+    }
+
+    #[tokio::test]
+    async fn since_anchor_refuses_an_entry_after_the_anchor_signed_by_another_key() {
+        let dir = scratch("since-anchor-foreign-key");
+        anchored_at_two(&dir, async |chain| {
+            chain.allow(&subject("three", &Salt::generate().unwrap())).await.unwrap();
+        })
+        .await;
+        let log = dir.join("receipts.jsonl");
+        let mut entries: Vec<String> = lines(&log);
+        let mut entry: LogEntry = serde_json::from_str(&entries[2]).unwrap();
+        entry.sign(&Signer::from_seed([9u8; 32]));
+        entries[2] = serde_json::to_string(&entry).unwrap();
+        fs::write(&log, entries.join("\n") + "\n").unwrap();
+        match ReceiptChain::open(&dir, since_anchor()) {
+            Err(ReceiptError::Unverified(why)) => assert!(why.contains("not signed by this replica"), "{why}"),
+            other => panic!("expected Unverified, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[tokio::test]
+    async fn since_anchor_refuses_a_log_with_an_entry_after_the_anchor_removed() {
+        let dir = scratch("since-anchor-removed");
+        anchored_at_two(&dir, async |chain| {
+            let salt = Salt::generate().unwrap();
+            chain.allow(&subject("three", &salt)).await.unwrap();
+            chain.allow(&subject("four", &salt)).await.unwrap();
+        })
+        .await;
+        let log = dir.join("receipts.jsonl");
+        let mut entries = lines(&log);
+        entries.remove(2);
+        fs::write(&log, entries.join("\n") + "\n").unwrap();
+        match ReceiptChain::open(&dir, since_anchor()) {
+            Err(ReceiptError::Unverified(why)) => assert!(why.contains("does not link"), "{why}"),
+            other => panic!("expected Unverified, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[tokio::test]
+    async fn since_anchor_refuses_two_outcomes_for_one_allow() {
+        let dir = scratch("since-anchor-two-outcomes");
+        anchored_at_two(&dir, async |chain| {
+            let id = chain.allow(&subject("three", &Salt::generate().unwrap())).await.unwrap();
+            chain.outcome(&open_for(chain, id.clone()), "completed", None).await.unwrap();
+            chain.outcome(&open_for(chain, id), "completed", None).await.unwrap();
+        })
+        .await;
+        match ReceiptChain::open(&dir, since_anchor()) {
+            Err(ReceiptError::Unverified(why)) => assert!(why.contains("more than one outcome"), "{why}"),
+            other => panic!("expected Unverified, got {:?}", other.map(|_| ())),
+        }
+        assert!(matches!(ReceiptChain::open(&dir, options(1_000_000)), Err(ReceiptError::Unverified(_))));
+    }
+
+    #[tokio::test]
+    async fn since_anchor_refuses_an_outcome_that_answers_no_allow() {
+        let dir = scratch("since-anchor-dangling-outcome");
+        anchored_at_two(&dir, async |chain| {
+            chain
+                .outcome(&open_for(chain, "receipt:sha3-256:00".into()), "completed", None)
+                .await
+                .unwrap();
+        })
+        .await;
+        match ReceiptChain::open(&dir, since_anchor()) {
+            Err(ReceiptError::Unverified(why)) => assert!(why.contains("answers no earlier allow"), "{why}"),
+            other => panic!("expected Unverified, got {:?}", other.map(|_| ())),
+        }
+        assert!(matches!(ReceiptChain::open(&dir, options(1_000_000)), Err(ReceiptError::Unverified(_))));
+    }
+
+    #[tokio::test]
+    async fn since_anchor_accepts_an_outcome_for_an_allow_before_the_anchor() {
+        let dir = scratch("since-anchor-outcome-for-old-allow");
+        let salt = Salt::generate().unwrap();
+        let first = {
+            let chain = ReceiptChain::open(&dir, options(1_000_000)).unwrap();
+            let first = chain.allow(&subject("one", &salt)).await.unwrap();
+            chain.allow(&subject("two", &salt)).await.unwrap();
+            first
+        };
+        {
+            let chain = Arc::new(ReceiptChain::open(&dir, options(1_000_000)).unwrap());
+            chain.outcome(&open_for(&chain, first), "completed", None).await.unwrap();
+        }
+        let anchor = dir.join("anchor.jsonl");
+        let text = fs::read_to_string(&anchor).unwrap();
+        fs::write(&anchor, format!("{}\n", text.lines().next().unwrap())).unwrap();
+        let chain = ReceiptChain::open(&dir, since_anchor()).unwrap();
+        assert_eq!(chain.startup_entries_checked(), 1);
+        assert_eq!(chain.len(), 3);
     }
 }

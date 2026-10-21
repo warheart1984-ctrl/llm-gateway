@@ -63,7 +63,10 @@ that person's honesty. Say so to the customer rather than implying otherwise.
    ```
 
    `ok` is false when a rewrite was detected, a tenant was refused, or git
-   failed; `error` then holds a one-line reason. Times are unix seconds. The
+   failed; `error` then holds a one-line reason. Times are unix seconds.
+   `last_push` and `last_push_at` stay at the most recent push across passes
+   that push nothing or fail (`last_push_at` is `0` when this status file has
+   not seen that push, for example after a restart). The
    file is valid JSON after every pass, so an operator or monitor can read it
    without parsing stderr.
 

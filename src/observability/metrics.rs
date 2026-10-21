@@ -572,14 +572,14 @@ impl Metrics {
                     &mut out,
                     "gw_receipts_written_total",
                     "counter",
-                    "receipt entries durably written",
-                    series.iter().map(|(_, l, c)| (l.as_str(), c.len())),
+                    "receipt entries this process durably wrote",
+                    series.iter().map(|(_, l, c)| (l.as_str(), c.written())),
                 );
                 family(
                     &mut out,
                     "gw_receipt_write_failures_total",
                     "counter",
-                    "receipt jobs answered Unavailable or Io because a write failed",
+                    "receipt jobs answered Unavailable: a failed write, or a stopped chain",
                     series.iter().map(|(_, l, c)| (l.as_str(), c.write_failures())),
                 );
                 family(
@@ -1088,5 +1088,116 @@ mod tests {
             text.contains("gw_receipt_entries{tenant=\"acme\"} 3"),
             "{text}"
         );
+    }
+
+    fn receipt_book(name: &str, anchor_every: u64) -> Arc<crate::receipts::ReceiptBook> {
+        let dir = std::env::temp_dir().join(format!("llm-gw-metrics-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Arc::new(
+            crate::receipts::ReceiptBook::open(
+                &dir,
+                crate::receipts::ChainOptions {
+                    anchor_every,
+                    anchor_interval: std::time::Duration::from_secs(3600),
+                    startup_verify: crate::receipts::StartupVerify::Full,
+                },
+                ["acme"],
+            )
+            .unwrap(),
+        )
+    }
+
+    fn receipt_subject(request_id: &str) -> crate::receipts::Subject {
+        crate::receipts::Subject {
+            request_id: request_id.into(),
+            tenant_id: "acme".into(),
+            key_id: "ak".into(),
+            model: "mock/chat".into(),
+            action: "reserve".into(),
+            call_digest: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stopped_chain_shows_in_the_stopped_gauge_and_the_failure_counter() {
+        let m = Metrics::new(std::time::Instant::now());
+        let book = receipt_book("stopped", 1_000_000);
+        m.set_receipts(Some(Arc::clone(&book)));
+        let chain = book.chain("acme").unwrap();
+        chain.allow(&receipt_subject("req-1")).await.unwrap();
+        let text = m.render();
+        assert!(text.contains("gw_receipt_chain_stopped{tenant=\"acme\"} 0"), "{text}");
+        assert!(text.contains("gw_receipt_write_failures_total{tenant=\"acme\"} 0"), "{text}");
+
+        chain.fail_disk_writes_from_now(1);
+        assert!(chain.allow(&receipt_subject("req-2")).await.is_err());
+        let text = m.render();
+        assert!(text.contains("gw_receipt_chain_stopped{tenant=\"acme\"} 1"), "{text}");
+        assert!(text.contains("gw_receipt_write_failures_total{tenant=\"acme\"} 1"), "{text}");
+
+        // Every later job the stopped chain refuses counts too.
+        assert!(chain.allow(&receipt_subject("req-3")).await.is_err());
+        let text = m.render();
+        assert!(text.contains("gw_receipt_write_failures_total{tenant=\"acme\"} 2"), "{text}");
+        assert!(text.contains("gw_receipts_written_total{tenant=\"acme\"} 1"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn anchor_age_is_minus_one_until_this_process_anchors() {
+        let m = Metrics::new(std::time::Instant::now());
+        let book = receipt_book("anchor-age", 2);
+        m.set_receipts(Some(Arc::clone(&book)));
+        let chain = book.chain("acme").unwrap();
+        chain.allow(&receipt_subject("req-1")).await.unwrap();
+        let text = m.render();
+        assert!(text.contains("gw_receipt_anchor_age_seconds{tenant=\"acme\"} -1"), "{text}");
+
+        chain.allow(&receipt_subject("req-2")).await.unwrap();
+        // The writer anchors after answering; give it a moment.
+        for _ in 0..200 {
+            if chain.last_anchor_secs() != 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let text = m.render();
+        let age: i64 = text
+            .lines()
+            .find_map(|line| line.strip_prefix("gw_receipt_anchor_age_seconds{tenant=\"acme\"} "))
+            .unwrap_or_else(|| panic!("{text}"))
+            .parse()
+            .unwrap();
+        assert!((0..5).contains(&age), "{text}");
+    }
+
+    #[tokio::test]
+    async fn written_counts_this_process_while_entries_counts_the_log() {
+        let book = receipt_book("written-vs-entries", 1_000_000);
+        let chain = book.chain("acme").unwrap();
+        chain.allow(&receipt_subject("req-1")).await.unwrap();
+        chain.allow(&receipt_subject("req-2")).await.unwrap();
+        let root = book.root().to_path_buf();
+        drop(chain);
+        drop(book);
+
+        let m = Metrics::new(std::time::Instant::now());
+        let book = Arc::new(
+            crate::receipts::ReceiptBook::open(
+                &root,
+                crate::receipts::ChainOptions {
+                    anchor_every: 1_000_000,
+                    anchor_interval: std::time::Duration::from_secs(3600),
+                    startup_verify: crate::receipts::StartupVerify::Full,
+                },
+                ["acme"],
+            )
+            .unwrap(),
+        );
+        m.set_receipts(Some(Arc::clone(&book)));
+        book.chain("acme").unwrap().allow(&receipt_subject("req-3")).await.unwrap();
+        let text = m.render();
+        assert!(text.contains("gw_receipts_written_total{tenant=\"acme\"} 1"), "{text}");
+        assert!(text.contains("gw_receipt_entries{tenant=\"acme\"} 3"), "{text}");
     }
 }
