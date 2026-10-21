@@ -381,6 +381,40 @@ async fn a_failed_receipt_write_withholds_the_reply() {
 }
 
 #[tokio::test]
+async fn an_injected_disk_write_failure_withholds_the_reply_and_stops_the_chain() {
+    let (upstream, mock) = mock_upstream().await;
+    let gateway = Gateway::boot(upstream, true, true, false).await;
+    let chain = gateway.chain.as_ref().unwrap();
+    chain.fail_disk_writes_from_now(1);
+    let (status, text) = gateway.post(&stream_body("mock/chat")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{text}");
+    assert!(text.contains("receipt_unavailable"), "{text}");
+    assert_eq!(mock.calls.load(Ordering::SeqCst), 0, "the model must not be called");
+    assert!(chain.is_failed(), "a real write error stops the chain");
+    let before = chain.verifies();
+    let (status2, _) = gateway.post(&stream_body("mock/chat")).await;
+    assert_eq!(status2, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(chain.verifies(), before, "no rescan on the second failure");
+    assert_eq!(mock.calls.load(Ordering::SeqCst), 0, "still no model call");
+}
+
+#[tokio::test]
+async fn an_injected_sync_data_failure_withholds_the_reply_and_stops_the_chain() {
+    let (upstream, mock) = mock_upstream().await;
+    let gateway = Gateway::boot(upstream, true, true, false).await;
+    let chain = gateway.chain.as_ref().unwrap();
+    chain.fail_disk_syncs_from_now(1);
+    let (status, text) = gateway.post(&stream_body("mock/chat")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{text}");
+    assert!(text.contains("receipt_unavailable"), "{text}");
+    assert_eq!(mock.calls.load(Ordering::SeqCst), 0, "the model must not be called");
+    assert!(chain.is_failed(), "a sync_data failure stops the chain");
+    let (status2, _) = gateway.post(&stream_body("mock/chat")).await;
+    assert_eq!(status2, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(mock.calls.load(Ordering::SeqCst), 0, "still no model call");
+}
+
+#[tokio::test]
 async fn receipts_off_still_answers_when_the_decision_queue_is_full() {
     let (upstream, _mock) = mock_upstream().await;
     let gateway = Gateway::boot(upstream, true, false, false).await;

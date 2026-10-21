@@ -303,6 +303,10 @@ struct Shared {
     fail_appends: AtomicU64,
     /// Appends still allowed before `fail_appends` starts counting down.
     fail_after: AtomicU64,
+    /// `write_all` calls left to fail, through commit()'s real path.
+    fail_disk_write: AtomicU64,
+    /// `sync_data` calls left to fail, through commit()'s real path.
+    fail_disk_sync: AtomicU64,
 }
 
 impl Shared {
@@ -324,6 +328,31 @@ impl Shared {
                 Err(actual) => current = actual,
             }
         }
+    }
+
+    /// Decrement `counter` and report whether one failure remains to spend.
+    fn take_disk(&self, counter: &AtomicU64) -> bool {
+        let mut current = counter.load(Ordering::SeqCst);
+        loop {
+            if current == 0 {
+                return false;
+            }
+            match counter.compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// The next `write_all` fails, through commit()'s real path.
+    fn take_disk_write_failure(&self) -> bool {
+        self.take_disk(&self.fail_disk_write)
+    }
+
+    /// The next `sync_data` fails, through commit()'s real path. `write_all`
+    /// itself succeeds; the bytes never reach durable storage.
+    fn take_disk_sync_failure(&self) -> bool {
+        self.take_disk(&self.fail_disk_sync)
     }
 }
 
@@ -488,6 +517,21 @@ impl ReceiptChain {
     pub fn fail_appends_after(&self, ok: u64, n: u64) {
         self.shared.fail_after.store(ok, Ordering::SeqCst);
         self.shared.fail_appends.store(n, Ordering::SeqCst);
+    }
+
+    /// Test hook: the next `n` `write_all` calls fail with an injected disk
+    /// error, through commit()'s real path. The entry never reaches the disk.
+    #[doc(hidden)]
+    pub fn fail_disk_writes_from_now(&self, n: u64) {
+        self.shared.fail_disk_write.store(n, Ordering::SeqCst);
+    }
+
+    /// Test hook: the next `n` `sync_data` calls fail with an injected disk
+    /// error, through commit()'s real path. `write_all` itself succeeds; the
+    /// bytes never reach durable storage.
+    #[doc(hidden)]
+    pub fn fail_disk_syncs_from_now(&self, n: u64) {
+        self.shared.fail_disk_sync.store(n, Ordering::SeqCst);
     }
 
     /// Reservation → kernel `allow`.
@@ -717,10 +761,18 @@ impl Writer {
         if written.is_empty() {
             return;
         }
-        let flushed = self
-            .log
-            .write_all(lines.as_bytes())
-            .and_then(|()| self.log.sync_data());
+        let flushed = (|| {
+            if self.shared.take_disk_write_failure() {
+                return Err(std::io::Error::other("injected disk failure"));
+            }
+            let written = self.log.write_all(lines.as_bytes());
+            if self.shared.take_disk_sync_failure() {
+                // `write_all` already handed the bytes to the OS; it is
+                // `sync_data` that refuses to make them durable.
+                return Err(std::io::Error::other("injected disk failure"));
+            }
+            written.and_then(|()| self.log.sync_data())
+        })();
         match flushed {
             Ok(()) => {
                 self.shared.count.store(self.count, Ordering::SeqCst);
@@ -1805,6 +1857,53 @@ mod tests {
         assert!(lines(chain.log_path()).is_empty());
         chain.allow(&subject("reserve", &salt)).await.unwrap();
         assert_eq!(chain.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_injected_write_all_failure_stops_the_chain() {
+        let dir = scratch("disk-write");
+        let chain = ReceiptChain::open(&dir, options(100)).unwrap();
+        let salt = Salt::generate().unwrap();
+        chain.fail_disk_writes_from_now(1);
+        assert!(matches!(
+            chain.allow(&subject("reserve", &salt)).await,
+            Err(ReceiptError::Unavailable)
+        ));
+        assert!(chain.is_failed(), "a real write error stops the chain");
+        assert_eq!(chain.len(), 0);
+        assert!(
+            lines(chain.log_path()).is_empty(),
+            "no partial line from the failed job"
+        );
+        // A following allow also returns Unavailable without touching the disk.
+        let before = chain.verifies();
+        assert!(matches!(
+            chain.allow(&subject("reserve", &salt)).await,
+            Err(ReceiptError::Unavailable)
+        ));
+        assert_eq!(chain.verifies(), before, "no rescan on the second failure");
+        assert_eq!(chain.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_injected_sync_data_failure_stops_the_chain() {
+        let dir = scratch("disk-sync");
+        let chain = ReceiptChain::open(&dir, options(100)).unwrap();
+        let salt = Salt::generate().unwrap();
+        chain.fail_disk_syncs_from_now(1);
+        assert!(matches!(
+            chain.allow(&subject("reserve", &salt)).await,
+            Err(ReceiptError::Unavailable)
+        ));
+        assert!(chain.is_failed(), "a sync_data failure stops the chain");
+        assert_eq!(chain.len(), 0);
+        // A following allow also returns Unavailable without touching the disk.
+        let before = chain.verifies();
+        assert!(matches!(
+            chain.allow(&subject("reserve", &salt)).await,
+            Err(ReceiptError::Unavailable)
+        ));
+        assert_eq!(chain.verifies(), before, "no rescan on the second failure");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
