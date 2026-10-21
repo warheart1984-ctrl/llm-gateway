@@ -415,6 +415,25 @@ async fn an_injected_sync_data_failure_withholds_the_reply_and_stops_the_chain()
 }
 
 #[tokio::test]
+async fn a_stopped_receipt_chain_is_listed_in_readiness_but_keeps_the_replica_ready() {
+    let (upstream, _mock) = mock_upstream().await;
+    let gateway = Gateway::boot(upstream, true, true, false).await;
+    let chain = gateway.chain.as_ref().unwrap();
+    chain.fail_disk_writes_from_now(1);
+    let (status, text) = gateway.post(&stream_body("mock/chat")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{text}");
+    assert!(chain.is_failed(), "a real write error stops the chain");
+
+    let (ready_status, _, ready_bytes) = gateway.get("/health/ready", None).await;
+    let ready_text = String::from_utf8_lossy(&ready_bytes);
+    assert_eq!(ready_status, StatusCode::OK, "{ready_text}");
+    assert!(ready_text.contains("\"status\":\"ready\""), "{ready_text}");
+    assert!(ready_text.contains("\"receipts\":{"), "{ready_text}");
+    assert!(ready_text.contains("\"enabled\":true"), "{ready_text}");
+    assert!(ready_text.contains("\"stopped\":[\"acme\"]"), "{ready_text}");
+}
+
+#[tokio::test]
 async fn receipts_off_still_answers_when_the_decision_queue_is_full() {
     let (upstream, _mock) = mock_upstream().await;
     let gateway = Gateway::boot(upstream, true, false, false).await;

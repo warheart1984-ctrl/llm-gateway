@@ -195,6 +195,7 @@ pub async fn build_with_ledger(
 
     let receipts = open_receipts(&settings, &tenants)?;
     let metrics = crate::observability::Metrics::new(std::time::Instant::now());
+    metrics.set_receipts(receipts.clone());
     let generation = Arc::new(RegistryGeneration {
         models: snapshot,
         tenants,

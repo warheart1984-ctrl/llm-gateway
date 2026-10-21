@@ -14,14 +14,17 @@ use std::{
     fmt::Write as _,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(target_os = "linux")]
 use std::fs;
 
 use dashmap::DashMap;
+
+use crate::receipts::{ReceiptBook, ReceiptChain};
 
 use super::logging::StreamSummary;
 
@@ -77,12 +80,45 @@ struct TenantRollup {
     completion_tokens: AtomicU64,
 }
 
-#[derive(Debug, Default)]
 pub struct Metrics {
     global: Counters,
     by_model: DashMap<String, Arc<ModelRollup>>,
     by_tenant: DashMap<String, Arc<TenantRollup>>,
     uptime_secs: AtomicU64,
+    /// Every receipt-enabled tenant's chain on this replica, set once at
+    /// boot. Gauges are read here at scrape time; counters live in each
+    /// chain's `Shared` atomics.
+    receipts: Mutex<Option<Arc<ReceiptBook>>>,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self {
+            global: Counters::default(),
+            by_model: DashMap::new(),
+            by_tenant: DashMap::new(),
+            uptime_secs: AtomicU64::new(0),
+            receipts: Mutex::new(None),
+        }
+    }
+}
+
+impl std::fmt::Debug for Metrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Metrics")
+            .field("uptime_secs", &self.uptime_secs.load(Ordering::Relaxed))
+            .field(
+                "receipts",
+                &self
+                    .receipts
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_ref()
+                    .map(|book| book.tenants().len())
+                    .unwrap_or(0),
+            )
+            .finish()
+    }
 }
 
 pub type SharedMetrics = Arc<Metrics>;
@@ -98,6 +134,13 @@ impl Metrics {
     /// only place that needs it and runs off the hot path.
     pub fn refresh_uptime(&self, start: std::time::Instant) {
         self.uptime_secs.store(start.elapsed().as_secs(), Ordering::Relaxed);
+    }
+
+    /// Publish the receipt book so `render` can expose per-tenant chain
+    /// state at scrape time. Set once at boot; chains open lazily on first
+    /// request and are read here through the same `Arc`.
+    pub fn set_receipts(&self, book: Option<Arc<ReceiptBook>>) {
+        *self.receipts.lock().unwrap_or_else(|p| p.into_inner()) = book;
     }
 
     pub fn request_observed(&self) {
@@ -504,6 +547,74 @@ impl Metrics {
             family(&mut out, name, "counter", help, tenants.iter().map(|(l, t)| (l.as_str(), value(t))));
         }
 
+        // Receipts: one series per open tenant chain, labelled by the
+        // configured tenant id (never by request input).
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|s| s.as_secs())
+            .unwrap_or(0);
+        if let Some(book) = self
+            .receipts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(Arc::clone)
+        {
+            let mut series: Vec<(String, String, Arc<ReceiptChain>)> = Vec::new();
+            for id in book.tenants() {
+                let Some(chain) = book.open_chain(&id) else { continue };
+                let label = render_labels(&[("tenant", safe_label(&id))], &[]);
+                series.push((id, label, chain));
+            }
+            series.sort_by(|a, b| a.0.cmp(&b.0));
+            if !series.is_empty() {
+                family(
+                    &mut out,
+                    "gw_receipts_written_total",
+                    "counter",
+                    "receipt entries durably written",
+                    series.iter().map(|(_, l, c)| (l.as_str(), c.len())),
+                );
+                family(
+                    &mut out,
+                    "gw_receipt_write_failures_total",
+                    "counter",
+                    "receipt jobs answered Unavailable or Io because a write failed",
+                    series.iter().map(|(_, l, c)| (l.as_str(), c.write_failures())),
+                );
+                family(
+                    &mut out,
+                    "gw_receipt_recoveries_total",
+                    "counter",
+                    "receipt torn tails quarantined at startup",
+                    series.iter().map(|(_, l, c)| (l.as_str(), c.recoveries())),
+                );
+                family(
+                    &mut out,
+                    "gw_receipt_entries",
+                    "gauge",
+                    "receipt entries in the log",
+                    series.iter().map(|(_, l, c)| (l.as_str(), c.len())),
+                );
+                family(
+                    &mut out,
+                    "gw_receipt_chain_stopped",
+                    "gauge",
+                    "the receipt chain refused further appends",
+                    series.iter().map(|(_, l, c)| (l.as_str(), if c.is_failed() { 1 } else { 0 })),
+                );
+                let _ = writeln!(out, "# HELP gw_receipt_anchor_age_seconds seconds since the last anchor this process wrote");
+                let _ = writeln!(out, "# TYPE gw_receipt_anchor_age_seconds gauge");
+                for (_id, l, c) in &series {
+                    let age = match c.last_anchor_secs() {
+                        0 => -1i64,
+                        secs => now.saturating_sub(secs) as i64,
+                    };
+                    let _ = writeln!(out, "gw_receipt_anchor_age_seconds{l} {age}");
+                }
+            }
+        }
+
         out
     }
 }
@@ -851,5 +962,65 @@ mod tests {
         {
             assert!(!line.contains('{'), "total must be a bare counter line: {line}");
         }
+    }
+
+    #[test]
+    fn a_torn_tail_at_startup_counts_as_a_recovery() {
+        let m = Metrics::new(std::time::Instant::now());
+        let dir = std::env::temp_dir().join(format!(
+            "llm-gw-metrics-recovery-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let acme = dir.join("acme");
+        std::fs::create_dir_all(&acme).unwrap();
+        // A torn tail: a partial line with no terminating newline.
+        std::fs::write(acme.join("receipts.jsonl"), "{\"version\":\"infinity.receipt.v2\"").unwrap();
+        let book = Arc::new(
+            crate::receipts::ReceiptBook::open(
+                &dir,
+                crate::receipts::ChainOptions {
+                    anchor_every: 1_000_000,
+                    anchor_interval: std::time::Duration::from_secs(3600),
+                },
+                ["acme"],
+            )
+            .unwrap(),
+        );
+        assert_eq!(book.chain("acme").unwrap().recoveries(), 1);
+        m.set_receipts(Some(Arc::clone(&book)));
+        let text = m.render();
+        assert!(
+            text.contains("gw_receipt_recoveries_total{tenant=\"acme\"} 1"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn unknown_tenant_ids_never_create_a_receipts_series() {
+        let m = Metrics::new(std::time::Instant::now());
+        let dir = std::env::temp_dir().join(format!(
+            "llm-gw-metrics-cardinality-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = Arc::new(
+            crate::receipts::ReceiptBook::open(
+                &dir,
+                crate::receipts::ChainOptions {
+                    anchor_every: 1_000_000,
+                    anchor_interval: std::time::Duration::from_secs(3600),
+                },
+                ["acme"],
+            )
+            .unwrap(),
+        );
+        m.set_receipts(Some(Arc::clone(&book)));
+        let text = m.render();
+        assert!(!text.contains("tenant=\"evil\""), "{text}");
+        // acme's chain is open, so it is listed even with no entries.
+        assert!(text.contains("tenant=\"acme\""), "{text}");
     }
 }

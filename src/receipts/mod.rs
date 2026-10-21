@@ -307,6 +307,12 @@ struct Shared {
     fail_disk_write: AtomicU64,
     /// `sync_data` calls left to fail, through commit()'s real path.
     fail_disk_sync: AtomicU64,
+    /// Jobs answered Unavailable because the disk write failed.
+    write_failures: AtomicU64,
+    /// Torn tails quarantined at startup.
+    recoveries: AtomicU64,
+    /// Unix seconds when this process last wrote an anchor; 0 means never.
+    last_anchor_secs: AtomicU64,
 }
 
 impl Shared {
@@ -406,9 +412,10 @@ impl ReceiptChain {
             .map_err(io_err)?;
         // The anchor's own torn tail first (no anchor vouches for an anchor),
         // then the log's, checked against what the anchors cover.
-        recover_torn_tail(&anchor_path, directory, 0)?;
+        let mut recoveries: u64 = 0;
+        recoveries += recover_torn_tail(&anchor_path, directory, 0)? as u64;
         let anchor_text = fs::read_to_string(&anchor_path).unwrap_or_default();
-        recover_torn_tail(&log_path, directory, anchored_entries(&anchor_text))?;
+        recoveries += recover_torn_tail(&log_path, directory, anchored_entries(&anchor_text))? as u64;
         let text = read_from(&mut log, 0)?;
         let entries = verify_snapshot(&text, &anchor_text, &signer)?;
         let anchored_count = anchored_entries(&anchor_text);
@@ -424,6 +431,7 @@ impl ReceiptChain {
         let head_id = head.as_ref().map(|entry| entry.receipt_id().to_string());
         let shared = Arc::new(Shared::default());
         shared.count.store(count, Ordering::SeqCst);
+        shared.recoveries.store(recoveries, Ordering::SeqCst);
         shared.verifies.store(1, Ordering::SeqCst);
         *shared.head.lock().unwrap_or_else(|p| p.into_inner()) = head_id.clone();
 
@@ -506,6 +514,21 @@ impl ReceiptChain {
     /// until the process restarts and the log verifies again.
     pub fn is_failed(&self) -> bool {
         self.shared.failed.load(Ordering::SeqCst)
+    }
+
+    /// Jobs answered Unavailable because a disk write failed.
+    pub fn write_failures(&self) -> u64 {
+        self.shared.write_failures.load(Ordering::SeqCst)
+    }
+
+    /// Torn tails quarantined at startup.
+    pub fn recoveries(&self) -> u64 {
+        self.shared.recoveries.load(Ordering::SeqCst)
+    }
+
+    /// Unix seconds when this process last wrote an anchor; 0 means never.
+    pub fn last_anchor_secs(&self) -> u64 {
+        self.shared.last_anchor_secs.load(Ordering::SeqCst)
     }
 
     /// Test hook: the next `n` appends fail before they touch the log.
@@ -784,6 +807,7 @@ impl Writer {
             }
             Err(err) => {
                 let err = io_err(err);
+                self.shared.write_failures.fetch_add(1, Ordering::SeqCst);
                 self.fail(&err);
                 self.head = start_head;
                 self.count = start_count;
@@ -870,6 +894,9 @@ impl Writer {
             .map_err(io_err)?;
         self.anchored_count = self.count;
         self.last_anchor = Instant::now();
+        self.shared
+            .last_anchor_secs
+            .store(unix_secs(), Ordering::SeqCst);
         self.shared.anchors.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -1011,14 +1038,16 @@ fn check_anchors(entries: &[LogEntry], text: &str, keys: &TrustedKeys) -> Result
 /// * Running it again is a no-op: the file now ends in a newline, the
 ///   quarantine name is the fragment's hash, and a recovery line already
 ///   written for the same cut is not written twice.
-fn recover_torn_tail(path: &Path, directory: &Path, anchored_entries: u64) -> Result<(), ReceiptError> {
+/// True when a fragment was quarantined and the file was cut. False when
+/// there was nothing to recover (empty, or already ending in a newline).
+fn recover_torn_tail(path: &Path, directory: &Path, anchored_entries: u64) -> Result<bool, ReceiptError> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(err) => return Err(io_err(err)),
     };
     if bytes.is_empty() || bytes.ends_with(b"\n") {
-        return Ok(());
+        return Ok(false);
     }
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("log");
     let keep = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
@@ -1068,13 +1097,13 @@ fn recover_torn_tail(path: &Path, directory: &Path, anchored_entries: u64) -> Re
     }
     let file = OpenOptions::new().write(true).open(path).map_err(io_err)?;
     file.set_len(keep as u64).and_then(|()| file.sync_all()).map_err(io_err)?;
-    tracing::warn!(
-        file = %path.display(),
-        fragment_bytes = fragment.len(),
-        quarantined_as = %kept_at.display(),
-        "moved an unterminated last line left by an interrupted write to quarantine; see recovery.jsonl"
-    );
-    Ok(())
+        tracing::warn!(
+            file = %path.display(),
+            fragment_bytes = fragment.len(),
+            quarantined_as = %kept_at.display(),
+            "moved an unterminated last line left by an interrupted write to quarantine; see recovery.jsonl"
+        );
+        Ok(true)
 }
 
 /// The highest entry count any well-formed anchor line claims. Recovery
@@ -1201,6 +1230,14 @@ fn issued_at_now() -> Result<String, ReceiptError> {
         .map_err(|_| ReceiptError::Io("the system clock is before 1970".into()))?
         .as_secs();
     Ok(rfc3339_from_unix(secs as i64))
+}
+
+/// Seconds since the UNIX epoch, or 0 when the clock is before 1970.
+fn unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|s| s.as_secs())
+        .unwrap_or(0)
 }
 
 /// Seconds since 1970 as `YYYY-MM-DDTHH:MM:SSZ`. Same civil conversion the
