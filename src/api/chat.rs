@@ -427,7 +427,7 @@ async fn handle(state: Arc<AppState>, headers: HeaderMap, body: Bytes, mode: Mod
             response
         }
         Err(err) => {
-            let err = match ensure_deny_receipt(&state, &span, &request_id, mode, &err).await {
+            let err = match ensure_deny_receipt(&state, &span, &request_id, &err).await {
                 Ok(()) => err,
                 Err(receipt_err) => receipt_err,
             };
@@ -510,15 +510,14 @@ fn record_decision(state: &AppState, span: &RequestSpan, request_id: &str, mode:
     state.limits.ledger().record_decision(decision);
 }
 
-/// The process chain, when this stream's tenant has receipts on.
-/// Completions are out of this slice. Receipts off returns `None` and the
-/// decision queue keeps today's best-effort behavior.
-fn stream_chain(
+/// The process chain, when this tenant has receipts on, for either
+/// endpoint. Receipts off returns `None` and the decision queue keeps
+/// today's best-effort behavior.
+fn tenant_chain(
     state: &AppState,
-    mode: Mode,
     tenant_id: &str,
 ) -> Result<Option<std::sync::Arc<receipts::ReceiptChain>>, RequestError> {
-    if mode != Mode::Stream || tenant_id.is_empty() {
+    if tenant_id.is_empty() {
         return Ok(None);
     }
     let wants = state.current_tenants().get(tenant_id).is_some_and(|tenant| tenant.receipts);
@@ -551,7 +550,6 @@ async fn ensure_deny_receipt(
     state: &AppState,
     span: &RequestSpan,
     request_id: &str,
-    mode: Mode,
     err: &RequestError,
 ) -> Result<(), RequestError> {
     if matches!(
@@ -561,7 +559,7 @@ async fn ensure_deny_receipt(
     {
         return Ok(());
     }
-    let Some(chain) = stream_chain(state, mode, &span.tenant_id)? else {
+    let Some(chain) = tenant_chain(state, &span.tenant_id)? else {
         return Ok(());
     };
     chain
@@ -578,11 +576,11 @@ async fn ensure_deny_receipt(
         .map_err(|_| RequestError::ReceiptUnavailable)
 }
 
-/// The upstream refused before anything was relayed: close the allow with a
-/// `failed` outcome over an empty reply, and wait until it is durable.
-async fn failed_outcome(open: &OpenReceipt, empty_reply: String) -> Result<(), RequestError> {
+/// Nothing came back: close the allow with a `failed` outcome that has no
+/// reply digest, and wait until it is durable.
+async fn failed_outcome(open: &OpenReceipt) -> Result<(), RequestError> {
     open.chain
-        .outcome(open, "failed", empty_reply)
+        .outcome(open, "failed", None)
         .await
         .map(|_| ())
         .map_err(|_| RequestError::ReceiptUnavailable)
@@ -798,7 +796,7 @@ async fn admit(
     } else {
         Value::Null
     };
-    let chain = if mode == Mode::Stream && decision.tenant.receipts {
+    let chain = if decision.tenant.receipts {
         Some(state.receipts.clone().ok_or(RequestError::ReceiptUnavailable)?)
     } else {
         None
@@ -953,7 +951,7 @@ async fn normalized_response(
             admitted.reservation.release();
             state.metrics.stream_failed_to_start(&provider, &model);
             if let Some(open) = &admitted.receipt {
-                failed_outcome(open, ReplyDigest::new(open.salt.clone()).finish()).await?;
+                failed_outcome(open).await?;
             }
             return Err(err.into());
         }
@@ -1093,7 +1091,7 @@ impl NormalizedState {
         if let Some(open) = self.open_receipt.clone() {
             let failed = extra.is_some() || self.summary.error_code.is_some();
             let status = if failed { "failed" } else { "completed" };
-            let response = self.reply_hash.as_ref().map(ReplyDigest::finish).unwrap_or_default();
+            let response = self.reply_hash.as_ref().map(ReplyDigest::finish);
             // Waits on the receipt writer without holding a runtime thread.
             if open.chain.outcome(&open, status, response).await.is_err() {
                 // The successful close is the reply. Withhold it.
@@ -1343,7 +1341,7 @@ impl Drop for NormalizedState {
             self.settle();
             if let Some(open) = &self.open_receipt {
                 // Nobody is left to withhold from; the writer still records it.
-                let response = self.reply_hash.as_ref().map(ReplyDigest::finish).unwrap_or_default();
+                let response = self.reply_hash.as_ref().map(ReplyDigest::finish);
                 open.chain.outcome_detached(open, "failed", response);
             }
             self.emit_summary();
@@ -1548,9 +1546,13 @@ async fn complete_response(
     admitted: Admitted,
     span: &RequestSpan,
 ) -> Result<Response, RequestError> {
-    let headers = response_headers(span, &admitted.resolved, &admitted.principal, &admitted.reservation);
+    let mut headers = response_headers(span, &admitted.resolved, &admitted.principal, &admitted.reservation);
+    insert_receipt_headers(&mut headers, admitted.receipt.as_ref());
+    let receipt = admitted.receipt;
     // Counted as in flight for the whole wait, so a graceful shutdown drains
-    // a completion the same way it drains a stream.
+    // a completion the same way it drains a stream. A client that hangs up
+    // while waiting leaves its allow without an outcome: whether the
+    // upstream finished is unknown, and the log says exactly that.
     state.inflight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut guard = CompletionGuard {
         reservation: admitted.reservation,
@@ -1585,6 +1587,9 @@ async fn complete_response(
                 guard.reservation.release();
                 state.metrics.stream_failed_to_start(&guard.span.provider, &guard.span.model);
             }
+            if let Some(open) = &receipt {
+                failed_outcome(open).await?;
+            }
             return Err(err.into());
         }
     };
@@ -1603,6 +1608,28 @@ async fn complete_response(
     s.upstream_model.clone_from(&completion.upstream_model);
     s.events = 1;
     let payload = completion_payload(&completion, &usage, cost, &guard, admitted.metadata.as_ref());
+    // The outcome is durable before the answer goes anywhere: if it cannot
+    // be written the answer is withheld, and it is not kept for an
+    // idempotent replay either, so a retry cannot fetch what was withheld.
+    // The provider did the work, so the usage is still billed.
+    if let Some(open) = &receipt {
+        let mut reply = ReplyDigest::new(open.salt.clone());
+        reply.content(&completion.content);
+        reply.reasoning(completion.reasoning.as_deref().unwrap_or_default());
+        for (index, call) in completion.tool_calls.iter().enumerate() {
+            reply.tool(
+                u32::try_from(index).unwrap_or(u32::MAX),
+                Some(&call.id),
+                Some(&call.function.name),
+                Some(&call.function.arguments),
+            );
+        }
+        if open.chain.outcome(open, "completed", Some(reply.finish())).await.is_err() {
+            guard.reservation.settle(usage, &guard.cost_model);
+            guard.record(true);
+            return Err(RequestError::ReceiptUnavailable);
+        }
+    }
     // The answer goes into the ledger with the settlement, so a repeat under
     // the same Idempotency-Key is served from there.
     guard.reservation.keep_response(payload.clone());
@@ -1714,7 +1741,7 @@ async fn passthrough_response(
             admitted.reservation.release();
             state.metrics.stream_failed_to_start(&provider_name, &model_id);
             if let Some(open) = &admitted.receipt {
-                failed_outcome(open, RawReplyDigest::new(&open.salt).finish()).await?;
+                failed_outcome(open).await?;
             }
             return Err(err.into());
         }
@@ -1883,7 +1910,7 @@ impl RawStream {
         self.reservation.commit_reserved();
         if let Some(open) = &self.open_receipt {
             let failed = failed || self.summary.error_code.is_some() || self.summary.aborted_by_client;
-            let response = self.reply_hash.as_ref().map(RawReplyDigest::finish).unwrap_or_default();
+            let response = self.reply_hash.as_ref().map(RawReplyDigest::finish);
             if failed {
                 // Already ending in an error, or nobody is left: record it
                 // without waiting.

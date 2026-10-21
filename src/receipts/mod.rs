@@ -283,7 +283,8 @@ enum Work {
         decision_receipt_id: String,
         status: &'static str,
         request: String,
-        response: String,
+        /// `None` when nothing came back at all.
+        response: Option<String>,
     },
 }
 
@@ -300,10 +301,19 @@ struct Shared {
     anchors: AtomicU64,
     failed: AtomicBool,
     fail_appends: AtomicU64,
+    /// Appends still allowed before `fail_appends` starts counting down.
+    fail_after: AtomicU64,
 }
 
 impl Shared {
     fn take_failure(&self) -> bool {
+        let mut skip = self.fail_after.load(Ordering::SeqCst);
+        while skip > 0 {
+            match self.fail_after.compare_exchange(skip, skip - 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return false,
+                Err(actual) => skip = actual,
+            }
+        }
         let mut current = self.fail_appends.load(Ordering::SeqCst);
         loop {
             if current == 0 {
@@ -365,15 +375,14 @@ impl ReceiptChain {
             .append(true)
             .open(&log_path)
             .map_err(io_err)?;
-        let text = read_from(&mut log, 0)?;
+        // The anchor's own torn tail first (no anchor vouches for an anchor),
+        // then the log's, checked against what the anchors cover.
+        recover_torn_tail(&anchor_path, directory, 0)?;
         let anchor_text = fs::read_to_string(&anchor_path).unwrap_or_default();
+        recover_torn_tail(&log_path, directory, anchored_entries(&anchor_text))?;
+        let text = read_from(&mut log, 0)?;
         let entries = verify_snapshot(&text, &anchor_text, &signer)?;
-        let anchored_count = anchor_text
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter_map(|record| record.get("count").and_then(Value::as_u64))
-            .max()
-            .unwrap_or(0);
+        let anchored_count = anchored_entries(&anchor_text);
 
         let anchor = OpenOptions::new()
             .create(true)
@@ -472,6 +481,12 @@ impl ReceiptChain {
 
     /// Test hook: the next `n` appends fail before they touch the log.
     pub fn fail_next_appends(&self, n: u64) {
+        self.fail_appends_after(0, n);
+    }
+
+    /// Test hook: let `ok` appends through, then fail the `n` after them.
+    pub fn fail_appends_after(&self, ok: u64, n: u64) {
+        self.shared.fail_after.store(ok, Ordering::SeqCst);
         self.shared.fail_appends.store(n, Ordering::SeqCst);
     }
 
@@ -493,14 +508,15 @@ impl ReceiptChain {
         self.judge(subject, "read", true, "await_human_approval").await
     }
 
-    /// Stream end → kernel outcome, waiting until it is durable.
-    pub async fn outcome(&self, open: &OpenReceipt, status: &'static str, response: String) -> Answer {
+    /// Stream end → kernel outcome, waiting until it is durable. `response`
+    /// is `None` when the upstream sent nothing back at all.
+    pub async fn outcome(&self, open: &OpenReceipt, status: &'static str, response: Option<String>) -> Answer {
         wait(self.outcome_pending(open, status, response)).await
     }
 
     /// Queue an outcome and return the receiver, for code that has to poll
     /// it rather than `.await` it.
-    pub fn outcome_pending(&self, open: &OpenReceipt, status: &'static str, response: String) -> oneshot::Receiver<Answer> {
+    pub fn outcome_pending(&self, open: &OpenReceipt, status: &'static str, response: Option<String>) -> oneshot::Receiver<Answer> {
         let (reply, answer) = oneshot::channel();
         self.send(Work::Outcome {
             decision_receipt_id: open.decision_receipt_id.clone(),
@@ -513,7 +529,7 @@ impl ReceiptChain {
 
     /// Queue an outcome nobody waits for: a client that hung up, or a stream
     /// that already failed. It is still written in order.
-    pub fn outcome_detached(&self, open: &OpenReceipt, status: &'static str, response: String) {
+    pub fn outcome_detached(&self, open: &OpenReceipt, status: &'static str, response: Option<String>) {
         self.send(Work::Outcome {
             decision_receipt_id: open.decision_receipt_id.clone(),
             status,
@@ -651,7 +667,7 @@ impl Writer {
                 &decision_receipt_id,
                 status,
                 Some(request),
-                Some(response),
+                response,
                 previous,
                 issued_at,
             )
@@ -921,6 +937,105 @@ fn check_anchors(entries: &[LogEntry], text: &str, keys: &TrustedKeys) -> Result
     Ok(())
 }
 
+/// The rule for an interrupted write, which can leave a file ending part-way
+/// through a line:
+///
+/// * Only an unterminated last line is ever considered. A file ending in a
+///   newline is never changed, and a complete line that does not verify
+///   refuses to start as before.
+/// * Committed entries always end in a newline: the writer answers only
+///   after the whole batch, newlines included, is flushed, and anchors only
+///   cover entries it read back complete. So an unterminated fragment was
+///   never acknowledged to anyone.
+/// * A fragment that parses as a complete JSON record is not treated as
+///   debris: it could be a whole entry that lost only its newline, so
+///   startup refuses and a person decides.
+/// * If an anchor counts more entries than the complete lines on disk, an
+///   anchored entry is damaged: startup refuses without changing anything.
+/// * Nothing is deleted. The fragment's bytes are moved to
+///   `quarantine/<file>.<hash>.fragment` before the file is cut, and a line in
+///   `recovery.jsonl` names the file, the bytes kept, and the fragment's size,
+///   hash and quarantine path.
+/// * Running it again is a no-op: the file now ends in a newline, the
+///   quarantine name is the fragment's hash, and a recovery line already
+///   written for the same cut is not written twice.
+fn recover_torn_tail(path: &Path, directory: &Path, anchored_entries: u64) -> Result<(), ReceiptError> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(io_err(err)),
+    };
+    if bytes.is_empty() || bytes.ends_with(b"\n") {
+        return Ok(());
+    }
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("log");
+    let keep = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    let fragment = &bytes[keep..];
+    if serde_json::from_slice::<Value>(fragment).is_ok() {
+        return Err(ReceiptError::Unverified(format!(
+            "{name} ends in a complete record without a newline; it may be committed evidence, so it is not removed automatically"
+        )));
+    }
+    let complete_lines = bytes[..keep]
+        .split(|&b| b == b'\n')
+        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+        .count() as u64;
+    if anchored_entries > complete_lines {
+        return Err(ReceiptError::Unverified(format!(
+            "an anchor covers {anchored_entries} entries but only {complete_lines} are complete in {name}; an anchored entry is damaged"
+        )));
+    }
+
+    let hash = format!("{:x}", Sha256::digest(fragment));
+    let quarantine = directory.join("quarantine");
+    fs::create_dir_all(&quarantine).map_err(io_err)?;
+    let kept_at = quarantine.join(format!("{name}.{}.fragment", &hash[..16]));
+    if fs::read(&kept_at).ok().as_deref() != Some(fragment) {
+        let mut out = File::create(&kept_at).map_err(io_err)?;
+        out.write_all(fragment).and_then(|()| out.sync_all()).map_err(io_err)?;
+    }
+    let record_path = directory.join("recovery.jsonl");
+    let sha = format!("sha256:{hash}");
+    let already = fs::read_to_string(&record_path).unwrap_or_default().lines().any(|line| {
+        serde_json::from_str::<Value>(line).is_ok_and(|r| {
+            r["file"] == name && r["kept_bytes"] == keep && r["fragment_sha256"] == sha.as_str()
+        })
+    });
+    if !already {
+        let entry = json!({
+            "recovered_at": issued_at_now()?,
+            "file": name,
+            "kept_bytes": keep,
+            "fragment_bytes": fragment.len(),
+            "fragment_sha256": sha,
+            "quarantined_as": format!("quarantine/{}", kept_at.file_name().and_then(|n| n.to_str()).unwrap_or_default()),
+            "rule": "unterminated last line, never acknowledged, not covered by any anchor",
+        });
+        let mut out = OpenOptions::new().create(true).append(true).open(&record_path).map_err(io_err)?;
+        writeln!(out, "{entry}").and_then(|()| out.sync_data()).map_err(io_err)?;
+    }
+    let file = OpenOptions::new().write(true).open(path).map_err(io_err)?;
+    file.set_len(keep as u64).and_then(|()| file.sync_all()).map_err(io_err)?;
+    tracing::warn!(
+        file = %path.display(),
+        fragment_bytes = fragment.len(),
+        quarantined_as = %kept_at.display(),
+        "moved an unterminated last line left by an interrupted write to quarantine; see recovery.jsonl"
+    );
+    Ok(())
+}
+
+/// The highest entry count any well-formed anchor line claims. Recovery
+/// uses it to tell an unacknowledged tail from damaged anchored evidence.
+fn anchored_entries(anchor_text: &str) -> u64 {
+    anchor_text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|record| record.get("count").and_then(Value::as_u64))
+        .max()
+        .unwrap_or(0)
+}
+
 fn read_from(file: &mut File, offset: u64) -> Result<String, ReceiptError> {
     file.seek(SeekFrom::Start(offset)).map_err(io_err)?;
     let mut text = String::new();
@@ -1158,7 +1273,7 @@ mod tests {
         let mut reply = ReplyDigest::new(salt.clone());
         reply.content("Hello, world");
         let open = open_receipt(&chain, allow_id, &salt);
-        chain.outcome(&open, "completed", reply.finish()).await.unwrap();
+        chain.outcome(&open, "completed", Some(reply.finish())).await.unwrap();
         chain.deny(&subject("budget_exhausted", &salt)).await.unwrap();
         chain.await_approval(&subject("hold", &salt)).await.unwrap();
 
@@ -1293,6 +1408,200 @@ mod tests {
         assert_eq!(anchor["head_receipt_id"], head);
         let reopened = ReceiptChain::open(&dir, options(1_000_000)).unwrap();
         assert_eq!(reopened.len(), 1);
+    }
+
+    /// A chain with `n` entries, closed, ready to be damaged on disk.
+    async fn closed_chain(name: &str, n: usize, anchor_every: u64) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = scratch(name);
+        let chain = ReceiptChain::open(&dir, options(anchor_every)).unwrap();
+        let salt = Salt::generate().unwrap();
+        for _ in 0..n {
+            chain.allow(&subject("reserve", &salt)).await.unwrap();
+        }
+        let (log, anchor) = (chain.log_path().to_path_buf(), chain.anchor_path().to_path_buf());
+        drop(chain);
+        (dir, log, anchor)
+    }
+
+    fn quarantined(dir: &Path) -> Vec<Vec<u8>> {
+        fs::read_dir(dir.join("quarantine"))
+            .map(|entries| entries.map(|e| fs::read(e.unwrap().path()).unwrap()).collect())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn a_torn_tail_is_quarantined_recorded_and_the_committed_entries_verify() {
+        // Three committed entries, anchored at shutdown, and a torn fourth.
+        let (dir, log, anchor) = closed_chain("torn", 3, 1_000_000).await;
+        let committed = fs::read(&log).unwrap();
+        let anchors = fs::read(&anchor).unwrap();
+        // A crash mid-write: half an entry at the end of the log, half a
+        // record at the end of the anchor file.
+        let log_fragment = br#"{"version":"infinity.receipt.v2","receipt_id":"rece"#.to_vec();
+        let anchor_fragment = br#"{"version":"infinity.anch"#.to_vec();
+        fs::write(&log, [committed.clone(), log_fragment.clone()].concat()).unwrap();
+        fs::write(&anchor, [anchors.clone(), anchor_fragment.clone()].concat()).unwrap();
+
+        let chain = ReceiptChain::open(&dir, options(1_000_000)).expect("a torn tail must not stop the replica");
+        assert_eq!(chain.len(), 3, "every committed entry is still there");
+        assert_eq!(fs::read(&log).unwrap(), committed, "exactly the fragment was cut, nothing committed");
+        assert_eq!(fs::read(&anchor).unwrap(), anchors);
+        let mut kept = quarantined(&dir);
+        kept.sort();
+        let mut expected = vec![log_fragment.clone(), anchor_fragment];
+        expected.sort();
+        assert_eq!(kept, expected, "the cut bytes are kept, not destroyed");
+        let records = lines(&dir.join("recovery.jsonl"));
+        assert_eq!(records.len(), 2, "{records:?}");
+        let log_record: Value = records
+            .iter()
+            .map(|r| serde_json::from_str::<Value>(r).unwrap())
+            .find(|r| r["file"] == "receipts.jsonl")
+            .unwrap();
+        assert_eq!(log_record["kept_bytes"], committed.len());
+        assert_eq!(log_record["fragment_bytes"], log_fragment.len());
+        assert_eq!(
+            log_record["fragment_sha256"],
+            format!("sha256:{:x}", Sha256::digest(&log_fragment))
+        );
+
+        let salt = Salt::generate().unwrap();
+        chain.allow(&subject("reserve", &salt)).await.unwrap();
+        if let Some(code) = ickverify(chain.log_path(), &chain, true) {
+            assert_eq!(code, 0, "the recovered log must verify");
+        }
+        drop(chain);
+
+        // Again: nothing to do, nothing recorded twice.
+        ReceiptChain::open(&dir, options(1_000_000)).unwrap();
+        assert_eq!(lines(&dir.join("recovery.jsonl")).len(), 2);
+        assert_eq!(quarantined(&dir).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn recovery_interrupted_before_the_cut_is_idempotent() {
+        let (dir, log, _) = closed_chain("torn-twice", 2, 1_000_000).await;
+        let committed = fs::read(&log).unwrap();
+        fs::write(&log, [committed.clone(), b"{\"version\":\"inf".to_vec()].concat()).unwrap();
+        // The first attempt dies after quarantining and recording, before
+        // cutting: simulate by running the steps and restoring the tail.
+        recover_torn_tail(&log, &dir, 0).unwrap();
+        fs::write(&log, [committed.clone(), b"{\"version\":\"inf".to_vec()].concat()).unwrap();
+        recover_torn_tail(&log, &dir, 0).unwrap();
+        assert_eq!(fs::read(&log).unwrap(), committed);
+        assert_eq!(lines(&dir.join("recovery.jsonl")).len(), 1, "one cut, one record");
+        assert_eq!(quarantined(&dir).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_whole_record_missing_only_its_newline_is_not_removed() {
+        let (dir, log, _) = closed_chain("no-newline", 2, 1_000_000).await;
+        let mut bytes = fs::read(&log).unwrap();
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        fs::write(&log, &bytes).unwrap();
+        match ReceiptChain::open(&dir, options(1_000_000)) {
+            Err(ReceiptError::Unverified(message)) => assert!(message.contains("may be committed"), "{message}"),
+            Err(err) => panic!("expected a refusal, got {err}"),
+            Ok(_) => panic!("a complete record must not be treated as debris"),
+        }
+        assert_eq!(fs::read(&log).unwrap(), bytes, "nothing was changed");
+        assert!(!dir.join("recovery.jsonl").exists());
+        assert!(quarantined(&dir).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_torn_entry_an_anchor_already_covers_is_damage_not_debris() {
+        // Three entries, all anchored; then the third is cut in half.
+        let (dir, log, _) = closed_chain("anchored-torn", 3, 1).await;
+        let committed = fs::read(&log).unwrap();
+        let text = String::from_utf8(committed.clone()).unwrap();
+        let last_start = text[..text.len() - 1].rfind('\n').unwrap() + 1;
+        let cut = &committed[..last_start + 40];
+        fs::write(&log, cut).unwrap();
+        match ReceiptChain::open(&dir, options(1)) {
+            Err(ReceiptError::Unverified(message)) => assert!(message.contains("anchored entry is damaged"), "{message}"),
+            Err(err) => panic!("expected a refusal, got {err}"),
+            Ok(_) => panic!("anchored evidence must not be auto-repaired"),
+        }
+        assert_eq!(fs::read(&log).unwrap(), cut, "nothing was changed");
+        assert!(quarantined(&dir).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_log_ending_in_a_newline_is_never_touched() {
+        let (dir, log, _) = closed_chain("clean", 2, 1_000_000).await;
+        let committed = fs::read(&log).unwrap();
+        ReceiptChain::open(&dir, options(1_000_000)).unwrap();
+        assert_eq!(fs::read(&log).unwrap(), committed);
+        assert!(!dir.join("recovery.jsonl").exists());
+    }
+
+    #[tokio::test]
+    async fn a_complete_line_that_does_not_parse_still_refuses() {
+        let dir = scratch("garbage");
+        let chain = ReceiptChain::open(&dir, options(100)).unwrap();
+        let salt = Salt::generate().unwrap();
+        chain.allow(&subject("reserve", &salt)).await.unwrap();
+        let log = chain.log_path().to_path_buf();
+        drop(chain);
+        let mut text = fs::read_to_string(&log).unwrap();
+        text.push_str("not a receipt\n");
+        fs::write(&log, text).unwrap();
+        assert!(matches!(ReceiptChain::open(&dir, options(100)), Err(ReceiptError::Unverified(_))));
+        assert!(!dir.join("recovery.jsonl").exists(), "only an unterminated tail is recovered");
+    }
+
+    #[tokio::test]
+    async fn reordered_entries_refuse_to_open() {
+        let dir = scratch("reorder");
+        let chain = ReceiptChain::open(&dir, options(100)).unwrap();
+        let salt = Salt::generate().unwrap();
+        for _ in 0..3 {
+            chain.allow(&subject("reserve", &salt)).await.unwrap();
+        }
+        let log = chain.log_path().to_path_buf();
+        drop(chain);
+        let mut rows: Vec<String> = lines(&log);
+        rows.swap(1, 2);
+        fs::write(&log, rows.join("\n") + "\n").unwrap();
+        assert!(matches!(ReceiptChain::open(&dir, options(100)), Err(ReceiptError::Unverified(_))));
+    }
+
+    #[tokio::test]
+    async fn a_damaged_anchor_refuses_to_open() {
+        let dir = scratch("bad-anchor");
+        let chain = ReceiptChain::open(&dir, options(2)).unwrap();
+        let salt = Salt::generate().unwrap();
+        chain.allow(&subject("reserve", &salt)).await.unwrap();
+        chain.allow(&subject("reserve", &salt)).await.unwrap();
+        settle_anchor(&chain, 1).await;
+        let anchor = chain.anchor_path().to_path_buf();
+        drop(chain);
+        let good = fs::read_to_string(&anchor).unwrap();
+        for (what, damaged) in [
+            ("count changed", good.replacen("\"count\":2", "\"count\":1", 1)),
+            ("signature changed", {
+                let at = good.find("\"signature\":\"ed25519:").unwrap() + "\"signature\":\"ed25519:".len();
+                let mut text = good.clone();
+                let flip = if &text[at..at + 1] == "0" { "1" } else { "0" };
+                text.replace_range(at..at + 1, flip);
+                text
+            }),
+            ("unsigned", {
+                let mut record: Value = serde_json::from_str(good.trim()).unwrap();
+                record.as_object_mut().unwrap().remove("signature");
+                format!("{record}\n")
+            }),
+        ] {
+            assert_ne!(damaged, good, "{what}");
+            fs::write(&anchor, &damaged).unwrap();
+            assert!(
+                matches!(ReceiptChain::open(&dir, options(2)), Err(ReceiptError::Unverified(_))),
+                "{what} must refuse"
+            );
+        }
+        fs::write(&anchor, &good).unwrap();
+        ReceiptChain::open(&dir, options(2)).expect("the undamaged anchor opens");
     }
 
     #[tokio::test]
