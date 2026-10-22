@@ -556,6 +556,15 @@ folding:
 
 `[folding]` in `config/default.toml` bounds the in-memory store (`max_entries`, `max_total_chars`) and sets `background`. The default runs the fold before the request is forwarded. `background = true` answers with the summary already committed and folds afterwards, which spends the tenant's budget after the response.
 
+What a fold costs and keeps:
+
+- **The summarizer call takes a rate slot.** It is admitted like any request, so a fold only runs when the tenant's rate window has room for it and for the request it serves. Near the limit, the request goes out unfolded rather than being refused. A request that is refused afterwards for budget or a repeated `Idempotency-Key` has still paid for its fold; the summary it made is kept for the next request.
+- **It is billed like a main call.** Summarizer prompt tokens are billed at no less than the gateway's estimate of what was sent, and a summarizer that reports no usage is billed the estimated output. `gw_fold_summarizer_tokens_total` counts what was billed.
+- **Values that must survive are pinned.** Times, dates, hyphenated or underscored identifiers, ticket ids, short quoted strings, amounts, and explicit updates ("moved to 15:30", "actually use Tromso instead of Oslo") must appear in the clipped summary, or the fold is refused and the previous summary stays. System messages are not pinned: they go out verbatim on every request.
+- **One fold per conversation at a time.** A request that finds a fold running for its conversation goes out with the summary already committed.
+- **A conversation is keyed by tenant, API key, system messages and first turn.** Sessions behind different keys never share a summary.
+- **The store is shared by all tenants.** One busy tenant can evict others' summaries, which then pay to fold again. Size `max_entries` and `max_total_chars` for every folding tenant together.
+
 ## Receipts
 
 To see all of this end to end, run the receipts demo: `python demo/receipts/run_local.py`,

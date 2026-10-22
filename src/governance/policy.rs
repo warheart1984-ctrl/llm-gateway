@@ -202,26 +202,6 @@ impl FoldingConfig {
         let _ = tenant_id;
         Ok(())
     }
-
-    /// Validate this folding config against the tenant and provider availability.
-    pub fn validate(
-        &self,
-        tenant_id: &str,
-        receipts: bool,
-        provider_available: &dyn Fn(&str) -> bool,
-    ) -> Result<(), String> {
-        self.validate_basic(tenant_id, receipts)?;
-        if !self.enabled {
-            return Ok(());
-        }
-        if !provider_available(self.summarizer_model.split('/').next().unwrap_or("")) {
-            return Err(format!(
-                "summarizer_model `{}` references a provider with no configured adapter",
-                self.summarizer_model
-            ));
-        }
-        Ok(())
-    }
 }
 
 impl HoldPolicy {

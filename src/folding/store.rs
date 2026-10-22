@@ -130,20 +130,26 @@ impl FoldingStore {
         true
     }
 
-    /// Compute the conversation key: HMAC-SHA256 over (tenant_id, protected_messages, first_turn).
+    /// Compute the conversation key: HMAC-SHA256 over the tenant, the API key
+    /// that sent the request, the protected messages and the first turn.
+    /// Two sessions in one tenant that share a system prompt and opening turn
+    /// but use different keys get different entries, instead of evicting
+    /// each other's summary on every request.
     pub fn conversation_key(
         &self,
         tenant_id: &str,
+        key_id: &str,
         protected: &[ChatMessage],
         first_turn: Option<&ChatMessage>,
     ) -> [u8; 32] {
         let mut mac = HmacSha256::new_from_slice(&self.secret).expect("HMAC key is valid");
-        mac.update(tenant_id.as_bytes());
-        mac.update(b"\0");
+        field(&mut mac, tenant_id.as_bytes());
+        field(&mut mac, key_id.as_bytes());
+        count(&mut mac, protected.len());
         for msg in protected {
             Self::message_identity(msg, &mut mac);
         }
-        mac.update(b"\0");
+        count(&mut mac, usize::from(first_turn.is_some()));
         if let Some(turn) = first_turn {
             Self::message_identity(turn, &mut mac);
         }
@@ -153,37 +159,43 @@ impl FoldingStore {
     /// Compute the prefix hash: HMAC-SHA256 over the exact turn list.
     pub fn prefix_hash(&self, tenant_id: &str, turns: &[ChatMessage]) -> [u8; 32] {
         let mut mac = HmacSha256::new_from_slice(&self.secret).expect("HMAC key is valid");
-        mac.update(tenant_id.as_bytes());
-        mac.update(b"\0");
+        field(&mut mac, tenant_id.as_bytes());
+        count(&mut mac, turns.len());
         for turn in turns {
             Self::message_identity(turn, &mut mac);
         }
         mac.finalize().into_bytes().as_slice().try_into().unwrap()
     }
 
-    /// Hash a message's identity (role, name, tool fields, text) into the MAC.
+    /// Hash a message's identity (role, text, tool fields) into the MAC. Every
+    /// field is length-prefixed and every list counted, so no text can imitate
+    /// a field boundary: one message reading "a\0user\0b" and two messages
+    /// "a", "b" hash differently.
     fn message_identity(msg: &ChatMessage, mac: &mut HmacSha256) {
-        mac.update(msg.role().as_bytes());
-        mac.update(b"\0");
-        if let Some(content) = msg.content() {
-            mac.update(content.text().as_bytes());
+        field(mac, msg.role().as_bytes());
+        match msg.content() {
+            Some(content) => {
+                count(mac, 1);
+                field(mac, content.text().as_bytes());
+            }
+            None => count(mac, 0),
         }
-        mac.update(b"\0");
         match msg {
             ChatMessage::Tool { tool_call_id, name, .. } => {
-                mac.update(tool_call_id.as_bytes());
-                mac.update(b"\0");
-                if let Some(n) = name {
-                    mac.update(n.as_bytes());
+                field(mac, tool_call_id.as_bytes());
+                match name {
+                    Some(name) => {
+                        count(mac, 1);
+                        field(mac, name.as_bytes());
+                    }
+                    None => count(mac, 0),
                 }
-                mac.update(b"\0");
             }
             ChatMessage::Assistant { tool_calls, .. } => {
+                count(mac, tool_calls.len());
                 for tc in tool_calls {
-                    mac.update(tc.function.name.as_bytes());
-                    mac.update(b"\0");
-                    mac.update(tc.function.arguments.as_bytes());
-                    mac.update(b"\0");
+                    field(mac, tc.function.name.as_bytes());
+                    field(mac, tc.function.arguments.as_bytes());
                 }
             }
             _ => {}
@@ -316,6 +328,17 @@ pub enum StoreError {
     CapacityExceeded,
 }
 
+/// One length-prefixed field: its byte length, then its bytes.
+fn field(mac: &mut HmacSha256, bytes: &[u8]) {
+    mac.update(&(bytes.len() as u64).to_le_bytes());
+    mac.update(bytes);
+}
+
+/// A count (list length, or 0/1 for an absent/present option).
+fn count(mac: &mut HmacSha256, n: usize) {
+    mac.update(&(n as u64).to_le_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,10 +359,9 @@ mod tests {
         let protected = vec![msg("system", "sys")];
         let first_turn = msg("user", "hello");
 
-        let key1 = store.conversation_key("tenant1", &protected, Some(&first_turn));
-        let key2 = store.conversation_key("tenant1", &protected, Some(&first_turn));
-        let key3 = store.conversation_key(
-            "tenant1",
+        let key1 = store.conversation_key("tenant1", "ak", &protected, Some(&first_turn));
+        let key2 = store.conversation_key("tenant1", "ak", &protected, Some(&first_turn));
+        let key3 = store.conversation_key("tenant1", "ak",
             &protected,
             Some(&first_turn),
         );
@@ -352,8 +374,8 @@ mod tests {
         let store = FoldingStore::new(100, 10000);
         let protected = vec![msg("system", "sys")];
 
-        let key1 = store.conversation_key("tenant1", &protected, Some(&msg("user", "hello")));
-        let key2 = store.conversation_key("tenant1", &protected, Some(&msg("user", "goodbye")));
+        let key1 = store.conversation_key("tenant1", "ak", &protected, Some(&msg("user", "hello")));
+        let key2 = store.conversation_key("tenant1", "ak", &protected, Some(&msg("user", "goodbye")));
         assert_ne!(key1, key2);
     }
 
@@ -363,9 +385,56 @@ mod tests {
         let protected = vec![msg("system", "sys")];
         let first_turn = msg("user", "hello");
 
-        let key1 = store.conversation_key("tenant1", &protected, Some(&first_turn));
-        let key2 = store.conversation_key("tenant2", &protected, Some(&first_turn));
+        let key1 = store.conversation_key("tenant1", "ak", &protected, Some(&first_turn));
+        let key2 = store.conversation_key("tenant2", "ak", &protected, Some(&first_turn));
         assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn different_api_keys_in_one_tenant_get_different_keys() {
+        // Two sessions sharing a system prompt and opening turn used to share
+        // one entry and evict each other's summary on every request.
+        let store = FoldingStore::new(100, 10000);
+        let protected = vec![msg("system", "sys")];
+        let first_turn = msg("user", "hello");
+        assert_ne!(
+            store.conversation_key("tenant1", "ak_one", &protected, Some(&first_turn)),
+            store.conversation_key("tenant1", "ak_two", &protected, Some(&first_turn)),
+        );
+    }
+
+    #[test]
+    fn text_cannot_imitate_a_message_boundary() {
+        // With NUL-joined fields, one message "a\0user\0b" hashed like the two
+        // messages "a", "b". Length prefixes make them differ.
+        let store = FoldingStore::new(100, 10000);
+        let one = [msg("user", "a\0user\0b")];
+        let two = [msg("user", "a"), msg("user", "b")];
+        assert_ne!(store.prefix_hash("tenant1", &one), store.prefix_hash("tenant1", &two));
+        let protected_one = [msg("system", "s\0user\0x")];
+        let protected_two = [msg("system", "s")];
+        assert_ne!(
+            store.conversation_key("tenant1", "ak", &protected_one, None),
+            store.conversation_key("tenant1", "ak", &protected_two, Some(&msg("user", "x"))),
+        );
+        // Same message and list counts; only the field lengths tell these
+        // apart.
+        let call = |name: &str, arguments: &str| ChatMessage::Assistant {
+            content: None,
+            tool_calls: vec![crate::providers::ToolCall {
+                id: "call_1".into(),
+                kind: "function".into(),
+                function: crate::providers::FunctionCall { name: name.into(), arguments: arguments.into() },
+            }],
+        };
+        assert_ne!(
+            store.prefix_hash("tenant1", &[call("f\0x", "y")]),
+            store.prefix_hash("tenant1", &[call("f", "x\0y")]),
+        );
+        assert_ne!(
+            store.conversation_key("t\0a", "b", &[], None),
+            store.conversation_key("t", "a\0b", &[], None),
+        );
     }
 
     #[test]
@@ -394,7 +463,7 @@ mod tests {
         let store = FoldingStore::new(100, 10000);
         let protected = vec![msg("system", "sys")];
         let first_turn = msg("user", "hello");
-        let key = store.conversation_key("tenant1", &protected, Some(&first_turn));
+        let key = store.conversation_key("tenant1", "ak", &protected, Some(&first_turn));
 
         let turns = vec![msg("user", "hello"), msg("assistant", "hi")];
         let prefix_hash = store.prefix_hash("tenant1", &turns);
@@ -430,7 +499,7 @@ mod tests {
         let store = FoldingStore::new(100, 10000);
         let protected = vec![msg("system", "sys")];
         let first = msg("user", "hello");
-        let key = store.conversation_key("tenant1", &protected, Some(&first));
+        let key = store.conversation_key("tenant1", "ak", &protected, Some(&first));
         let turns = vec![first, msg("assistant", "hi"), msg("user", "later")];
         let prefix_hash = store.prefix_hash("tenant1", &turns[..2]);
         store.insert(
@@ -459,8 +528,8 @@ mod tests {
         let store = FoldingStore::new(100, 10000);
         let protected = vec![msg("system", "sys")];
         let first = msg("user", "hello");
-        let short = store.conversation_key("tenant1", &protected, Some(&first));
-        let long = store.conversation_key("tenant1", &protected, Some(&first));
+        let short = store.conversation_key("tenant1", "ak", &protected, Some(&first));
+        let long = store.conversation_key("tenant1", "ak", &protected, Some(&first));
         assert_eq!(short, long);
         let longer_prefix = store.prefix_hash(
             "tenant1",
@@ -469,7 +538,7 @@ mod tests {
         let shorter_prefix = store.prefix_hash("tenant1", &[first, msg("assistant", "one")]);
         assert_ne!(longer_prefix, shorter_prefix);
         assert_eq!(
-            store.conversation_key("tenant1", &protected, Some(&msg("user", "hello"))),
+            store.conversation_key("tenant1", "ak", &protected, Some(&msg("user", "hello"))),
             short
         );
     }
@@ -482,7 +551,7 @@ mod tests {
 
         for i in 0..3 {
             let first_turn = msg("user", &format!("turn{i}"));
-            let key = store.conversation_key("tenant1", &protected, Some(&first_turn));
+            let key = store.conversation_key("tenant1", "ak", &protected, Some(&first_turn));
             let turns = vec![first_turn.clone(), msg("assistant", "resp")];
             let prefix_hash = store.prefix_hash("tenant1", &turns);
 
@@ -512,7 +581,7 @@ mod tests {
 
         for i in 0..3 {
             let first_turn = msg("user", &format!("turn{i}"));
-            let key = store.conversation_key("tenant1", &protected, Some(&first_turn));
+            let key = store.conversation_key("tenant1", "ak", &protected, Some(&first_turn));
             let turns = vec![first_turn.clone(), msg("assistant", "resp")];
             let prefix_hash = store.prefix_hash("tenant1", &turns);
 

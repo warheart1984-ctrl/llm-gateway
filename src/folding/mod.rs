@@ -74,7 +74,8 @@ pub fn prefix_hex(hash: &[u8; 32]) -> String {
 
 use crate::providers::ChatMessage;
 
-/// Split messages into protected (system, developer) and turns (user, assistant, tool).
+/// Split messages into protected (system) and turns (user, assistant, tool).
+/// `developer` is refused at parse, so `system` is the only protected role.
 pub fn split_messages(messages: &[ChatMessage]) -> (Vec<ChatMessage>, Vec<ChatMessage>) {
     let mut protected = Vec::new();
     let mut turns = Vec::new();
@@ -83,27 +84,10 @@ pub fn split_messages(messages: &[ChatMessage]) -> (Vec<ChatMessage>, Vec<ChatMe
             ChatMessage::System { .. } => {
                 protected.push(msg.clone());
             }
-            ChatMessage::User { .. } if is_developer_role(msg) => {
-                protected.push(msg.clone());
-            }
             _ => turns.push(msg.clone()),
         }
     }
     (protected, turns)
-}
-
-/// Check if a message is a developer role (User with name "developer").
-fn is_developer_role(msg: &ChatMessage) -> bool {
-    match msg {
-        ChatMessage::User { .. } => {
-            // In OpenAI format, developer messages are User messages with name="developer"
-            // We check the content for a marker, but the actual wire format
-            // uses a separate role. For now, we treat all User as turns.
-            // The role field is handled in serialization.
-            false
-        }
-        _ => false,
-    }
 }
 
 /// Estimate tokens for a message list using the gateway's estimator.

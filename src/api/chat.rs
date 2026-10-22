@@ -882,6 +882,24 @@ fn stored_summary(entry: &EntryRef) -> StoredSummary {
     }
 }
 
+/// The request as it goes out when no fold runs now: with the committed
+/// summary and the turns it does not cover, or unchanged if there is none.
+fn with_current_summary(
+    messages: &[ChatMessage],
+    protected: &[ChatMessage],
+    prior: Option<&StoredSummary>,
+    pending: &[ChatMessage],
+    tail: &[ChatMessage],
+) -> (Vec<ChatMessage>, usize) {
+    match prior {
+        Some(summary) => (
+            crate::folding::plan::build_forwarded_messages(protected, Some(&summary.summary), pending, tail),
+            summary.turns_covered,
+        ),
+        None => (messages.to_vec(), 0),
+    }
+}
+
 /// Owns everything a fold needs after the request that planned it has moved on.
 struct FoldWork {
     state: Arc<AppState>,
@@ -894,7 +912,6 @@ struct FoldWork {
     cost: crate::router::CostModel,
     provider: Arc<dyn ChatProvider>,
     key: [u8; 32],
-    protected: Vec<ChatMessage>,
     head: Vec<ChatMessage>,
     pending: Vec<ChatMessage>,
     covered: usize,
@@ -1040,7 +1057,9 @@ async fn run_applied_fold(work: FoldWork) -> AppliedFold {
                 };
             }
         };
-        let usage = completion.usage.unwrap_or_default();
+        // Billed like a main completion: a provider that reports no usage is
+        // charged the gateway's estimate of the output, not zero.
+        let usage = billable_usage(&completion, prompt_tokens, budget);
         used_prompt = used_prompt.saturating_add(u64::from(usage.prompt_tokens));
         used_completion = used_completion.saturating_add(u64::from(usage.completion_tokens));
         let content = summarizer::extract_content(&completion);
@@ -1068,7 +1087,6 @@ async fn run_applied_fold(work: FoldWork) -> AppliedFold {
         }
         let Ok(summary) = summarizer::run_checks_with_prior(
             &content,
-            &work.protected,
             work.prior_text.as_deref(),
             &work.pending,
             &work.plan_config,
@@ -1123,6 +1141,7 @@ async fn foreground_fold(
     generation: &crate::state::RegistryGeneration,
     decision: &crate::governance::policy::Decision,
     resolved: &router::ResolvedModel,
+    key_id: &str,
     messages: &[ChatMessage],
 ) -> FoldResult {
     let Some(folding) = decision.tenant.folding.as_ref().filter(|f| f.enabled) else {
@@ -1135,7 +1154,7 @@ async fn foreground_fold(
     };
     let key = state
         .folding
-        .conversation_key(&decision.tenant.tenant_id, &protected, Some(first_turn));
+        .conversation_key(&decision.tenant.tenant_id, key_id, &protected, Some(first_turn));
 
     let existing = state
         .folding
@@ -1152,7 +1171,10 @@ async fn foreground_fold(
     let prior = existing.as_ref().map(stored_summary);
     let plan_config = PlanConfig::from_tenant(folding);
 
-    let Some(summarizer_model) = generation.models.resolve(&folding.summarizer_model).ok() else {
+    // Resolved with the tenant's model suffix, as load-time validation checked
+    // it and as the tenant's own requests are resolved.
+    let summarizer_id = crate::governance::policy::qualify(&decision.tenant.model_suffix, &folding.summarizer_model);
+    let Some(summarizer_model) = generation.models.resolve(&summarizer_id).ok() else {
         return bare_fold(
             messages.to_vec(),
             "failed",
@@ -1216,6 +1238,43 @@ async fn foreground_fold(
     let tail = turns[split..].to_vec();
     let covered = prior.as_ref().map(|summary| summary.turns_covered.min(head.len())).unwrap_or(0);
     let pending = head[covered..].to_vec();
+
+    // The summarizer is admitted like any request: it takes a rate slot and
+    // prompt tokens from the tenant's window. Fold only when the window has
+    // room for it and for the request it serves, so a fold never turns an
+    // admissible request into a 429. Without room, the request goes out with
+    // the summary it already has, or unfolded.
+    let summarizer_prompt = estimate_prompt_tokens(&summarizer::prompt_messages(
+        &plan_config,
+        prior.as_ref().map(|summary| summary.summary.as_str()),
+        &pending,
+    ));
+    if !state.limits.has_rate_headroom(
+        &decision.tenant.tenant_id,
+        &decision.limits,
+        2,
+        summarizer_prompt.saturating_add(estimate_prompt_tokens(messages)),
+    ) {
+        let (forwarded, folded_turns) = with_current_summary(messages, &protected, prior.as_ref(), &pending, &tail);
+        return describe_fold(
+            messages,
+            forwarded,
+            &plan,
+            FoldStamp {
+                outcome: "refused",
+                reason: "no_rate_headroom",
+                attempt: Some(FoldAttempt {
+                    outcome: FoldAccounting::RefusedAdmission,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                }),
+                fold_count: prior.as_ref().map(|summary| summary.fold_count).unwrap_or(0),
+                prefix_hash: prior.as_ref().map(|summary| summary.prefix_hash),
+                folded_turns,
+            },
+        );
+    }
+
     let (old_spent, old_saved) = existing
         .as_ref()
         .map(|entry| {
@@ -1234,7 +1293,6 @@ async fn foreground_fold(
         cost: summarizer_model.config.cost.clone(),
         provider: summarizer_provider,
         key,
-        protected: protected.clone(),
         head,
         pending: pending.clone(),
         covered,
@@ -1248,17 +1306,7 @@ async fn foreground_fold(
     };
 
     if state.settings.folding.background {
-        let folded_turns = prior.as_ref().map(|summary| summary.turns_covered).unwrap_or(0);
-        let immediate = if folded_turns == 0 {
-            messages.to_vec()
-        } else {
-            crate::folding::plan::build_forwarded_messages(
-                &protected,
-                prior.as_ref().map(|summary| summary.summary.as_str()),
-                &pending,
-                &tail,
-            )
-        };
+        let (immediate, folded_turns) = with_current_summary(messages, &protected, prior.as_ref(), &pending, &tail);
         if state.folding.try_begin(key) {
             let tenant_id = work.tenant_id.clone();
             let metrics = Arc::clone(&state.metrics);
@@ -1303,6 +1351,27 @@ async fn foreground_fold(
             attempt: None,
         };
     }
+
+    // One fold per conversation at a time, as in background mode. A request
+    // that finds one running goes out with the summary it already has: two
+    // concurrent folds would both be paid for and only one could commit.
+    if !state.folding.try_begin(key) {
+        let (forwarded, folded_turns) = with_current_summary(messages, &protected, prior.as_ref(), &pending, &tail);
+        return describe_fold(
+            messages,
+            forwarded,
+            &plan,
+            FoldStamp {
+                outcome: "not_due",
+                reason: "fold_in_flight",
+                attempt: None,
+                fold_count: prior.as_ref().map(|summary| summary.fold_count).unwrap_or(0),
+                prefix_hash: prior.as_ref().map(|summary| summary.prefix_hash),
+                folded_turns,
+            },
+        );
+    }
+    let _end = EndFold { store: Arc::clone(&state.folding), key };
 
     match run_applied_fold(work).await {
         AppliedFold::Committed { summary, prefix_hash, prompt_tokens, completion_tokens } => {
@@ -1568,6 +1637,7 @@ async fn admit(
         &generation,
         &decision,
         &resolved,
+        &principal.key_id,
         &req.messages,
     )
     .await;

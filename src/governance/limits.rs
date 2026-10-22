@@ -599,6 +599,22 @@ impl LimitEngine {
 
     /// Pre-flight gate. Every rejection names the ceiling that was hit, so a
     /// tenant can tell "slow down" apart from "you cannot afford this".
+    /// Whether this tenant's rate window has room for `requests` more
+    /// admissions carrying `prompt_tokens` in total. Advisory: it records and
+    /// reserves nothing. A conversation fold asks before spending, so its
+    /// summarizer call never takes the slot the request it serves needs.
+    /// On a shared ledger the window only mirrors this replica's admissions,
+    /// so the answer is this replica's view.
+    pub fn has_rate_headroom(&self, tenant_id: &str, limits: &LimitProfile, requests: u32, prompt_tokens: u32) -> bool {
+        let requests_per_minute = self.enforced_limit(limits.requests_per_minute);
+        let tokens_per_minute = self.enforced_limit(limits.tokens_per_minute);
+        let state = self.state(tenant_id);
+        let mut window = state.window();
+        window.evict(Instant::now());
+        (requests_per_minute == 0 || window.requests().saturating_add(requests) <= requests_per_minute)
+            && (tokens_per_minute == 0 || window.tokens().saturating_add(prompt_tokens) <= tokens_per_minute)
+    }
+
     pub async fn admit_request(self: &Arc<Self>, req: AdmitRequest<'_>) -> Result<Reservation, LimitError> {
         let limits = req.limits;
         let estimated_cost_nano_usd = req.estimate.total();

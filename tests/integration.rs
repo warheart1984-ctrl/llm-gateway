@@ -771,7 +771,7 @@ fn folding_body(turns: usize) -> Value {
         .map(|index| {
             json!({
                 "role": if index % 2 == 0 { "user" } else { "assistant" },
-                "content": format!("turn-{index}-{}", "x".repeat(400)),
+                "content": format!("turn {index} {}", "x".repeat(400)),
             })
         })
         .collect();
@@ -888,8 +888,8 @@ async fn foreground_folding_summarizes_before_the_main_upstream_call() {
     assert_eq!(messages.len(), 3, "summary plus the verbatim tail");
     assert_eq!(messages[0]["role"], "user");
     assert!(messages[0]["content"].as_str().unwrap().contains("Hello, world"));
-    assert!(messages[1]["content"].as_str().unwrap().starts_with("turn-28"));
-    assert!(messages[2]["content"].as_str().unwrap().starts_with("turn-29"));
+    assert!(messages[1]["content"].as_str().unwrap().starts_with("turn 28 "));
+    assert!(messages[2]["content"].as_str().unwrap().starts_with("turn 29 "));
 
     let reserved: u64 = headers["x-reserved-nano-usd"].to_str().unwrap().parse().unwrap();
     let forwarded = serde_json::from_value::<Vec<llm_gateway::providers::ChatMessage>>(sent["messages"].clone()).unwrap();
@@ -2176,11 +2176,11 @@ fn fold_counter(metrics: &str, outcome: &str) -> u64 {
         .unwrap_or(0)
 }
 
-const FOLD_MARKER: &str = "FOLDMARKER-9f3c2a";
+const FOLD_MARKER: &str = "FOLDMARKER9f3c2a";
 
 fn marked_folding_body(turns: usize, tail_pad: usize) -> Value {
     let mut body = folding_body(turns);
-    body["messages"][0]["content"] = json!(format!("{FOLD_MARKER} turn-0-{}", "x".repeat(400)));
+    body["messages"][0]["content"] = json!(format!("{FOLD_MARKER} turn 0 {}", "x".repeat(400)));
     let last = body["messages"].as_array().unwrap().len() - 1;
     let content = body["messages"][last]["content"].as_str().unwrap().to_string();
     body["messages"][last]["content"] = json!(format!("{content}{}", "y".repeat(tail_pad)));
@@ -2227,7 +2227,10 @@ async fn the_decision_log_records_each_fold_outcome_without_message_text() {
     assert_eq!(fold["benefit_nano_usd"], plan.benefit_nano_usd);
     assert_eq!(fold["overhead_nano_usd"], plan.overhead_nano_usd);
     assert_eq!(fold["min_saving_nano_usd"], plan.min_saving_nano_usd);
-    assert_eq!(fold["summarizer_prompt_tokens"], 12);
+    // Billed like a main call: the reported 12 prompt tokens, floored at the
+    // gateway's estimate of what was sent.
+    let summarizer = summarizer_bodies(&upstream);
+    assert_eq!(fold["summarizer_prompt_tokens"], prompt_tokens_of(&summarizer[0]).max(12));
     assert_eq!(fold["summarizer_completion_tokens"], 3);
     assert_eq!(fold["fold_count"], 1);
     assert_eq!(fold["prefix_hash"].as_str().unwrap().len(), 64);
@@ -2332,7 +2335,14 @@ async fn fold_metric_outcomes_add_up_to_the_attempts() {
     assert_eq!((committed, rejected, failed, unprofitable, refused), (1, 1, 0, 0, 0), "{metrics}");
     assert_eq!(committed + rejected + failed + unprofitable + refused, 2);
     assert!(metrics.contains("gw_fold_requests_total{tenant=\"acme\"} 2"), "{metrics}");
-    assert!(metrics.contains("gw_fold_summarizer_tokens_total{tenant=\"acme\",kind=\"prompt\"} 19"), "{metrics}");
+    // Each call billed at its reported prompt tokens (12, then 7), floored at
+    // the gateway's estimate of what was sent.
+    let summarizer = summarizer_bodies(&upstream);
+    let billed: u32 = summarizer.iter().zip([12, 7]).map(|(body, reported)| prompt_tokens_of(body).max(reported)).sum();
+    assert!(
+        metrics.contains(&format!("gw_fold_summarizer_tokens_total{{tenant=\"acme\",kind=\"prompt\"}} {billed}")),
+        "{metrics}"
+    );
     assert!(metrics.contains("gw_fold_summarizer_tokens_total{tenant=\"acme\",kind=\"completion\"} 7"), "{metrics}");
     assert!(metrics.contains("gw_fold_store_entries 1"), "{metrics}");
     let cut = metrics.lines().find_map(|line| {
@@ -2359,7 +2369,7 @@ async fn a_background_fold_lands_on_the_next_request() {
         .into_iter()
         .find(|body| body["stream"] == json!(true))
         .expect("main request");
-    assert!(first["messages"][0]["content"].as_str().unwrap().contains("turn-0-"));
+    assert!(first["messages"][0]["content"].as_str().unwrap().contains("turn 0 "));
 
     for _ in 0..100 {
         let (_, metrics) = gw.get("/metrics", TEST_KEY).await;
@@ -2377,7 +2387,7 @@ async fn a_background_fold_lands_on_the_next_request() {
     let sent = upstream.last_body().unwrap();
     let text = sent.to_string();
     assert!(text.contains("Hello, world"), "the next request uses the committed summary: {text}");
-    assert!(!text.contains("turn-0-"), "the covered turns stay out of the next request: {text}");
+    assert!(!text.contains("turn 0 "), "the covered turns stay out of the next request: {text}");
     assert_eq!(summarizer_bodies(&upstream).len(), 1, "the next request does not fold again");
 }
 
@@ -2713,33 +2723,209 @@ async fn completions_are_governed_like_streams() {
     assert_eq!(upstream.calls(), 2, "no refused request reached the provider");
 }
 
+#[tokio::test]
+async fn a_value_in_the_system_prompt_does_not_block_a_fold() {
+    // System messages are sent verbatim and never reach the summarizer, so
+    // their values are not pinned. Pinning them refused every fold after the
+    // summarizer had been paid for.
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(FOLDING_TENANT)).await;
+    let mut body = folding_body(30);
+    let mut messages = body["messages"].as_array().unwrap().clone();
+    messages.insert(0, json!({ "role": "system", "content": "Office hours are 09:00 to 17:00." }));
+    body["messages"] = Value::Array(messages);
+    let (status, headers, _) = gw.post_chat(TEST_KEY, body).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get("x-gateway-folded").unwrap(), "28");
+    assert_eq!(summarizer_bodies(&upstream).len(), 1);
+    let sent = upstream.bodies().into_iter().rev().find(|b| b["stream"] == json!(true)).unwrap();
+    assert_eq!(sent["messages"][0]["content"], "Office hours are 09:00 to 17:00.", "the system prompt still goes out verbatim");
+}
+
+#[tokio::test]
+async fn a_fold_never_takes_the_last_rate_limit_slot() {
+    // acme allows 60 requests a minute. With 59 used, a fold would take the
+    // 60th slot and the request it serves would get 429. It must go out
+    // unfolded instead, with no summarizer call.
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(FOLDING_TENANT)).await;
+    for _ in 0..59 {
+        assert_eq!(gw.post_chat(TEST_KEY, folding_body(2)).await.0, StatusCode::OK);
+    }
+    let (status, headers, text) = gw.post_chat(TEST_KEY, folding_body(30)).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(headers.get("x-gateway-folded").is_none());
+    assert!(summarizer_bodies(&upstream).is_empty(), "no summarizer call without room for it");
+    let (_, metrics) = gw.get("/metrics", TEST_KEY).await;
+    assert_eq!(fold_counter(&metrics, "refused_admission"), 1, "{metrics}");
+}
+
+#[tokio::test]
+async fn a_summarizer_that_reports_no_usage_is_billed_its_output() {
+    // NoUsage: the summarizer reply carries no usage. Its output is billed at
+    // the gateway's estimate, as a main completion's is, not as zero.
+    let upstream = MockUpstream::start(Scenario::NoUsage).await;
+    let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(FOLDING_TENANT)).await;
+    let (status, headers, _) = gw.post_chat(TEST_KEY, folding_body(30)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get("x-gateway-folded").unwrap(), "28");
+    let (_, metrics) = gw.get("/metrics", TEST_KEY).await;
+    let completion = metrics
+        .lines()
+        .find_map(|line| line.strip_prefix("gw_fold_summarizer_tokens_total{tenant=\"acme\",kind=\"completion\"} "))
+        .unwrap_or_else(|| panic!("{metrics}"));
+    assert!(completion.parse::<u64>().unwrap() > 0, "{metrics}");
+    let prompt = metrics
+        .lines()
+        .find_map(|line| line.strip_prefix("gw_fold_summarizer_tokens_total{tenant=\"acme\",kind=\"prompt\"} "))
+        .unwrap();
+    assert!(prompt.parse::<u64>().unwrap() > 0, "{metrics}");
+}
+
+#[tokio::test]
+async fn two_concurrent_requests_start_one_foreground_fold() {
+    let upstream = MockUpstream::start(Scenario::SummarizerHold).await;
+    let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(FOLDING_TENANT)).await;
+    let body = folding_body(6);
+    let first = tokio::spawn({
+        let gw_url = gw.url("/v1/chat/stream");
+        let body = body.clone();
+        async move {
+            reqwest::Client::new().post(gw_url).header("x-api-key", TEST_KEY).json(&body).send().await.unwrap()
+        }
+    });
+    for _ in 0..100 {
+        if summarizer_bodies(&upstream).len() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // The first request's fold is held at the summarizer.
+    let (status, headers, _) = gw.post_chat(TEST_KEY, body).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.get("x-gateway-folded").is_none(), "no summary yet, so unfolded");
+    assert_eq!(summarizer_bodies(&upstream).len(), 1, "the second request started no fold");
+    upstream.open_gate(1);
+    let first = first.await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert!(first.headers().get("x-gateway-folded").is_some());
+}
+
+#[tokio::test]
+async fn the_summarizer_is_resolved_with_the_tenant_model_suffix() {
+    // A tenant with `model_suffix: ":prod"` calls `mock/chat:prod`, and its
+    // summarizer `mock/summarizer` must resolve as `mock/summarizer:prod`,
+    // the entry load-time validation checked.
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let models = r#"  mock/chat:prod:
+    provider: nvidia
+    endpoint: http://REPLACE_ME/v1/chat/completions
+    upstream_model: mock-model-prod
+    default_params:
+      max_tokens: 256
+    cost:
+      input_per_mtok_usd: 2.0
+      output_per_mtok_usd: 8.0
+  mock/summarizer:prod:
+    provider: nvidia
+    endpoint: http://REPLACE_ME/v1/chat/completions
+    upstream_model: mock-summarizer-prod
+    default_params:
+      max_tokens: 64
+    cost:
+      input_per_mtok_usd: 0.01
+      output_per_mtok_usd: 0.02
+"#;
+    let gw = Gateway::start_folding(&upstream, models, Some(FOLDING_TENANT), None, "    model_suffix: \":prod\"\n", false).await;
+    let (status, headers, text) = gw.post_chat(TEST_KEY, folding_body(30)).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(headers.get("x-gateway-folded").unwrap(), "28");
+    let summarizer = summarizer_bodies(&upstream);
+    assert_eq!(summarizer.len(), 1);
+    assert_eq!(summarizer[0]["model"], "mock-summarizer-prod");
+}
+
+/// The same growing conversation sent to two gateways, one without folding
+/// and one with it. Spend is each gateway's own ledger, so the summarizer
+/// calls, any fold that is refused or fails, and the main calls are counted
+/// exactly as the tenant is billed. The mock's usage is canned (12 prompt, 3
+/// completion on every reply), so the ledger bills the gateway's own prompt
+/// estimate as the floor; the summarizer's output is billed at what the mock
+/// reports, which is far below a real summary. Read the net as an upper bound
+/// on what folding saves with this summarizer's prices, not as a measurement
+/// of a real model.
+///
 /// Run with `cargo test --locked --test integration fold_economics -- --ignored --nocapture`.
 #[tokio::test]
 #[ignore = "measurement, not a check"]
 async fn fold_economics() {
-    let body = folding_body(50);
+    const START_TURNS: usize = 30;
+    const REQUESTS: usize = 10;
 
     let plain_upstream = MockUpstream::start(Scenario::Happy).await;
     let plain = Gateway::start(&plain_upstream).await;
-    assert_eq!(plain.post_chat(TEST_KEY, body.clone()).await.0, StatusCode::OK);
-    let unfolded = prompt_tokens_of(&plain_upstream.last_body().unwrap());
-
     let upstream = MockUpstream::start(Scenario::Happy).await;
     let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(FOLDING_TENANT)).await;
-    let (status, headers, _) = gw.post_chat(TEST_KEY, body).await;
-    assert_eq!(status, StatusCode::OK);
-    let bodies = upstream.bodies();
-    let summarizer = bodies.iter().find(|item| item["stream"] == json!(false)).expect("summarizer call");
-    let folded_body = bodies.iter().rev().find(|item| item["stream"] == json!(true)).expect("folded main call");
-    let folded = prompt_tokens_of(folded_body);
-    let summarizer_prompt = prompt_tokens_of(summarizer);
-    println!("fold_economics");
-    println!("  turns: 50");
-    println!("  unfolded prompt tokens: {unfolded}");
-    println!("  folded prompt tokens: {folded}");
-    println!("  summarizer prompt tokens: {summarizer_prompt}");
-    println!("  summarizer usage: prompt 12, completion 3");
-    println!("  x-gateway-folded: {}", headers.get("x-gateway-folded").unwrap().to_str().unwrap());
+
+    println!("fold_economics: {REQUESTS} requests, {START_TURNS} turns growing by 2 per request");
+    println!("  req turns folded | main prompt tok: plain folded | summarizer: calls in_tok | spend nano-USD: plain folded | net");
+    let (mut plain_spent, mut folded_spent) = (0u64, 0u64);
+    let (mut plain_prompt, mut folded_prompt, mut summarizer_in, mut summarizer_calls) = (0u64, 0u64, 0u64, 0usize);
+    let mut seen = 0;
+    for request in 0..REQUESTS {
+        let turns = START_TURNS + 2 * request;
+        let body = folding_body(turns);
+        let (plain_before, before) = (spent(&plain, TEST_KEY).await, spent(&gw, TEST_KEY).await);
+        assert_eq!(plain.post_chat(TEST_KEY, body.clone()).await.0, StatusCode::OK);
+        let (status, headers, _) = gw.post_chat(TEST_KEY, body).await;
+        assert_eq!(status, StatusCode::OK);
+        // Both reservations settle when their streams close.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let plain_cost = spent(&plain, TEST_KEY).await - plain_before;
+        let folded_cost = spent(&gw, TEST_KEY).await - before;
+
+        let plain_tokens = prompt_tokens_of(&plain_upstream.last_body().unwrap());
+        let bodies = upstream.bodies();
+        let new = &bodies[seen..];
+        seen = bodies.len();
+        let main = new.iter().rev().find(|item| item["stream"] == json!(true)).expect("main call");
+        let folds: Vec<&Value> = new.iter().filter(|item| item["stream"] == json!(false)).collect();
+        let fold_in: u64 = folds.iter().map(|item| u64::from(prompt_tokens_of(item))).sum();
+        let main_tokens = prompt_tokens_of(main);
+
+        plain_spent += plain_cost;
+        folded_spent += folded_cost;
+        plain_prompt += u64::from(plain_tokens);
+        folded_prompt += u64::from(main_tokens);
+        summarizer_in += fold_in;
+        summarizer_calls += folds.len();
+        let folded = headers.get("x-gateway-folded").map(|v| v.to_str().unwrap().to_string()).unwrap_or_else(|| "-".into());
+        println!(
+            "  {:>3} {:>5} {:>6} | {:>12} {:>6} | {:>15} {:>6} | {:>21} {:>6} | {:>+8}",
+            request + 1,
+            turns,
+            folded,
+            plain_tokens,
+            main_tokens,
+            folds.len(),
+            fold_in,
+            plain_cost,
+            folded_cost,
+            plain_spent as i64 - folded_spent as i64,
+        );
+    }
+    let (_, metrics) = gw.get("/metrics", TEST_KEY).await;
+    let reported: Vec<&str> = metrics
+        .lines()
+        .filter(|line| line.starts_with("gw_fold_summarizer_tokens_total") || line.starts_with("gw_folds_total"))
+        .collect();
+    println!("  totals: main prompt tokens plain {plain_prompt}, folded {folded_prompt}");
+    println!("  totals: summarizer calls {summarizer_calls}, summarizer prompt tokens sent {summarizer_in}");
+    println!(
+        "  totals: spend plain {plain_spent} nano-USD, folded {folded_spent} nano-USD, net saving {} nano-USD",
+        plain_spent as i64 - folded_spent as i64
+    );
+    println!("  provider-reported (canned by the mock): {}", reported.join(" | "));
 }
 
 // ---------------------------------------------------------------------------

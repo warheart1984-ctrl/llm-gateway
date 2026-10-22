@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::{
     folding::{checks, plan::PlanConfig},
-    providers::{ChatMessage, ChatProvider, Completion, ProviderError, ProviderRequest, ResolvedParams},
+    providers::{ChatMessage, Completion, ProviderRequest, ResolvedParams},
 };
 
 /// The system prompt for the summarizer.
@@ -32,85 +32,6 @@ New turns:
 {new_turns}
 
 Extend the prior summary to include the new turns. Keep all specific facts verbatim."#;
-
-/// Summarize the given turns using the configured summarizer model.
-#[allow(clippy::too_many_arguments)]
-pub async fn summarize(
-    provider: &Arc<dyn ChatProvider>,
-    config: &PlanConfig,
-    summarizer_model: &str,
-    _protected: &[ChatMessage],
-    pending_turns: &[ChatMessage],
-    prior_summary: Option<&str>,
-    request_id: &str,
-    tenant_id: &str,
-) -> Result<(String, u32, u32), SummarizerError> {
-    let max_budget = config.summarizer_max_tokens;
-    let mut attempt = 0;
-
-    loop {
-        attempt += 1;
-        let budget = if attempt == 1 { max_budget } else { max_budget * 2 };
-
-        let req = build_request(
-            summarizer_model,
-            None,
-            tenant_id,
-            request_id,
-            prompt_messages(config, prior_summary, pending_turns),
-            budget,
-        );
-
-        let completion = match provider.complete(req).await {
-            Ok(c) => c,
-            Err(e) => return Err(SummarizerError::Provider(e)),
-        };
-
-        let content = extract_content(&completion);
-        let usage = completion.usage.unwrap_or_default();
-
-        // A reasoning-only response can consume the whole budget without
-        // producing visible content. Give it one escalation, never an open
-        // retry loop.
-        let is_empty_reasoning = content.trim().is_empty()
-            && (completion.reasoning.as_deref().is_some_and(|text| !text.is_empty())
-                || completion.finish_reason.as_deref() == Some("length"));
-
-        if is_empty_reasoning && attempt == 1 {
-            // Retry once at double budget.
-            tracing::warn!(
-                request_id = %request_id,
-                tenant = %tenant_id,
-                budget,
-                "summarizer returned empty with finish_reason=length; retrying at double budget"
-            );
-            continue;
-        }
-
-        if content.trim().is_empty() {
-            return Err(SummarizerError::EmptyReply {
-                budget,
-                finish_reason: completion.finish_reason.unwrap_or_default(),
-            });
-        }
-
-        if completion.finish_reason.as_deref() == Some("length") {
-            return Err(SummarizerError::LengthFinish { budget });
-        }
-
-        // Check length bound (1.5 * summary_chars) - done after clipping in checks.
-        // For now, just check raw length.
-        let max_len = (config.summary_chars as f64 * 1.5).ceil() as usize;
-        if content.chars().count() > max_len {
-            return Err(SummarizerError::LengthExceeded {
-                actual: content.chars().count(),
-                limit: max_len,
-            });
-        }
-
-        return Ok((content, usage.prompt_tokens, usage.completion_tokens));
-    }
-}
 
 /// Build the summarizer messages (system + user).
 fn build_summarizer_messages(prompt: &str) -> Vec<ChatMessage> {
@@ -167,11 +88,25 @@ fn build_summarizer_prompt(
 ) -> String {
     let prior = prior_summary.map(|s| s.to_string()).unwrap_or_else(|| "(none)".into());
     let new_turns = format_turns(pending_turns);
+    // The same values the commit check will demand, so the summarizer is told
+    // what it must keep instead of guessing (5-fold-engine's `fold_prompt`).
+    let mut source = checks::build_source_text(pending_turns);
+    if let Some(prior) = prior_summary {
+        source.push('\n');
+        source.push_str(prior);
+    }
+    let pinned = checks::extract_pinned_terms(&source);
 
-    FOLD_PROMPT_TEMPLATE
+    let mut prompt = FOLD_PROMPT_TEMPLATE
         .replace("{budget}", &config.summary_chars.to_string())
         .replace("{prior_summary}", &prior)
-        .replace("{new_turns}", &new_turns)
+        .replace("{new_turns}", &new_turns);
+    if !pinned.is_empty() {
+        prompt.push_str("\n\nRetain these values verbatim: ");
+        prompt.push_str(&pinned.join(", "));
+        prompt.push('.');
+    }
+    prompt
 }
 
 /// Format turns for the summarizer prompt.
@@ -188,45 +123,14 @@ pub fn extract_content(completion: &Completion) -> String {
     completion.content.clone()
 }
 
-/// Errors from the summarizer.
-#[derive(Debug, thiserror::Error)]
-pub enum SummarizerError {
-    #[error("summarizer provider error: {0}")]
-    Provider(ProviderError),
-    #[error("summarizer returned empty content (budget: {budget}, finish_reason: {finish_reason})")]
-    EmptyReply { budget: u32, finish_reason: String },
-    #[error("summarizer exceeded length bound: {actual} chars > {limit}")]
-    LengthExceeded { actual: usize, limit: usize },
-    #[error("summarizer stopped at the length limit (budget: {budget})")]
-    LengthFinish { budget: u32 },
-}
-
-/// Run all checks on a summary before committing.
-pub fn run_checks(
-    summary: &str,
-    protected: &[ChatMessage],
-    turns_being_summarized: &[ChatMessage],
-    config: &PlanConfig,
-) -> Result<String, Vec<String>> {
-    // Build source text from all messages being summarized (protected + turns).
-    let source_text = checks::build_source_text(protected, turns_being_summarized);
-
-    // Run checks.
-    checks::check_summary(summary, &source_text, config.summary_chars)?;
-
-    // Clip to summary_chars.
-    Ok(checks::clip_to_chars(summary, config.summary_chars))
-}
-
 /// Check an incremental summary against both the prior summary and new turns.
 pub fn run_checks_with_prior(
     summary: &str,
-    protected: &[ChatMessage],
     prior_summary: Option<&str>,
     turns_being_summarized: &[ChatMessage],
     config: &PlanConfig,
 ) -> Result<String, Vec<String>> {
-    let mut source = checks::build_source_text(protected, turns_being_summarized);
+    let mut source = checks::build_source_text(turns_being_summarized);
     if let Some(prior) = prior_summary {
         source.push('\n');
         source.push_str(prior);
@@ -281,6 +185,14 @@ mod tests {
     }
 
     #[test]
+    fn build_summarizer_prompt_lists_the_values_to_keep() {
+        let config = PlanConfig { summary_chars: 1200, ..Default::default() };
+        let turns = vec![msg("user", "The standup moved to 09:15, ticket OPS-7")];
+        let prompt = build_summarizer_prompt(&config, None, &turns, 512);
+        assert!(prompt.ends_with("Retain these values verbatim: 09:15, OPS-7."), "{prompt}");
+    }
+
+    #[test]
     fn format_turns_includes_roles() {
         let turns = vec![msg("user", "hello"), msg("assistant", "hi")];
         let formatted = format_turns(&turns);
@@ -293,10 +205,9 @@ mod tests {
             summary_chars: 10,
             ..Default::default()
         };
-        let protected = vec![];
         let turns = vec![msg("user", "hello")];
         let summary = "12345678901234";
-        let result = run_checks(summary, &protected, &turns, &config).unwrap();
+        let result = run_checks_with_prior(summary, None, &turns, &config).unwrap();
         assert_eq!(result.chars().count(), 10);
     }
 
@@ -306,10 +217,9 @@ mod tests {
             summary_chars: 1200,
             ..Default::default()
         };
-        let protected = vec![];
         let turns = vec![msg("user", "Meeting moved to 15:30")];
         let summary = "The user scheduled a meeting. Meeting moved to 15:30 was discussed.";
-        let result = run_checks(summary, &protected, &turns, &config).unwrap();
+        let result = run_checks_with_prior(summary, None, &turns, &config).unwrap();
         assert!(result.contains("15:30"));
     }
 
@@ -319,10 +229,9 @@ mod tests {
             summary_chars: 1200,
             ..Default::default()
         };
-        let protected = vec![];
         let turns = vec![msg("user", "Meeting moved to 15:30")];
         let summary = "The user scheduled a meeting for the afternoon.";
-        let err = run_checks(summary, &protected, &turns, &config).unwrap_err();
+        let err = run_checks_with_prior(summary, None, &turns, &config).unwrap_err();
         assert!(err.iter().any(|e| e.contains("15:30")));
     }
 }

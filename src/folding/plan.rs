@@ -241,15 +241,12 @@ pub fn plan_fold(
             && pending_tokens >= config.min_new_tokens);
 
     if !should_fold {
-        let reason = if pending_tokens >= 4000 {
-            FoldReason::UrgentValve { pending_tokens }
-        } else {
-            FoldReason::NotEnoughNewTurns {
-                pending_turns: pending_turns_count,
-                pending_tokens,
-                min_turns: config.min_new_turns,
-                min_tokens: config.min_new_tokens,
-            }
+        // Under the urgent valve by construction: at 4,000 tokens it folds.
+        let reason = FoldReason::NotEnoughNewTurns {
+            pending_turns: pending_turns_count,
+            pending_tokens,
+            min_turns: config.min_new_turns,
+            min_tokens: config.min_new_tokens,
         };
         return FoldPlan {
             outcome: FoldOutcome::NotDue,
@@ -314,7 +311,7 @@ pub fn plan_fold(
     let placeholder_summary = "x".repeat(config.summary_chars);
     let forwarded_with_placeholder =
         build_forwarded_messages(protected, Some(&placeholder_summary), &[], &tail);
-    let forwarded_without = build_forwarded_messages(protected, None, &head, &tail);
+    let forwarded_without = without_this_fold(protected, &head, &pending_turns, &tail, stored_summary);
     let folded_prompt_tokens = estimate_prompt_tokens(&forwarded_with_placeholder);
     let unfolded_prompt_tokens = estimate_prompt_tokens(&forwarded_without);
     let prompt_tokens_cut = unfolded_prompt_tokens.saturating_sub(folded_prompt_tokens);
@@ -403,8 +400,11 @@ fn cost_check(
     // Build folded request with placeholder summary.
     let placeholder_summary = "x".repeat(config.summary_chars);
     let folded_messages = build_forwarded_messages(protected, Some(&placeholder_summary), &[], tail);
-    // Build unfolded request (what would be sent without folding).
-    let unfolded_messages = build_forwarded_messages(protected, None, head, tail);
+    // What goes out if this fold does not run. With a committed summary that
+    // is the summary plus the pending turns, not the whole head: the turns it
+    // already covers were saved by an earlier fold, and crediting them again
+    // would let every later fold pass the check on savings it does not make.
+    let unfolded_messages = without_this_fold(protected, head, pending_turns, tail, stored_summary);
 
     let folded_prompt_tokens = estimate_prompt_tokens(&folded_messages);
     let unfolded_prompt_tokens = estimate_prompt_tokens(&unfolded_messages);
@@ -424,6 +424,20 @@ fn cost_check(
         + (2 * config.summarizer_max_tokens as u64).saturating_mul(summarizer_completion_rate);
 
     (benefit, overhead, prompt_tokens_cut)
+}
+
+/// The request as it goes out when this fold does not run.
+fn without_this_fold(
+    protected: &[ChatMessage],
+    head: &[ChatMessage],
+    pending_turns: &[ChatMessage],
+    tail: &[ChatMessage],
+    stored_summary: Option<&StoredSummary>,
+) -> Vec<ChatMessage> {
+    match stored_summary {
+        Some(stored) => build_forwarded_messages(protected, Some(&stored.summary), pending_turns, tail),
+        None => build_forwarded_messages(protected, None, head, tail),
+    }
 }
 
 /// Estimate tokens the summarizer will read.
@@ -536,6 +550,39 @@ mod tests {
             msg("assistant", "tail-2"),
         ]);
         head
+    }
+
+    #[test]
+    fn a_later_fold_is_credited_only_with_what_it_adds() {
+        // Twenty old turns are already covered by a full-length summary; four
+        // new ones are pending. Folding them saves the four turns, not the
+        // twenty an earlier fold already removed.
+        let config = PlanConfig { min_new_tokens: 0, ..config() };
+        let (main, summarizer) = cost_models();
+        let protected = vec![msg("system", "sys")];
+        let mut head: Vec<ChatMessage> = (0..24)
+            .map(|i| msg(if i % 2 == 0 { "user" } else { "assistant" }, &"old turn ".repeat(40)))
+            .collect();
+        for turn in head.iter_mut().skip(20) {
+            *turn = msg("user", &"new turn ".repeat(40));
+        }
+        let turns = with_tail(head.clone());
+        let stored = StoredSummary {
+            turns_covered: 20,
+            prefix_hash: [0; 32],
+            summary: "s".repeat(config.summary_chars),
+            fold_count: 1,
+            summarizer_model: "m".into(),
+        };
+        let plan = plan_fold(&config, &main, &summarizer, &protected, &turns, Some(&stored));
+        let tail = &turns[24..];
+        let placeholder = "x".repeat(config.summary_chars);
+        let marginal = estimate_prompt_tokens(&build_forwarded_messages(&protected, Some(&stored.summary), &head[20..], tail))
+            - estimate_prompt_tokens(&build_forwarded_messages(&protected, Some(&placeholder), &[], tail));
+        let whole_head = estimate_prompt_tokens(&build_forwarded_messages(&protected, None, &head, tail))
+            - estimate_prompt_tokens(&build_forwarded_messages(&protected, Some(&placeholder), &[], tail));
+        assert_eq!(plan.prompt_tokens_cut, marginal);
+        assert!(plan.prompt_tokens_cut < whole_head / 4, "{} vs {whole_head}", plan.prompt_tokens_cut);
     }
 
     #[test]
