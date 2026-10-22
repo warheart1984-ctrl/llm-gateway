@@ -41,6 +41,29 @@ pub enum FoldReason {
     SummarizerError(String),
 }
 
+impl FoldReason {
+    /// Stable reason code. Counts and names only: never message text.
+    pub fn code(&self) -> &'static str {
+        match self {
+            FoldReason::NoHead => "no_head",
+            FoldReason::HeadHasTools => "head_has_tools",
+            FoldReason::HeadHasNonText => "head_has_non_text",
+            FoldReason::HeadHasToolMessage => "head_has_tool_message",
+            FoldReason::NotEnoughNewTurns { .. } => "not_enough_new_turns",
+            FoldReason::BatchReady => "batch_ready",
+            FoldReason::UrgentValve { .. } => "urgent_valve",
+            FoldReason::CostCheckFailed { .. } => "cost_check",
+            FoldReason::MaxFoldsReached { .. } => "max_folds",
+            FoldReason::RefoldTriggered { .. } => "refold",
+            FoldReason::SummarizerAdmissionFailed => "admission_refused",
+            FoldReason::SummarizerEmptyReply => "empty_reply",
+            FoldReason::SummarizerLengthExceeded { .. } => "length",
+            FoldReason::SummarizerChecksFailed(_) => "checks_failed",
+            FoldReason::SummarizerError(_) => "provider_error",
+        }
+    }
+}
+
 /// Complete fold plan with all decision facts.
 #[derive(Debug, Clone)]
 pub struct FoldPlan {

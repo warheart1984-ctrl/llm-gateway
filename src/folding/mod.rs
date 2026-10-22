@@ -12,6 +12,66 @@ pub mod plan;
 pub mod store;
 pub mod summarizer;
 
+use serde::Serialize;
+
+/// How one fold attempt is counted. Every attempt lands on exactly one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldAccounting {
+    Committed,
+    Rejected,
+    Failed,
+    Unprofitable,
+    RefusedAdmission,
+}
+
+impl FoldAccounting {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FoldAccounting::Committed => "committed",
+            FoldAccounting::Rejected => "rejected",
+            FoldAccounting::Failed => "failed",
+            FoldAccounting::Unprofitable => "unprofitable",
+            FoldAccounting::RefusedAdmission => "refused_admission",
+        }
+    }
+}
+
+/// Counts and hashes for one folding decision. No summary text and no message text.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FoldFacts {
+    pub outcome: &'static str,
+    pub reason: String,
+    pub turns_replaced: u64,
+    pub turns_covered: u64,
+    pub prompt_tokens_cut: u64,
+    pub benefit_nano_usd: u64,
+    pub overhead_nano_usd: u64,
+    pub min_saving_nano_usd: u64,
+    pub summarizer_prompt_tokens: u64,
+    pub summarizer_completion_tokens: u64,
+    pub fold_count: u64,
+    /// Hex HMAC of the turn prefix a summary covers, or empty when none was used.
+    pub prefix_hash: String,
+}
+
+/// Real summarizer usage attached to the single accounting outcome of an attempt.
+#[derive(Debug, Clone, Copy)]
+pub struct FoldAttempt {
+    pub outcome: FoldAccounting,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+}
+
+pub fn prefix_hex(hash: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in hash {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    out
+}
+
 use crate::providers::ChatMessage;
 
 /// Split messages into protected (system, developer) and turns (user, assistant, tool).

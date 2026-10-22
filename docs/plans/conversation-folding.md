@@ -381,11 +381,11 @@ reply that is fixed per test, with usage numbers.
 - [ ] Both endpoints: `/v1/chat/stream` and `/v1/chat/completions`.
 
 ### Phase 4: visibility
-- [ ] The decision-log `fold` object for applied, skipped, refused and failed
+- [x] The decision-log `fold` object for applied, skipped, refused and failed
       folds, asserted field by field. A test proves no message or summary
       text appears in the log line (search for a unique marker string from
       the conversation).
-- [ ] Every metric in 3.7 after the Phase 3 scenarios. The outcomes add up to
+- [x] Every metric in 3.7 after the Phase 3 scenarios. The outcomes add up to
       the attempts. An unknown tenant id never creates a series (extend the
       cardinality test).
 

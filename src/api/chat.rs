@@ -51,9 +51,9 @@ use uuid::Uuid;
 use crate::{
     config::OverflowMode,
     folding::{
-        plan::{FoldOutcome, PlanConfig, StoredSummary},
+        plan::{FoldOutcome, FoldPlan, PlanConfig, StoredSummary},
         store::EntryRef,
-        summarizer,
+        summarizer, FoldAccounting, FoldAttempt, FoldFacts,
     },
     governance::{
         auth::Principal,
@@ -802,6 +802,73 @@ struct Admitted {
 struct FoldResult {
     messages: Vec<ChatMessage>,
     folded_turns: usize,
+    facts: Option<FoldFacts>,
+    attempt: Option<FoldAttempt>,
+}
+
+fn bare_fold(messages: Vec<ChatMessage>, outcome: &'static str, reason: &str, attempt: Option<FoldAttempt>) -> FoldResult {
+    FoldResult {
+        messages,
+        folded_turns: 0,
+        facts: Some(FoldFacts {
+            outcome,
+            reason: reason.to_string(),
+            turns_replaced: 0,
+            turns_covered: 0,
+            prompt_tokens_cut: 0,
+            benefit_nano_usd: 0,
+            overhead_nano_usd: 0,
+            min_saving_nano_usd: 0,
+            summarizer_prompt_tokens: attempt.map(|item| item.prompt_tokens).unwrap_or(0),
+            summarizer_completion_tokens: attempt.map(|item| item.completion_tokens).unwrap_or(0),
+            fold_count: 0,
+            prefix_hash: String::new(),
+        }),
+        attempt,
+    }
+}
+
+struct FoldStamp<'a> {
+    outcome: &'static str,
+    reason: &'a str,
+    attempt: Option<FoldAttempt>,
+    fold_count: u32,
+    prefix_hash: Option<[u8; 32]>,
+    folded_turns: usize,
+}
+
+fn describe_fold(
+    original: &[ChatMessage],
+    messages: Vec<ChatMessage>,
+    plan: &FoldPlan,
+    stamp: FoldStamp<'_>,
+) -> FoldResult {
+    let sent_cut = u64::from(
+        estimate_prompt_tokens(original).saturating_sub(estimate_prompt_tokens(&messages)),
+    );
+    // A request that went out folded records the tokens actually removed.
+    // A refused plan records the cost check's own estimate, which is what
+    // the operator needs to see why it did not run.
+    let prompt_tokens_cut = if stamp.folded_turns > 0 { sent_cut } else { u64::from(plan.prompt_tokens_cut) };
+    FoldResult {
+        messages,
+        folded_turns: stamp.folded_turns,
+        facts: Some(FoldFacts {
+            outcome: stamp.outcome,
+            reason: stamp.reason.to_string(),
+            turns_replaced: u64::try_from(stamp.folded_turns).unwrap_or(u64::MAX),
+            turns_covered: u64::try_from(plan.turns_covered).unwrap_or(u64::MAX),
+            prompt_tokens_cut,
+            benefit_nano_usd: plan.benefit_nano_usd,
+            overhead_nano_usd: plan.overhead_nano_usd,
+            min_saving_nano_usd: plan.min_saving_nano_usd,
+            summarizer_prompt_tokens: stamp.attempt.map(|item| item.prompt_tokens).unwrap_or(0),
+            summarizer_completion_tokens: stamp.attempt.map(|item| item.completion_tokens).unwrap_or(0),
+            fold_count: u64::from(stamp.fold_count),
+            prefix_hash: stamp.prefix_hash.map(|hash| crate::folding::prefix_hex(&hash)).unwrap_or_default(),
+        }),
+        attempt: stamp.attempt,
+    }
 }
 
 fn stored_summary(entry: &EntryRef) -> StoredSummary {
@@ -825,12 +892,12 @@ async fn foreground_fold(
     messages: &[ChatMessage],
 ) -> FoldResult {
     let Some(folding) = decision.tenant.folding.as_ref().filter(|f| f.enabled) else {
-        return FoldResult { messages: messages.to_vec(), folded_turns: 0 };
+        return FoldResult { messages: messages.to_vec(), ..FoldResult::default() };
     };
 
     let (protected, turns) = crate::folding::split_messages(messages);
     let Some(first_turn) = turns.first() else {
-        return FoldResult { messages: messages.to_vec(), folded_turns: 0 };
+        return bare_fold(messages.to_vec(), "not_due", "no_turns", None);
     };
     let key = state
         .folding
@@ -852,10 +919,20 @@ async fn foreground_fold(
     let plan_config = PlanConfig::from_tenant(folding);
 
     let Some(summarizer_model) = generation.models.resolve(&folding.summarizer_model).ok() else {
-        return FoldResult { messages: messages.to_vec(), folded_turns: 0 };
+        return bare_fold(
+            messages.to_vec(),
+            "failed",
+            "summarizer_unavailable",
+            Some(FoldAttempt { outcome: FoldAccounting::Failed, prompt_tokens: 0, completion_tokens: 0 }),
+        );
     };
     let Ok(summarizer_provider) = router::provider_for(&summarizer_model, &state.providers) else {
-        return FoldResult { messages: messages.to_vec(), folded_turns: 0 };
+        return bare_fold(
+            messages.to_vec(),
+            "failed",
+            "summarizer_unavailable",
+            Some(FoldAttempt { outcome: FoldAccounting::Failed, prompt_tokens: 0, completion_tokens: 0 }),
+        );
     };
     let summarizer_provider = Arc::clone(summarizer_provider);
 
@@ -868,16 +945,36 @@ async fn foreground_fold(
         prior.as_ref(),
     );
     if plan.outcome != FoldOutcome::Applied {
-        return FoldResult {
-            messages: if plan.forwarded_messages.is_empty() {
-                messages.to_vec()
-            } else {
-                plan.forwarded_messages
-            },
-            // A request that still goes out with a committed summary has
-            // replaced those turns, even when no new fold runs.
-            folded_turns: plan.turns_replaced,
+        let forwarded = if plan.forwarded_messages.is_empty() {
+            messages.to_vec()
+        } else {
+            plan.forwarded_messages.clone()
         };
+        let outcome = match plan.outcome {
+            FoldOutcome::Applied => "applied",
+            FoldOutcome::NotDue => "not_due",
+            FoldOutcome::Skipped => "skipped",
+            FoldOutcome::Refused => "refused",
+            FoldOutcome::Failed => "failed",
+        };
+        let attempt = (plan.outcome == FoldOutcome::Refused).then_some(FoldAttempt {
+            outcome: FoldAccounting::Unprofitable,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+        });
+        return describe_fold(
+            messages,
+            forwarded,
+            &plan,
+            FoldStamp {
+                outcome,
+                reason: plan.reason.code(),
+                attempt,
+                fold_count: prior.as_ref().map(|summary| summary.fold_count).unwrap_or(0),
+                prefix_hash: prior.as_ref().map(|summary| summary.prefix_hash),
+                folded_turns: plan.turns_replaced,
+            },
+        );
     }
 
     let (head, tail) = {
@@ -887,11 +984,13 @@ async fn foreground_fold(
     let covered = prior.as_ref().map(|s| s.turns_covered.min(head.len())).unwrap_or(0);
     let pending = &head[covered..];
     let prior_text = prior.as_ref().map(|s| s.summary.as_str());
-    let mut attempt = 0u8;
+    let mut attempt_no = 0u8;
+    let mut used_prompt = 0u64;
+    let mut used_completion = 0u64;
 
     loop {
-        attempt += 1;
-        let budget = if attempt == 1 {
+        attempt_no += 1;
+        let budget = if attempt_no == 1 {
             folding.summarizer_max_tokens
         } else {
             folding.summarizer_max_tokens.saturating_mul(2)
@@ -916,7 +1015,23 @@ async fn foreground_fold(
             })
             .await
         else {
-            return FoldResult { messages: messages.to_vec(), folded_turns: 0 };
+            return describe_fold(
+                messages,
+                messages.to_vec(),
+                &plan,
+                FoldStamp {
+                    outcome: "refused",
+                    reason: "admission_refused",
+                    attempt: Some(FoldAttempt {
+                        outcome: FoldAccounting::RefusedAdmission,
+                        prompt_tokens: used_prompt,
+                        completion_tokens: used_completion,
+                    }),
+                    fold_count: prior.as_ref().map(|summary| summary.fold_count).unwrap_or(0),
+                    prefix_hash: prior.as_ref().map(|summary| summary.prefix_hash),
+                    folded_turns: 0,
+                },
+            );
         };
 
         let summarizer_request_id = Uuid::new_v4().to_string();
@@ -936,12 +1051,30 @@ async fn foreground_fold(
                 } else {
                     reservation.release();
                 }
-                return FoldResult { messages: messages.to_vec(), folded_turns: 0 };
+                return describe_fold(
+                    messages,
+                    messages.to_vec(),
+                    &plan,
+                    FoldStamp {
+                        outcome: "failed",
+                        reason: "provider_error",
+                        attempt: Some(FoldAttempt {
+                            outcome: FoldAccounting::Failed,
+                            prompt_tokens: used_prompt,
+                            completion_tokens: used_completion,
+                        }),
+                        fold_count: prior.as_ref().map(|summary| summary.fold_count).unwrap_or(0),
+                        prefix_hash: prior.as_ref().map(|summary| summary.prefix_hash),
+                        folded_turns: 0,
+                    },
+                );
             }
         };
         let usage = completion.usage.unwrap_or_default();
+        used_prompt = used_prompt.saturating_add(u64::from(usage.prompt_tokens));
+        used_completion = used_completion.saturating_add(u64::from(usage.completion_tokens));
         let content = summarizer::extract_content(&completion);
-        let retry_empty = attempt == 1
+        let retry_empty = attempt_no == 1
             && content.trim().is_empty()
             && (completion.reasoning.as_deref().is_some_and(|text| !text.is_empty())
                 || completion.finish_reason.as_deref() == Some("length"));
@@ -950,7 +1083,28 @@ async fn foreground_fold(
             continue;
         }
         if content.trim().is_empty() || completion.finish_reason.as_deref() == Some("length") {
-            return FoldResult { messages: messages.to_vec(), folded_turns: 0 };
+            let reason = if completion.finish_reason.as_deref() == Some("length") {
+                "length"
+            } else {
+                "empty_reply"
+            };
+            return describe_fold(
+                messages,
+                messages.to_vec(),
+                &plan,
+                FoldStamp {
+                    outcome: "refused",
+                    reason,
+                    attempt: Some(FoldAttempt {
+                        outcome: FoldAccounting::Rejected,
+                        prompt_tokens: used_prompt,
+                        completion_tokens: used_completion,
+                    }),
+                    fold_count: prior.as_ref().map(|summary| summary.fold_count).unwrap_or(0),
+                    prefix_hash: prior.as_ref().map(|summary| summary.prefix_hash),
+                    folded_turns: 0,
+                },
+            );
         }
 
         let Ok(summary) = summarizer::run_checks_with_prior(
@@ -960,7 +1114,23 @@ async fn foreground_fold(
             pending,
             &plan_config,
         ) else {
-            return FoldResult { messages: messages.to_vec(), folded_turns: 0 };
+            return describe_fold(
+                messages,
+                messages.to_vec(),
+                &plan,
+                FoldStamp {
+                    outcome: "refused",
+                    reason: "checks_failed",
+                    attempt: Some(FoldAttempt {
+                        outcome: FoldAccounting::Rejected,
+                        prompt_tokens: used_prompt,
+                        completion_tokens: used_completion,
+                    }),
+                    fold_count: prior.as_ref().map(|summary| summary.fold_count).unwrap_or(0),
+                    prefix_hash: prior.as_ref().map(|summary| summary.prefix_hash),
+                    folded_turns: 0,
+                },
+            );
         };
 
         let new_covered = covered + pending.len();
@@ -981,22 +1151,30 @@ async fn foreground_fold(
                 prefix_hash,
                 summary: summary.clone(),
                 fold_count: plan.new_fold_count,
-                tokens_spent: old_spent
-                    .saturating_add(u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens)),
+                tokens_spent: old_spent.saturating_add(used_prompt.saturating_add(used_completion)),
                 tokens_saved: old_saved.saturating_add(u64::from(plan.prompt_tokens_cut)),
                 summarizer_model: folding.summarizer_model.clone(),
                 last_accessed: std::time::Instant::now(),
             },
         );
-        return FoldResult {
-            messages: crate::folding::plan::build_forwarded_messages(
-                &protected,
-                Some(&summary),
-                &[],
-                tail,
-            ),
-            folded_turns: plan.turns_replaced,
-        };
+        let forwarded = crate::folding::plan::build_forwarded_messages(&protected, Some(&summary), &[], tail);
+        return describe_fold(
+            messages,
+            forwarded,
+            &plan,
+            FoldStamp {
+                outcome: "applied",
+                reason: plan.reason.code(),
+                attempt: Some(FoldAttempt {
+                    outcome: FoldAccounting::Committed,
+                    prompt_tokens: used_prompt,
+                    completion_tokens: used_completion,
+                }),
+                fold_count: plan.new_fold_count,
+                prefix_hash: Some(prefix_hash),
+                folded_turns: plan.turns_replaced,
+            },
+        );
     }
 }
 
@@ -1230,6 +1408,21 @@ async fn admit(
         &req.messages,
     )
     .await;
+    if let Some(facts) = &fold.facts {
+        span.fold = Some(serde_json::to_string(facts).unwrap_or_else(|_| "{}".to_string()));
+    }
+    if let Some(attempt) = fold.attempt {
+        state.metrics.record_fold(
+            &decision.tenant.tenant_id,
+            attempt.outcome,
+            attempt.prompt_tokens,
+            attempt.completion_tokens,
+        );
+    }
+    if fold.folded_turns > 0 {
+        let cut = fold.facts.as_ref().map(|facts| facts.prompt_tokens_cut).unwrap_or(0);
+        state.metrics.record_folded_request(&decision.tenant.tenant_id, cut);
+    }
     req.messages = fold.messages;
     let folded_turns = fold.folded_turns;
     prompt_tokens = estimate_prompt_tokens(&req.messages);

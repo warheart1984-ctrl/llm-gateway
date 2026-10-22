@@ -27,6 +27,9 @@ pub struct RequestSpan {
     pub upstream_model: String,
     pub started: Instant,
     pub ttft: Option<Instant>,
+    /// JSON object of fold counts and hashes, present only when the tenant
+    /// has folding on. Never summary text and never message text.
+    pub fold: Option<String>,
 }
 
 impl RequestSpan {
@@ -41,6 +44,7 @@ impl RequestSpan {
             upstream_model: String::new(),
             started: Instant::now(),
             ttft: None,
+            fold: None,
         }
     }
 
@@ -187,6 +191,36 @@ pub fn log_stream_complete(span: &RequestSpan, outcome: &StreamSummary) {
     let total = outcome.prompt_tokens as u64
         + outcome.completion_tokens as u64
         + outcome.cached_prompt_tokens as u64;
+    if let Some(fold) = &span.fold {
+        tracing::info!(
+            request_id = %span.request_id,
+            tenant = %span.tenant_id,
+            key = %span.key_id,
+            scheme = %span.scheme,
+            model = %span.model,
+            provider = %span.provider,
+            upstream_model = %span.upstream_model,
+            status = if outcome.error_code.is_some() { "error" } else { "ok" },
+            finish_reason = outcome.finish_reason.as_deref().unwrap_or("-"),
+            upstream_id = outcome.upstream_id.as_deref().unwrap_or("-"),
+            duration_ms = span.elapsed_ms(),
+            ttft_ms = span.ttft_ms().unwrap_or(0),
+            prompt_tokens = outcome.prompt_tokens,
+            completion_tokens = outcome.completion_tokens,
+            reasoning_tokens = outcome.reasoning_tokens,
+            cached_prompt_tokens = outcome.cached_prompt_tokens,
+            total_tokens = total,
+            cost_nano_usd = outcome.cost_nano_usd,
+            events = outcome.events,
+            bytes_out = outcome.bytes_out,
+            client_abort = outcome.aborted_by_client,
+            error_code = outcome.error_code.unwrap_or("-"),
+            error_retryable = outcome.error_retryable,
+            fold = %fold,
+            "stream complete"
+        );
+        return;
+    }
     tracing::info!(
         request_id = %span.request_id,
         tenant = %span.tenant_id,
