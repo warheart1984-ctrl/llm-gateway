@@ -7,6 +7,7 @@
 //! A fold that fails or does not pay leaves the request exactly as the
 //! client sent it.
 
+pub mod plan;
 pub mod store;
 
 use crate::providers::ChatMessage;
