@@ -441,11 +441,11 @@ impl ReceiptChain {
         let mut recoveries: u64 = 0;
         recoveries += recover_torn_tail(&anchor_path, directory, 0)? as u64;
         let anchor_text = fs::read_to_string(&anchor_path).unwrap_or_default();
-        recoveries += recover_torn_tail(&log_path, directory, anchored_entries(&anchor_text))? as u64;
+        recoveries += recover_torn_tail(&log_path, directory, anchored_entries(&anchor_text)?)? as u64;
         let text = read_from(&mut log, 0)?;
         let (entries, entries_checked) =
             verify_snapshot(&text, &anchor_text, &signer, options.startup_verify)?;
-        let anchored_count = anchored_entries(&anchor_text);
+        let anchored_count = anchored_entries(&anchor_text)?;
 
         let anchor = OpenOptions::new()
             .create(true)
@@ -1269,6 +1269,7 @@ fn recover_torn_tail(path: &Path, directory: &Path, anchored_entries: u64) -> Re
         let mut out = File::create(&kept_at).map_err(io_err)?;
         out.write_all(fragment).and_then(|()| out.sync_all()).map_err(io_err)?;
     }
+    sync_dir(&quarantine)?;
     let record_path = directory.join("recovery.jsonl");
     let sha = format!("sha256:{hash}");
     let already = fs::read_to_string(&record_path).unwrap_or_default().lines().any(|line| {
@@ -1289,6 +1290,9 @@ fn recover_torn_tail(path: &Path, directory: &Path, anchored_entries: u64) -> Re
         let mut out = OpenOptions::new().create(true).append(true).open(&record_path).map_err(io_err)?;
         writeln!(out, "{entry}").and_then(|()| out.sync_data()).map_err(io_err)?;
     }
+    // The quarantine folder and recovery.jsonl may both be new: their names
+    // must be on disk before the file is cut.
+    sync_dir(directory)?;
     let file = OpenOptions::new().write(true).open(path).map_err(io_err)?;
     file.set_len(keep as u64).and_then(|()| file.sync_all()).map_err(io_err)?;
     tracing::warn!(
@@ -1300,15 +1304,41 @@ fn recover_torn_tail(path: &Path, directory: &Path, anchored_entries: u64) -> Re
     Ok(true)
 }
 
-/// The highest entry count any well-formed anchor line claims. Recovery
-/// uses it to tell an unacknowledged tail from damaged anchored evidence.
-fn anchored_entries(anchor_text: &str) -> u64 {
-    anchor_text
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter_map(|record| record.get("count").and_then(Value::as_u64))
-        .max()
-        .unwrap_or(0)
+/// The highest entry count any anchor line claims. Recovery uses it to tell
+/// an unacknowledged tail from damaged anchored evidence, so an anchor line it
+/// cannot read refuses here: skipping it could let recovery cut an entry that
+/// line covers.
+fn anchored_entries(anchor_text: &str) -> Result<u64, ReceiptError> {
+    let mut highest = 0;
+    for (index, line) in anchor_text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let count = serde_json::from_str::<Value>(line)
+            .ok()
+            .and_then(|record| record.get("count").and_then(Value::as_u64))
+            .ok_or_else(|| {
+                ReceiptError::Unverified(format!(
+                    "anchor line {} cannot be read, so it is unknown which entries it covers; nothing is recovered",
+                    index + 1
+                ))
+            })?;
+        highest = highest.max(count);
+    }
+    Ok(highest)
+}
+
+/// Make a file created in `directory` survive a power cut: syncing the file
+/// does not sync the directory entry that names it. Windows has no directory
+/// handle to sync; NTFS journals the entry itself.
+#[cfg(unix)]
+fn sync_dir(directory: &Path) -> Result<(), ReceiptError> {
+    File::open(directory).and_then(|dir| dir.sync_all()).map_err(io_err)
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_directory: &Path) -> Result<(), ReceiptError> {
+    Ok(())
 }
 
 fn read_from(file: &mut File, offset: u64) -> Result<String, ReceiptError> {
@@ -1927,6 +1957,29 @@ mod tests {
             Err(ReceiptError::Unverified(message)) => assert!(message.contains("anchored entry is damaged"), "{message}"),
             Err(err) => panic!("expected a refusal, got {err}"),
             Ok(_) => panic!("anchored evidence must not be auto-repaired"),
+        }
+        assert_eq!(fs::read(&log).unwrap(), cut, "nothing was changed");
+        assert!(quarantined(&dir).is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_anchor_line_stops_recovery_before_it_cuts_anything() {
+        // Three entries, each anchored. The newest anchor line (covering 3)
+        // is damaged and entry 3 is torn. Skipping the unreadable line would
+        // make entry 3 look unanchored and cut it.
+        let (dir, log, anchor) = closed_chain("unreadable-anchor", 3, 1).await;
+        let anchors = fs::read_to_string(&anchor).unwrap();
+        let newest = anchors.lines().last().unwrap();
+        fs::write(&anchor, anchors.replace(newest, &newest.replacen('{', "#", 1))).unwrap();
+        let committed = fs::read(&log).unwrap();
+        let text = String::from_utf8(committed.clone()).unwrap();
+        let last_start = text[..text.len() - 1].rfind('\n').unwrap() + 1;
+        let cut = &committed[..last_start + 40];
+        fs::write(&log, cut).unwrap();
+        match ReceiptChain::open(&dir, options(1)) {
+            Err(ReceiptError::Unverified(message)) => assert!(message.contains("anchor line 3 cannot be read"), "{message}"),
+            Err(err) => panic!("expected a refusal, got {err}"),
+            Ok(_) => panic!("an unreadable anchor must not be skipped"),
         }
         assert_eq!(fs::read(&log).unwrap(), cut, "nothing was changed");
         assert!(quarantined(&dir).is_empty());

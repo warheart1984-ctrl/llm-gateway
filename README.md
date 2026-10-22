@@ -700,7 +700,9 @@ written after the newest local anchor, so startup stays bounded for a large
 log. Tampering before that anchor is not caught at startup — it is still
 caught by `ickverify.py` against the published anchor, and by
 `startup_verify = "full"`. Neither weakens protection against someone who
-holds the signing key, since they could re-sign either way.
+holds the signing key, since they could re-sign either way. `since_anchor`
+bounds the hashing and signature checks, not the reading: startup still reads
+and parses the whole log, so its memory grows with the log either way.
 
 **After a crash.** A kill can interrupt a write, leaving the log or the anchor
 file ending part-way through a line. Startup handles that by one fixed rule,
@@ -714,11 +716,14 @@ and refuses to start in every other case:
 - A fragment that parses as a whole JSON record is not removed (it could be a
   committed entry that lost only its newline): startup refuses.
 - If an anchor counts more entries than are complete on disk, an anchored
-  entry is damaged: startup refuses without changing anything.
+  entry is damaged: startup refuses without changing anything. So does an
+  anchor line that cannot be read, since then it is unknown what it covers.
 - Nothing is deleted. The fragment is moved to
   `quarantine/<file>.<hash>.fragment`, and `recovery.jsonl` records the file,
   the bytes kept, and the fragment's size, hash and quarantine name, before
-  the file is cut. Running it again changes nothing and records nothing twice.
+  the file is cut; on Unix the folders holding them are synced too, so a power
+  cut cannot lose their names. Running it again changes nothing and records
+  nothing twice.
 
 ```bash
 python3 vendor/wicket/verifier/ickverify.py \

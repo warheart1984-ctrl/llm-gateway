@@ -90,12 +90,21 @@ It is built to never become a way to launder a rewrite:
 - **It does not publish over a rewritten anchor.** If a tenant's anchor file on
   the replica no longer starts with what was already published, it alerts and
   publishes nothing more for that tenant. Other tenants carry on.
-- **It does not replace a key.** A changed `signing.pub` is an alert; the key
-  published first is kept.
+- **It does not replace a key.** If the replica's `signing.pub` and the
+  published one differ, that is an alert; the key published first is kept.
 - **It notices a rewritten repository.** It remembers the last commit it
   pushed. If the branch no longer contains it, because history was replaced or
   the branch deleted, it stops, exits `2`, and publishes nothing until a person
   looks.
+- **It notices an edited published copy.** History can stay intact while an
+  ordinary commit by someone else deletes the newest anchor lines, changes a
+  line, or swaps a key. Since its last push, this replica's folder may only
+  have grown; if a published line or file was removed or changed, it stops the
+  same way and names the file.
+- **It does not build on anchors it cannot vouch for.** With no state file
+  (lost, or a new machine) and anchors for this replica already on the remote,
+  it refuses rather than trust them. Check the published history by hand, then
+  run once with `--adopt`, or restore the state file.
 
 Each of these is tested in `tools/tests/test_anchor_publisher.py` against real
 git repositories.

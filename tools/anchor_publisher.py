@@ -16,10 +16,15 @@ It only ever appends:
   changed. The published copy is the evidence, so it is never "corrected".
 * It remembers the last commit it pushed. If the remote's history no longer
   contains it, someone rewrote the published history: it stops and says so.
+  If the history still contains it but this replica's folder has since lost
+  or changed a published line or key (an ordinary commit by someone else),
+  it stops the same way.
+* With no record of a push (a lost state file) it will not build on a remote
+  that already holds anchors for this replica, unless told to `--adopt` them.
 
 Subcommands:
 
-    python tools/anchor_publisher.py publish --source ROOT --repo URL --replica NAME --state FILE [--watch SECONDS]
+    python tools/anchor_publisher.py publish --source ROOT --repo URL --replica NAME --state FILE [--watch SECONDS] [--adopt]
     python tools/anchor_publisher.py verify  --repo URL --replica NAME --tenant ID --log receipts.jsonl [--verifier ickverify.py]
 
 Exit status: 0 published (or nothing new), 1 failed (git, I/O), 2 refused
@@ -62,13 +67,16 @@ def git(*args: str, cwd: Path | None = None, check: bool = True) -> subprocess.C
     return run
 
 
-def complete_lines(path: Path) -> list[str]:
+def finished_lines(text: str) -> list[str]:
     """Finished lines only: a last line without a newline is still being written."""
+    return [line for line in text.split("\n")[:-1] if line.strip()]
+
+
+def complete_lines(path: Path) -> list[str]:
     try:
-        text = path.read_text(encoding="utf-8")
+        return finished_lines(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return []
-    return [line for line in text.split("\n")[:-1] if line.strip()]
 
 
 @dataclass
@@ -86,15 +94,20 @@ class RewriteDetected(Exception):
     pass
 
 
+class UnknownHistory(RewriteDetected):
+    """The remote holds this replica's anchors, but the publisher has no record of pushing them."""
+
+
 class Publisher:
     def __init__(self, source: Path, repo: str, replica: str, state: Path, work: Path, branch: str = DEFAULT_BRANCH,
                  author: str = "llm-gateway anchor publisher <anchors@invalid>",
-                 status: Path | None = None) -> None:
+                 status: Path | None = None, adopt: bool = False) -> None:
         if not safe_name(replica):
             raise ValueError(f"replica name {replica!r} must be 1-64 of letters, digits, '.', '_', '-'")
         self.source, self.repo, self.replica = source, repo, replica
         self.state, self.work, self.branch = state, work, branch
         self.status_path = status
+        self.adopt = adopt
         name, _, email = author.partition(" <")
         self.identity = ["-c", f"user.name={name}", "-c", f"user.email={email.rstrip('>')}"]
 
@@ -143,10 +156,44 @@ class Publisher:
                     f"the remote branch no longer contains {last[:12]}, the last commit this publisher pushed: "
                     "published history was rewritten"
                 )
+            self.check_only_appended(last, remote)
+        elif git("ls-tree", "--name-only", remote, "--", self.replica, cwd=self.work).stdout.strip():
+            if not self.adopt:
+                raise UnknownHistory(
+                    f"the remote already holds anchors for replica {self.replica!r}, but this publisher has no record "
+                    f"of pushing them (is {self.state} missing?); restore the state file, or check the published "
+                    "history by hand and run once with --adopt"
+                )
+            self.remember(remote)
         git("checkout", "--quiet", "--force", "-B", self.branch, remote, cwd=self.work)
         git("reset", "--quiet", "--hard", remote, cwd=self.work)
         git("clean", "-fdxq", cwd=self.work)
         return True
+
+    def check_only_appended(self, last: str, remote: str) -> None:
+        """Since `last`, this replica's folder may only have grown: lines appended, files added.
+
+        Commits after `last` are someone else's (or this publisher's own push
+        whose answer was lost, which only appends). Anything that removed or
+        changed a published line or key stops publishing, naming the file.
+        """
+        diff = git("diff", "--name-status", "--no-renames", last, remote, "--", f"{self.replica}/", cwd=self.work)
+        for row in diff.stdout.splitlines():
+            status, _, path = row.partition("\t")
+            if status == "A":
+                continue
+            if status == "M" and path.endswith("/anchor.jsonl"):
+                before = finished_lines(git("show", f"{last}:{path}", cwd=self.work).stdout)
+                after = finished_lines(git("show", f"{remote}:{path}", cwd=self.work).stdout)
+                if after[: len(before)] == before:
+                    continue
+                what = "lost or changed published anchor lines"
+            else:
+                what = "was deleted" if status == "D" else "was changed"
+            raise RewriteDetected(
+                f"{path} {what} on the remote after {last[:12]}, the last commit this publisher pushed; "
+                "the published copy is the evidence, so nothing more is published until a person looks"
+            )
 
     # ---- one pass ---------------------------------------------------------------------------
 
@@ -164,12 +211,12 @@ class Publisher:
             dest = self.work / self.replica / tenant
             key_src, key_dst = folder / "signing.pub", dest / "signing.pub"
             if key_src.exists() and key_dst.exists() and key_src.read_text(encoding="utf-8").strip() != key_dst.read_text(encoding="utf-8").strip():
-                report.alert(tenant, "the replica's public key changed; the published key is kept and nothing more is published")
+                report.alert(tenant, "the replica's public key and the published key differ; the published key is kept and nothing more is published")
                 continue
             published = complete_lines(dest / "anchor.jsonl")
             current = complete_lines(folder / "anchor.jsonl")
             if current[: len(published)] != published:
-                report.alert(tenant, "the replica's anchor file no longer starts with what was published; nothing more is published")
+                report.alert(tenant, "the replica's anchor file and the published anchors disagree (one does not extend the other); nothing more is published")
                 continue
             new = current[len(published):]
             added_key = key_src.exists() and not key_dst.exists()
@@ -282,6 +329,8 @@ def main(argv: list[str] | None = None) -> int:
     pub.add_argument("--branch", default=DEFAULT_BRANCH)
     pub.add_argument("--watch", type=float, metavar="SECONDS", help="keep publishing at this interval")
     pub.add_argument("--status", type=Path, help="write a JSON summary of each pass to this file")
+    pub.add_argument("--adopt", action="store_true",
+                     help="with no state file, accept anchors already on the remote for this replica (check them first)")
     ver = sub.add_parser("verify", help="check a tenant's log against the published anchor and key")
     ver.add_argument("--repo", required=True)
     ver.add_argument("--replica", required=True)
@@ -297,7 +346,7 @@ def main(argv: list[str] | None = None) -> int:
 
     publisher = Publisher(args.source, args.repo, args.replica, args.state,
                           args.work or args.state.parent / "anchor-repo", args.branch,
-                          status=args.status)
+                          status=args.status, adopt=args.adopt)
     while True:
         try:
             report = publisher.publish_once()

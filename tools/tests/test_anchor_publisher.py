@@ -168,6 +168,89 @@ class Refusing(Case):
         with self.assertRaises(ap.RewriteDetected):
             publisher.publish_once()
 
+    def someone_else_commits(self, path: str, text: str) -> None:
+        """An ordinary (not forced) commit to the published branch by another account."""
+        other = self.tmp / "someone-else"
+        if not other.exists():
+            run("clone", "--quiet", "--branch", ap.DEFAULT_BRANCH, str(self.remote), str(other))
+        run("pull", "--quiet", cwd=other)
+        target = other / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8", newline="\n")
+        run("add", "-A", cwd=other)
+        run(*ID, "commit", "--quiet", "-m", "someone else", cwd=other)
+        run("push", "--quiet", "origin", f"HEAD:{ap.DEFAULT_BRANCH}", cwd=other)
+
+    def test_a_commit_that_drops_published_anchors_is_detected(self) -> None:
+        self.tenant("acme", [1, 2, 3])
+        publisher = self.publisher()
+        publisher.publish_once()
+        self.someone_else_commits("r1/acme/anchor.jsonl", anchor(1) + "\n")
+        before = self.commits()
+        with self.assertRaises(ap.RewriteDetected) as caught:
+            publisher.publish_once()
+        self.assertIn("r1/acme/anchor.jsonl lost or changed published anchor lines", str(caught.exception))
+        self.assertEqual(self.commits(), before, "the dropped lines were not quietly published again")
+
+    def test_a_commit_that_edits_a_published_anchor_is_detected(self) -> None:
+        self.tenant("acme", [1, 2])
+        publisher = self.publisher()
+        publisher.publish_once()
+        self.someone_else_commits("r1/acme/anchor.jsonl", anchor(1) + "\n" + anchor(7) + "\n")
+        with self.assertRaises(ap.RewriteDetected):
+            publisher.publish_once()
+
+    def test_a_commit_that_replaces_the_published_key_is_detected(self) -> None:
+        self.tenant("acme", [1])
+        publisher = self.publisher()
+        publisher.publish_once()
+        self.someone_else_commits("r1/acme/signing.pub", "ed25519-public:ff\n")
+        with self.assertRaises(ap.RewriteDetected) as caught:
+            publisher.publish_once()
+        self.assertIn("r1/acme/signing.pub was changed", str(caught.exception))
+
+    def test_a_commit_that_deletes_a_published_file_is_detected(self) -> None:
+        self.tenant("acme", [1])
+        publisher = self.publisher()
+        publisher.publish_once()
+        other = self.tmp / "deleter"
+        run("clone", "--quiet", "--branch", ap.DEFAULT_BRANCH, str(self.remote), str(other))
+        run("rm", "--quiet", "r1/acme/anchor.jsonl", cwd=other)
+        run(*ID, "commit", "--quiet", "-m", "gone", cwd=other)
+        run("push", "--quiet", "origin", f"HEAD:{ap.DEFAULT_BRANCH}", cwd=other)
+        with self.assertRaises(ap.RewriteDetected) as caught:
+            publisher.publish_once()
+        self.assertIn("was deleted", str(caught.exception))
+
+    def test_a_commit_that_only_appends_what_the_replica_has_is_accepted(self) -> None:
+        # What a push looks like when the remote took it but the answer was lost.
+        folder = self.tenant("acme", [1])
+        publisher = self.publisher()
+        publisher.publish_once()
+        with (folder / "anchor.jsonl").open("a", encoding="utf-8", newline="\n") as out:
+            out.write(anchor(2) + "\n")
+        self.someone_else_commits("r1/acme/anchor.jsonl", anchor(1) + "\n" + anchor(2) + "\n")
+        report = publisher.publish_once()
+        self.assertEqual(report.refused, {})
+        self.assertIsNone(report.commit, "nothing left to publish")
+
+    def test_without_a_state_file_existing_anchors_are_not_built_on(self) -> None:
+        folder = self.tenant("acme", [1])
+        publisher = self.publisher()
+        publisher.publish_once()
+        publisher.state.unlink()
+        with (folder / "anchor.jsonl").open("a", encoding="utf-8", newline="\n") as out:
+            out.write(anchor(2) + "\n")
+        before = self.commits()
+        with self.assertRaises(ap.UnknownHistory):
+            publisher.publish_once()
+        self.assertEqual(self.commits(), before)
+
+        publisher.adopt = True
+        report = publisher.publish_once()
+        self.assertEqual(report.published, {"acme": 1})
+        self.assertEqual(publisher.last_pushed(), self.commits()[0])
+
 
 class Verifying(Case):
     def test_verify_hands_the_published_anchor_and_key_to_the_verifier(self) -> None:
