@@ -160,7 +160,7 @@ startup_verify = "full"
 [folding]
 max_entries = 10000      # conversations held across all tenants (LRU)
 max_total_chars = 20000000
-background = false       # Phase 5
+background = false       # true folds after the response and spends budget then
 
 [telemetry]
 service_name = "llm-gateway"

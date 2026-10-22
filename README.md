@@ -529,6 +529,33 @@ newest first.
 - Kept `decision_retention_days` (default 30), then deleted by the sweeper.
   Durable on `sqlite` and `postgres`; the last 10,000 in memory on `memory`.
 
+## Conversation folding
+
+A chat client resends the whole conversation on every request, so the prompt grows with every turn. A tenant that opts in can have the older turns replaced by a rolling summary before the request is forwarded. Folding is off unless that tenant's `folding.enabled` is true. On one 14-call run, 5-fold-engine cut main-path prompt tokens from 18,977 to 4,311, and the summarizer still spent more than the cut saved (net −$0.0057) because it was an expensive reasoning model. A summary can also drop facts that changed during the conversation. Both are reasons to leave it off until the summarizer is cheap enough and the loss is acceptable.
+
+The summary is a `user` message, never `system` or `developer`: it is model-written from the tenant's own turns, and a user turn that says "ignore your rules" must not come back with system authority. Some providers reject two `user` messages in a row. The OpenAI-compatible providers this gateway calls accept it.
+
+A folded response carries `x-gateway-folded: <turns replaced>`. The decision log records counts and hashes only, never the summary or the message text. The summarizer call is a separate governed request: a model the tenant is allowed to call, with its own reservation and settlement. If the fold fails, is refused, does not pay, or cannot be admitted, the client request still succeeds and goes out with the last good summary, or unfolded.
+
+Folding cannot be combined with `receipts: true`. A receipt binds the request the client sent, and a fold sends something else. Loading a tenant with both is a configuration error.
+
+```yaml
+folding:
+  enabled: true
+  summarizer_model: groq/summarizer   # must be in this tenant's allowlist
+  keep_last: 4                         # newest turns sent verbatim
+  summary_chars: 1200
+  summarizer_max_tokens: 512          # one retry at double this budget
+  max_folds: 8
+  refold_threshold: 8
+  min_new_turns: 4
+  min_new_tokens: 400
+  amortization_requests: 4
+  min_saving_nano_usd: 0
+```
+
+`[folding]` in `config/default.toml` bounds the in-memory store (`max_entries`, `max_total_chars`) and sets `background`. The default runs the fold before the request is forwarded. `background = true` answers with the summary already committed and folds afterwards, which spends the tenant's budget after the response.
+
 ## Receipts
 
 To see all of this end to end, run the receipts demo: `python demo/receipts/run_local.py`,

@@ -328,41 +328,41 @@ Commit per phase. Tests use the existing mock upstream. Give it a summarizer
 reply that is fixed per test, with usage numbers.
 
 ### Phase 1: configuration and store
-- [ ] `tenants.yaml` with `folding` parses; every field has the default shown;
+- [x] `tenants.yaml` with `folding` parses; every field has the default shown;
       unknown keys are refused.
-- [ ] Load refuses folding together with `receipts: true`, an unknown or
+- [x] Load refuses folding together with `receipts: true`, an unknown or
       disallowed `summarizer_model`, `keep_last: 0`, and `summary_chars` out of
       range. Each case is its own test, checking the error names the tenant.
-- [ ] Store: the same conversation gets the same key at any length. Two
+- [x] Store: the same conversation gets the same key at any length. Two
       conversations differing only in the first turn get different keys. Two
       tenants with identical messages get different keys.
-- [ ] Store: a lookup whose prefix no longer matches (an edited early turn)
+- [x] Store: a lookup whose prefix no longer matches (an edited early turn)
       drops the entry and counts a mismatch.
-- [ ] Store: the LRU evicts by entry count and by total characters.
+- [x] Store: the LRU evicts by entry count and by total characters.
 
 ### Phase 2: planning and the cost check (pure)
-- [ ] The split keeps protected messages and the last `keep_last` turns.
+- [x] The split keeps protected messages and the last `keep_last` turns.
       Turns with tools or non-text content stop the fold.
-- [ ] Batching: below `min_new_turns` / `min_new_tokens` there is no fold;
+- [x] Batching: below `min_new_turns` / `min_new_tokens` there is no fold;
       above the 4,000-token valve there is a fold regardless.
-- [ ] Cost check: an expensive summarizer against a cheap main model is
+- [x] Cost check: an expensive summarizer against a cheap main model is
       refused, and a cheap summarizer against an expensive main model passes.
       The numbers are recorded and match a hand calculation in the test.
-- [ ] Cap and re-fold: after `max_folds` there are no more folds and pending
+- [x] Cap and re-fold: after `max_folds` there are no more folds and pending
       turns go verbatim. At `refold_threshold` one re-fold is allowed and the
       count resets.
-- [ ] The built request has the order protected, summary (`user` role),
+- [x] The built request has the order protected, summary (`user` role),
       pending, tail, and the summary message's role is `user`.
 
 ### Phase 3: summarizer, checks, foreground wiring
-- [ ] Through HTTP, a 30-turn conversation on a folding tenant:
+- [x] Through HTTP, a 30-turn conversation on a folding tenant:
       - the mock upstream receives the folded message list;
       - the response has `x-gateway-folded`;
       - the reservation was made on the folded estimate;
       - the summarizer call shows in the ledger as its own settled request.
-- [ ] The same conversation's next request (one turn longer) reuses the
+- [x] The same conversation's next request (one turn longer) reuses the
       summary with no new summarizer call.
-- [ ] A summarizer reply that:
+- [x] A summarizer reply that:
       - is empty;
       - is over 1.5 × `summary_chars`;
       - drops a pinned value (e.g. `"moved to 15:30"`);
@@ -370,15 +370,15 @@ reply that is fixed per test, with usage numbers.
 
       is rejected, and the request goes out unfolded or with the previous
       summary. One test per case.
-- [ ] A reasoning-only empty reply is retried once at double the budget, and
+- [x] A reasoning-only empty reply is retried once at double the budget, and
       a good second reply commits.
-- [ ] A summarizer call the tenant's budget refuses means no fold, and the
+- [x] A summarizer call the tenant's budget refuses means no fold, and the
       main request still succeeds.
-- [ ] A held request runs no summarizer call. An `Idempotency-Key` replay
+- [x] A held request runs no summarizer call. An `Idempotency-Key` replay
       returns the same `x-gateway-folded` header and makes no summarizer call.
-- [ ] A tenant without folding: the upstream body is byte-for-byte unchanged
+- [x] A tenant without folding: the upstream body is byte-for-byte unchanged
       (compare against a recorded body), and there is no header.
-- [ ] Both endpoints: `/v1/chat/stream` and `/v1/chat/completions`.
+- [x] Both endpoints: `/v1/chat/stream` and `/v1/chat/completions`.
 
 ### Phase 4: visibility
 - [x] The decision-log `fold` object for applied, skipped, refused and failed
@@ -400,7 +400,7 @@ reply that is fixed per test, with usage numbers.
       none outstanding).
 
 ### Phase 6: docs and a measurement
-- [ ] README section "Conversation folding":
+- [x] README section "Conversation folding":
       - what it does and that it is off by default, and why (cite the 5-fold
         numbers in section 1, including the net loss);
       - the config;
@@ -408,8 +408,8 @@ reply that is fixed per test, with usage numbers.
       - the receipts exclusion;
       - the `user`-role summary;
       - and, in plain words, that a summary can lose information.
-- [ ] `config/tenants.yaml`: a commented-out `folding` example.
-- [ ] An `#[ignore]`d test `fold_economics` that runs a 50-turn synthetic
+- [x] `config/tenants.yaml`: a commented-out `folding` example.
+- [x] An `#[ignore]`d test `fold_economics` that runs a 50-turn synthetic
       conversation through the mock with fixed usage. It prints prompt tokens
       sent with and without folding and the summarizer's tokens, the way
       `receipt_throughput` prints its numbers. Report its output in the PR.

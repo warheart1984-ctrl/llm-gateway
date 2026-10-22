@@ -2713,6 +2713,35 @@ async fn completions_are_governed_like_streams() {
     assert_eq!(upstream.calls(), 2, "no refused request reached the provider");
 }
 
+/// Run with `cargo test --locked --test integration fold_economics -- --ignored --nocapture`.
+#[tokio::test]
+#[ignore = "measurement, not a check"]
+async fn fold_economics() {
+    let body = folding_body(50);
+
+    let plain_upstream = MockUpstream::start(Scenario::Happy).await;
+    let plain = Gateway::start(&plain_upstream).await;
+    assert_eq!(plain.post_chat(TEST_KEY, body.clone()).await.0, StatusCode::OK);
+    let unfolded = prompt_tokens_of(&plain_upstream.last_body().unwrap());
+
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(FOLDING_TENANT)).await;
+    let (status, headers, _) = gw.post_chat(TEST_KEY, body).await;
+    assert_eq!(status, StatusCode::OK);
+    let bodies = upstream.bodies();
+    let summarizer = bodies.iter().find(|item| item["stream"] == json!(false)).expect("summarizer call");
+    let folded_body = bodies.iter().rev().find(|item| item["stream"] == json!(true)).expect("folded main call");
+    let folded = prompt_tokens_of(folded_body);
+    let summarizer_prompt = prompt_tokens_of(summarizer);
+    println!("fold_economics");
+    println!("  turns: 50");
+    println!("  unfolded prompt tokens: {unfolded}");
+    println!("  folded prompt tokens: {folded}");
+    println!("  summarizer prompt tokens: {summarizer_prompt}");
+    println!("  summarizer usage: prompt 12, completion 3");
+    println!("  x-gateway-folded: {}", headers.get("x-gateway-folded").unwrap().to_str().unwrap());
+}
+
 // ---------------------------------------------------------------------------
 // Captured logs
 // ---------------------------------------------------------------------------
