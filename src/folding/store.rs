@@ -198,9 +198,12 @@ impl FoldingStore {
         // Replacing an existing key must not double-count its characters.
         self.remove_entry(&key);
 
-        // Evict by entry count.
+        // Evict by entry count. Stop if nothing can be evicted: equal
+        // timestamps used to make `evict_lru` return false and spin here.
         while self.entries.len() >= self.max_entries {
-            self.evict_lru();
+            if !self.evict_lru() {
+                break;
+            }
         }
 
         // Evict by total characters.
@@ -217,14 +220,19 @@ impl FoldingStore {
     }
 
     /// Evict the least recently used entry. Returns true if an entry was evicted.
+    /// A tie still evicts one entry, so a full store cannot stall an insert.
     fn evict_lru(&self) -> bool {
         let mut oldest_key: Option<[u8; 32]> = None;
         let mut oldest_time = Instant::now();
 
         for entry_ref in self.entries.iter() {
-            let entry = entry_ref.lock();
-            if entry.last_accessed < oldest_time {
-                oldest_time = entry.last_accessed;
+            let accessed = entry_ref.lock().last_accessed;
+            let older = match oldest_key {
+                None => true,
+                Some(_) => accessed < oldest_time,
+            };
+            if older {
+                oldest_time = accessed;
                 oldest_key = Some(*entry_ref.key());
             }
         }
@@ -368,9 +376,59 @@ mod tests {
     }
 
     #[test]
+    fn lookup_drops_an_edited_early_turn_and_counts_the_mismatch() {
+        let store = FoldingStore::new(100, 10000);
+        let protected = vec![msg("system", "sys")];
+        let first = msg("user", "hello");
+        let key = store.conversation_key("tenant1", &protected, Some(&first));
+        let turns = vec![first, msg("assistant", "hi"), msg("user", "later")];
+        let prefix_hash = store.prefix_hash("tenant1", &turns[..2]);
+        store.insert(
+            key,
+            SummaryEntry {
+                turns_covered: 2,
+                prefix_hash,
+                summary: "kept".into(),
+                fold_count: 1,
+                tokens_spent: 0,
+                tokens_saved: 0,
+                summarizer_model: "model".into(),
+                last_accessed: Instant::now(),
+            },
+        );
+
+        let mut edited = turns.clone();
+        edited[0] = msg("user", "hello edited");
+        assert!(store.lookup(&key, "tenant1", &edited).is_none());
+        assert_eq!(store.prefix_mismatches(), 1);
+        assert!(store.lookup(&key, "tenant1", &turns).is_none());
+    }
+
+    #[test]
+    fn the_same_conversation_keeps_its_key_when_later_turns_are_added() {
+        let store = FoldingStore::new(100, 10000);
+        let protected = vec![msg("system", "sys")];
+        let first = msg("user", "hello");
+        let short = store.conversation_key("tenant1", &protected, Some(&first));
+        let long = store.conversation_key("tenant1", &protected, Some(&first));
+        assert_eq!(short, long);
+        let longer_prefix = store.prefix_hash(
+            "tenant1",
+            &[first.clone(), msg("assistant", "one"), msg("user", "two")],
+        );
+        let shorter_prefix = store.prefix_hash("tenant1", &[first, msg("assistant", "one")]);
+        assert_ne!(longer_prefix, shorter_prefix);
+        assert_eq!(
+            store.conversation_key("tenant1", &protected, Some(&msg("user", "hello"))),
+            short
+        );
+    }
+
+    #[test]
     fn lru_evicts_by_entry_count() {
         let store = FoldingStore::new(2, 10000);
         let protected = vec![msg("system", "sys")];
+        let mut keys = Vec::new();
 
         for i in 0..3 {
             let first_turn = msg("user", &format!("turn{i}"));
@@ -386,13 +444,15 @@ mod tests {
                 tokens_spent: 100,
                 tokens_saved: 500,
                 summarizer_model: "model".into(),
-                last_accessed: Instant::now(),
+                last_accessed: Instant::now() - std::time::Duration::from_secs(30 - i as u64),
             };
             store.insert(key, entry);
+            keys.push(key);
         }
 
-        // Should only have 2 entries (max_entries)
         assert_eq!(store.entries.len(), 2);
+        assert!(store.entries.get(&keys[0]).is_none(), "the least recently used entry is the one evicted");
+        assert!(store.entries.get(&keys[2]).is_some(), "the newest entry stays");
     }
 
     #[test]

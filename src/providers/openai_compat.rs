@@ -1338,6 +1338,19 @@ mod tests {
     }
 
     #[test]
+    fn a_summarizer_reply_reads_content_that_is_a_list_of_parts() {
+        let value: Value = serde_json::from_str(
+            r#"{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":[
+                {"type":"text","text":"Meeting moved to "},
+                {"type":"text","text":"15:30"}
+            ]}}]}"#,
+        )
+        .unwrap();
+        let completion = parse_completion(&value, quirks()).unwrap();
+        assert_eq!(completion.content, "Meeting moved to 15:30");
+    }
+
+    #[test]
     fn a_tool_call_only_completion_has_empty_content() {
         let value: Value = serde_json::from_str(
             r#"{"choices":[{"finish_reason":"tool_calls","message":{"content":null,

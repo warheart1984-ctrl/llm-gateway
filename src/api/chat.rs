@@ -874,7 +874,9 @@ async fn foreground_fold(
             } else {
                 plan.forwarded_messages
             },
-            folded_turns: 0,
+            // A request that still goes out with a committed summary has
+            // replaced those turns, even when no new fold runs.
+            folded_turns: plan.turns_replaced,
         };
     }
 

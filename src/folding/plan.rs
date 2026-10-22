@@ -136,25 +136,9 @@ pub fn plan_fold(
         };
     }
 
-    // 2. Skip if head contains tools, non-text, or tool messages.
-    if let Some(reason) = check_head_skippable(&head) {
-        return FoldPlan {
-            outcome: FoldOutcome::Skipped,
-            reason,
-            turns_replaced: 0,
-            turns_covered: stored_summary.map(|s| s.turns_covered).unwrap_or(0),
-            prompt_tokens_cut: 0,
-            benefit_nano_usd: 0,
-            overhead_nano_usd: 0,
-            min_saving_nano_usd: config.min_saving_nano_usd,
-            forwarded_messages: build_forwarded_messages(protected, stored_summary.map(|s| s.summary.as_str()), &head, &tail),
-            summary: stored_summary.map(|s| s.summary.clone()),
-            new_prefix_hash: stored_summary.map(|s| s.prefix_hash),
-            new_fold_count: stored_summary.map(|s| s.fold_count).unwrap_or(0),
-        };
-    }
-
-    // 3. Determine covered and pending turns.
+    // 3. Determine covered and pending turns before the skip check, so a tool
+    //    that arrives after a committed summary stays verbatim instead of
+    //    being sent twice (once inside the summary and once in the head).
     let (covered_turns, pending_turns) = if let Some(stored) = stored_summary {
         let head_len = head.len();
         let covered_end = stored.turns_covered.min(head_len);
@@ -164,6 +148,33 @@ pub fn plan_fold(
     } else {
         (vec![], head.clone())
     };
+
+    // 2. Skip if head contains tools, non-text, or tool messages.
+    if let Some(reason) = check_head_skippable(&head) {
+        // A tool inside the already-covered prefix means the stored summary
+        // is not a safe stand-in. Send the client messages unchanged.
+        let summary_is_safe = check_head_skippable(&covered_turns).is_none();
+        let summary = summary_is_safe.then_some(stored_summary).flatten();
+        return FoldPlan {
+            outcome: FoldOutcome::Skipped,
+            reason,
+            turns_replaced: summary.map(|s| s.turns_covered).unwrap_or(0),
+            turns_covered: summary.map(|s| s.turns_covered).unwrap_or(0),
+            prompt_tokens_cut: 0,
+            benefit_nano_usd: 0,
+            overhead_nano_usd: 0,
+            min_saving_nano_usd: config.min_saving_nano_usd,
+            forwarded_messages: build_forwarded_messages(
+                protected,
+                summary.map(|s| s.summary.as_str()),
+                if summary.is_some() { &pending_turns } else { &head },
+                &tail,
+            ),
+            summary: summary.map(|s| s.summary.clone()),
+            new_prefix_hash: summary.map(|s| s.prefix_hash),
+            new_fold_count: summary.map(|s| s.fold_count).unwrap_or(0),
+        };
+    }
 
     // 4. Batching: fold only when pending reaches thresholds or urgent valve.
     let pending_turns_count = pending_turns.len();
@@ -183,7 +194,7 @@ pub fn plan_fold(
                 fold_count: current_fold_count,
                 max_folds: config.max_folds,
             },
-            turns_replaced: 0,
+            turns_replaced: covered_turns.len(),
             turns_covered: covered_turns.len(),
             prompt_tokens_cut: 0,
             benefit_nano_usd: 0,
@@ -220,7 +231,7 @@ pub fn plan_fold(
         return FoldPlan {
             outcome: FoldOutcome::NotDue,
             reason,
-            turns_replaced: 0,
+            turns_replaced: covered_turns.len(),
             turns_covered: covered_turns.len(),
             prompt_tokens_cut: 0,
             benefit_nano_usd: 0,
@@ -258,7 +269,7 @@ pub fn plan_fold(
                 overhead,
                 min_saving: config.min_saving_nano_usd,
             },
-            turns_replaced: 0,
+            turns_replaced: covered_turns.len(),
             turns_covered: covered_turns.len(),
             prompt_tokens_cut,
             benefit_nano_usd: benefit,
@@ -304,7 +315,9 @@ pub fn plan_fold(
     FoldPlan {
         outcome: FoldOutcome::Applied,
         reason,
-        turns_replaced: pending_turns_count,
+        // The committed summary replaces the whole head, including turns a
+        // previous summary already covered. Pending turns are not sent again.
+        turns_replaced: covered_turns.len() + pending_turns_count,
         turns_covered: covered_turns.len() + pending_turns_count,
         prompt_tokens_cut,
         benefit_nano_usd: benefit,
@@ -723,6 +736,18 @@ mod tests {
         let plan3 = plan_fold(&config, &main_cost, &summ_cost, &protected, &third, Some(&stored2));
         assert_eq!(plan3.outcome, FoldOutcome::NotDue);
         assert!(matches!(plan3.reason, FoldReason::MaxFoldsReached { .. }));
+        let forwarded: Vec<String> = plan3
+            .forwarded_messages
+            .iter()
+            .filter_map(|message| message.content().map(|content| content.text()))
+            .collect();
+        assert!(
+            forwarded.iter().any(|text| text.contains("prev summary")),
+            "the committed summary still replaces its prefix: {forwarded:?}"
+        );
+        assert!(forwarded.iter().any(|text| text == "5"), "pending turns stay verbatim: {forwarded:?}");
+        assert!(forwarded.iter().any(|text| text == "6"), "the tail stays verbatim: {forwarded:?}");
+        assert!(!forwarded.iter().any(|text| text == "1"), "covered turns are not sent again: {forwarded:?}");
 
         // Fourth request: four uncovered turns trigger one re-fold and reset the count.
         let fourth = vec![

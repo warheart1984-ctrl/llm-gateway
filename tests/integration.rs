@@ -81,7 +81,7 @@ struct MockState {
     scenario: Scenario,
     calls: Arc<AtomicU64>,
     gate: Arc<tokio::sync::Semaphore>,
-    last_body: Arc<std::sync::Mutex<Option<Value>>>,
+    last_body: Arc<std::sync::Mutex<Vec<Value>>>,
 }
 
 struct MockUpstream {
@@ -95,7 +95,7 @@ impl MockUpstream {
             scenario,
             calls: Arc::new(AtomicU64::new(0)),
             gate: Arc::new(tokio::sync::Semaphore::new(0)),
-            last_body: Arc::new(std::sync::Mutex::new(None)),
+            last_body: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         let app = Router::new()
             .route("/v1/chat/completions", post(handle))
@@ -113,6 +113,10 @@ impl MockUpstream {
     }
 
     fn last_body(&self) -> Option<Value> {
+        self.state.last_body.lock().unwrap().last().cloned()
+    }
+
+    fn bodies(&self) -> Vec<Value> {
         self.state.last_body.lock().unwrap().clone()
     }
 
@@ -156,7 +160,7 @@ fn sse_stream(items: Vec<String>, tail_delay: Option<Duration>) -> impl Stream<I
 async fn handle(State(state): State<MockState>, Json(body): Json<Value>) -> Response {
     state.calls.fetch_add(1, Ordering::SeqCst);
     let streaming = body["stream"] != json!(false);
-    *state.last_body.lock().unwrap() = Some(body);
+    state.last_body.lock().unwrap().push(body);
 
     let scenario = match state.scenario {
         Scenario::Gated => {
@@ -439,6 +443,17 @@ impl Gateway {
         extra_models: &str,
         folding: Option<&str>,
     ) -> Self {
+        Self::start_folding(upstream, extra_models, folding, None, "", false).await
+    }
+
+    async fn start_folding(
+        upstream: &MockUpstream,
+        extra_models: &str,
+        folding: Option<&str>,
+        acme_budget: Option<u64>,
+        acme_yaml: &str,
+        background: bool,
+    ) -> Self {
         captured_logs::install();
         let dir = tempdir::TempDir::new("llm-gateway-test");
         // Test-provided models may carry a placeholder endpoint, so substitute
@@ -548,17 +563,23 @@ tenants:
       max_output_tokens: 1
       daily_budget_nano_usd: 1000
 "#;
-        let tenants = match folding {
+        let mut tenants = match folding {
             Some(config) => tenants.replacen(
                 "    allowed_models: [\"*\"]\n    limits:",
                 &format!(
-                    "    allowed_models: [\"*\"]\n    folding:\n{}\n    limits:",
-                    config
+                    "    allowed_models: [\"*\"]\n{acme_yaml}    folding:\n{config}\n    limits:"
                 ),
                 1,
             ),
             None => tenants.to_string(),
         };
+        if let Some(budget) = acme_budget {
+            tenants = tenants.replacen(
+                "daily_budget_nano_usd: 100000000000",
+                &format!("daily_budget_nano_usd: {budget}"),
+                1,
+            );
+        }
         std::fs::write(dir.path().join("models.yaml"), models).unwrap();
         std::fs::write(dir.path().join("tenants.yaml"), tenants).unwrap();
 
@@ -583,6 +604,10 @@ tenants:
             // and parallel tests must not share one.
             ledger: llm_gateway::config::LedgerConfig {
                 backend: llm_gateway::config::LedgerBackend::Memory,
+                ..Default::default()
+            },
+            folding: llm_gateway::config::FoldingConfig {
+                background,
                 ..Default::default()
             },
             ..Default::default()
@@ -622,13 +647,22 @@ tenants:
     }
 
     async fn post_complete(&self, key: &str, body: Value) -> (StatusCode, HeaderMap, String) {
-        let resp = reqwest::Client::new()
-            .post(self.url("/v1/chat/complete"))
-            .header("x-api-key", key)
-            .json(&body)
-            .send()
-            .await
-            .expect("post complete");
+        self.post_json("/v1/chat/complete", key, body, &[]).await
+    }
+
+    async fn post_json(
+        &self,
+        path: &str,
+        key: &str,
+        body: Value,
+        extra: &[(&str, &str)],
+    ) -> (StatusCode, HeaderMap, String) {
+        let client = reqwest::Client::new();
+        let mut request = client.post(self.url(path)).header("x-api-key", key);
+        for (name, value) in extra {
+            request = request.header(*name, *value);
+        }
+        let resp = request.json(&body).send().await.expect("post");
         let status = resp.status();
         let headers = resp.headers().clone();
         (status, headers, resp.text().await.unwrap_or_default())
@@ -788,9 +822,9 @@ async fn foreground_folding_summarizes_before_the_main_upstream_call() {
     )
     .await;
 
-    let (status, headers, body) = gw.post_chat(TEST_KEY, folding_body(6)).await;
+    let (status, headers, body) = gw.post_chat(TEST_KEY, folding_body(30)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(headers.get("x-gateway-folded").unwrap(), "4");
+    assert_eq!(headers.get("x-gateway-folded").unwrap(), "28");
     assert_eq!(upstream.calls(), 2, "one summarizer call and one main call");
 
     let sent = upstream.last_body().expect("main request body");
@@ -798,8 +832,21 @@ async fn foreground_folding_summarizes_before_the_main_upstream_call() {
     assert_eq!(messages.len(), 3, "summary plus the verbatim tail");
     assert_eq!(messages[0]["role"], "user");
     assert!(messages[0]["content"].as_str().unwrap().contains("Hello, world"));
-    assert!(messages[1]["content"].as_str().unwrap().starts_with("turn-4"));
-    assert!(messages[2]["content"].as_str().unwrap().starts_with("turn-5"));
+    assert!(messages[1]["content"].as_str().unwrap().starts_with("turn-28"));
+    assert!(messages[2]["content"].as_str().unwrap().starts_with("turn-29"));
+
+    let reserved: u64 = headers["x-reserved-nano-usd"].to_str().unwrap().parse().unwrap();
+    let forwarded = serde_json::from_value::<Vec<llm_gateway::providers::ChatMessage>>(sent["messages"].clone()).unwrap();
+    let prompt = llm_gateway::router::estimate_prompt_tokens(&forwarded);
+    // mock/chat is $2 / $8 per million tokens; the request caps output at 64.
+    let expected = prompt as u64 * 2_000 + 64 * 8_000;
+    assert_eq!(reserved, expected, "the reservation is the folded estimate");
+    let original = serde_json::from_value::<Vec<llm_gateway::providers::ChatMessage>>(
+        folding_body(30)["messages"].clone(),
+    )
+    .unwrap();
+    let unfolded = llm_gateway::router::estimate_prompt_tokens(&original) as u64 * 2_000 + 64 * 8_000;
+    assert!(reserved < unfolded, "folding must reserve less than the client body");
 }
 
 #[tokio::test]
@@ -818,7 +865,7 @@ async fn a_committed_summary_is_reused_until_a_new_batch_is_due() {
 
     let (second_status, second_headers, _) = gw.post_chat(TEST_KEY, folding_body(7)).await;
     assert_eq!(second_status, StatusCode::OK);
-    assert!(second_headers.get("x-gateway-folded").is_none());
+    assert_eq!(second_headers.get("x-gateway-folded").unwrap(), "4");
     assert_eq!(upstream.calls(), 3, "the second request only calls the main model");
 }
 
@@ -902,6 +949,127 @@ async fn a_reasoning_only_reply_is_retried_once_at_double_budget() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers.get("x-gateway-folded").unwrap(), "4");
     assert_eq!(upstream.calls(), 3, "retry, then main request");
+    let bodies = upstream.bodies();
+    assert_eq!(bodies[0]["max_tokens"], 64, "the first attempt uses the base budget");
+    assert_eq!(bodies[1]["max_tokens"], 128, "the retry doubles the budget");
+}
+
+fn openai_folding_body(turns: usize, stream: bool) -> Value {
+    let mut body = folding_body(turns);
+    let max_tokens = body["params"]["max_tokens"].clone();
+    body.as_object_mut().unwrap().remove("params");
+    body["max_tokens"] = max_tokens;
+    body["stream"] = json!(stream);
+    body
+}
+
+fn billed_nano(messages: &Value, input_nano_per_token: u64, completion_tokens: u64, output_nano_per_token: u64) -> u64 {
+    let parsed = serde_json::from_value::<Vec<llm_gateway::providers::ChatMessage>>(messages.clone()).unwrap();
+    let prompt = u64::from(llm_gateway::router::estimate_prompt_tokens(&parsed));
+    prompt * input_nano_per_token + completion_tokens * output_nano_per_token
+}
+
+#[tokio::test]
+async fn the_summarizer_is_its_own_settled_ledger_request() {
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(FOLDING_TENANT)).await;
+    let (status, _, _) = gw.post_chat(TEST_KEY, folding_body(6)).await;
+    assert_eq!(status, StatusCode::OK);
+    let bodies = upstream.bodies();
+    assert_eq!(bodies.len(), 2);
+    // Summarizer catalogue rate is $0.01 / $0.02 per million tokens (10 and 20
+    // nano-USD per token). The main model is $2 / $8. Reported completion is 3.
+    let summarizer = billed_nano(&bodies[0]["messages"], 10, 3, 20);
+    let main = billed_nano(&bodies[1]["messages"], 2_000, 3, 8_000);
+    let (_, usage) = gw.get("/v1/usage", TEST_KEY).await;
+    let usage: Value = serde_json::from_str(&usage).unwrap();
+    assert_eq!(usage["requests_last_minute"], 2, "the summarizer is a second request: {usage}");
+    assert_eq!(
+        usage["spent_nano_usd"],
+        summarizer + main,
+        "each call is settled from its own usage: {usage}"
+    );
+}
+
+#[tokio::test]
+async fn a_summarizer_the_budget_refuses_leaves_the_main_request_unfolded() {
+    const EXPENSIVE: &str = r#"  mock/summarizer:
+    provider: nvidia
+    endpoint: http://REPLACE_ME/v1/chat/completions
+    upstream_model: mock-summarizer
+    cost:
+      input_per_mtok_usd: 0.01
+      output_per_mtok_usd: 100.0
+"#;
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    // 64 output tokens at $100 / million is 6.4M nano-USD, over this budget.
+    // The unfolded main call on mock/chat fits under it.
+    let gw = Gateway::start_folding(&upstream, EXPENSIVE, Some(FOLDING_TENANT), Some(5_000_000), "", false).await;
+    let body = folding_body(6);
+    let (status, headers, _) = gw.post_chat(TEST_KEY, body.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.get("x-gateway-folded").is_none());
+    assert_eq!(upstream.calls(), 1, "admission failure must not call the summarizer");
+    let sent = serde_json::to_string(&upstream.last_body().unwrap()["messages"]).unwrap();
+    let original = serde_json::to_string(&body["messages"]).unwrap();
+    assert_eq!(sent, original);
+}
+
+#[tokio::test]
+async fn a_held_request_never_calls_the_summarizer() {
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let gw = Gateway::start_folding(
+        &upstream,
+        FOLDING_SUMMARIZER_MODEL,
+        Some(FOLDING_TENANT),
+        None,
+        "    holds:\n      above_nano_usd: 1\n",
+        false,
+    )
+    .await;
+    let (status, _, body) = gw.post_chat(TEST_KEY, folding_body(6)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(upstream.calls(), 0);
+}
+
+#[tokio::test]
+async fn an_idempotent_replay_returns_the_folded_header_without_a_new_summarizer_call() {
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(FOLDING_TENANT)).await;
+    let mut body = folding_body(6);
+    body["stream"] = json!(false);
+    let first = gw
+        .post_json("/v1/chat/complete", TEST_KEY, body.clone(), &[("idempotency-key", "fold-once")])
+        .await;
+    assert_eq!(first.0, StatusCode::OK, "{}", first.2);
+    assert_eq!(first.1.get("x-gateway-folded").unwrap(), "4");
+    assert_eq!(upstream.calls(), 2);
+
+    let replay = gw
+        .post_json("/v1/chat/complete", TEST_KEY, body, &[("idempotency-key", "fold-once")])
+        .await;
+    assert_eq!(replay.0, StatusCode::OK, "{}", replay.2);
+    assert_eq!(replay.1.get("x-gateway-folded").unwrap(), "4");
+    assert_eq!(replay.1.get("idempotent-replayed").unwrap(), "true");
+    assert_eq!(upstream.calls(), 2, "a replay must not call the summarizer again");
+}
+
+#[tokio::test]
+async fn folding_applies_on_the_openai_completions_endpoint() {
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(FOLDING_TENANT)).await;
+
+    let (status, headers, body) = gw
+        .post_json("/v1/chat/completions", TEST_KEY, openai_folding_body(6, true), &[])
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(headers.get("x-gateway-folded").unwrap(), "4");
+
+    let (status, headers, body) = gw
+        .post_json("/v1/chat/completions", TEST_KEY, openai_folding_body(6, false), &[])
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(headers.get("x-gateway-folded").unwrap(), "4");
 }
 
 #[tokio::test]
