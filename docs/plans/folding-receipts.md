@@ -2,7 +2,8 @@
 
 **Branch:** `opencode/folding-receipts`, off `master` (PR 51 merged).
 **Builder:** OpenCode. **Reviewer:** Claude Code, after handoff (section 6).
-**Status: needs the owner's decisions D1–D4 (section 3) before handoff.**
+**Status: ready for OpenCode.** The owner approved D1–D4 (section 3) as
+recommended on 2026-10-22.
 **Goal:** a tenant with `receipts: true` can turn on folding, and its receipts
 still prove what happened. The receipts must show what the client sent, what
 the model was actually sent, and what the summarizer read and wrote. A client
@@ -67,9 +68,10 @@ All of `docs/plans/receipts-operations.md` section 2 and
 
 ---
 
-## 3. Design, with the decisions to sign off
+## 3. Design
 
-Each decision is the recommended choice; the alternative is noted.
+D1–D4 below are approved as written. The alternatives are kept for the
+record; do not build them.
 
 ### D1. The client gets the summary that was sent
 
@@ -219,8 +221,8 @@ Commit per phase.
 
 - One commit per phase, message saying what and why. Never `--no-verify`,
   never force-push, never edit `vendor/`.
-- Do not start until the owner has signed off D1–D4. If a decision changes,
-  this file is updated first.
+- D1–D4 are approved. If building shows one of them cannot work as written,
+  stop and say so in the PR rather than choosing another design.
 - If a design point turns out impossible, implement the closest safe thing and
   list it under "Deviations". Never weaken section 2.
 - **"Passing" means on both platforms:** read `gh pr checks` before handing
