@@ -217,6 +217,7 @@ mod tests {
             auth,
         });
         let _ = std::fs::remove_dir_all(&dir);
+        let folding_bounds = (settings.folding.max_entries, settings.folding.max_total_chars);
 
         Arc::new(AppState {
             settings,
@@ -228,6 +229,7 @@ mod tests {
             ),
             providers: crate::router::ProviderPool::new(vec![]),
             limits: crate::governance::limits::LimitEngine::new(8, false),
+            folding: Arc::new(crate::folding::store::FoldingStore::new(folding_bounds.0, folding_bounds.1)),
             receipts: None,
             metrics: crate::observability::Metrics::new(std::time::Instant::now()),
             started_at: std::time::Instant::now(),

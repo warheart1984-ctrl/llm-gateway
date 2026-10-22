@@ -4,6 +4,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::{
     config::Settings,
+    folding::store::FoldingStore,
     governance::{
         auth::build_authenticator, limits::LimitEngine, policy::{self, PolicyEngine, TenantRegistry},
         Authenticator,
@@ -32,6 +33,8 @@ pub struct AppState {
     pub providers: RouterProviderPool,
     pub policy: PolicyEngine,
     pub limits: Arc<LimitEngine>,
+    /// Per-process bounded rolling-summary store.
+    pub folding: Arc<FoldingStore>,
     /// Every receipt-enabled tenant's chain on this replica, when
     /// `[receipts] enabled` is set. `None` means no tenant may write receipts.
     pub receipts: Option<Arc<crate::receipts::ReceiptBook>>,
@@ -210,6 +213,7 @@ mod tests {
             tenants,
             auth,
         });
+        let folding_bounds = (settings.folding.max_entries, settings.folding.max_total_chars);
         Arc::new(AppState {
             settings,
             models,
@@ -217,6 +221,7 @@ mod tests {
             providers: crate::router::ProviderPool::new(vec![]),
             policy: PolicyEngine::new(true, crate::config::DEFAULT_LIMITS),
             limits: LimitEngine::new(8, false),
+            folding: Arc::new(FoldingStore::new(folding_bounds.0, folding_bounds.1)),
             receipts: None,
             metrics: crate::observability::Metrics::new(Instant::now()),
             started_at: Instant::now(),

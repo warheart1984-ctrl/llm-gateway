@@ -82,6 +82,8 @@ libc = "0.2"
 hmac = "0.12"
 subtle = "2"
 base64 = "0.22"
+# Pinned-value checks for summaries.
+regex = "1.10"
 # For interior mutability in the folding store.
 parking_lot = "0.12"
 

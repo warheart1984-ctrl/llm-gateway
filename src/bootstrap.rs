@@ -203,6 +203,7 @@ pub async fn build_with_ledger(
         tenants,
         auth,
     });
+    let folding_bounds = (settings.folding.max_entries, settings.folding.max_total_chars);
 
     Ok(Arc::new(AppState {
         settings,
@@ -211,6 +212,7 @@ pub async fn build_with_ledger(
         providers,
         policy,
         limits,
+        folding: Arc::new(crate::folding::store::FoldingStore::new(folding_bounds.0, folding_bounds.1)),
         receipts,
         metrics,
         started_at: std::time::Instant::now(),

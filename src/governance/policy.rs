@@ -747,13 +747,6 @@ pub fn validate_with_models(
                     folding.summarizer_model
                 ));
             }
-            let provider = requested.split('/').next().unwrap_or_default();
-            if provider != "*" && !provider_available(provider) {
-                v.errors.push(format!(
-                    "tenant `{id}` summarizer_model `{}` has no configured provider adapter",
-                    folding.summarizer_model
-                ));
-            }
             if glob_any(&tenant.denied_models, &requested)
                 || (require_allowlist && !glob_any(&tenant.allowed_models, &requested))
             {

@@ -164,6 +164,24 @@ impl FoldingStore {
         }
     }
 
+    /// Look up an entry against the exact prefix it claims to cover. A
+    /// mismatch removes the entry and increments `prefix_mismatches`.
+    pub fn lookup(
+        &self,
+        key: &[u8; 32],
+        tenant_id: &str,
+        turns: &[ChatMessage],
+    ) -> Option<EntryRef> {
+        let turns_covered = self.entries.get(key)?.lock().turns_covered;
+        let covered_end = turns_covered.min(turns.len());
+        let prefix_hash = self.prefix_hash(tenant_id, &turns[..covered_end]);
+        self.get(key, &prefix_hash)
+    }
+
+    pub fn remove(&self, key: &[u8; 32]) {
+        self.remove_entry(key);
+    }
+
     /// Remove an entry by key and update total chars.
     fn remove_entry(&self, key: &[u8; 32]) {
         if let Some((_, entry)) = self.entries.remove(key) {

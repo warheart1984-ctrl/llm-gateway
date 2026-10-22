@@ -1274,6 +1274,7 @@ dependencies = [
  "infinity-kernel",
  "libc",
  "parking_lot",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

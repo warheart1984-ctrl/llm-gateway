@@ -80,6 +80,22 @@ pub struct PlanConfig {
     pub min_saving_nano_usd: u64,
 }
 
+impl PlanConfig {
+    pub fn from_tenant(config: &crate::governance::policy::FoldingConfig) -> Self {
+        Self {
+            keep_last: config.keep_last,
+            summary_chars: config.summary_chars,
+            summarizer_max_tokens: config.summarizer_max_tokens,
+            max_folds: config.max_folds,
+            refold_threshold: config.refold_threshold,
+            min_new_turns: config.min_new_turns,
+            min_new_tokens: config.min_new_tokens,
+            amortization_requests: config.amortization_requests,
+            min_saving_nano_usd: config.min_saving_nano_usd,
+        }
+    }
+}
+
 /// A summary entry from the store (what we need for planning).
 #[derive(Debug, Clone)]
 pub struct StoredSummary {
@@ -234,7 +250,7 @@ pub fn plan_fold(
         stored_summary,
     );
 
-    if benefit.saturating_sub(overhead) < config.min_saving_nano_usd {
+    if benefit < overhead.saturating_add(config.min_saving_nano_usd) {
         return FoldPlan {
             outcome: FoldOutcome::Refused,
             reason: FoldReason::CostCheckFailed {
@@ -387,7 +403,7 @@ fn estimate_summarizer_input_tokens(stored_summary: Option<&StoredSummary>, pend
 }
 
 /// Build the forwarded messages: protected + summary (user) + pending + tail.
-fn build_forwarded_messages(
+pub fn build_forwarded_messages(
     protected: &[ChatMessage],
     summary: Option<&str>,
     pending: &[ChatMessage],
@@ -652,7 +668,12 @@ mod tests {
         config.refold_threshold = 4;
         config.keep_last = 2;
         config.min_new_tokens = 0;
-        let (main_cost, summ_cost) = cost_models();
+        let main_cost = CostModel {
+            input_per_mtok_usd: 10.0,
+            output_per_mtok_usd: 20.0,
+            cached_input_per_mtok_usd: None,
+        };
+        let summ_cost = CostModel::default();
         let protected = vec![msg("system", "sys")];
 
         // First fold: four pending turns and a two-turn tail.
