@@ -1273,6 +1273,8 @@ dependencies = [
  "http-body-util",
  "infinity-kernel",
  "libc",
+ "parking_lot",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

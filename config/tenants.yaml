@@ -47,6 +47,22 @@ tenants:
       max_output_tokens: 8192
       # 100 USD/day.
       daily_budget_nano_usd: 100000000000
+    # Conversation folding stays off until a tenant opts in. A summary can
+    # lose information, and the 5-fold run that cut 18,977 prompt tokens to
+    # 4,311 still lost money (net −$0.0057). The summarizer must be a model
+    # this tenant is allowed to call. Do not combine this with receipts.
+    # folding:
+    #   enabled: true
+    #   summarizer_model: groq/summarizer
+    #   keep_last: 4
+    #   summary_chars: 1200
+    #   summarizer_max_tokens: 512
+    #   max_folds: 8
+    #   refold_threshold: 8
+    #   min_new_turns: 4
+    #   min_new_tokens: 400
+    #   amortization_requests: 4
+    #   min_saving_nano_usd: 0
 
   # Isolated benchmark tenant. Limits are intentionally high enough to expose
   # provider and gateway capacity at the selected test point, but remain finite

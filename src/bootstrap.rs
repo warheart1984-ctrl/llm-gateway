@@ -116,10 +116,12 @@ pub async fn build_with_ledger(
     // warned about, because refusing to start would turn a missing secret into
     // a full outage.
     let pool = providers.names();
-    let validation = policy::validate(
+    let model_snapshot = models.snapshot().await;
+    let validation = policy::validate_with_models(
         &tenants,
         settings.governance.require_model_allowlist,
         &|p| pool.contains(&p.to_ascii_lowercase()),
+        &|model| model_snapshot.by_id.contains_key(model),
     );
     for warning in &validation.warnings {
         tracing::warn!(%warning, "tenant registry warning");
@@ -175,7 +177,7 @@ pub async fn build_with_ledger(
     // Report which catalogue entries cannot currently be served. Not fatal:
     // the gateway is a multi-provider front door, and one absent credential
     // should not stop the others from working.
-    let snapshot = models.snapshot().await;
+    let snapshot = model_snapshot;
     let unavailable: Vec<&str> = snapshot
         .ids()
         .into_iter()
@@ -201,6 +203,9 @@ pub async fn build_with_ledger(
         tenants,
         auth,
     });
+    let folding_bounds = (settings.folding.max_entries, settings.folding.max_total_chars);
+    let folding = Arc::new(crate::folding::store::FoldingStore::new(folding_bounds.0, folding_bounds.1));
+    metrics.set_folding(Arc::clone(&folding));
 
     Ok(Arc::new(AppState {
         settings,
@@ -209,6 +214,7 @@ pub async fn build_with_ledger(
         providers,
         policy,
         limits,
+        folding,
         receipts,
         metrics,
         started_at: std::time::Instant::now(),

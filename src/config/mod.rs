@@ -43,6 +43,9 @@ pub struct Settings {
     /// Absent in older config files, which write no receipts.
     #[serde(default)]
     pub receipts: ReceiptsConfig,
+    /// Conversation folding configuration. Absent in older config files.
+    #[serde(default)]
+    pub folding: FoldingConfig,
 }
 
 /// This process's Wicket receipt chain. The directory holds the log, the
@@ -90,6 +93,32 @@ impl Default for ReceiptsConfig {
             anchor_every: 1_000,
             anchor_interval_secs: 60,
             startup_verify: StartupVerify::default(),
+        }
+    }
+}
+
+/// Conversation folding configuration. Off by default; when enabled, tenants
+/// with `folding.enabled: true` can have their long conversations summarized.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct FoldingConfig {
+    /// Maximum conversations held across all tenants (LRU eviction).
+    pub max_entries: usize,
+    /// Maximum total summary characters across all tenants (LRU eviction).
+    pub max_total_chars: usize,
+    /// When true, folds run in a background task after the response is sent.
+    /// Foreground (false) runs the fold before sending the request, which is
+    /// the default because background folds spend tenant money after the
+    /// response.
+    pub background: bool,
+}
+
+impl Default for FoldingConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: 10_000,
+            max_total_chars: 20_000_000,
+            background: false,
         }
     }
 }

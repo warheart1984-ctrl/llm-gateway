@@ -110,7 +110,7 @@ async fn run(state: std::sync::Arc<AppState>) -> anyhow::Result<()> {
 
     let app = api::router(state.clone());
     let serve = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(grace, state.inflight.clone()));
+        .with_graceful_shutdown(shutdown_signal(grace, state.clone()));
 
     // The serve future completes only when every stream has finished, which a
     // stream that will not settle can delay indefinitely. Race it against the
@@ -165,11 +165,12 @@ async fn terminate_signal() {
 
 /// Signal the server to stop accepting, then give in-flight streams up to
 /// `grace` to settle rather than cutting them mid-token.
-async fn shutdown_signal(grace: std::time::Duration, inflight: Arc<std::sync::atomic::AtomicU64>) {
+async fn shutdown_signal(grace: std::time::Duration, state: Arc<AppState>) {
     terminate_signal().await;
     tracing::info!("received shutdown signal; draining in-flight streams");
+    state.folding.cancel();
 
-    let drain = wait_for_drain(inflight);
+    let drain = wait_for_drain(state.inflight.clone());
     tokio::pin!(drain);
     tokio::select! {
         _ = &mut drain => tracing::info!("all in-flight streams settled"),

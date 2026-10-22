@@ -50,6 +50,11 @@ use uuid::Uuid;
 
 use crate::{
     config::OverflowMode,
+    folding::{
+        plan::{FoldOutcome, FoldPlan, PlanConfig, StoredSummary},
+        store::EntryRef,
+        summarizer, FoldAccounting, FoldAttempt, FoldFacts,
+    },
     governance::{
         auth::Principal,
         ledger::{
@@ -483,7 +488,7 @@ async fn handle(state: Arc<AppState>, headers: HeaderMap, body: Bytes, mode: Mod
                 original = %original,
                 "idempotent replay served from the ledger"
             );
-            let (body, receipt) = unwrap_stored(stored);
+            let (body, receipt, folded_turns) = unwrap_stored(stored);
             let mut response = (StatusCode::OK, body).into_response();
             let h = response.headers_mut();
             h.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -495,6 +500,12 @@ async fn handle(state: Arc<AppState>, headers: HeaderMap, body: Bytes, mode: Mod
             if let Some((receipt_id, salt)) = receipt {
                 h.insert(HeaderName::from_static("x-receipt-id"), header_value(&receipt_id));
                 h.insert(HeaderName::from_static("x-receipt-salt"), header_value(&salt));
+            }
+            if folded_turns > 0 {
+                h.insert(
+                    HeaderName::from_static("x-gateway-folded"),
+                    header_value(&folded_turns.to_string()),
+                );
             }
             response
         }
@@ -686,14 +697,24 @@ async fn failed_outcome(open: &OpenReceipt) -> Result<(), RequestError> {
 /// Marks a stored answer that carries its receipt. Never a field of an
 /// answer itself, so a stored answer without it is returned as it is.
 const STORED_WITH_RECEIPT: &str = "llm_gateway_stored_with_receipt";
+const STORED_WITH_FOLDING: &str = "llm_gateway_stored_with_folding";
 
 /// The answer kept for idempotent replay, with the id and salt of the
 /// receipt that covers it.
-fn stored_with_receipt(payload: &str, open: &OpenReceipt) -> String {
+fn stored_with_receipt(payload: &str, open: &OpenReceipt, folded_turns: usize) -> String {
     json!({
         STORED_WITH_RECEIPT: 1,
         "receipt_id": open.decision_receipt_id,
         "receipt_salt": open.salt.to_hex(),
+        STORED_WITH_FOLDING: folded_turns,
+        "body": payload,
+    })
+    .to_string()
+}
+
+fn stored_with_folding(payload: &str, folded_turns: usize) -> String {
+    json!({
+        STORED_WITH_FOLDING: folded_turns,
         "body": payload,
     })
     .to_string()
@@ -702,15 +723,25 @@ fn stored_with_receipt(payload: &str, open: &OpenReceipt) -> String {
 /// A stored answer and, when it was kept with one, its receipt id and salt.
 /// Answers stored before receipts, or for tenants without them, come back
 /// unchanged.
-fn unwrap_stored(stored: String) -> (String, Option<(String, String)>) {
+fn unwrap_stored(stored: String) -> (String, Option<(String, String)>, usize) {
     if let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(&stored)
-        && fields.get(STORED_WITH_RECEIPT) == Some(&json!(1))
-        && let (Some(Value::String(body)), Some(Value::String(id)), Some(Value::String(salt))) =
-            (fields.get("body"), fields.get("receipt_id"), fields.get("receipt_salt"))
+        && let Some(Value::String(body)) = fields.get("body")
     {
-        return (body.clone(), Some((id.clone(), salt.clone())));
+        let folded_turns = fields
+            .get(STORED_WITH_FOLDING)
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        if fields.get(STORED_WITH_RECEIPT) == Some(&json!(1))
+            && let (Some(Value::String(id)), Some(Value::String(salt))) =
+                (fields.get("receipt_id"), fields.get("receipt_salt"))
+        {
+            return (body.clone(), Some((id.clone(), salt.clone())), folded_turns);
+        }
+        if folded_turns > 0 {
+            return (body.clone(), None, folded_turns);
+        }
     }
-    (stored, None)
+    (stored, None, 0)
 }
 
 /// `x-receipt-id` names the allow receipt; `x-receipt-salt` is the salt in
@@ -763,6 +794,620 @@ struct Admitted {
     receipt: Option<OpenReceipt>,
     /// Set for `/v1/chat/completions`: answer in OpenAI's format.
     openai: Option<OpenAiReply>,
+    /// Number of old turns replaced in the forwarded request.
+    folded_turns: usize,
+}
+
+#[derive(Debug, Default)]
+struct FoldResult {
+    messages: Vec<ChatMessage>,
+    folded_turns: usize,
+    facts: Option<FoldFacts>,
+    attempt: Option<FoldAttempt>,
+}
+
+fn bare_fold(messages: Vec<ChatMessage>, outcome: &'static str, reason: &str, attempt: Option<FoldAttempt>) -> FoldResult {
+    FoldResult {
+        messages,
+        folded_turns: 0,
+        facts: Some(FoldFacts {
+            outcome,
+            reason: reason.to_string(),
+            turns_replaced: 0,
+            turns_covered: 0,
+            prompt_tokens_cut: 0,
+            benefit_nano_usd: 0,
+            overhead_nano_usd: 0,
+            min_saving_nano_usd: 0,
+            summarizer_prompt_tokens: attempt.map(|item| item.prompt_tokens).unwrap_or(0),
+            summarizer_completion_tokens: attempt.map(|item| item.completion_tokens).unwrap_or(0),
+            fold_count: 0,
+            prefix_hash: String::new(),
+        }),
+        attempt,
+    }
+}
+
+struct FoldStamp<'a> {
+    outcome: &'static str,
+    reason: &'a str,
+    attempt: Option<FoldAttempt>,
+    fold_count: u32,
+    prefix_hash: Option<[u8; 32]>,
+    folded_turns: usize,
+}
+
+fn describe_fold(
+    original: &[ChatMessage],
+    messages: Vec<ChatMessage>,
+    plan: &FoldPlan,
+    stamp: FoldStamp<'_>,
+) -> FoldResult {
+    let sent_cut = u64::from(
+        estimate_prompt_tokens(original).saturating_sub(estimate_prompt_tokens(&messages)),
+    );
+    // A request that went out folded records the tokens actually removed.
+    // A refused plan records the cost check's own estimate, which is what
+    // the operator needs to see why it did not run.
+    let prompt_tokens_cut = if stamp.folded_turns > 0 { sent_cut } else { u64::from(plan.prompt_tokens_cut) };
+    FoldResult {
+        messages,
+        folded_turns: stamp.folded_turns,
+        facts: Some(FoldFacts {
+            outcome: stamp.outcome,
+            reason: stamp.reason.to_string(),
+            turns_replaced: u64::try_from(stamp.folded_turns).unwrap_or(u64::MAX),
+            turns_covered: u64::try_from(plan.turns_covered).unwrap_or(u64::MAX),
+            prompt_tokens_cut,
+            benefit_nano_usd: plan.benefit_nano_usd,
+            overhead_nano_usd: plan.overhead_nano_usd,
+            min_saving_nano_usd: plan.min_saving_nano_usd,
+            summarizer_prompt_tokens: stamp.attempt.map(|item| item.prompt_tokens).unwrap_or(0),
+            summarizer_completion_tokens: stamp.attempt.map(|item| item.completion_tokens).unwrap_or(0),
+            fold_count: u64::from(stamp.fold_count),
+            prefix_hash: stamp.prefix_hash.map(|hash| crate::folding::prefix_hex(&hash)).unwrap_or_default(),
+        }),
+        attempt: stamp.attempt,
+    }
+}
+
+fn stored_summary(entry: &EntryRef) -> StoredSummary {
+    let entry = entry.lock();
+    StoredSummary {
+        turns_covered: entry.turns_covered,
+        prefix_hash: entry.prefix_hash,
+        summary: entry.summary.clone(),
+        fold_count: entry.fold_count,
+        summarizer_model: entry.summarizer_model.clone(),
+    }
+}
+
+/// The request as it goes out when no fold runs now: with the committed
+/// summary and the turns it does not cover, or unchanged if there is none.
+fn with_current_summary(
+    messages: &[ChatMessage],
+    protected: &[ChatMessage],
+    prior: Option<&StoredSummary>,
+    pending: &[ChatMessage],
+    tail: &[ChatMessage],
+) -> (Vec<ChatMessage>, usize) {
+    match prior {
+        Some(summary) => (
+            crate::folding::plan::build_forwarded_messages(protected, Some(&summary.summary), pending, tail),
+            summary.turns_covered,
+        ),
+        None => (messages.to_vec(), 0),
+    }
+}
+
+/// Owns everything a fold needs after the request that planned it has moved on.
+struct FoldWork {
+    state: Arc<AppState>,
+    tenant_id: String,
+    limits: crate::config::LimitProfile,
+    summarizer_model_id: String,
+    summarizer_max_tokens: u32,
+    upstream_model: String,
+    endpoint: Option<String>,
+    cost: crate::router::CostModel,
+    provider: Arc<dyn ChatProvider>,
+    key: [u8; 32],
+    head: Vec<ChatMessage>,
+    pending: Vec<ChatMessage>,
+    covered: usize,
+    prior_text: Option<String>,
+    started_prefix: Option<[u8; 32]>,
+    old_spent: u64,
+    old_saved: u64,
+    new_fold_count: u32,
+    prompt_tokens_cut: u32,
+    plan_config: PlanConfig,
+}
+
+enum AppliedFold {
+    Committed {
+        summary: String,
+        prefix_hash: [u8; 32],
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    },
+    Stopped {
+        outcome: &'static str,
+        reason: &'static str,
+        accounting: FoldAccounting,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    },
+}
+
+/// Clears the in-flight flag however the task ends, including cancellation.
+struct EndFold {
+    store: Arc<crate::folding::store::FoldingStore>,
+    key: [u8; 32],
+}
+
+impl Drop for EndFold {
+    fn drop(&mut self) {
+        self.store.finish(&self.key);
+    }
+}
+
+/// Run the summarizer. The store lock is never held across the provider call.
+/// On shutdown the reservation is released, not abandoned.
+async fn run_applied_fold(work: FoldWork) -> AppliedFold {
+    let mut shutdown = work.state.folding.subscribe_shutdown();
+    let mut attempt_no = 0u8;
+    let mut used_prompt = 0u64;
+    let mut used_completion = 0u64;
+
+    loop {
+        if *shutdown.borrow() {
+            return AppliedFold::Stopped {
+                outcome: "failed",
+                reason: "cancelled",
+                accounting: FoldAccounting::Failed,
+                prompt_tokens: used_prompt,
+                completion_tokens: used_completion,
+            };
+        }
+        attempt_no += 1;
+        let budget = if attempt_no == 1 {
+            work.summarizer_max_tokens
+        } else {
+            work.summarizer_max_tokens.saturating_mul(2)
+        };
+        let prompt_messages = summarizer::prompt_messages(&work.plan_config, work.prior_text.as_deref(), &work.pending);
+        let prompt_tokens = estimate_prompt_tokens(&prompt_messages);
+        let estimate = CostEstimate {
+            prompt_nano_usd: estimate_cost_nano_usd(&work.cost, prompt_tokens, 0),
+            completion_nano_usd: estimate_cost_nano_usd(&work.cost, 0, budget),
+        };
+        let Ok(mut reservation) = work
+            .state
+            .limits
+            .admit_request(AdmitRequest {
+                id: Uuid::new_v4(),
+                tenant_id: &work.tenant_id,
+                limits: &work.limits,
+                prompt_tokens,
+                max_output_tokens: budget,
+                estimate,
+                idempotency: None,
+                hold: None,
+            })
+            .await
+        else {
+            return AppliedFold::Stopped {
+                outcome: "refused",
+                reason: "admission_refused",
+                accounting: FoldAccounting::RefusedAdmission,
+                prompt_tokens: used_prompt,
+                completion_tokens: used_completion,
+            };
+        };
+        if *shutdown.borrow() {
+            reservation.release();
+            return AppliedFold::Stopped {
+                outcome: "failed",
+                reason: "cancelled",
+                accounting: FoldAccounting::Failed,
+                prompt_tokens: used_prompt,
+                completion_tokens: used_completion,
+            };
+        }
+
+        let request = summarizer::build_request(
+            &work.upstream_model,
+            work.endpoint.clone(),
+            &work.tenant_id,
+            &Uuid::new_v4().to_string(),
+            prompt_messages,
+            budget,
+        );
+        let pending = work.provider.complete(request);
+        tokio::pin!(pending);
+        let completion = tokio::select! {
+            biased;
+            _ = shutdown.changed() => {
+                reservation.release();
+                return AppliedFold::Stopped {
+                    outcome: "failed",
+                    reason: "cancelled",
+                    accounting: FoldAccounting::Failed,
+                    prompt_tokens: used_prompt,
+                    completion_tokens: used_completion,
+                };
+            }
+            result = &mut pending => result,
+        };
+        let completion = match completion {
+            Ok(completion) => completion,
+            Err(error) => {
+                if error.accepted_by_upstream() {
+                    reservation.abandon();
+                } else {
+                    reservation.release();
+                }
+                return AppliedFold::Stopped {
+                    outcome: "failed",
+                    reason: "provider_error",
+                    accounting: FoldAccounting::Failed,
+                    prompt_tokens: used_prompt,
+                    completion_tokens: used_completion,
+                };
+            }
+        };
+        // Billed like a main completion: a provider that reports no usage is
+        // charged the gateway's estimate of the output, not zero.
+        let usage = billable_usage(&completion, prompt_tokens, budget);
+        used_prompt = used_prompt.saturating_add(u64::from(usage.prompt_tokens));
+        used_completion = used_completion.saturating_add(u64::from(usage.completion_tokens));
+        let content = summarizer::extract_content(&completion);
+        let retry_empty = attempt_no == 1
+            && content.trim().is_empty()
+            && (completion.reasoning.as_deref().is_some_and(|text| !text.is_empty())
+                || completion.finish_reason.as_deref() == Some("length"));
+        reservation.settle(usage, &work.cost);
+        if retry_empty {
+            continue;
+        }
+        if content.trim().is_empty() || completion.finish_reason.as_deref() == Some("length") {
+            let reason = if completion.finish_reason.as_deref() == Some("length") {
+                "length"
+            } else {
+                "empty_reply"
+            };
+            return AppliedFold::Stopped {
+                outcome: "refused",
+                reason,
+                accounting: FoldAccounting::Rejected,
+                prompt_tokens: used_prompt,
+                completion_tokens: used_completion,
+            };
+        }
+        let Ok(summary) = summarizer::run_checks_with_prior(
+            &content,
+            work.prior_text.as_deref(),
+            &work.pending,
+            &work.plan_config,
+        ) else {
+            return AppliedFold::Stopped {
+                outcome: "refused",
+                reason: "checks_failed",
+                accounting: FoldAccounting::Rejected,
+                prompt_tokens: used_prompt,
+                completion_tokens: used_completion,
+            };
+        };
+
+        let new_covered = work.covered + work.pending.len();
+        let prefix_hash = work.state.folding.prefix_hash(&work.tenant_id, &work.head[..new_covered]);
+        let committed = work.state.folding.commit_if_current(
+            work.key,
+            work.started_prefix,
+            crate::folding::store::SummaryEntry {
+                turns_covered: new_covered,
+                prefix_hash,
+                summary: summary.clone(),
+                fold_count: work.new_fold_count,
+                tokens_spent: work.old_spent.saturating_add(used_prompt.saturating_add(used_completion)),
+                tokens_saved: work.old_saved.saturating_add(u64::from(work.prompt_tokens_cut)),
+                summarizer_model: work.summarizer_model_id.clone(),
+                last_accessed: std::time::Instant::now(),
+            },
+        );
+        if !committed {
+            return AppliedFold::Stopped {
+                outcome: "failed",
+                reason: "prefix_moved",
+                accounting: FoldAccounting::Failed,
+                prompt_tokens: used_prompt,
+                completion_tokens: used_completion,
+            };
+        }
+        return AppliedFold::Committed {
+            summary,
+            prefix_hash,
+            prompt_tokens: used_prompt,
+            completion_tokens: used_completion,
+        };
+    }
+}
+
+/// Run one foreground fold. Every failure returns the client messages
+/// unchanged; the main request is never made dependent on summarization.
+async fn foreground_fold(
+    state: &Arc<AppState>,
+    generation: &crate::state::RegistryGeneration,
+    decision: &crate::governance::policy::Decision,
+    resolved: &router::ResolvedModel,
+    key_id: &str,
+    messages: &[ChatMessage],
+) -> FoldResult {
+    let Some(folding) = decision.tenant.folding.as_ref().filter(|f| f.enabled) else {
+        return FoldResult { messages: messages.to_vec(), ..FoldResult::default() };
+    };
+
+    let (protected, turns) = crate::folding::split_messages(messages);
+    let Some(first_turn) = turns.first() else {
+        return bare_fold(messages.to_vec(), "not_due", "no_turns", None);
+    };
+    let key = state
+        .folding
+        .conversation_key(&decision.tenant.tenant_id, key_id, &protected, Some(first_turn));
+
+    let existing = state
+        .folding
+        .lookup(&key, &decision.tenant.tenant_id, &turns);
+    let existing = existing.and_then(|entry| {
+        let same_model = entry.lock().summarizer_model == folding.summarizer_model;
+        if same_model {
+            Some(entry)
+        } else {
+            state.folding.remove(&key);
+            None
+        }
+    });
+    let prior = existing.as_ref().map(stored_summary);
+    let plan_config = PlanConfig::from_tenant(folding);
+
+    // Resolved with the tenant's model suffix, as load-time validation checked
+    // it and as the tenant's own requests are resolved.
+    let summarizer_id = crate::governance::policy::qualify(&decision.tenant.model_suffix, &folding.summarizer_model);
+    let Some(summarizer_model) = generation.models.resolve(&summarizer_id).ok() else {
+        return bare_fold(
+            messages.to_vec(),
+            "failed",
+            "summarizer_unavailable",
+            Some(FoldAttempt { outcome: FoldAccounting::Failed, prompt_tokens: 0, completion_tokens: 0 }),
+        );
+    };
+    let Ok(summarizer_provider) = router::provider_for(&summarizer_model, &state.providers) else {
+        return bare_fold(
+            messages.to_vec(),
+            "failed",
+            "summarizer_unavailable",
+            Some(FoldAttempt { outcome: FoldAccounting::Failed, prompt_tokens: 0, completion_tokens: 0 }),
+        );
+    };
+    let summarizer_provider = Arc::clone(summarizer_provider);
+
+    let plan = crate::folding::plan::plan_fold(
+        &plan_config,
+        &resolved.config.cost,
+        &summarizer_model.config.cost,
+        &protected,
+        &turns,
+        prior.as_ref(),
+    );
+    if plan.outcome != FoldOutcome::Applied {
+        let forwarded = if plan.forwarded_messages.is_empty() {
+            messages.to_vec()
+        } else {
+            plan.forwarded_messages.clone()
+        };
+        let outcome = match plan.outcome {
+            FoldOutcome::Applied => "applied",
+            FoldOutcome::NotDue => "not_due",
+            FoldOutcome::Skipped => "skipped",
+            FoldOutcome::Refused => "refused",
+            FoldOutcome::Failed => "failed",
+        };
+        let attempt = (plan.outcome == FoldOutcome::Refused).then_some(FoldAttempt {
+            outcome: FoldAccounting::Unprofitable,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+        });
+        return describe_fold(
+            messages,
+            forwarded,
+            &plan,
+            FoldStamp {
+                outcome,
+                reason: plan.reason.code(),
+                attempt,
+                fold_count: prior.as_ref().map(|summary| summary.fold_count).unwrap_or(0),
+                prefix_hash: prior.as_ref().map(|summary| summary.prefix_hash),
+                folded_turns: plan.turns_replaced,
+            },
+        );
+    }
+
+    let split = turns.len().saturating_sub(folding.keep_last);
+    let head = turns[..split].to_vec();
+    let tail = turns[split..].to_vec();
+    let covered = prior.as_ref().map(|summary| summary.turns_covered.min(head.len())).unwrap_or(0);
+    let pending = head[covered..].to_vec();
+
+    // The summarizer is admitted like any request: it takes a rate slot and
+    // prompt tokens from the tenant's window. Fold only when the window has
+    // room for it and for the request it serves, so a fold never turns an
+    // admissible request into a 429. Without room, the request goes out with
+    // the summary it already has, or unfolded.
+    let summarizer_prompt = estimate_prompt_tokens(&summarizer::prompt_messages(
+        &plan_config,
+        prior.as_ref().map(|summary| summary.summary.as_str()),
+        &pending,
+    ));
+    if !state.limits.has_rate_headroom(
+        &decision.tenant.tenant_id,
+        &decision.limits,
+        2,
+        summarizer_prompt.saturating_add(estimate_prompt_tokens(messages)),
+    ) {
+        let (forwarded, folded_turns) = with_current_summary(messages, &protected, prior.as_ref(), &pending, &tail);
+        return describe_fold(
+            messages,
+            forwarded,
+            &plan,
+            FoldStamp {
+                outcome: "refused",
+                reason: "no_rate_headroom",
+                attempt: Some(FoldAttempt {
+                    outcome: FoldAccounting::RefusedAdmission,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                }),
+                fold_count: prior.as_ref().map(|summary| summary.fold_count).unwrap_or(0),
+                prefix_hash: prior.as_ref().map(|summary| summary.prefix_hash),
+                folded_turns,
+            },
+        );
+    }
+
+    let (old_spent, old_saved) = existing
+        .as_ref()
+        .map(|entry| {
+            let entry = entry.lock();
+            (entry.tokens_spent, entry.tokens_saved)
+        })
+        .unwrap_or_default();
+    let work = FoldWork {
+        state: Arc::clone(state),
+        tenant_id: decision.tenant.tenant_id.clone(),
+        limits: decision.limits.clone(),
+        summarizer_model_id: folding.summarizer_model.clone(),
+        summarizer_max_tokens: folding.summarizer_max_tokens,
+        upstream_model: summarizer_model.upstream_model.clone(),
+        endpoint: summarizer_model.endpoint.clone(),
+        cost: summarizer_model.config.cost.clone(),
+        provider: summarizer_provider,
+        key,
+        head,
+        pending: pending.clone(),
+        covered,
+        prior_text: prior.as_ref().map(|summary| summary.summary.clone()),
+        started_prefix: prior.as_ref().map(|summary| summary.prefix_hash),
+        old_spent,
+        old_saved,
+        new_fold_count: plan.new_fold_count,
+        prompt_tokens_cut: plan.prompt_tokens_cut,
+        plan_config,
+    };
+
+    if state.settings.folding.background {
+        let (immediate, folded_turns) = with_current_summary(messages, &protected, prior.as_ref(), &pending, &tail);
+        if state.folding.try_begin(key) {
+            let tenant_id = work.tenant_id.clone();
+            let metrics = Arc::clone(&state.metrics);
+            let store = Arc::clone(&state.folding);
+            tokio::spawn(async move {
+                let _end = EndFold { store, key };
+                let result = run_applied_fold(work).await;
+                let (accounting, prompt_tokens, completion_tokens) = match result {
+                    AppliedFold::Committed { prompt_tokens, completion_tokens, .. } => {
+                        (FoldAccounting::Committed, prompt_tokens, completion_tokens)
+                    }
+                    AppliedFold::Stopped { accounting, prompt_tokens, completion_tokens, .. } => {
+                        (accounting, prompt_tokens, completion_tokens)
+                    }
+                };
+                metrics.record_fold(&tenant_id, accounting, prompt_tokens, completion_tokens);
+            });
+        }
+        let sent_cut = u64::from(
+            estimate_prompt_tokens(messages).saturating_sub(estimate_prompt_tokens(&immediate)),
+        );
+        return FoldResult {
+            messages: immediate,
+            folded_turns,
+            facts: Some(FoldFacts {
+                outcome: "not_due",
+                reason: "background".to_string(),
+                turns_replaced: u64::try_from(folded_turns).unwrap_or(u64::MAX),
+                turns_covered: u64::try_from(folded_turns).unwrap_or(u64::MAX),
+                prompt_tokens_cut: if folded_turns > 0 { sent_cut } else { 0 },
+                benefit_nano_usd: plan.benefit_nano_usd,
+                overhead_nano_usd: plan.overhead_nano_usd,
+                min_saving_nano_usd: plan.min_saving_nano_usd,
+                summarizer_prompt_tokens: 0,
+                summarizer_completion_tokens: 0,
+                fold_count: u64::from(prior.as_ref().map(|summary| summary.fold_count).unwrap_or(0)),
+                prefix_hash: prior
+                    .as_ref()
+                    .map(|summary| crate::folding::prefix_hex(&summary.prefix_hash))
+                    .unwrap_or_default(),
+            }),
+            attempt: None,
+        };
+    }
+
+    // One fold per conversation at a time, as in background mode. A request
+    // that finds one running goes out with the summary it already has: two
+    // concurrent folds would both be paid for and only one could commit.
+    if !state.folding.try_begin(key) {
+        let (forwarded, folded_turns) = with_current_summary(messages, &protected, prior.as_ref(), &pending, &tail);
+        return describe_fold(
+            messages,
+            forwarded,
+            &plan,
+            FoldStamp {
+                outcome: "not_due",
+                reason: "fold_in_flight",
+                attempt: None,
+                fold_count: prior.as_ref().map(|summary| summary.fold_count).unwrap_or(0),
+                prefix_hash: prior.as_ref().map(|summary| summary.prefix_hash),
+                folded_turns,
+            },
+        );
+    }
+    let _end = EndFold { store: Arc::clone(&state.folding), key };
+
+    match run_applied_fold(work).await {
+        AppliedFold::Committed { summary, prefix_hash, prompt_tokens, completion_tokens } => {
+            let forwarded = crate::folding::plan::build_forwarded_messages(&protected, Some(&summary), &[], &tail);
+            describe_fold(
+                messages,
+                forwarded,
+                &plan,
+                FoldStamp {
+                    outcome: "applied",
+                    reason: plan.reason.code(),
+                    attempt: Some(FoldAttempt {
+                        outcome: FoldAccounting::Committed,
+                        prompt_tokens,
+                        completion_tokens,
+                    }),
+                    fold_count: plan.new_fold_count,
+                    prefix_hash: Some(prefix_hash),
+                    folded_turns: plan.turns_replaced,
+                },
+            )
+        }
+        AppliedFold::Stopped { outcome, reason, accounting, prompt_tokens, completion_tokens } => describe_fold(
+            messages,
+            messages.to_vec(),
+            &plan,
+            FoldStamp {
+                outcome,
+                reason,
+                attempt: Some(FoldAttempt { outcome: accounting, prompt_tokens, completion_tokens }),
+                fold_count: prior.as_ref().map(|summary| summary.fold_count).unwrap_or(0),
+                prefix_hash: prior.as_ref().map(|summary| summary.prefix_hash),
+                folded_turns: 0,
+            },
+        ),
+    }
 }
 
 /// Everything before the upstream connection: authenticate, parse, authorize,
@@ -793,7 +1438,7 @@ async fn admit(
     span.scheme = principal.scheme.to_string();
 
     // 2. Parse. Bounded upstream by the body-limit layer.
-    let (req, include_usage) = match dialect {
+    let (mut req, include_usage) = match dialect {
         Dialect::Gateway => (
             serde_json::from_slice::<ChatRequest>(body).map_err(|e| RequestError::BadJson(e.to_string()))?,
             false,
@@ -900,15 +1545,16 @@ async fn admit(
     //    The provider is resolved first: a routing failure is a config error,
     //    and must not cost the tenant anything.
     let provider = router::provider_for(&resolved, &state.providers)?.clone();
-    let prompt_tokens = estimate_prompt_tokens(&req.messages);
+    let mut prompt_tokens = estimate_prompt_tokens(&req.messages);
     // The reservation also covers what the vendor adds around the prompt.
     // `prompt_tokens` alone stays the billing floor and the rate-limit count:
     // the overhead is reserved, never billed unless the vendor reports it.
     let reserved_prompt_tokens = prompt_tokens.saturating_add(resolved.config.prompt_overhead_tokens);
-    let cost = CostEstimate {
+    let mut cost = CostEstimate {
         prompt_nano_usd: estimate_cost_nano_usd(&resolved.config.cost, reserved_prompt_tokens, 0),
         completion_nano_usd: estimate_cost_nano_usd(&resolved.config.cost, 0, max_output_tokens),
     };
+    let unfolded_cost = cost;
     //    A repeated Idempotency-Key is decided here too, by the ledger, in the
     //    same step as the budget: a duplicate never reaches the provider.
     if decision.tenant.require_idempotency_key && idempotency_key.is_none() {
@@ -982,11 +1628,47 @@ async fn admit(
             .map_err(LimitError::from)?;
         return Err(RequestError::Held(Box::new(hold)));
     }
+
+    // Holds are deliberately resolved before folding: a held request must not
+    // spend a summarizer reservation, and idempotency still fingerprints the
+    // original client body below.
+    let fold = foreground_fold(
+        state,
+        &generation,
+        &decision,
+        &resolved,
+        &principal.key_id,
+        &req.messages,
+    )
+    .await;
+    if let Some(facts) = &fold.facts {
+        span.fold = Some(serde_json::to_string(facts).unwrap_or_else(|_| "{}".to_string()));
+    }
+    if let Some(attempt) = fold.attempt {
+        state.metrics.record_fold(
+            &decision.tenant.tenant_id,
+            attempt.outcome,
+            attempt.prompt_tokens,
+            attempt.completion_tokens,
+        );
+    }
+    if fold.folded_turns > 0 {
+        let cut = fold.facts.as_ref().map(|facts| facts.prompt_tokens_cut).unwrap_or(0);
+        state.metrics.record_folded_request(&decision.tenant.tenant_id, cut);
+    }
+    req.messages = fold.messages;
+    let folded_turns = fold.folded_turns;
+    prompt_tokens = estimate_prompt_tokens(&req.messages);
+    let reserved_prompt_tokens = prompt_tokens.saturating_add(resolved.config.prompt_overhead_tokens);
+    cost = CostEstimate {
+        prompt_nano_usd: estimate_cost_nano_usd(&resolved.config.cost, reserved_prompt_tokens, 0),
+        completion_nano_usd: estimate_cost_nano_usd(&resolved.config.cost, 0, max_output_tokens),
+    };
     let hold = hold_id.map(|id| HoldClaim {
         id,
         fingerprints: state.limits.fingerprinter().encodings(scope, &value),
         model: resolved.registry_id.clone(),
-        exposure_nano_usd: cost.total(),
+        exposure_nano_usd: unfolded_cost.total(),
         key_id: principal.key_id.to_string(),
     });
     let idempotency = idempotency_key.map(|key| state.limits.fingerprinter().claim(key, scope, &value));
@@ -1076,6 +1758,7 @@ async fn admit(
         metadata: req.metadata,
         receipt,
         openai,
+        folded_turns,
     })
 }
 
@@ -1174,7 +1857,13 @@ async fn normalized_response(
         }
     };
 
-    let mut headers = response_headers(span, &admitted.resolved, &admitted.principal, &admitted.reservation);
+    let mut headers = response_headers(
+        span,
+        &admitted.resolved,
+        &admitted.principal,
+        &admitted.reservation,
+        admitted.folded_turns,
+    );
     insert_receipt_headers(&mut headers, admitted.receipt.as_ref());
     let reply_hash = admitted.receipt.as_ref().map(|open| ReplyDigest::new(open.salt.clone()));
     let stream = normalized_stream(NormalizedState {
@@ -1224,6 +1913,7 @@ fn response_headers(
     resolved: &router::ResolvedModel,
     principal: &Principal,
     reservation: &Reservation,
+    folded_turns: usize,
 ) -> HeaderMap {
     let mut h = HeaderMap::new();
     h.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream; charset=utf-8"));
@@ -1241,6 +1931,12 @@ fn response_headers(
         HeaderName::from_static("x-reserved-nano-usd"),
         header_value(&reservation.reserved_nano_usd().to_string()),
     );
+    if folded_turns > 0 {
+        h.insert(
+            HeaderName::from_static("x-gateway-folded"),
+            header_value(&folded_turns.to_string()),
+        );
+    }
     h
 }
 
@@ -1819,7 +2515,13 @@ async fn complete_response(
     admitted: Admitted,
     span: &RequestSpan,
 ) -> Result<Response, RequestError> {
-    let mut headers = response_headers(span, &admitted.resolved, &admitted.principal, &admitted.reservation);
+    let mut headers = response_headers(
+        span,
+        &admitted.resolved,
+        &admitted.principal,
+        &admitted.reservation,
+        admitted.folded_turns,
+    );
     insert_receipt_headers(&mut headers, admitted.receipt.as_ref());
     let receipt = admitted.receipt;
     // Counted as in flight for the whole wait, so a graceful shutdown drains
@@ -1911,7 +2613,8 @@ async fn complete_response(
     // receipt id and salt are kept with it (sealed at rest like the answer),
     // so the replay can name the receipt that covers it.
     let stored = match &receipt {
-        Some(open) => stored_with_receipt(&payload, open),
+        Some(open) => stored_with_receipt(&payload, open, admitted.folded_turns),
+        None if admitted.folded_turns > 0 => stored_with_folding(&payload, admitted.folded_turns),
         None => payload.clone(),
     };
     guard.reservation.keep_response(stored);
@@ -2063,7 +2766,13 @@ async fn passthrough_response(
         }
     };
 
-    let mut headers = response_headers(span, &admitted.resolved, &admitted.principal, &admitted.reservation);
+    let mut headers = response_headers(
+        span,
+        &admitted.resolved,
+        &admitted.principal,
+        &admitted.reservation,
+        admitted.folded_turns,
+    );
     headers.insert(
         HeaderName::from_static("x-gateway-framing"),
         HeaderValue::from_static("passthrough"),

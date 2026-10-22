@@ -24,7 +24,10 @@ use std::fs;
 
 use dashmap::DashMap;
 
-use crate::receipts::{ReceiptBook, ReceiptChain};
+use crate::{
+    folding::{store::FoldingStore, FoldAccounting},
+    receipts::{ReceiptBook, ReceiptChain},
+};
 
 use super::logging::StreamSummary;
 
@@ -69,6 +72,22 @@ struct ModelRollup {
     ttft_ms_count: AtomicU64,
 }
 
+/// Per-tenant folding counters. Created only for a tenant id that came from
+/// configuration, and only after that tenant made a fold attempt or sent a
+/// folded request.
+#[derive(Debug, Default)]
+struct FoldCounters {
+    committed: AtomicU64,
+    rejected: AtomicU64,
+    failed: AtomicU64,
+    unprofitable: AtomicU64,
+    refused_admission: AtomicU64,
+    requests: AtomicU64,
+    prompt_tokens_cut: AtomicU64,
+    summarizer_prompt: AtomicU64,
+    summarizer_completion: AtomicU64,
+}
+
 /// Per-tenant rollup, for the governed view: who is spending what.
 #[derive(Debug, Default)]
 struct TenantRollup {
@@ -84,6 +103,9 @@ pub struct Metrics {
     global: Counters,
     by_model: DashMap<String, Arc<ModelRollup>>,
     by_tenant: DashMap<String, Arc<TenantRollup>>,
+    folds: DashMap<String, Arc<FoldCounters>>,
+    /// Read at scrape time so the gauge is the conversations actually held.
+    fold_store: Mutex<Option<Arc<FoldingStore>>>,
     uptime_secs: AtomicU64,
     /// Every receipt-enabled tenant's chain on this replica, set once at
     /// boot. Gauges are read here at scrape time; counters live in each
@@ -97,6 +119,8 @@ impl Default for Metrics {
             global: Counters::default(),
             by_model: DashMap::new(),
             by_tenant: DashMap::new(),
+            folds: DashMap::new(),
+            fold_store: Mutex::new(None),
             uptime_secs: AtomicU64::new(0),
             receipts: Mutex::new(None),
         }
@@ -139,6 +163,50 @@ impl Metrics {
     /// Publish the receipt book so `render` can expose per-tenant chain
     /// state at scrape time. Set once at boot; chains open lazily on first
     /// request and are read here through the same `Arc`.
+    pub fn set_folding(&self, store: Arc<FoldingStore>) {
+        *self.fold_store.lock().unwrap_or_else(|p| p.into_inner()) = Some(store);
+    }
+
+    fn fold_counters(&self, tenant: &str) -> Arc<FoldCounters> {
+        Arc::clone(
+            self.folds
+                .entry(tenant.to_string())
+                .or_insert_with(|| Arc::new(FoldCounters::default()))
+                .value(),
+        )
+    }
+
+    /// One fold attempt. `prompt_tokens` and `completion_tokens` are the
+    /// summarizer's reported usage, summed across the one allowed retry.
+    pub fn record_fold(
+        &self,
+        tenant: &str,
+        outcome: FoldAccounting,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    ) {
+        let counters = self.fold_counters(tenant);
+        let slot = match outcome {
+            FoldAccounting::Committed => &counters.committed,
+            FoldAccounting::Rejected => &counters.rejected,
+            FoldAccounting::Failed => &counters.failed,
+            FoldAccounting::Unprofitable => &counters.unprofitable,
+            FoldAccounting::RefusedAdmission => &counters.refused_admission,
+        };
+        slot.fetch_add(1, Ordering::Relaxed);
+        counters.summarizer_prompt.fetch_add(prompt_tokens, Ordering::Relaxed);
+        counters
+            .summarizer_completion
+            .fetch_add(completion_tokens, Ordering::Relaxed);
+    }
+
+    /// A main request that was sent with a summary in place of old turns.
+    pub fn record_folded_request(&self, tenant: &str, prompt_tokens_cut: u64) {
+        let counters = self.fold_counters(tenant);
+        counters.requests.fetch_add(1, Ordering::Relaxed);
+        counters.prompt_tokens_cut.fetch_add(prompt_tokens_cut, Ordering::Relaxed);
+    }
+
     pub fn set_receipts(&self, book: Option<Arc<ReceiptBook>>) {
         *self.receipts.lock().unwrap_or_else(|p| p.into_inner()) = book;
     }
@@ -613,6 +681,91 @@ impl Metrics {
                     let _ = writeln!(out, "gw_receipt_anchor_age_seconds{l} {age}");
                 }
             }
+        }
+
+        let store_entries = self
+            .fold_store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|store| store.stats().0 as u64)
+            .unwrap_or(0);
+        metric(
+            &mut out,
+            "gw_fold_store_entries",
+            "gauge",
+            "Conversations held in the in-memory folding store.",
+            &[],
+            store_entries,
+        );
+
+        let mut folds: BTreeMap<String, Arc<FoldCounters>> = BTreeMap::new();
+        for entry in self.folds.iter() {
+            folds.insert(entry.key().clone(), Arc::clone(entry.value()));
+        }
+        if !folds.is_empty() {
+            let mut outcome_series = Vec::new();
+            let mut request_series = Vec::new();
+            let mut cut_series = Vec::new();
+            let mut prompt_series = Vec::new();
+            let mut completion_series = Vec::new();
+            for (tenant, counters) in &folds {
+                let tenant_label = safe_label(tenant);
+                for (outcome, value) in [
+                    ("committed", counters.committed.load(Ordering::Relaxed)),
+                    ("rejected", counters.rejected.load(Ordering::Relaxed)),
+                    ("failed", counters.failed.load(Ordering::Relaxed)),
+                    ("unprofitable", counters.unprofitable.load(Ordering::Relaxed)),
+                    ("refused_admission", counters.refused_admission.load(Ordering::Relaxed)),
+                ] {
+                    outcome_series.push((
+                        render_labels(&[("tenant", tenant_label), ("outcome", outcome)], &[]),
+                        value,
+                    ));
+                }
+                let labels = render_labels(&[("tenant", tenant_label)], &[]);
+                request_series.push((labels.clone(), counters.requests.load(Ordering::Relaxed)));
+                cut_series.push((labels.clone(), counters.prompt_tokens_cut.load(Ordering::Relaxed)));
+                prompt_series.push((
+                    render_labels(&[("tenant", tenant_label), ("kind", "prompt")], &[]),
+                    counters.summarizer_prompt.load(Ordering::Relaxed),
+                ));
+                completion_series.push((
+                    render_labels(&[("tenant", tenant_label), ("kind", "completion")], &[]),
+                    counters.summarizer_completion.load(Ordering::Relaxed),
+                ));
+            }
+            family(
+                &mut out,
+                "gw_folds_total",
+                "counter",
+                "Fold attempts by outcome.",
+                outcome_series.iter().map(|(l, v)| (l.as_str(), *v)),
+            );
+            family(
+                &mut out,
+                "gw_fold_requests_total",
+                "counter",
+                "Main requests sent with a summary in place of older turns.",
+                request_series.iter().map(|(l, v)| (l.as_str(), *v)),
+            );
+            family(
+                &mut out,
+                "gw_fold_prompt_tokens_cut_total",
+                "counter",
+                "Estimated prompt tokens removed from main calls.",
+                cut_series.iter().map(|(l, v)| (l.as_str(), *v)),
+            );
+            family(
+                &mut out,
+                "gw_fold_summarizer_tokens_total",
+                "counter",
+                "Real summarizer token usage.",
+                prompt_series
+                    .iter()
+                    .chain(completion_series.iter())
+                    .map(|(l, v)| (l.as_str(), *v)),
+            );
         }
 
         out
