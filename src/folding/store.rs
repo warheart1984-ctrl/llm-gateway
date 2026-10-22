@@ -9,11 +9,12 @@ use std::{
     time::Instant,
 };
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use hmac::{Hmac, Mac};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use tokio::sync::watch;
 
 use crate::providers::ChatMessage;
 
@@ -63,6 +64,11 @@ pub struct FoldingStore {
     total_chars: std::sync::atomic::AtomicUsize,
     /// Prefix mismatches that caused an entry to be dropped.
     prefix_mismatches: std::sync::atomic::AtomicU64,
+    /// Conversation keys with a fold running. Kept beside the entries, never
+    /// inside one, so a running fold cannot change the committed summary.
+    in_flight: DashSet<[u8; 32]>,
+    /// `true` once shutdown has asked every fold task to stop.
+    shutdown: watch::Sender<bool>,
 }
 
 impl FoldingStore {
@@ -77,7 +83,51 @@ impl FoldingStore {
             max_total_chars: max_total_chars.max(1),
             total_chars: std::sync::atomic::AtomicUsize::new(0),
             prefix_mismatches: std::sync::atomic::AtomicU64::new(0),
+            in_flight: DashSet::new(),
+            shutdown: watch::channel(false).0,
         }
+    }
+
+    /// Reserve the right to fold this conversation. False when a fold is
+    /// already running or the process is shutting down.
+    pub fn try_begin(&self, key: [u8; 32]) -> bool {
+        if *self.shutdown.borrow() {
+            return false;
+        }
+        self.in_flight.insert(key)
+    }
+
+    /// The fold for this key has finished, one way or another.
+    pub fn finish(&self, key: &[u8; 32]) {
+        self.in_flight.remove(key);
+    }
+
+    /// Ask every in-flight fold to stop. Each task releases its reservation
+    /// itself; dropping it would abandon the prompt half.
+    pub fn cancel(&self) {
+        // `send` refuses to store the value when nobody is listening yet.
+        // Shutdown still has to stick, so a fold that starts afterwards sees it.
+        self.shutdown.send_modify(|flag| *flag = true);
+    }
+
+    pub fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
+        self.shutdown.subscribe()
+    }
+
+    /// Store `entry` only when the committed prefix is still the one this
+    /// fold started from. `None` means the fold started with no summary.
+    pub fn commit_if_current(
+        &self,
+        key: [u8; 32],
+        started_prefix: Option<[u8; 32]>,
+        entry: SummaryEntry,
+    ) -> bool {
+        let current = self.entries.get(&key).map(|existing| existing.lock().prefix_hash);
+        if current != started_prefix {
+            return false;
+        }
+        self.insert(key, entry);
+        true
     }
 
     /// Compute the conversation key: HMAC-SHA256 over (tenant_id, protected_messages, first_turn).
@@ -482,5 +532,45 @@ mod tests {
         // Should only fit 2 entries of 200 chars each (500 total)
         let total = store.total_chars.load(std::sync::atomic::Ordering::Acquire);
         assert!(total <= 500);
+    }
+
+    fn stored(prefix: [u8; 32], summary: &str) -> SummaryEntry {
+        SummaryEntry {
+            turns_covered: 1,
+            prefix_hash: prefix,
+            summary: summary.into(),
+            fold_count: 1,
+            tokens_spent: 0,
+            tokens_saved: 0,
+            summarizer_model: "model".into(),
+            last_accessed: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn one_fold_runs_per_conversation_and_shutdown_blocks_another() {
+        let store = FoldingStore::new(10, 1000);
+        let key = [7u8; 32];
+        assert!(store.try_begin(key));
+        assert!(!store.try_begin(key), "a second fold must not start");
+        store.finish(&key);
+        assert!(store.try_begin(key));
+        store.cancel();
+        assert!(!store.try_begin([8u8; 32]), "shutdown starts no new fold");
+    }
+
+    #[test]
+    fn commit_keeps_the_summary_the_fold_started_from() {
+        let store = FoldingStore::new(10, 1000);
+        let key = [4u8; 32];
+        let first = [1u8; 32];
+        let second = [2u8; 32];
+        assert!(store.commit_if_current(key, None, stored(first, "one")));
+        assert!(!store.commit_if_current(key, None, stored(second, "displaced")));
+        assert_eq!(store.entries.get(&key).unwrap().lock().prefix_hash, first);
+        assert!(store.commit_if_current(key, Some(first), stored(second, "next")));
+        assert_eq!(store.entries.get(&key).unwrap().lock().summary, "next");
+        assert!(!store.commit_if_current(key, Some(first), stored([3u8; 32], "stale")));
+        assert_eq!(store.entries.get(&key).unwrap().lock().summary, "next");
     }
 }

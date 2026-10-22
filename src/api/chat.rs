@@ -882,6 +882,240 @@ fn stored_summary(entry: &EntryRef) -> StoredSummary {
     }
 }
 
+/// Owns everything a fold needs after the request that planned it has moved on.
+struct FoldWork {
+    state: Arc<AppState>,
+    tenant_id: String,
+    limits: crate::config::LimitProfile,
+    summarizer_model_id: String,
+    summarizer_max_tokens: u32,
+    upstream_model: String,
+    endpoint: Option<String>,
+    cost: crate::router::CostModel,
+    provider: Arc<dyn ChatProvider>,
+    key: [u8; 32],
+    protected: Vec<ChatMessage>,
+    head: Vec<ChatMessage>,
+    pending: Vec<ChatMessage>,
+    covered: usize,
+    prior_text: Option<String>,
+    started_prefix: Option<[u8; 32]>,
+    old_spent: u64,
+    old_saved: u64,
+    new_fold_count: u32,
+    prompt_tokens_cut: u32,
+    plan_config: PlanConfig,
+}
+
+enum AppliedFold {
+    Committed {
+        summary: String,
+        prefix_hash: [u8; 32],
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    },
+    Stopped {
+        outcome: &'static str,
+        reason: &'static str,
+        accounting: FoldAccounting,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    },
+}
+
+/// Clears the in-flight flag however the task ends, including cancellation.
+struct EndFold {
+    store: Arc<crate::folding::store::FoldingStore>,
+    key: [u8; 32],
+}
+
+impl Drop for EndFold {
+    fn drop(&mut self) {
+        self.store.finish(&self.key);
+    }
+}
+
+/// Run the summarizer. The store lock is never held across the provider call.
+/// On shutdown the reservation is released, not abandoned.
+async fn run_applied_fold(work: FoldWork) -> AppliedFold {
+    let mut shutdown = work.state.folding.subscribe_shutdown();
+    let mut attempt_no = 0u8;
+    let mut used_prompt = 0u64;
+    let mut used_completion = 0u64;
+
+    loop {
+        if *shutdown.borrow() {
+            return AppliedFold::Stopped {
+                outcome: "failed",
+                reason: "cancelled",
+                accounting: FoldAccounting::Failed,
+                prompt_tokens: used_prompt,
+                completion_tokens: used_completion,
+            };
+        }
+        attempt_no += 1;
+        let budget = if attempt_no == 1 {
+            work.summarizer_max_tokens
+        } else {
+            work.summarizer_max_tokens.saturating_mul(2)
+        };
+        let prompt_messages = summarizer::prompt_messages(&work.plan_config, work.prior_text.as_deref(), &work.pending);
+        let prompt_tokens = estimate_prompt_tokens(&prompt_messages);
+        let estimate = CostEstimate {
+            prompt_nano_usd: estimate_cost_nano_usd(&work.cost, prompt_tokens, 0),
+            completion_nano_usd: estimate_cost_nano_usd(&work.cost, 0, budget),
+        };
+        let Ok(mut reservation) = work
+            .state
+            .limits
+            .admit_request(AdmitRequest {
+                id: Uuid::new_v4(),
+                tenant_id: &work.tenant_id,
+                limits: &work.limits,
+                prompt_tokens,
+                max_output_tokens: budget,
+                estimate,
+                idempotency: None,
+                hold: None,
+            })
+            .await
+        else {
+            return AppliedFold::Stopped {
+                outcome: "refused",
+                reason: "admission_refused",
+                accounting: FoldAccounting::RefusedAdmission,
+                prompt_tokens: used_prompt,
+                completion_tokens: used_completion,
+            };
+        };
+        if *shutdown.borrow() {
+            reservation.release();
+            return AppliedFold::Stopped {
+                outcome: "failed",
+                reason: "cancelled",
+                accounting: FoldAccounting::Failed,
+                prompt_tokens: used_prompt,
+                completion_tokens: used_completion,
+            };
+        }
+
+        let request = summarizer::build_request(
+            &work.upstream_model,
+            work.endpoint.clone(),
+            &work.tenant_id,
+            &Uuid::new_v4().to_string(),
+            prompt_messages,
+            budget,
+        );
+        let pending = work.provider.complete(request);
+        tokio::pin!(pending);
+        let completion = tokio::select! {
+            biased;
+            _ = shutdown.changed() => {
+                reservation.release();
+                return AppliedFold::Stopped {
+                    outcome: "failed",
+                    reason: "cancelled",
+                    accounting: FoldAccounting::Failed,
+                    prompt_tokens: used_prompt,
+                    completion_tokens: used_completion,
+                };
+            }
+            result = &mut pending => result,
+        };
+        let completion = match completion {
+            Ok(completion) => completion,
+            Err(error) => {
+                if error.accepted_by_upstream() {
+                    reservation.abandon();
+                } else {
+                    reservation.release();
+                }
+                return AppliedFold::Stopped {
+                    outcome: "failed",
+                    reason: "provider_error",
+                    accounting: FoldAccounting::Failed,
+                    prompt_tokens: used_prompt,
+                    completion_tokens: used_completion,
+                };
+            }
+        };
+        let usage = completion.usage.unwrap_or_default();
+        used_prompt = used_prompt.saturating_add(u64::from(usage.prompt_tokens));
+        used_completion = used_completion.saturating_add(u64::from(usage.completion_tokens));
+        let content = summarizer::extract_content(&completion);
+        let retry_empty = attempt_no == 1
+            && content.trim().is_empty()
+            && (completion.reasoning.as_deref().is_some_and(|text| !text.is_empty())
+                || completion.finish_reason.as_deref() == Some("length"));
+        reservation.settle(usage, &work.cost);
+        if retry_empty {
+            continue;
+        }
+        if content.trim().is_empty() || completion.finish_reason.as_deref() == Some("length") {
+            let reason = if completion.finish_reason.as_deref() == Some("length") {
+                "length"
+            } else {
+                "empty_reply"
+            };
+            return AppliedFold::Stopped {
+                outcome: "refused",
+                reason,
+                accounting: FoldAccounting::Rejected,
+                prompt_tokens: used_prompt,
+                completion_tokens: used_completion,
+            };
+        }
+        let Ok(summary) = summarizer::run_checks_with_prior(
+            &content,
+            &work.protected,
+            work.prior_text.as_deref(),
+            &work.pending,
+            &work.plan_config,
+        ) else {
+            return AppliedFold::Stopped {
+                outcome: "refused",
+                reason: "checks_failed",
+                accounting: FoldAccounting::Rejected,
+                prompt_tokens: used_prompt,
+                completion_tokens: used_completion,
+            };
+        };
+
+        let new_covered = work.covered + work.pending.len();
+        let prefix_hash = work.state.folding.prefix_hash(&work.tenant_id, &work.head[..new_covered]);
+        let committed = work.state.folding.commit_if_current(
+            work.key,
+            work.started_prefix,
+            crate::folding::store::SummaryEntry {
+                turns_covered: new_covered,
+                prefix_hash,
+                summary: summary.clone(),
+                fold_count: work.new_fold_count,
+                tokens_spent: work.old_spent.saturating_add(used_prompt.saturating_add(used_completion)),
+                tokens_saved: work.old_saved.saturating_add(u64::from(work.prompt_tokens_cut)),
+                summarizer_model: work.summarizer_model_id.clone(),
+                last_accessed: std::time::Instant::now(),
+            },
+        );
+        if !committed {
+            return AppliedFold::Stopped {
+                outcome: "failed",
+                reason: "prefix_moved",
+                accounting: FoldAccounting::Failed,
+                prompt_tokens: used_prompt,
+                completion_tokens: used_completion,
+            };
+        }
+        return AppliedFold::Committed {
+            summary,
+            prefix_hash,
+            prompt_tokens: used_prompt,
+            completion_tokens: used_completion,
+        };
+    }
+}
+
 /// Run one foreground fold. Every failure returns the client messages
 /// unchanged; the main request is never made dependent on summarization.
 async fn foreground_fold(
@@ -977,204 +1211,133 @@ async fn foreground_fold(
         );
     }
 
-    let (head, tail) = {
-        let split = turns.len().saturating_sub(folding.keep_last);
-        (&turns[..split], &turns[split..])
+    let split = turns.len().saturating_sub(folding.keep_last);
+    let head = turns[..split].to_vec();
+    let tail = turns[split..].to_vec();
+    let covered = prior.as_ref().map(|summary| summary.turns_covered.min(head.len())).unwrap_or(0);
+    let pending = head[covered..].to_vec();
+    let (old_spent, old_saved) = existing
+        .as_ref()
+        .map(|entry| {
+            let entry = entry.lock();
+            (entry.tokens_spent, entry.tokens_saved)
+        })
+        .unwrap_or_default();
+    let work = FoldWork {
+        state: Arc::clone(state),
+        tenant_id: decision.tenant.tenant_id.clone(),
+        limits: decision.limits.clone(),
+        summarizer_model_id: folding.summarizer_model.clone(),
+        summarizer_max_tokens: folding.summarizer_max_tokens,
+        upstream_model: summarizer_model.upstream_model.clone(),
+        endpoint: summarizer_model.endpoint.clone(),
+        cost: summarizer_model.config.cost.clone(),
+        provider: summarizer_provider,
+        key,
+        protected: protected.clone(),
+        head,
+        pending: pending.clone(),
+        covered,
+        prior_text: prior.as_ref().map(|summary| summary.summary.clone()),
+        started_prefix: prior.as_ref().map(|summary| summary.prefix_hash),
+        old_spent,
+        old_saved,
+        new_fold_count: plan.new_fold_count,
+        prompt_tokens_cut: plan.prompt_tokens_cut,
+        plan_config,
     };
-    let covered = prior.as_ref().map(|s| s.turns_covered.min(head.len())).unwrap_or(0);
-    let pending = &head[covered..];
-    let prior_text = prior.as_ref().map(|s| s.summary.as_str());
-    let mut attempt_no = 0u8;
-    let mut used_prompt = 0u64;
-    let mut used_completion = 0u64;
 
-    loop {
-        attempt_no += 1;
-        let budget = if attempt_no == 1 {
-            folding.summarizer_max_tokens
+    if state.settings.folding.background {
+        let folded_turns = prior.as_ref().map(|summary| summary.turns_covered).unwrap_or(0);
+        let immediate = if folded_turns == 0 {
+            messages.to_vec()
         } else {
-            folding.summarizer_max_tokens.saturating_mul(2)
+            crate::folding::plan::build_forwarded_messages(
+                &protected,
+                prior.as_ref().map(|summary| summary.summary.as_str()),
+                &pending,
+                &tail,
+            )
         };
-        let prompt_messages = summarizer::prompt_messages(&plan_config, prior_text, pending);
-        let prompt_tokens = estimate_prompt_tokens(&prompt_messages);
-        let estimate = CostEstimate {
-            prompt_nano_usd: estimate_cost_nano_usd(&summarizer_model.config.cost, prompt_tokens, 0),
-            completion_nano_usd: estimate_cost_nano_usd(&summarizer_model.config.cost, 0, budget),
-        };
-        let Ok(mut reservation) = state
-            .limits
-            .admit_request(AdmitRequest {
-                id: Uuid::new_v4(),
-                tenant_id: &decision.tenant.tenant_id,
-                limits: &decision.limits,
-                prompt_tokens,
-                max_output_tokens: budget,
-                estimate,
-                idempotency: None,
-                hold: None,
-            })
-            .await
-        else {
-            return describe_fold(
-                messages,
-                messages.to_vec(),
-                &plan,
-                FoldStamp {
-                    outcome: "refused",
-                    reason: "admission_refused",
-                    attempt: Some(FoldAttempt {
-                        outcome: FoldAccounting::RefusedAdmission,
-                        prompt_tokens: used_prompt,
-                        completion_tokens: used_completion,
-                    }),
-                    fold_count: prior.as_ref().map(|summary| summary.fold_count).unwrap_or(0),
-                    prefix_hash: prior.as_ref().map(|summary| summary.prefix_hash),
-                    folded_turns: 0,
-                },
-            );
-        };
-
-        let summarizer_request_id = Uuid::new_v4().to_string();
-        let request = summarizer::build_request(
-            &summarizer_model.upstream_model,
-            summarizer_model.endpoint.clone(),
-            &decision.tenant.tenant_id,
-            &summarizer_request_id,
-            prompt_messages,
-            budget,
-        );
-        let completion = match summarizer_provider.complete(request).await {
-            Ok(completion) => completion,
-            Err(error) => {
-                if error.accepted_by_upstream() {
-                    reservation.abandon();
-                } else {
-                    reservation.release();
-                }
-                return describe_fold(
-                    messages,
-                    messages.to_vec(),
-                    &plan,
-                    FoldStamp {
-                        outcome: "failed",
-                        reason: "provider_error",
-                        attempt: Some(FoldAttempt {
-                            outcome: FoldAccounting::Failed,
-                            prompt_tokens: used_prompt,
-                            completion_tokens: used_completion,
-                        }),
-                        fold_count: prior.as_ref().map(|summary| summary.fold_count).unwrap_or(0),
-                        prefix_hash: prior.as_ref().map(|summary| summary.prefix_hash),
-                        folded_turns: 0,
-                    },
-                );
-            }
-        };
-        let usage = completion.usage.unwrap_or_default();
-        used_prompt = used_prompt.saturating_add(u64::from(usage.prompt_tokens));
-        used_completion = used_completion.saturating_add(u64::from(usage.completion_tokens));
-        let content = summarizer::extract_content(&completion);
-        let retry_empty = attempt_no == 1
-            && content.trim().is_empty()
-            && (completion.reasoning.as_deref().is_some_and(|text| !text.is_empty())
-                || completion.finish_reason.as_deref() == Some("length"));
-        reservation.settle(usage, &summarizer_model.config.cost);
-        if retry_empty {
-            continue;
+        if state.folding.try_begin(key) {
+            let tenant_id = work.tenant_id.clone();
+            let metrics = Arc::clone(&state.metrics);
+            let store = Arc::clone(&state.folding);
+            tokio::spawn(async move {
+                let _end = EndFold { store, key };
+                let result = run_applied_fold(work).await;
+                let (accounting, prompt_tokens, completion_tokens) = match result {
+                    AppliedFold::Committed { prompt_tokens, completion_tokens, .. } => {
+                        (FoldAccounting::Committed, prompt_tokens, completion_tokens)
+                    }
+                    AppliedFold::Stopped { accounting, prompt_tokens, completion_tokens, .. } => {
+                        (accounting, prompt_tokens, completion_tokens)
+                    }
+                };
+                metrics.record_fold(&tenant_id, accounting, prompt_tokens, completion_tokens);
+            });
         }
-        if content.trim().is_empty() || completion.finish_reason.as_deref() == Some("length") {
-            let reason = if completion.finish_reason.as_deref() == Some("length") {
-                "length"
-            } else {
-                "empty_reply"
-            };
-            return describe_fold(
-                messages,
-                messages.to_vec(),
-                &plan,
-                FoldStamp {
-                    outcome: "refused",
-                    reason,
-                    attempt: Some(FoldAttempt {
-                        outcome: FoldAccounting::Rejected,
-                        prompt_tokens: used_prompt,
-                        completion_tokens: used_completion,
-                    }),
-                    fold_count: prior.as_ref().map(|summary| summary.fold_count).unwrap_or(0),
-                    prefix_hash: prior.as_ref().map(|summary| summary.prefix_hash),
-                    folded_turns: 0,
-                },
-            );
-        }
-
-        let Ok(summary) = summarizer::run_checks_with_prior(
-            &content,
-            &protected,
-            prior_text,
-            pending,
-            &plan_config,
-        ) else {
-            return describe_fold(
-                messages,
-                messages.to_vec(),
-                &plan,
-                FoldStamp {
-                    outcome: "refused",
-                    reason: "checks_failed",
-                    attempt: Some(FoldAttempt {
-                        outcome: FoldAccounting::Rejected,
-                        prompt_tokens: used_prompt,
-                        completion_tokens: used_completion,
-                    }),
-                    fold_count: prior.as_ref().map(|summary| summary.fold_count).unwrap_or(0),
-                    prefix_hash: prior.as_ref().map(|summary| summary.prefix_hash),
-                    folded_turns: 0,
-                },
-            );
-        };
-
-        let new_covered = covered + pending.len();
-        let prefix_hash = state
-            .folding
-            .prefix_hash(&decision.tenant.tenant_id, &head[..new_covered]);
-        let (old_spent, old_saved) = existing
-            .as_ref()
-            .map(|entry| {
-                let entry = entry.lock();
-                (entry.tokens_spent, entry.tokens_saved)
-            })
-            .unwrap_or_default();
-        state.folding.insert(
-            key,
-            crate::folding::store::SummaryEntry {
-                turns_covered: new_covered,
-                prefix_hash,
-                summary: summary.clone(),
-                fold_count: plan.new_fold_count,
-                tokens_spent: old_spent.saturating_add(used_prompt.saturating_add(used_completion)),
-                tokens_saved: old_saved.saturating_add(u64::from(plan.prompt_tokens_cut)),
-                summarizer_model: folding.summarizer_model.clone(),
-                last_accessed: std::time::Instant::now(),
-            },
+        let sent_cut = u64::from(
+            estimate_prompt_tokens(messages).saturating_sub(estimate_prompt_tokens(&immediate)),
         );
-        let forwarded = crate::folding::plan::build_forwarded_messages(&protected, Some(&summary), &[], tail);
-        return describe_fold(
+        return FoldResult {
+            messages: immediate,
+            folded_turns,
+            facts: Some(FoldFacts {
+                outcome: "not_due",
+                reason: "background".to_string(),
+                turns_replaced: u64::try_from(folded_turns).unwrap_or(u64::MAX),
+                turns_covered: u64::try_from(folded_turns).unwrap_or(u64::MAX),
+                prompt_tokens_cut: if folded_turns > 0 { sent_cut } else { 0 },
+                benefit_nano_usd: plan.benefit_nano_usd,
+                overhead_nano_usd: plan.overhead_nano_usd,
+                min_saving_nano_usd: plan.min_saving_nano_usd,
+                summarizer_prompt_tokens: 0,
+                summarizer_completion_tokens: 0,
+                fold_count: u64::from(prior.as_ref().map(|summary| summary.fold_count).unwrap_or(0)),
+                prefix_hash: prior
+                    .as_ref()
+                    .map(|summary| crate::folding::prefix_hex(&summary.prefix_hash))
+                    .unwrap_or_default(),
+            }),
+            attempt: None,
+        };
+    }
+
+    match run_applied_fold(work).await {
+        AppliedFold::Committed { summary, prefix_hash, prompt_tokens, completion_tokens } => {
+            let forwarded = crate::folding::plan::build_forwarded_messages(&protected, Some(&summary), &[], &tail);
+            describe_fold(
+                messages,
+                forwarded,
+                &plan,
+                FoldStamp {
+                    outcome: "applied",
+                    reason: plan.reason.code(),
+                    attempt: Some(FoldAttempt {
+                        outcome: FoldAccounting::Committed,
+                        prompt_tokens,
+                        completion_tokens,
+                    }),
+                    fold_count: plan.new_fold_count,
+                    prefix_hash: Some(prefix_hash),
+                    folded_turns: plan.turns_replaced,
+                },
+            )
+        }
+        AppliedFold::Stopped { outcome, reason, accounting, prompt_tokens, completion_tokens } => describe_fold(
             messages,
-            forwarded,
+            messages.to_vec(),
             &plan,
             FoldStamp {
-                outcome: "applied",
-                reason: plan.reason.code(),
-                attempt: Some(FoldAttempt {
-                    outcome: FoldAccounting::Committed,
-                    prompt_tokens: used_prompt,
-                    completion_tokens: used_completion,
-                }),
-                fold_count: plan.new_fold_count,
-                prefix_hash: Some(prefix_hash),
-                folded_turns: plan.turns_replaced,
+                outcome,
+                reason,
+                attempt: Some(FoldAttempt { outcome: accounting, prompt_tokens, completion_tokens }),
+                fold_count: prior.as_ref().map(|summary| summary.fold_count).unwrap_or(0),
+                prefix_hash: prior.as_ref().map(|summary| summary.prefix_hash),
+                folded_turns: 0,
             },
-        );
+        ),
     }
 }
 

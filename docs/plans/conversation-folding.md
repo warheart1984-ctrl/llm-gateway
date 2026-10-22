@@ -390,13 +390,13 @@ reply that is fixed per test, with usage numbers.
       cardinality test).
 
 ### Phase 5: background folds
-- [ ] With `background = true`, the request that triggers a fold is sent with
+- [x] With `background = true`, the request that triggers a fold is sent with
       the previous summary (or unfolded), and the next request uses the new
       one.
-- [ ] Two concurrent requests in one conversation start at most one fold.
-- [ ] A fold that fails in the background leaves the committed summary in
+- [x] Two concurrent requests in one conversation start at most one fold.
+- [x] A fold that fails in the background leaves the committed summary in
       place and counts `failed`.
-- [ ] Shutdown with a fold in flight releases its reservation (ledger shows
+- [x] Shutdown with a fold in flight releases its reservation (ledger shows
       none outstanding).
 
 ### Phase 6: docs and a measurement
