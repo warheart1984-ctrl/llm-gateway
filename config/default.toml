@@ -157,6 +157,11 @@ anchor_interval_secs = 60
 # startup_verify = "full").
 startup_verify = "full"
 
+[folding]
+max_entries = 10000      # conversations held across all tenants (LRU)
+max_total_chars = 20000000
+background = false       # Phase 5
+
 [telemetry]
 service_name = "llm-gateway"
 service_version = "0.1.0"

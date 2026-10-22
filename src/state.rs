@@ -86,10 +86,11 @@ impl AppState {
         let fresh = TenantRegistry::load(self.settings.registry.tenants_path.clone())
             .map_err(|e| e.to_string())?;
         let providers = self.providers.names();
-        let validation = policy::validate(
+        let validation = policy::validate_with_models(
             &fresh,
             self.settings.governance.require_model_allowlist,
             &|p| providers.contains(&p.to_ascii_lowercase()),
+            &|model| prepared_models.snapshot.by_id.contains_key(model),
         );
         if !validation.errors.is_empty() {
             return Err(validation.errors.join("\n"));
@@ -124,10 +125,11 @@ impl AppState {
         let fresh = TenantRegistry::load(self.settings.registry.tenants_path.clone())
             .map_err(|e| e.to_string())?;
         let providers = self.providers.names();
-        let validation = policy::validate(
+        let validation = policy::validate_with_models(
             &fresh,
             self.settings.governance.require_model_allowlist,
             &|p| providers.contains(&p.to_ascii_lowercase()),
+            &|model| current.models.by_id.contains_key(model),
         );
         if !validation.errors.is_empty() {
             return Err(validation.errors.join("\n"));

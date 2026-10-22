@@ -33,6 +33,8 @@ pub enum PolicyError {
     TenantHasNoKeys { tenant: String },
     #[error("tenant `{tenant}`: {message}")]
     InvalidHolds { tenant: String, message: String },
+    #[error("tenant `{tenant}`: {message}")]
+    InvalidFolding { tenant: String, message: String },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -87,6 +89,11 @@ pub struct Tenant {
     /// reply (fail closed).
     #[serde(default)]
     pub receipts: bool,
+
+    /// Conversation folding (token savings). Off by default; when enabled,
+    /// the tenant's long conversations are folded with a rolling summary.
+    #[serde(default)]
+    pub folding: Option<FoldingConfig>,
 }
 
 /// When a tenant's requests are held for approval instead of executed.
@@ -124,6 +131,97 @@ fn default_approval_valid_secs() -> u64 {
 
 fn default_max_pending_holds() -> u32 {
     20
+}
+
+/// Per-tenant folding configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct FoldingConfig {
+    /// Whether folding is enabled for this tenant.
+    pub enabled: bool,
+    /// Registry model id for the summarizer. Must be in the tenant's allowlist.
+    pub summarizer_model: String,
+    /// Most recent turns always sent verbatim.
+    pub keep_last: usize,
+    /// Stored and sent summary length cap (characters).
+    pub summary_chars: usize,
+    /// Base output budget for the summarizer; escalation doubles it once.
+    pub summarizer_max_tokens: u32,
+    /// Folds per conversation before re-fold.
+    pub max_folds: u32,
+    /// Uncovered head turns that trigger a re-fold.
+    pub refold_threshold: u32,
+    /// Batch at least this many new turns per fold.
+    pub min_new_turns: u32,
+    /// ...and at least this many estimated tokens.
+    pub min_new_tokens: u32,
+    /// Requests a summary is expected to serve (amortization factor).
+    pub amortization_requests: u32,
+    /// Cost check floor in nano-USD.
+    pub min_saving_nano_usd: u64,
+}
+
+impl Default for FoldingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            summarizer_model: String::new(),
+            keep_last: 4,
+            summary_chars: 1200,
+            summarizer_max_tokens: 512,
+            max_folds: 8,
+            refold_threshold: 8,
+            min_new_turns: 4,
+            min_new_tokens: 400,
+            amortization_requests: 4,
+            min_saving_nano_usd: 0,
+        }
+    }
+}
+
+impl FoldingConfig {
+    fn validate_basic(&self, tenant_id: &str, receipts: bool) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if receipts {
+            return Err("folding cannot be enabled together with `receipts: true`".into());
+        }
+        if self.summarizer_model.trim().is_empty() {
+            return Err("folding.enabled requires `summarizer_model`".into());
+        }
+        if self.keep_last == 0 {
+            return Err("folding.keep_last must be at least 1".into());
+        }
+        if !(200..=8000).contains(&self.summary_chars) {
+            return Err(format!(
+                "folding.summary_chars must be in 200..=8000, got {}",
+                self.summary_chars
+            ));
+        }
+        let _ = tenant_id;
+        Ok(())
+    }
+
+    /// Validate this folding config against the tenant and provider availability.
+    pub fn validate(
+        &self,
+        tenant_id: &str,
+        receipts: bool,
+        provider_available: &dyn Fn(&str) -> bool,
+    ) -> Result<(), String> {
+        self.validate_basic(tenant_id, receipts)?;
+        if !self.enabled {
+            return Ok(());
+        }
+        if !provider_available(self.summarizer_model.split('/').next().unwrap_or("")) {
+            return Err(format!(
+                "summarizer_model `{}` references a provider with no configured adapter",
+                self.summarizer_model
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl HoldPolicy {
@@ -287,6 +385,14 @@ impl TenantRegistry {
                     tenant: tenant.tenant_id.clone(),
                     message,
                 })?;
+            }
+            if let Some(folding) = &tenant.folding {
+                folding
+                    .validate_basic(&tenant.tenant_id, tenant.receipts)
+                    .map_err(|message| PolicyError::InvalidFolding {
+                        tenant: tenant.tenant_id.clone(),
+                        message,
+                    })?;
             }
             by_id.insert(tenant.tenant_id.clone(), Arc::new(tenant));
         }
@@ -562,6 +668,18 @@ pub fn validate(
     require_allowlist: bool,
     provider_available: &dyn Fn(&str) -> bool,
 ) -> Validation {
+    validate_with_models(tenants, require_allowlist, provider_available, &|_| true)
+}
+
+/// Cross-check the tenant registry against providers and the model catalogue.
+/// The model predicate is kept separate so callers can validate the tenant file
+/// against the exact registry generation they are about to publish.
+pub fn validate_with_models(
+    tenants: &TenantRegistry,
+    require_allowlist: bool,
+    provider_available: &dyn Fn(&str) -> bool,
+    model_available: &dyn Fn(&str) -> bool,
+) -> Validation {
     let mut v = Validation::default();
     for id in tenants.tenant_ids() {
         let Some(tenant) = tenants.get(id) else { continue };
@@ -614,6 +732,34 @@ pub fn validate(
             if provider != "*" && !provider_available(provider) {
                 v.warnings.push(format!(
                     "tenant `{id}` default_model `{model}` needs provider `{provider}`, which has no configured adapter; it will error until a credential is set"
+                ));
+            }
+        }
+
+        if let Some(folding) = &tenant.folding {
+            if !folding.enabled {
+                continue;
+            }
+            let requested = qualify(&tenant.model_suffix, &folding.summarizer_model);
+            if !model_available(&requested) {
+                v.errors.push(format!(
+                    "tenant `{id}` summarizer_model `{}` is not in the model registry",
+                    folding.summarizer_model
+                ));
+            }
+            let provider = requested.split('/').next().unwrap_or_default();
+            if provider != "*" && !provider_available(provider) {
+                v.errors.push(format!(
+                    "tenant `{id}` summarizer_model `{}` has no configured provider adapter",
+                    folding.summarizer_model
+                ));
+            }
+            if glob_any(&tenant.denied_models, &requested)
+                || (require_allowlist && !glob_any(&tenant.allowed_models, &requested))
+            {
+                v.errors.push(format!(
+                    "tenant `{id}` summarizer_model `{}` is not callable by the tenant",
+                    folding.summarizer_model
                 ));
             }
         }
@@ -693,7 +839,103 @@ mod tests {
             require_idempotency_key: false,
             holds: None,
             receipts: false,
+            folding: None,
         }
+    }
+
+    fn folding_config(model: &str) -> FoldingConfig {
+        FoldingConfig {
+            enabled: true,
+            summarizer_model: model.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn folding_defaults_parse_and_unknown_keys_are_rejected() {
+        let file: TenantFile = serde_yaml::from_str(
+            "tenants:\n  - tenant_id: acme\n    credentials: [{ key_id: k, key: secret }]\n    folding:\n      enabled: true\n      summarizer_model: groq/summarizer\n",
+        )
+        .unwrap();
+        let folding = file.tenants[0].folding.as_ref().unwrap();
+        assert_eq!(folding.keep_last, 4);
+        assert_eq!(folding.summary_chars, 1200);
+        assert_eq!(folding.summarizer_max_tokens, 512);
+        assert_eq!(folding.max_folds, 8);
+        assert_eq!(folding.refold_threshold, 8);
+        assert_eq!(folding.min_new_turns, 4);
+        assert_eq!(folding.min_new_tokens, 400);
+        assert_eq!(folding.amortization_requests, 4);
+        assert_eq!(folding.min_saving_nano_usd, 0);
+
+        let unknown = serde_yaml::from_str::<TenantFile>(
+            "tenants:\n  - tenant_id: acme\n    credentials: [{ key_id: k, key: secret }]\n    folding:\n      enabled: true\n      summarizer_model: groq/summarizer\n      typo: true\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(unknown.contains("typo"), "{unknown}");
+    }
+
+    #[test]
+    fn folding_with_receipts_is_rejected_for_the_named_tenant() {
+        let mut t = tenant(&["*"], &[]);
+        t.receipts = true;
+        t.folding = Some(folding_config("groq/summarizer"));
+        let err = TenantRegistry::from_file(
+            TenantFile { tenants: vec![t] },
+            PathBuf::from("tenants.yaml"),
+        )
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("acme"), "{err}");
+        assert!(err.to_string().contains("receipts"), "{err}");
+    }
+
+    #[test]
+    fn folding_with_zero_keep_last_is_rejected_for_the_named_tenant() {
+        let mut t = tenant(&["*"], &[]);
+        let mut folding = folding_config("groq/summarizer");
+        folding.keep_last = 0;
+        t.folding = Some(folding);
+        let err = TenantRegistry::from_file(
+            TenantFile { tenants: vec![t] },
+            PathBuf::from("tenants.yaml"),
+        )
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("acme"), "{err}");
+        assert!(err.to_string().contains("keep_last"), "{err}");
+    }
+
+    #[test]
+    fn folding_with_out_of_range_summary_chars_is_rejected_for_the_named_tenant() {
+        let mut t = tenant(&["*"], &[]);
+        let mut folding = folding_config("groq/summarizer");
+        folding.summary_chars = 199;
+        t.folding = Some(folding);
+        let err = TenantRegistry::from_file(
+            TenantFile { tenants: vec![t] },
+            PathBuf::from("tenants.yaml"),
+        )
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("acme"), "{err}");
+        assert!(err.to_string().contains("summary_chars"), "{err}");
+    }
+
+    #[test]
+    fn folding_unknown_or_disallowed_summarizer_is_rejected_for_the_named_tenant() {
+        let mut unknown = tenant(&["groq/main"], &[]);
+        unknown.folding = Some(folding_config("groq/missing"));
+        let unknown_registry = registry(unknown);
+        let validation = validate_with_models(&unknown_registry, true, &|_| true, &|_| false);
+        assert!(validation.errors.iter().any(|e| e.contains("acme") && e.contains("not in the model registry")));
+
+        let mut disallowed = tenant(&["groq/main"], &[]);
+        disallowed.folding = Some(folding_config("groq/summarizer"));
+        let disallowed_registry = registry(disallowed);
+        let validation = validate_with_models(&disallowed_registry, true, &|_| true, &|_| true);
+        assert!(validation.errors.iter().any(|e| e.contains("acme") && e.contains("not callable")));
     }
 
     fn registry(t: Tenant) -> TenantRegistry {

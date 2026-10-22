@@ -23,6 +23,7 @@
 pub mod api;
 pub mod bootstrap;
 pub mod config;
+pub mod folding;
 pub mod governance;
 pub mod observability;
 pub mod providers;
