@@ -189,8 +189,8 @@ impl FoldingConfig {
         if !self.enabled {
             return Ok(());
         }
-        if receipts {
-            return Err("folding cannot be enabled together with `receipts: true`".into());
+        if receipts && self.summary_chars > 4_000 {
+            return Err("folding.summary_chars must be at most 4000 when receipts are enabled".into());
         }
         if self.summarizer_model.trim().is_empty() {
             return Err("folding.enabled requires `summarizer_model`".into());
@@ -745,6 +745,24 @@ pub fn validate_with_models(
     v
 }
 
+/// Validate the one global setting that changes the receipt/folding contract.
+/// Tenant parsing stays independent of the process-wide setting, while boot and
+/// reload call this after both registries have been prepared.
+pub fn validate_receipt_folding(tenants: &TenantRegistry, background: bool) -> Vec<String> {
+    if !background {
+        return Vec::new();
+    }
+    tenants
+        .tenant_ids()
+        .into_iter()
+        .filter_map(|id| {
+            let tenant = tenants.get(id)?;
+            (tenant.receipts && tenant.folding.as_ref().is_some_and(|folding| folding.enabled))
+                .then(|| format!("tenant `{id}` cannot enable folding with receipts while [folding] background = true"))
+        })
+        .collect()
+}
+
 pub fn default_tenant_path(base: &Path) -> PathBuf {
     base.join("tenants.yaml")
 }
@@ -855,18 +873,49 @@ mod tests {
     }
 
     #[test]
-    fn folding_with_receipts_is_rejected_for_the_named_tenant() {
+    fn folding_with_receipts_is_accepted() {
         let mut t = tenant(&["*"], &[]);
         t.receipts = true;
         t.folding = Some(folding_config("groq/summarizer"));
-        let err = TenantRegistry::from_file(
-            TenantFile { tenants: vec![t] },
-            PathBuf::from("tenants.yaml"),
-        )
-        .err()
-        .unwrap();
+        TenantRegistry::from_file(TenantFile { tenants: vec![t] }, PathBuf::from("tenants.yaml")).unwrap();
+    }
+
+    #[test]
+    fn a_receipts_tenant_cannot_fold_into_more_than_4000_chars() {
+        // The summary goes back in a header, so it is capped for receipts
+        // tenants (folding-receipts plan, D1). 4000 is allowed; 4001 is not.
+        let mut at_cap = tenant(&["*"], &[]);
+        at_cap.receipts = true;
+        at_cap.folding = Some(FoldingConfig { summary_chars: 4_000, ..folding_config("groq/summarizer") });
+        TenantRegistry::from_file(TenantFile { tenants: vec![at_cap] }, PathBuf::from("tenants.yaml")).unwrap();
+
+        let mut over = tenant(&["*"], &[]);
+        over.receipts = true;
+        over.folding = Some(FoldingConfig { summary_chars: 4_001, ..folding_config("groq/summarizer") });
+        let err = TenantRegistry::from_file(TenantFile { tenants: vec![over] }, PathBuf::from("tenants.yaml"))
+            .err()
+            .unwrap();
         assert!(err.to_string().contains("acme"), "{err}");
-        assert!(err.to_string().contains("receipts"), "{err}");
+        assert!(err.to_string().contains("4000"), "{err}");
+
+        // Without receipts the usual 8000 ceiling applies.
+        let mut plain = tenant(&["*"], &[]);
+        plain.folding = Some(FoldingConfig { summary_chars: 8_000, ..folding_config("groq/summarizer") });
+        TenantRegistry::from_file(TenantFile { tenants: vec![plain] }, PathBuf::from("tenants.yaml")).unwrap();
+    }
+
+    #[test]
+    fn background_folding_is_refused_for_a_receipts_tenant() {
+        // D4: a background fold has no client to hand the salt and summary to.
+        let mut t = tenant(&["*"], &[]);
+        t.receipts = true;
+        t.folding = Some(folding_config("groq/summarizer"));
+        let registry =
+            TenantRegistry::from_file(TenantFile { tenants: vec![t] }, PathBuf::from("tenants.yaml")).unwrap();
+        let errors = validate_receipt_folding(&registry, true);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("acme") && errors[0].contains("background"), "{errors:?}");
+        assert!(validate_receipt_folding(&registry, false).is_empty());
     }
 
     #[test]

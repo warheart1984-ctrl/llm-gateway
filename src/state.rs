@@ -98,6 +98,10 @@ impl AppState {
         if !validation.errors.is_empty() {
             return Err(validation.errors.join("\n"));
         }
+        let receipt_folding_errors = policy::validate_receipt_folding(&fresh, self.settings.folding.background);
+        if !receipt_folding_errors.is_empty() {
+            return Err(receipt_folding_errors.join("\n"));
+        }
         let auth_new = build_authenticator(&self.settings.auth, fresh.key_records())
             .map_err(|e| e.to_string())?;
         let models = Arc::clone(&prepared_models.snapshot);
@@ -136,6 +140,10 @@ impl AppState {
         );
         if !validation.errors.is_empty() {
             return Err(validation.errors.join("\n"));
+        }
+        let receipt_folding_errors = policy::validate_receipt_folding(&fresh, self.settings.folding.background);
+        if !receipt_folding_errors.is_empty() {
+            return Err(receipt_folding_errors.join("\n"));
         }
         let auth_new = build_authenticator(&self.settings.auth, fresh.key_records())
             .map_err(|e| e.to_string())?;

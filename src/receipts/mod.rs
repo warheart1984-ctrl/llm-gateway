@@ -57,6 +57,9 @@ const MAX_BATCH: usize = 512;
 const REQUEST_DOMAIN: &[u8] = b"llm-gateway/request/v1\n";
 const REPLY_DOMAIN: &[u8] = b"llm-gateway/reply/v1\n";
 const RAW_REPLY_DOMAIN: &[u8] = b"llm-gateway/raw-reply/v1\n";
+const FOLDED_REQUEST_DOMAIN: &[u8] = b"llm-gateway/folded-request/v1\n";
+const FOLD_REQUEST_DOMAIN: &[u8] = b"llm-gateway/fold-request/v1\n";
+const FOLD_REPLY_DOMAIN: &[u8] = b"llm-gateway/fold-reply/v1\n";
 
 // ---- salted digests ------------------------------------------------------------------------
 
@@ -105,6 +108,62 @@ pub fn request_digest(salt: &Salt, body: &[u8]) -> String {
     hasher.update(salt.0);
     hasher.update(REQUEST_DOMAIN);
     hasher.update(body);
+    prefixed(hasher)
+}
+
+/// What a folded call's outcome binds as its request:
+/// `sha256(salt || "llm-gateway/folded-request/v1\n" || call_digest || "\n"
+/// || turns_replaced || "\n" || summary)`, the count in decimal ASCII and the
+/// summary as UTF-8. The forwarded messages follow from the client's body, the
+/// number of turns replaced and the exact summary, so this binds what the model
+/// was sent without the client reproducing the gateway's JSON. The client has
+/// all three: its own `call_digest`, `x-gateway-folded`, and
+/// `x-gateway-fold-summary`.
+pub fn folded_request_digest(salt: &Salt, call_digest: &str, turns_replaced: usize, summary: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(salt.0);
+    hasher.update(FOLDED_REQUEST_DOMAIN);
+    hasher.update(call_digest.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(turns_replaced.to_string().as_bytes());
+    hasher.update(b"\n");
+    hasher.update(summary.as_bytes());
+    prefixed(hasher)
+}
+
+/// What a summarizer call's allow binds: `sha256(salt ||
+/// "llm-gateway/fold-request/v1\n" || call_digest || "\n" || turns_covered_before
+/// || "\n" || turns_covered_after || "\n" || prior_summary)`, counts in decimal
+/// ASCII, the prior summary as UTF-8 (empty when there is none). It names this
+/// request's body, which turns were folded, and the summary being extended,
+/// all of which the client holds.
+pub fn fold_request_digest(
+    salt: &Salt,
+    call_digest: &str,
+    turns_covered_before: usize,
+    turns_covered_after: usize,
+    prior_summary: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(salt.0);
+    hasher.update(FOLD_REQUEST_DOMAIN);
+    hasher.update(call_digest.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(turns_covered_before.to_string().as_bytes());
+    hasher.update(b"\n");
+    hasher.update(turns_covered_after.to_string().as_bytes());
+    hasher.update(b"\n");
+    hasher.update(prior_summary.as_bytes());
+    prefixed(hasher)
+}
+
+/// What a committed fold's outcome binds as its reply:
+/// `sha256(salt || "llm-gateway/fold-reply/v1\n" || summary)`.
+pub fn fold_reply_digest(salt: &Salt, summary: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(salt.0);
+    hasher.update(FOLD_REPLY_DOMAIN);
+    hasher.update(summary.as_bytes());
     prefixed(hasher)
 }
 
@@ -425,7 +484,7 @@ impl ReceiptChain {
             .write(true)
             .open(directory.join("receipts.lock"))
             .map_err(io_err)?;
-        lock_exclusive(&lock)?;
+        acquire_lock(&lock)?;
 
         let signer = load_or_create_signer(&key_path)?;
         fs::write(&public_key_path, format!("{}\n", signer.public_key_text())).map_err(io_err)?;
@@ -1394,6 +1453,25 @@ fn ensure_private(_path: &Path) -> Result<(), ReceiptError> {
 
 const LOCKED: &str = "receipt directory is locked by another process; each replica needs its own directory";
 
+/// How long opening waits for a directory lock before refusing.
+const LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// Take the directory lock, waiting up to `LOCK_WAIT` for it. A lock that was
+/// just released can look held for a moment: on Unix a child process that
+/// another thread is starting holds a copy of every descriptor until it execs,
+/// and `flock` stays held while any copy is open. A second replica on the same
+/// directory still holds it for good, so it is still refused, after the wait.
+fn acquire_lock(file: &File) -> Result<(), ReceiptError> {
+    let deadline = Instant::now() + LOCK_WAIT;
+    loop {
+        match lock_exclusive(file) {
+            Ok(()) => return Ok(()),
+            Err(err) if Instant::now() >= deadline => return Err(err),
+            Err(_) => thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
 #[cfg(unix)]
 fn lock_exclusive(file: &File) -> Result<(), ReceiptError> {
     use std::os::unix::io::AsRawFd;
@@ -1527,7 +1605,7 @@ impl ReceiptBook {
             .write(true)
             .open(root.join("replica.lock"))
             .map_err(io_err)?;
-        lock_exclusive(&lock)?;
+        acquire_lock(&lock)?;
         if root.join("receipts.jsonl").exists() {
             tracing::warn!(
                 root = %root.display(),
@@ -2114,6 +2192,24 @@ mod tests {
         fs::write(&path, "{\"a\":1}\n{\"b\":").unwrap();
         assert_eq!(complete_lines_of(&path).unwrap(), b"{\"a\":1}\n");
         assert!(complete_lines_of(&dir.join("missing")).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_lock_released_while_opening_is_taken_after_a_short_wait() {
+        // A briefly held lock (here a second handle released after 200 ms)
+        // must not refuse the open.
+        let dir = scratch("lock-wait");
+        drop(ReceiptChain::open(&dir, options(100)).unwrap());
+        let holder = OpenOptions::new().write(true).open(dir.join("receipts.lock")).unwrap();
+        lock_exclusive(&holder).unwrap();
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            drop(holder);
+        });
+        let started = Instant::now();
+        ReceiptChain::open(&dir, options(100)).expect("the lock is taken once it is released");
+        assert!(started.elapsed() >= Duration::from_millis(150), "it waited for the release");
+        release.join().unwrap();
     }
 
     #[tokio::test]

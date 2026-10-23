@@ -47,3 +47,32 @@ tenants:
       # 0.001 USD: a few 64-token requests fit, then the next reservation
       # does not, and the gateway refuses with 402 before calling the model.
       daily_budget_nano_usd: 1000000
+
+  # Receipts and conversation folding together: a long conversation goes to
+  # the model as a summary plus its newest turns, and the receipts bind the
+  # summary that was sent (docs/plans/folding-receipts.md).
+  - tenant_id: folding
+    display_name: Folding (receipts and conversation folding)
+    enabled: true
+    receipts: true
+    credentials:
+      - key_id: ak_folding
+        key_env: RECEIPTS_FOLDING_KEY
+        scopes: [chat:stream, models:read, receipts:read]
+    allowed_models: ["mock/*"]
+    default_model: mock/chat
+    limits:
+      requests_per_minute: 120
+      tokens_per_minute: 200000
+      max_concurrent_streams: 8
+      max_output_tokens: 1024
+      daily_budget_nano_usd: 1000000000   # 1 USD
+    folding:
+      enabled: true
+      summarizer_model: mock/summarizer
+      keep_last: 2
+      summary_chars: 400
+      summarizer_max_tokens: 64
+      min_new_turns: 2
+      min_new_tokens: 0
+      amortization_requests: 1

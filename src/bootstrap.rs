@@ -129,6 +129,10 @@ pub async fn build_with_ledger(
     if !validation.errors.is_empty() {
         return Err(BootError::InvalidRegistry(validation.errors));
     }
+    let receipt_folding_errors = policy::validate_receipt_folding(&tenants, settings.folding.background);
+    if !receipt_folding_errors.is_empty() {
+        return Err(BootError::InvalidRegistry(receipt_folding_errors));
+    }
 
     let auth = build_authenticator(&settings.auth, tenants.key_records())?;
     let policy = PolicyEngine::new(

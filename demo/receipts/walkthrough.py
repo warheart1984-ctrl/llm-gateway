@@ -323,6 +323,33 @@ def run(args: argparse.Namespace) -> None:
         code, report = ickverify(args.verifier, work / "rolled-back.jsonl", keys, published / "demo" / "anchor.jsonl")
         first_lines(report, 2)
         check(code == 1, "against the published anchor: NOT VERIFIED, the log is shorter than what was anchored")
+
+        step("10. A long conversation is folded, and the caller checks what the model was sent")
+        folding_key = os.environ["RECEIPTS_FOLDING_KEY"]
+        turns = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i} " + "x" * 200}
+                 for i in range(30)]
+        body = json.dumps({"model": "mock/chat", "stream": True, "messages": turns, "params": {"max_tokens": 64}},
+                          separators=(",", ":")).encode()
+        status, headers, _text = post(gateway, folding_key, body)
+        check(status == 200, f"HTTP {status}")
+        check(headers.get("x-gateway-folded") == "28",
+              f"x-gateway-folded: {headers.get('x-gateway-folded')}: the 28 oldest turns went to the model as one summary")
+        check("x-gateway-fold-summary" in headers, "x-gateway-fold-summary: the summary the model was sent, for the caller")
+        check("x-gateway-fold-receipt-id" in headers, "x-gateway-fold-receipt-id: the summarizer call has its own allow")
+        raw = evidence(gateway, folding_key, "log")
+        check(len(parse_log(raw)) == 4, "four entries: the fold's allow and outcome, then the request's allow and outcome")
+        (work / "fold-log.jsonl").write_bytes(raw)
+        (work / "fold-body.json").write_bytes(body)
+        (work / "fold-headers.json").write_text(json.dumps(headers), encoding="utf-8")
+        verify = [sys.executable, str(args.verify_fold), "--log", str(work / "fold-log.jsonl"),
+                  "--body", str(work / "fold-body.json"), "--headers", str(work / "fold-headers.json")]
+        result = subprocess.run(verify, capture_output=True, text=True)
+        first_lines(result.stdout, 1)
+        check(result.returncode == 0,
+              "every digest recomputed from the bytes sent, the salt and the headers matches the log")
+        (work / "fold-body.json").write_bytes(body.replace(b"turn 3 ", b"turn 4 "))
+        result = subprocess.run(verify, capture_output=True, text=True)
+        check(result.returncode == 1, "and a request body changed by one character does not verify")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -338,6 +365,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--gateway", default="http://gateway:8080")
     parser.add_argument("--published-dir", type=Path, required=True)
     parser.add_argument("--verifier", type=Path, required=True)
+    parser.add_argument("--verify-fold", type=Path, required=True, help="tools/verify_fold.py")
     args = parser.parse_args(argv)
     try:
         run(args)

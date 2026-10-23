@@ -537,7 +537,7 @@ The summary is a `user` message, never `system` or `developer`: it is model-writ
 
 A folded response carries `x-gateway-folded: <turns replaced>`. The decision log records counts and hashes only, never the summary or the message text. The summarizer call is a separate governed request: a model the tenant is allowed to call, with its own reservation and settlement. If the fold fails, is refused, does not pay, or cannot be admitted, the client request still succeeds and goes out with the last good summary, or unfolded.
 
-Folding cannot be combined with `receipts: true`. A receipt binds the request the client sent, and a fold sends something else. Loading a tenant with both is a configuration error.
+Folding works with `receipts: true`: the receipts bind the summary the model was actually sent, and the summarizer call gets its own receipt (see "Folded calls" under Receipts). For such a tenant `summary_chars` is at most 4,000, because the summary comes back in a header, and `[folding] background = true` is refused at load, because a background fold has no caller to hand the salt and summary to.
 
 ```yaml
 folding:
@@ -673,6 +673,38 @@ the JSON answer: `content`, `reasoning` (empty if null), and `tool_calls` with
 each call's position in the array as its index. The `allow` carries the
 request digest as `call_digest`; the outcome carries both. Each is written
 `sha256:<hex>`.
+
+**Folded calls.** For a tenant with receipts and conversation folding, a
+folded response also carries `x-gateway-folded` (turns replaced) and
+`x-gateway-fold-summary`: the summary the model was sent, as UTF-8 in
+base64url without padding. Its `allow` still binds the body the client sent;
+its outcome binds what the model was sent:
+
+```text
+request (folded) = sha256( salt || "llm-gateway/folded-request/v1\n" || call_digest
+                           || "\n" || turns_replaced || "\n" || summary )
+```
+
+The forwarded messages follow from the body, the number of turns replaced and
+the summary, so the caller can check this without reproducing the gateway's
+JSON. A request that runs a fold also carries `x-gateway-fold-receipt-id`.
+That fold is a model call of its own, so it gets its own `allow`, written
+before the summarizer is called (if it cannot be written, nothing is folded
+and the request meets the stopped chain), and its own outcome, under the same
+salt:
+
+```text
+fold allow   = sha256( salt || "llm-gateway/fold-request/v1\n" || call_digest || "\n"
+                       || turns_covered_before || "\n" || turns_covered_after || "\n" || prior summary )
+fold outcome = completed, reply = sha256( salt || "llm-gateway/fold-reply/v1\n" || summary )
+               or failed with no reply, when the fold was rejected or failed
+```
+
+`tools/verify_fold.py` recomputes all of these from the body, the headers, and
+the previous response's headers (for the summary being extended). A request
+that runs a fold writes four entries instead of two. Someone reading only the
+log cannot tell a fold's `allow` from a request's: the action is inside the
+proposal hash. The caller can, from the headers.
 
 **Fail closed when receipts are on.** If the `allow` cannot be written, the
 reservation is released, the model is not called, and the caller gets `503`
