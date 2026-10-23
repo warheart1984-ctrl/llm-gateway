@@ -2338,9 +2338,8 @@ async fn metric_labels_come_from_config_never_from_the_request() {
     );
 }
 
-/// The middleware stamps its own `x-request-id`, which is not the id on the
-/// decision line. The line's `prompt_tokens` is the estimate of the messages
-/// that were forwarded, so that count is the correlation.
+/// The decision line of a request, found by its `prompt_tokens` (the estimate
+/// of the messages that were forwarded), for tests that do not have its id.
 fn decision_record(prompt_tokens: u32) -> (String, Value) {
     let needle = format!("\"prompt_tokens\":{prompt_tokens},");
     let logs = captured_logs::contents();
@@ -2400,6 +2399,51 @@ fn marked_folding_body(turns: usize, tail_pad: usize) -> Value {
     let content = body["messages"][last]["content"].as_str().unwrap().to_string();
     body["messages"][last]["content"] = json!(format!("{content}{}", "y".repeat(tail_pad)));
     body
+}
+
+/// The "stream complete" line whose `field` is `value`.
+fn completion_line(field: &str, value: &str) -> Option<Value> {
+    captured_logs::contents().lines().rev().find_map(|line| {
+        let event: Value = serde_json::from_str(line).ok()?;
+        let fields = event.get("fields").unwrap_or(&event);
+        (fields["message"] == "stream complete" && fields[field] == value).then(|| fields.clone())
+    })
+}
+
+#[tokio::test]
+async fn the_request_id_a_response_carries_is_the_one_in_the_log() {
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let gw = Gateway::start(&upstream).await;
+    let (status, headers, _) = gw.post_chat(TEST_KEY, folding_body(3)).await;
+    assert_eq!(status, StatusCode::OK);
+    let id = headers.get("x-request-id").unwrap().to_str().unwrap().to_string();
+    assert!(uuid::Uuid::parse_str(&id).is_ok(), "{id}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let line = completion_line("request_id", &id).unwrap_or_else(|| panic!("no log line for {id}"));
+    assert_eq!(line["client_request_id"], "-");
+}
+
+#[tokio::test]
+async fn a_client_request_id_is_echoed_and_logged_beside_the_gateways() {
+    // A folding tenant, so the line with fold facts carries it too.
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(FOLDING_TENANT)).await;
+    let resp = reqwest::Client::new()
+        .post(gw.url("/v1/chat/stream"))
+        .header("x-api-key", TEST_KEY)
+        .header("x-request-id", "client-trace-7f3a")
+        .json(&folding_body(3))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("x-request-id").unwrap(), "client-trace-7f3a");
+    let _ = resp.text().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let line = completion_line("client_request_id", "client-trace-7f3a").expect("logged with the client's id");
+    assert!(line.get("fold").is_some(), "{line}");
+    let gateway_id = line["request_id"].as_str().unwrap();
+    assert!(uuid::Uuid::parse_str(gateway_id).is_ok(), "the gateway's own id stays its record: {gateway_id}");
 }
 
 #[tokio::test]

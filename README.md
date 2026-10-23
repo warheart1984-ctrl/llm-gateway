@@ -533,7 +533,7 @@ newest first.
 
 A chat client resends the whole conversation on every request, so the prompt grows with every turn. A tenant that opts in can have the older turns replaced by a rolling summary before the request is forwarded. Folding is off unless that tenant's `folding.enabled` is true. On one 14-call run, 5-fold-engine cut main-path prompt tokens from 18,977 to 4,311, and the summarizer still spent more than the cut saved (net −$0.0057) because it was an expensive reasoning model. A summary can also drop facts that changed during the conversation.
 
-**Folding saves money on stable facts, and keeps changed facts correct by refusing to fold what it cannot verify.** In the benchmark below, the fixed scenario kept every fact with the final version, at a 47% saving (51–55% in earlier versions, one of which lost a corrected budget). Facts that change mid-conversation are kept in a gateway-owned [fact ledger](#the-fact-ledger): the summarizer proposes updates, and the gateway verifies each against the conversation before it becomes current. In the final rounds no folded answer to a changed fact was wrong. But with `gpt-4.1-nano` summarizing, a conversation full of corrections was refused almost every fold, so it saved nothing (and, with the growing back-off, cost about 3% more than not folding); `gpt-4.1-mini` was refused nothing but, at its price, the cost check let few folds through. Earlier designs that let the summarizer write the facts lost 2–14% of changed facts; see [what each round showed](#changing-facts-what-the-safeguards-fixed-and-what-they-did-not).
+**Folding saves money, and keeps changed facts correct by refusing to fold what it cannot verify.** In the benchmark below, the fixed scenario kept every fact with the final version, at a 47% saving (51–55% in earlier versions, one of which lost a corrected budget). Facts that change mid-conversation are kept in a gateway-owned [fact ledger](#the-fact-ledger): the summarizer proposes updates, and the gateway verifies each against the conversation before it becomes current. With `gpt-4.1-mini` summarizing and `amortization_requests: 16`, two runs full of corrections kept every fact (889 / 889 each) at a 54–55% saving, through the fold cap, a correction after it, and a re-fold that carried the correction. With `gpt-4.1-nano` summarizing, the gateway refused almost every fold of those conversations, so they kept every fact but saved nothing (about 3% extra, with the growing back-off). The summarizer has to be able to report facts reliably, and `amortization_requests` has to reflect how many requests a summary really serves. Earlier designs that let the summarizer write the facts lost 2–14% of changed facts; see [what each round showed](#changing-facts-what-the-safeguards-fixed-and-what-they-did-not).
 
 The summary is a `user` message, never `system` or `developer`: it is model-written from the tenant's own turns, and a user turn that says "ignore your rules" must not come back with system authority. Some providers reject two `user` messages in a row. The OpenAI-compatible providers this gateway calls accept it.
 
@@ -552,7 +552,7 @@ folding:
   refold_threshold: 8
   min_new_turns: 4
   min_new_tokens: 400
-  amortization_requests: 4
+  amortization_requests: 4            # requests a summary is expected to serve; set near real reuse
   min_saving_nano_usd: 0
   backoff_turns: 8                     # after a rejected fold, wait this many more turns
 ```
@@ -662,7 +662,18 @@ What fixed it is a gateway that owns each fact's current value instead of inferr
 | same | mutating ×2 | no folds | 0 / 15, 0 / 15 | −14%, −16% | Nothing wrong, nothing folded, and the summarizer paid every 8 turns |
 | + growing back-off | mutating ×2 | no folds | 0 / 4, 0 / 4 | −3%, −3% | Four attempts instead of fifteen |
 
-Each fault a round found became a rule with its own test. What the rounds show: the ledger turns the summarizer's mistakes into refused folds rather than wrong answers, and the summarizer's quality then decides how much a conversation with corrections saves. With `gpt-4.1-nano` that is nothing; with `gpt-4.1-mini` the facts were clean, and the saving depends on a cost check that, at mini's price, needs a fold to pay off over more requests than the lifecycle profile's four.
+Then, with every rule above and `gpt-4.1-mini` summarizing, the cost check's `amortization_requests` (how many requests a fold's saving is counted over) was varied. In these runs each committed fold was in fact reused for about 21 calls:
+
+| `amortization_requests` | Folds | Facts kept | Saving with caching | Reached |
+|---|---|---|---|---|
+| 4 (the bench profiles' setting) | 2 | 710 / 710 | 41% | warm |
+| 8 | 4 | 863 / 863 | 49% | warm |
+| 16 | 6 | 889 / 889 | 55% | re-folded |
+| 16 (repeat) | 6 | 889 / 889 | 54% | re-folded |
+
+At 16 both runs reached the fold cap at call 85, were sent "owner is now Ines" at call 86, and re-folded at call 106; the owner was right on every counted call after it, and no fold was refused. That is the correction-then-re-fold path, in a real run, twice.
+
+Each fault a round found became a rule with its own test. What the rounds show: the ledger turns the summarizer's mistakes into refused folds rather than wrong answers, and the summarizer's quality then decides how much a conversation with corrections saves. With `gpt-4.1-nano` that is nothing; with `gpt-4.1-mini` it is 54–55%, once `amortization_requests` is set near how often a summary is really reused. A summarizer that costs as much as the main model needs a higher value than the default; one that costs a quarter of it, a lower one.
 
 ## Receipts
 
@@ -1089,7 +1100,7 @@ What the gateway does itself, and what it expects of the deployment around it.
 | **Upstream error bodies** | A vendor's error body can name the operator's provider account, its billing state or a key fragment, so it never reaches a tenant. Clients get the stable `code`, status and `retryable` flag plus a fixed sentence per class, such as "the upstream provider refused the request (HTTP 404)" or "the upstream provider is overloaded; retry shortly (HTTP 503)", in the error body and the SSE `error` event alike. The decision record keeps the same sentence. The vendor's text goes to the logs only (`request rejected before streaming` / `upstream failed mid-stream`), bounded to 1,000 characters with key-shaped tokens (known key prefixes, `Bearer` values, long opaque strings) replaced by `[redacted]`. Tested with a mock upstream whose 404 and in-band errors carry an account id and a key. | `passthrough` framing relays the vendor's bytes verbatim once the stream has started, in-band errors included; use `normalized` for tenants who must not see raw vendor output. |
 | **Secret rotation** | `key_file` credentials are re-read on every tenant reload, so replacing the file and reloading rotates a key with no restart; the old key stops working the moment the reload lands (tested). `key_env` values, provider API keys and the JWT secret are read once at boot, and rotating them means a restart. There is no dual-secret window for JWTs. | Rotate tenant keys without a gap by adding the new credential alongside the old, moving clients, then removing the old one. |
 | **Metric cardinality** | Every label value comes from configuration — provider, registry model id, tenant id from `tenants.yaml` — never from request input. A series is created only after authentication and routing succeed. Labels with delimiter characters or over 128 bytes become `invalid`. Tested with unknown models, unknown keys and junk metadata. | Cardinality is bounded by the size of the model and tenant files; size scrape limits accordingly. |
-| **Request ids** | A client-supplied `x-request-id` (≤ 128 visible ASCII chars) is echoed and logged for correlation. It is not an identity and is never trusted for anything else. | Overwrite it at the proxy if clients must not choose it. |
+| **Request ids** | Every response carries `x-request-id`. Without a client one it is the gateway's own id, the one in the decision log and the receipts. A client-supplied `x-request-id` (≤ 128 visible ASCII chars) is echoed instead and logged as `client_request_id` beside the gateway's `request_id`. It is not an identity and is never trusted for anything else. | Overwrite it at the proxy if clients must not choose it. |
 
 ## Testing
 

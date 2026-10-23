@@ -8,7 +8,7 @@ use std::sync::Arc;
 use axum::{
     Json,
     extract::{DefaultBodyLimit, State},
-    http::{HeaderName, HeaderValue, StatusCode},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -111,6 +111,16 @@ fn finish(routes: Router<Arc<AppState>>, state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+/// A client's own `x-request-id`: at most 128 visible ASCII characters. It is
+/// echoed and logged for correlation, and trusted for nothing else.
+pub(crate) fn client_request_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty() && v.len() <= 128)
+        .map(str::to_string)
+}
+
 /// Reject oversized bodies with 413 before a handler allocates for them, and
 /// attach the request id every response carries.
 async fn request_context(
@@ -118,13 +128,8 @@ async fn request_context(
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
-    let request_id = request
-        .headers()
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .filter(|v| !v.is_empty() && v.len() <= 128)
-        .map(str::to_string)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let client_id = client_request_id(request.headers());
+    let request_id = client_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     // Reject an oversized *declared* body before any handler starts reading it:
     // a client can declare 2 MiB in `content-length` and ship nothing, and
@@ -163,7 +168,12 @@ async fn request_context(
     }
 
     let mut response = next.run(request).await;
-    if let Ok(value) = HeaderValue::from_str(&request_id) {
+    // A client's own id is echoed. Without one, an id the handler set stays:
+    // it is the one in the decision log and the receipts. Replacing it with
+    // this one left a caller nothing to find its request by.
+    if (client_id.is_some() || !response.headers().contains_key("x-request-id"))
+        && let Ok(value) = HeaderValue::from_str(&request_id)
+    {
         response.headers_mut().insert("x-request-id", value);
     }
     response.headers_mut().insert(

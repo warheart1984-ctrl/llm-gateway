@@ -460,6 +460,7 @@ pub async fn openai_chat_completions(
 async fn handle(state: Arc<AppState>, headers: HeaderMap, body: Bytes, mode: Mode, dialect: Dialect) -> Response {
     let request_id = Uuid::new_v4().to_string();
     let mut span = RequestSpan::new(request_id.clone());
+    span.client_request_id = super::client_request_id(&headers);
     state.metrics.request_observed();
 
     // Returns `Response` rather than `Result<Response, RequestError>` so every

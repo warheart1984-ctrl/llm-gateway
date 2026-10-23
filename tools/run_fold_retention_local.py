@@ -23,7 +23,9 @@ Keys:
 files and the model ids swapped. `--summarizer` replaces the provider's
 summarizer with another model from the same file (`--summarizer
 openrouter/gpt-4.1-mini`); the result file's name then ends in
-`_sum-<model>`.
+`_sum-<model>`. `--amortization-requests N` sets the folded tenant's
+`amortization_requests`, how many requests the cost check counts a fold's
+saving over (the name then ends in `_amort-N`).
 
 Receipts are on for the folded tenant, so the gateway returns the summary it
 sent in `x-gateway-fold-summary` and the harness can keep it. The receipt
@@ -144,10 +146,24 @@ def stop(gateway: subprocess.Popen | None) -> None:
             gateway.kill()
 
 
-def result_name(provider: str, scenario: str, profile: str, stamp: str, summarizer: str | None = None) -> str:
-    """The result file's name; a summarizer other than the provider's own is named in it."""
+def result_name(provider: str, scenario: str, profile: str, stamp: str, summarizer: str | None = None,
+                amortization: int | None = None) -> str:
+    """The result file's name; a summarizer other than the provider's own, and
+    an amortization other than the profile's, are named in it."""
     suffix = f"_sum-{summarizer.rsplit('/', 1)[-1]}" if summarizer else ""
+    suffix += f"_amort-{amortization}" if amortization else ""
     return f"fold_retention_{provider}_{scenario}_{profile}_{stamp}{suffix}.json"
+
+
+def with_amortization(tenants: str, requests: int) -> str:
+    """The tenants file with the folded tenant's `amortization_requests` set."""
+    lines = tenants.splitlines(keepends=True)
+    hits = [i for i, line in enumerate(lines) if line.strip().startswith("amortization_requests:")]
+    if len(hits) != 1:
+        raise ValueError("the tenants file must set amortization_requests once")
+    line = lines[hits[0]]
+    lines[hits[0]] = f"{line[:len(line) - len(line.lstrip())]}amortization_requests: {requests}\n"
+    return "".join(lines)
 
 
 def free_port() -> int:
@@ -176,6 +192,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--profile", choices=["lifecycle", "economics"], default="economics")
     parser.add_argument("--provider", choices=sorted(PROVIDERS), default="groq")
     parser.add_argument("--summarizer", help="a model id from the provider's models file, in place of its summarizer")
+    parser.add_argument("--amortization-requests", type=int,
+                        help="the folded tenant's amortization_requests, in place of the profile's")
     parser.add_argument("--max-calls", type=int)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--binary", type=Path, default=ROOT / "target" / "release" /
@@ -209,6 +227,8 @@ def main(argv: list[str] | None = None) -> int:
         tenants = "tenants.lifecycle.yaml" if args.profile == "lifecycle" else "tenants.yaml"
         text = (BENCH / tenants).read_text(encoding="utf-8")
         text = text.replace(GROQ_SUMMARIZER, summarizer).replace(GROQ_MAIN, provider["main"])
+        if args.amortization_requests:
+            text = with_amortization(text, args.amortization_requests)
         (config / "tenants.yaml").write_text(text, encoding="utf-8")
 
         gateway_env = dict(os.environ, **gateway_keys, **{provider["key"]: key},
@@ -227,7 +247,8 @@ def main(argv: list[str] | None = None) -> int:
         sum_in, sum_out = model_prices(provider["models"], summarizer)
         stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
         output = args.output or (ROOT / "benchmark_results" /
-                                 result_name(args.provider, args.scenario, args.profile, stamp, args.summarizer))
+                                 result_name(args.provider, args.scenario, args.profile, stamp, args.summarizer,
+                                             args.amortization_requests))
         command = [sys.executable, "-u", str(ROOT / "tools" / "fold_retention.py"),
                    "--base-url", base_url, "--model", provider["main"],
                    "--scenario", args.scenario, "--profile", args.profile,
