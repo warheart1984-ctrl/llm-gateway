@@ -20,7 +20,10 @@ Keys:
 
 `--provider` picks the models: `groq` uses `bench/folding/models.yaml`, and
 `openrouter` uses `bench/folding/models.openrouter.yaml`, with the same tenant
-files and the model ids swapped.
+files and the model ids swapped. `--summarizer` replaces the provider's
+summarizer with another model from the same file (`--summarizer
+openrouter/gpt-4.1-mini`); the result file's name then ends in
+`_sum-<model>`.
 
 Receipts are on for the folded tenant, so the gateway returns the summary it
 sent in `x-gateway-fold-summary` and the harness can keep it. The receipt
@@ -141,6 +144,12 @@ def stop(gateway: subprocess.Popen | None) -> None:
             gateway.kill()
 
 
+def result_name(provider: str, scenario: str, profile: str, stamp: str, summarizer: str | None = None) -> str:
+    """The result file's name; a summarizer other than the provider's own is named in it."""
+    suffix = f"_sum-{summarizer.rsplit('/', 1)[-1]}" if summarizer else ""
+    return f"fold_retention_{provider}_{scenario}_{profile}_{stamp}{suffix}.json"
+
+
 def free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -166,6 +175,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scenario", choices=["fixed", "mutating"], default="fixed")
     parser.add_argument("--profile", choices=["lifecycle", "economics"], default="economics")
     parser.add_argument("--provider", choices=sorted(PROVIDERS), default="groq")
+    parser.add_argument("--summarizer", help="a model id from the provider's models file, in place of its summarizer")
     parser.add_argument("--max-calls", type=int)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--binary", type=Path, default=ROOT / "target" / "release" /
@@ -173,6 +183,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     provider = PROVIDERS[args.provider]
+    summarizer = args.summarizer or provider["summarizer"]
+    if f"  {summarizer}:" not in (BENCH / provider["models"]).read_text(encoding="utf-8"):
+        print(f"run-fold-retention: {summarizer} is not in {provider['models']}", file=sys.stderr)
+        return 2
     key = vendor_key(provider["key"])
     if not key:
         print(f"run-fold-retention: {provider['key']} is not set (environment or user environment)", file=sys.stderr)
@@ -194,7 +208,7 @@ def main(argv: list[str] | None = None) -> int:
         shutil.copy(BENCH / provider["models"], config / "models.yaml")
         tenants = "tenants.lifecycle.yaml" if args.profile == "lifecycle" else "tenants.yaml"
         text = (BENCH / tenants).read_text(encoding="utf-8")
-        text = text.replace(GROQ_SUMMARIZER, provider["summarizer"]).replace(GROQ_MAIN, provider["main"])
+        text = text.replace(GROQ_SUMMARIZER, summarizer).replace(GROQ_MAIN, provider["main"])
         (config / "tenants.yaml").write_text(text, encoding="utf-8")
 
         gateway_env = dict(os.environ, **gateway_keys, **{provider["key"]: key},
@@ -210,10 +224,10 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
         main_in, main_out = model_prices(provider["models"], provider["main"])
-        sum_in, sum_out = model_prices(provider["models"], provider["summarizer"])
+        sum_in, sum_out = model_prices(provider["models"], summarizer)
         stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
         output = args.output or (ROOT / "benchmark_results" /
-                                 f"fold_retention_{args.provider}_{args.scenario}_{args.profile}_{stamp}.json")
+                                 result_name(args.provider, args.scenario, args.profile, stamp, args.summarizer))
         command = [sys.executable, "-u", str(ROOT / "tools" / "fold_retention.py"),
                    "--base-url", base_url, "--model", provider["main"],
                    "--scenario", args.scenario, "--profile", args.profile,

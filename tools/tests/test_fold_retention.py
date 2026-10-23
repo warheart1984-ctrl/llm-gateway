@@ -287,6 +287,12 @@ class Diagnostics(unittest.TestCase):
         after = {key("committed"): 2, key("unprofitable"): 6, key("backoff"): 1, key("committed", "plain"): 9}
         self.assertEqual(fr.fold_outcome_deltas(before, after), {"backoff": 1, "unprofitable": 1})
 
+    def test_a_replaced_summarizer_is_named_in_the_result_file(self) -> None:
+        self.assertEqual(runner.result_name("openrouter", "mutating", "lifecycle", "T1"),
+                         "fold_retention_openrouter_mutating_lifecycle_T1.json")
+        self.assertEqual(runner.result_name("openrouter", "mutating", "lifecycle", "T1", "openrouter/gpt-4.1-mini"),
+                         "fold_retention_openrouter_mutating_lifecycle_T1_sum-gpt-4.1-mini.json")
+
     def test_the_runner_attaches_each_logged_fold_decision_by_request_id(self) -> None:
         decision = {"outcome": "refused", "reason": "cost_check", "fold_count": 8}
         log = "\n".join([

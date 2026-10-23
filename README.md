@@ -531,7 +531,9 @@ newest first.
 
 ## Conversation folding
 
-A chat client resends the whole conversation on every request, so the prompt grows with every turn. A tenant that opts in can have the older turns replaced by a rolling summary before the request is forwarded. Folding is off unless that tenant's `folding.enabled` is true. On one 14-call run, 5-fold-engine cut main-path prompt tokens from 18,977 to 4,311, and the summarizer still spent more than the cut saved (net −$0.0057) because it was an expensive reasoning model. A summary can also drop facts that changed during the conversation. Both are reasons to leave it off until the summarizer is cheap enough and the loss is acceptable.
+A chat client resends the whole conversation on every request, so the prompt grows with every turn. A tenant that opts in can have the older turns replaced by a rolling summary before the request is forwarded. Folding is off unless that tenant's `folding.enabled` is true. On one 14-call run, 5-fold-engine cut main-path prompt tokens from 18,977 to 4,311, and the summarizer still spent more than the cut saved (net −$0.0057) because it was an expensive reasoning model. A summary can also drop facts that changed during the conversation.
+
+**Folding is reliable only for conversations whose facts stay stable.** In the benchmark below, the fixed scenario, where no fact changes, kept every fact in every run, through 200 calls and the fold cap. The mutating scenario, where facts are corrected during the conversation, did not: with every safeguard below in place, the folded tenant still answered 2–12% of them wrong in the latest runs, because the summarizer (`gpt-4.1-nano`) wrote two lines for one fact with different values. Leave folding off for a conversation where a later correction must always win, such as an owner, an address, a port or an access decision, until the [changing-facts results](#changing-facts-what-the-safeguards-fixed-and-what-they-did-not) improve.
 
 The summary is a `user` message, never `system` or `developer`: it is model-written from the tenant's own turns, and a user turn that says "ignore your rules" must not come back with system authority. Some providers reject two `user` messages in a row. The OpenAI-compatible providers this gateway calls accept it.
 
@@ -616,9 +618,27 @@ Summarizer calls are priced with no cache discount. The two arms take turns goin
 What this shows:
 
 - **Caching does not erase the saving.** The unfolded tenant gets 57–65% of its prompt tokens from the cache, but its prompt is still several times larger. Priced the way the provider charges, folding saved 51–54% in all four runs. The billed saving, which ignores caching, varied more between repeats (45–53%).
-- **The economics profile froze at 200 calls and never re-folded.** It reached the fold cap with 8 folds. After that its cost checks refused every re-fold, and it kept every fact.
+- **The economics profile froze at 200 calls and never re-folded.** It reached the fold cap with 8 folds. Its gateway logs show a re-fold attempted every 8 calls from call 141, and every one failed the summary checks: the whole history no longer fit `summary_chars` with every pinned value. It kept every fact.
 - **The mutating runs lost a fact.** In both runs the folded tenant lost the latest `owner` right after a fold and never got it back. Run 1 lost "Noor" from call 31 (fold 3) and was wrong on 44 calls. Run 2 lost "Ines", the correction sent at the cap, from call 89 (its first re-fold) and was wrong on 31 calls. Every other field was kept. Pinned values did not prevent it. Both names were pinned ("Noor replaces Mira" and "owner is now Ines" both match a pin pattern), so each fold had to keep the name somewhere in the summary, yet the answers were still wrong: a pin keeps a value, not which field it belongs to. The result files do not record the wrong answers themselves. Both runs exit `1`, the harness's regression code.
 - **Repeats agree on the shape but not the details:** which fold drops the fact and when differ between repeats, even at `temperature: 0`.
+
+#### Changing facts: what the safeguards fixed and what they did not
+
+The runs above lost the latest owner. Their summaries showed why: a chronological story that stated the old owner first and the correction later, clipped at `summary_chars` where the newest corrections sat. Each safeguard in "What a fold costs and keeps" came from one of these rounds. Each round is two mutating, lifecycle runs of 120 calls on OpenRouter (2026-10-23), with `gpt-4.1-mini` answering and `gpt-4.1-nano` summarizing:
+
+| Added | Facts kept | Folds committed | Saving with caching | What the result files showed |
+|---|---|---|---|---|
+| Current-facts summary, field/value pins | 667 / 667, 705 / 818 | 4, 4 | 42%, 45% | Run 2's first summary read "Noor replaces Mira" backwards: `owner: Mira (was Noor)` |
+| A replaced value must not be current | 640 / 647, 695 / 695 | 4, 5 | 36%, 47% | The owner was kept; a summary dropped `production port: 9443`, which nothing pinned |
+| Bare numbers pinned, rejection reasons logged | 452 / 452, 727 / 727 | 1, 2 | 22%, 37% | Nothing lost, but most folds rejected (`pinned_facts_present`) for old values the prior summary kept as history |
+| Replaced values no longer required | 488 / 488, 510 / 510 | 3, 5 | 27%, 31% | Later folds passed; the first fold took 8 attempts, rejected for backwards readings (`superseded_not_current`) |
+| One corrective retry; a field update replaces the field's last value | 793 / 811, 662 / 749 | 6, 6 | 48%, 46% | Folding flowed and reached the re-fold, and facts were lost again: two lines for one fact (`owner: Ines` and `project owner: Noor`), or a fact named only by the conversation's word (`ceiling: 1250` for the budget) |
+
+"Facts kept" counts only facts last stated inside the folded turns, so it differs between runs. The trade-off is plain in the table: with checks strict enough to lose nothing, folding mostly stopped and the saving fell to 22–37%; once a retry let folds through, the summarizer's mistakes got through with them. The checks infer each fact's current value from wording, and a first statement ("Production listens on port 9443") is no update, so a later correction has no recorded value to replace.
+
+One more round, with every safeguard above and `gpt-4.1-mini` summarizing instead of `gpt-4.1-nano` (`--summarizer openrouter/gpt-4.1-mini`), kept 715 / 715 and 720 / 720 facts. Its first fold passed on the first attempt, no fold was rejected, one corrective retry per run committed, and its summaries held one line per fact with every correction the right way round. But at four times nano's price the cost check refused 118 of 120 fold attempts in each run as unprofitable, so it committed 2 folds per run, saved 43% and 40% with caching, and never reached the fold cap or the re-fold. A stronger summarizer removes most of the mistakes here; it does not show that corrections survive repeated re-folds.
+
+What would fix it is a gateway that owns each fact's current value instead of inferring it from the summary: the summarizer compresses history, and the gateway keeps the facts. The summarizer would return fact updates as data, each with the sentence it came from. A sentence that holds the value does not prove the update is right (it may name two ports, quote an old setting, or describe a change that was only considered), so the gateway would also have to check the field, scope and kind of update, and leave an update it cannot resolve unresolved rather than make it current. It would keep each value's source and the history of what it replaced, and write the `Current facts` block itself. Until then, the measured result is the cost saving on stable facts; keeping changing facts correct through repeated folds is not yet shown.
 
 ## Receipts
 
