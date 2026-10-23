@@ -18,7 +18,7 @@ use axum::{
 use base64::Engine as _;
 use llm_gateway::{
     folding::plan::SUMMARY_PREAMBLE,
-    receipts::{folded_request_digest, request_digest, ReceiptChain, Salt},
+    receipts::{fold_reply_digest, fold_request_digest, folded_request_digest, request_digest, ReceiptChain, Salt},
 };
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -230,6 +230,17 @@ fn conversation(turns: usize, stream: bool) -> String {
     body.to_string()
 }
 
+/// The same, with a value the summary must keep in its first turn.
+fn conversation_with_pinned_value(turns: usize) -> String {
+    let mut body: Value = serde_json::from_str(&conversation(turns, true)).unwrap();
+    body["messages"][0]["content"] = json!(format!("The meeting moved to 15:30. {}", "x".repeat(200)));
+    body.to_string()
+}
+
+fn position(rows: &[Value], receipt_id: &str) -> usize {
+    rows.iter().position(|row| row["receipt_id"] == receipt_id).expect("an entry with that id")
+}
+
 fn header<'a>(headers: &'a reqwest::header::HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).map(|value| value.to_str().unwrap())
 }
@@ -345,4 +356,113 @@ async fn background_folding_with_a_receipts_tenant_refuses_to_start() {
         Err(error) => error.to_string(),
     };
     assert!(error.contains("acme") && error.contains("background"), "{error}");
+}
+
+// ---- Phase 2: the summarizer's own receipt (D3) --------------------------------------------
+
+#[tokio::test]
+async fn a_fold_writes_its_allow_then_calls_then_writes_its_outcome() {
+    let (upstream, mock) = mock_upstream().await;
+    let gateway = Gateway::boot(&upstream).await;
+    let body = conversation(30, true);
+    let (status, headers, text) = gateway.post("/v1/chat/stream", &body, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let salt = Salt::from_hex(header(&headers, "x-receipt-salt").unwrap()).unwrap();
+    let call_digest = request_digest(&salt, body.as_bytes());
+    let fold_id = header(&headers, "x-gateway-fold-receipt-id").expect("x-gateway-fold-receipt-id").to_string();
+    let main_id = header(&headers, "x-receipt-id").unwrap().to_string();
+
+    let fold_allow = gateway.entry(&fold_id);
+    assert_eq!(fold_allow["verdict"], "allow");
+    // No prior summary: turns 0 to 28 are folded, from nothing.
+    assert_eq!(fold_allow["call_digest"], fold_request_digest(&salt, &call_digest, 0, 28, ""));
+    let fold_outcome = gateway.outcome_of(&fold_id);
+    assert_eq!(fold_outcome["status"], "completed");
+    assert_eq!(fold_outcome["request_sha256"], fold_allow["call_digest"]);
+    assert_eq!(fold_outcome["response_sha256"], fold_reply_digest(&salt, &decoded_summary(&headers)));
+
+    // In order: the fold's allow, its outcome, then the request's own allow.
+    let rows = gateway.rows();
+    let fold_outcome_at = rows.iter().position(|row| row["decision_receipt_id"] == fold_id.as_str()).unwrap();
+    assert!(position(&rows, &fold_id) < fold_outcome_at);
+    assert!(fold_outcome_at < position(&rows, &main_id));
+    assert_eq!(rows.len(), 4, "a folded request writes four entries");
+    assert_eq!(mock.summarizer_calls(), 1);
+}
+
+#[tokio::test]
+async fn a_second_fold_binds_the_summary_it_extends() {
+    let (upstream, mock) = mock_upstream().await;
+    let gateway = Gateway::boot(&upstream).await;
+    let (_, first, _) = gateway.post("/v1/chat/stream", &conversation(30, true), &[]).await;
+    let prior = decoded_summary(&first);
+    *mock.summary.lock().unwrap() = "The conversation went on with more filler.".into();
+    let body = conversation(34, true);
+    let (status, headers, text) = gateway.post("/v1/chat/stream", &body, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(mock.summarizer_calls(), 2);
+    let salt = Salt::from_hex(header(&headers, "x-receipt-salt").unwrap()).unwrap();
+    let call_digest = request_digest(&salt, body.as_bytes());
+    let fold_id = header(&headers, "x-gateway-fold-receipt-id").unwrap();
+    assert_eq!(gateway.entry(fold_id)["call_digest"], fold_request_digest(&salt, &call_digest, 28, 32, &prior));
+    assert_folded_binding(&gateway, &mock, &headers, &body, 32);
+}
+
+#[tokio::test]
+async fn a_fold_whose_allow_cannot_be_written_calls_no_summarizer() {
+    let (upstream, mock) = mock_upstream().await;
+    let gateway = Gateway::boot(&upstream).await;
+    gateway.chain.fail_disk_writes_from_now(1);
+    let (status, headers, text) = gateway.post("/v1/chat/stream", &conversation(30, true), &[]).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{text}");
+    assert!(text.contains("receipt_unavailable"), "{text}");
+    assert_eq!(mock.summarizer_calls(), 0, "no summarizer call without a durable allow");
+    assert!(mock.bodies().is_empty(), "and no model call at all once the chain stopped");
+    assert!(header(&headers, "x-gateway-fold-receipt-id").is_none());
+}
+
+#[tokio::test]
+async fn a_rejected_fold_writes_a_failed_outcome_and_the_request_goes_out_unfolded() {
+    let (upstream, mock) = mock_upstream().await;
+    let gateway = Gateway::boot(&upstream).await;
+    // The summary drops the pinned "15:30", so the fold is refused.
+    *mock.summary.lock().unwrap() = "Filler was exchanged.".into();
+    let body = conversation_with_pinned_value(30);
+    let (status, headers, text) = gateway.post("/v1/chat/stream", &body, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(mock.summarizer_calls(), 1);
+    let fold_id = header(&headers, "x-gateway-fold-receipt-id").expect("a fold ran");
+    let fold_outcome = gateway.outcome_of(fold_id);
+    assert_eq!(fold_outcome["status"], "failed");
+    assert!(fold_outcome.get("response_sha256").is_none_or(Value::is_null), "{fold_outcome}");
+
+    assert!(header(&headers, "x-gateway-folded").is_none());
+    assert!(header(&headers, "x-gateway-fold-summary").is_none());
+    let salt = Salt::from_hex(header(&headers, "x-receipt-salt").unwrap()).unwrap();
+    let call_digest = request_digest(&salt, body.as_bytes());
+    let main_id = header(&headers, "x-receipt-id").unwrap();
+    assert_eq!(gateway.outcome_of(main_id)["request_sha256"], call_digest, "sent unfolded, bound as such");
+    assert_eq!(mock.last_main()["messages"].as_array().unwrap().len(), 30, "the model got the whole conversation");
+}
+
+#[tokio::test]
+async fn the_unchanged_verifier_accepts_a_log_with_folds() {
+    let (upstream, mock) = mock_upstream().await;
+    let gateway = Gateway::boot(&upstream).await;
+    assert_eq!(gateway.post("/v1/chat/stream", &conversation(30, true), &[]).await.0, StatusCode::OK);
+    *mock.summary.lock().unwrap() = "Filler was exchanged.".into();
+    assert_eq!(gateway.post("/v1/chat/stream", &conversation_with_pinned_value(30), &[]).await.0, StatusCode::OK);
+    assert_eq!(gateway.post("/v1/chat/stream", &conversation(2, true), &[]).await.0, StatusCode::OK);
+    let Some(python) = llm_gateway::receipts::test_python() else {
+        return;
+    };
+    let out = std::process::Command::new(python)
+        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/wicket/verifier/ickverify.py"))
+        .arg(gateway.chain.log_path())
+        .arg("--trusted-keys")
+        .arg(gateway.chain.public_key_path())
+        .arg("--require-signatures")
+        .output()
+        .expect("run ickverify.py");
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stdout));
 }

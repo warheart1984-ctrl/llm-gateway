@@ -58,6 +58,8 @@ const REQUEST_DOMAIN: &[u8] = b"llm-gateway/request/v1\n";
 const REPLY_DOMAIN: &[u8] = b"llm-gateway/reply/v1\n";
 const RAW_REPLY_DOMAIN: &[u8] = b"llm-gateway/raw-reply/v1\n";
 const FOLDED_REQUEST_DOMAIN: &[u8] = b"llm-gateway/folded-request/v1\n";
+const FOLD_REQUEST_DOMAIN: &[u8] = b"llm-gateway/fold-request/v1\n";
+const FOLD_REPLY_DOMAIN: &[u8] = b"llm-gateway/fold-reply/v1\n";
 
 // ---- salted digests ------------------------------------------------------------------------
 
@@ -125,6 +127,42 @@ pub fn folded_request_digest(salt: &Salt, call_digest: &str, turns_replaced: usi
     hasher.update(b"\n");
     hasher.update(turns_replaced.to_string().as_bytes());
     hasher.update(b"\n");
+    hasher.update(summary.as_bytes());
+    prefixed(hasher)
+}
+
+/// What a summarizer call's allow binds: `sha256(salt ||
+/// "llm-gateway/fold-request/v1\n" || call_digest || "\n" || turns_covered_before
+/// || "\n" || turns_covered_after || "\n" || prior_summary)`, counts in decimal
+/// ASCII, the prior summary as UTF-8 (empty when there is none). It names this
+/// request's body, which turns were folded, and the summary being extended,
+/// all of which the client holds.
+pub fn fold_request_digest(
+    salt: &Salt,
+    call_digest: &str,
+    turns_covered_before: usize,
+    turns_covered_after: usize,
+    prior_summary: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(salt.0);
+    hasher.update(FOLD_REQUEST_DOMAIN);
+    hasher.update(call_digest.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(turns_covered_before.to_string().as_bytes());
+    hasher.update(b"\n");
+    hasher.update(turns_covered_after.to_string().as_bytes());
+    hasher.update(b"\n");
+    hasher.update(prior_summary.as_bytes());
+    prefixed(hasher)
+}
+
+/// What a committed fold's outcome binds as its reply:
+/// `sha256(salt || "llm-gateway/fold-reply/v1\n" || summary)`.
+pub fn fold_reply_digest(salt: &Salt, summary: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(salt.0);
+    hasher.update(FOLD_REPLY_DOMAIN);
     hasher.update(summary.as_bytes());
     prefixed(hasher)
 }
