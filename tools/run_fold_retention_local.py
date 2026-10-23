@@ -69,6 +69,14 @@ def vendor_key(name: str) -> str | None:
     return None
 
 
+def cached_price(models_file: str, model: str) -> float | None:
+    """The provider's price for cached prompt tokens, if the models file has one."""
+    text = (BENCH / models_file).read_text(encoding="utf-8")
+    block = text.split(f"  {model}:", 1)[1].split("\n\n", 1)[0]
+    found = re.search(r"cached_input_per_mtok_usd:\s*([0-9.]+)", block)
+    return float(found.group(1)) if found else None
+
+
 def model_prices(models_file: str, model: str) -> tuple[float, float]:
     """The cost the gateway bills for `model`, read from the bench models file."""
     text = (BENCH / models_file).read_text(encoding="utf-8")
@@ -157,6 +165,9 @@ def main(argv: list[str] | None = None) -> int:
                    "--main-input-per-mtok-usd", str(main_in), "--main-output-per-mtok-usd", str(main_out),
                    "--summarizer-input-per-mtok-usd", str(sum_in), "--summarizer-output-per-mtok-usd", str(sum_out),
                    "--output", str(output)]
+        cached = cached_price(provider["models"], provider["main"])
+        if cached is not None:
+            command += ["--main-cached-input-per-mtok-usd", str(cached)]
         if args.max_calls:
             command += ["--max-calls", str(args.max_calls)]
         # The harness gets the gateway keys, never the vendor key.

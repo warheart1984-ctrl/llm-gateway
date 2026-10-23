@@ -40,7 +40,8 @@ async fn handle(Json(body): Json<Value>) -> Response {
             "id": "up-1", "object": "chat.completion", "model": model,
             "choices": [{"index": 0, "finish_reason": "stop",
                          "message": {"role": "assistant", "content": "Hello, world"}}],
-            "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8,
+                      "prompt_tokens_details": {"cached_tokens": 4}}
         }))
         .into_response();
     }
@@ -187,6 +188,8 @@ async fn a_completion_comes_back_in_openai_shape() {
     assert_eq!(body["choices"][0]["message"]["content"], "Hello, world");
     assert_eq!(body["choices"][0]["finish_reason"], "stop");
     assert_eq!(body["usage"]["total_tokens"], body["usage"]["prompt_tokens"].as_u64().unwrap() + body["usage"]["completion_tokens"].as_u64().unwrap());
+    // The provider's prompt-cache count comes through, as OpenAI reports it.
+    assert_eq!(body["usage"]["prompt_tokens_details"]["cached_tokens"], 4);
     assert!(body.get("cost_nano_usd").is_none(), "no gateway-only fields in the OpenAI shape");
     assert!(headers.contains_key("x-receipt-id"), "receipts work the same");
 }

@@ -587,10 +587,33 @@ OpenRouter, 2026-10-23. Main model `openai/gpt-4.1-mini` ($0.40 / $1.60 per Mtok
 How to read these:
 
 - **Only the economics run measures cost.** The lifecycle runs lower the fold thresholds (`min_new_turns: 1`, `min_new_tokens: 0`) to exercise folding in a short run, so most of their fold attempts are cost checks that refuse a fold of one new turn.
-- **No run reached the fold cap.** None got to the frozen or re-fold stage, so this does not cover a summary that has stopped growing. The mutating scenario's correction at the cap was never sent.
+- **No run reached the fold cap.** None got to the frozen or re-fold stage. The longer runs below do.
 - **The scenario is synthetic:** ten facts, one second project to confuse them with. It shows that a cheap summarizer kept every fact here, not that summaries keep facts in general.
 
 Groq (`openai/gpt-oss-120b` main, `openai/gpt-oss-20b` summarizer, 2026-10-23) finished only the fixed lifecycle run. That run kept 182 of 182 facts and saved 5%, but committed just 1 fold of 69 attempts: 46 unprofitable, 9 rejected, 13 failed. The summarizer is a reasoning model priced at half the main model. The other two runs stopped at the account's 200,000-tokens-a-day limit for `gpt-oss-120b`. Their incomplete results are kept and exit `2`.
+
+#### Longer runs, with prompt caching
+
+The gateway bills every prompt token at the full input price. OpenAI, however, serves a repeated prompt prefix from its cache at a quarter of that price ($0.10 per Mtok for `gpt-4.1-mini`). An unfolded conversation only grows at the end, so most of it is cached. A folded one changes near the start at every fold, so little of it is. To see whether that erases the saving, the harness now:
+- records each call's cached prompt tokens (the OpenAI-compatible endpoint returns `usage.prompt_tokens_details.cached_tokens`);
+- prices them at `cached_input_per_mtok_usd` from the models file;
+- reports that as `aggregates.caching.provider_cost_usd`, next to the gateway's own billing.
+
+Summarizer calls are priced with no cache discount. The two arms take turns going first on alternate calls. Each run below was done twice (OpenRouter, 2026-10-23, same models):
+
+| Run | Reached | Facts kept | Folded accuracy | Billed saving | Cached share, unfolded / folded | Provider cost with caching, unfolded → folded | Saving |
+|---|---|---|---|---|---|---|---|
+| fixed, economics, 200 calls | frozen, 8 folds | 1492 / 1492 | 100% | 48% | 59% / 19% | $0.259 → $0.120 | 54% |
+| (repeat) | frozen, 8 folds | 1492 / 1492 | 100% | 51% | 64% / 20% | $0.243 → $0.118 | 51% |
+| mutating, lifecycle, 120 calls | re-folded, 6 folds | 772 / 816 | 96.3% | 53% | 57% / 15% | $0.136 → $0.066 | 52% |
+| (repeat) | re-folded, 8 folds | 836 / 867 | 97.4% | 45% | 65% / 5% | $0.123 → $0.060 | 51% |
+
+What this shows:
+
+- **Caching does not erase the saving.** The unfolded tenant gets 57–65% of its prompt tokens from the cache, but its prompt is still several times larger. Priced the way the provider charges, folding saved 51–54% in all four runs. The billed saving, which ignores caching, varied more between repeats (45–53%).
+- **The economics profile froze at 200 calls and never re-folded.** It reached the fold cap with 8 folds. After that its cost checks refused every re-fold, and it kept every fact.
+- **The mutating runs lost a fact.** In both runs the folded tenant lost the latest `owner` right after a fold and never got it back. Run 1 lost "Noor" from call 31 (fold 3) and was wrong on 44 calls. Run 2 lost "Ines", the correction sent at the cap, from call 89 (its first re-fold) and was wrong on 31 calls. Every other field was kept. Pinned values did not prevent it. Both names were pinned ("Noor replaces Mira" and "owner is now Ines" both match a pin pattern), so each fold had to keep the name somewhere in the summary, yet the answers were still wrong: a pin keeps a value, not which field it belongs to. The result files do not record the wrong answers themselves. Both runs exit `1`, the harness's regression code.
+- **Repeats agree on the shape but not the details:** which fold drops the fact and when differ between repeats, even at `temperature: 0`.
 
 ## Receipts
 

@@ -3,3 +3,6 @@
 # and a key file carries a stray carriage return into the header it is sent in.
 *.sh text eol=lf
 demo/secrets/* text eol=lf
+
+# Never touch line endings in binary documents.
+*.pdf binary

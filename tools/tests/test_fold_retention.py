@@ -79,6 +79,13 @@ class StubHandler(BaseHTTPRequestHandler):
                     "message": {"role": "assistant", "content": json.dumps(fr.INITIAL)},
                     "finish_reason": "stop",
                 }],
+                # An unfolded conversation is mostly served from the provider's
+                # prompt cache; a folded one, whose start changes, is not.
+                "usage": ({"prompt_tokens": 300, "completion_tokens": 10,
+                           "prompt_tokens_details": {"cached_tokens": 0}}
+                          if folded else
+                          {"prompt_tokens": 1000, "completion_tokens": 10,
+                           "prompt_tokens_details": {"cached_tokens": 800}}),
             },
             {"x-gateway-folded": "1"} if folded else {},
         )
@@ -165,6 +172,58 @@ class RetentionTests(unittest.TestCase):
         self.assertNotIn("admin-secret", serialized)
         self.assertFalse(report["settings"]["secrets_written"])
         self.assertEqual(report["calls"][0]["folded"]["folded_turns"], 1)
+
+    def test_the_arms_alternate_and_caching_is_priced(self) -> None:
+        output = Path(self.tmp.name) / "caching.json"
+        prices = {
+            "main_input_per_mtok_usd": 0.40, "main_cached_input_per_mtok_usd": 0.10,
+            "main_output_per_mtok_usd": 1.60,
+            "summarizer_input_per_mtok_usd": 0.10, "summarizer_output_per_mtok_usd": 0.40,
+        }
+        report, code = fr.run_benchmark(
+            base_url=f"http://127.0.0.1:{self.server.server_port}",
+            plain_key="plain-key", folded_key="folded-key", admin_key="admin-secret",
+            model="test/model", scenario_name="fixed", profile="lifecycle",
+            output=output, max_calls=2, timeout=2, prices=prices,
+        )
+        self.assertEqual(code, 0)
+        order = [key for key, _body in self.state.calls]
+        self.assertEqual(order, ["plain-key", "folded-key", "folded-key", "plain-key"])
+        self.assertEqual([row["order"] for row in report["calls"]], ["plain-first", "folded-first"])
+        self.assertEqual(report["calls"][0]["plain"]["usage"],
+                         {"prompt_tokens": 1000, "cached_tokens": 800, "completion_tokens": 10})
+
+        caching = report["aggregates"]["caching"]
+        self.assertAlmostEqual(caching["cached_share"]["plain"], 0.8)
+        self.assertAlmostEqual(caching["cached_share"]["folded"], 0.0)
+        # Per call: plain 200 fresh x 0.40 + 800 cached x 0.10 + 10 out x 1.60,
+        # folded 300 x 0.40 + 10 x 1.60; no summarizer tokens in the stub.
+        cost = caching["provider_cost_usd"]
+        self.assertAlmostEqual(cost["plain"], 2 * (200 * 0.40 + 800 * 0.10 + 10 * 1.60) / 1e6)
+        self.assertAlmostEqual(cost["folded"], 2 * (300 * 0.40 + 10 * 1.60) / 1e6)
+        self.assertAlmostEqual(cost["saving"], cost["plain"] - cost["folded"])
+
+    def test_without_every_price_there_is_no_provider_cost(self) -> None:
+        report, _code = fr.run_benchmark(
+            base_url=f"http://127.0.0.1:{self.server.server_port}",
+            plain_key="plain-key", folded_key="folded-key", admin_key="admin-secret",
+            model="test/model", scenario_name="fixed", profile="lifecycle",
+            output=Path(self.tmp.name) / "partial.json", max_calls=1, timeout=2,
+            prices={"main_input_per_mtok_usd": 0.40},
+        )
+        self.assertIsNone(report["aggregates"]["caching"]["provider_cost_usd"])
+        self.assertAlmostEqual(report["aggregates"]["caching"]["cached_share"]["plain"], 0.8)
+
+
+class Usage(unittest.TestCase):
+    def test_usage_without_cache_details_counts_none_cached(self) -> None:
+        self.assertEqual(fr._usage_of({"usage": {"prompt_tokens": 5, "completion_tokens": 2}}),
+                         {"prompt_tokens": 5, "cached_tokens": 0, "completion_tokens": 2})
+        self.assertEqual(fr._usage_of({}), {"prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0})
+
+    def test_provider_cost_prices_cached_tokens_at_the_cached_rate(self) -> None:
+        usage = {"prompt_tokens": 1_000_000, "cached_tokens": 750_000, "completion_tokens": 0}
+        self.assertAlmostEqual(fr.provider_cost_usd(usage, 0.40, 0.10, 1.60), 0.25 * 0.40 + 0.75 * 0.10)
 
 
 class Retrying(unittest.TestCase):
