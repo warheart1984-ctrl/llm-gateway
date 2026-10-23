@@ -484,7 +484,7 @@ impl ReceiptChain {
             .write(true)
             .open(directory.join("receipts.lock"))
             .map_err(io_err)?;
-        lock_exclusive(&lock)?;
+        acquire_lock(&lock)?;
 
         let signer = load_or_create_signer(&key_path)?;
         fs::write(&public_key_path, format!("{}\n", signer.public_key_text())).map_err(io_err)?;
@@ -1453,6 +1453,25 @@ fn ensure_private(_path: &Path) -> Result<(), ReceiptError> {
 
 const LOCKED: &str = "receipt directory is locked by another process; each replica needs its own directory";
 
+/// How long opening waits for a directory lock before refusing.
+const LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// Take the directory lock, waiting up to `LOCK_WAIT` for it. A lock that was
+/// just released can look held for a moment: on Unix a child process that
+/// another thread is starting holds a copy of every descriptor until it execs,
+/// and `flock` stays held while any copy is open. A second replica on the same
+/// directory still holds it for good, so it is still refused, after the wait.
+fn acquire_lock(file: &File) -> Result<(), ReceiptError> {
+    let deadline = Instant::now() + LOCK_WAIT;
+    loop {
+        match lock_exclusive(file) {
+            Ok(()) => return Ok(()),
+            Err(err) if Instant::now() >= deadline => return Err(err),
+            Err(_) => thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
 #[cfg(unix)]
 fn lock_exclusive(file: &File) -> Result<(), ReceiptError> {
     use std::os::unix::io::AsRawFd;
@@ -1586,7 +1605,7 @@ impl ReceiptBook {
             .write(true)
             .open(root.join("replica.lock"))
             .map_err(io_err)?;
-        lock_exclusive(&lock)?;
+        acquire_lock(&lock)?;
         if root.join("receipts.jsonl").exists() {
             tracing::warn!(
                 root = %root.display(),
@@ -2173,6 +2192,24 @@ mod tests {
         fs::write(&path, "{\"a\":1}\n{\"b\":").unwrap();
         assert_eq!(complete_lines_of(&path).unwrap(), b"{\"a\":1}\n");
         assert!(complete_lines_of(&dir.join("missing")).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_lock_released_while_opening_is_taken_after_a_short_wait() {
+        // A briefly held lock (here a second handle released after 200 ms)
+        // must not refuse the open.
+        let dir = scratch("lock-wait");
+        drop(ReceiptChain::open(&dir, options(100)).unwrap());
+        let holder = OpenOptions::new().write(true).open(dir.join("receipts.lock")).unwrap();
+        lock_exclusive(&holder).unwrap();
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            drop(holder);
+        });
+        let started = Instant::now();
+        ReceiptChain::open(&dir, options(100)).expect("the lock is taken once it is released");
+        assert!(started.elapsed() >= Duration::from_millis(150), "it waited for the release");
+        release.join().unwrap();
     }
 
     #[tokio::test]
