@@ -59,8 +59,9 @@ pub struct Tenant {
     #[serde(default)]
     pub credentials: Vec<Credential>,
     /// Model patterns this tenant may call. `groq/*` matches every Groq model.
-    /// `*` matches everything. Empty means "no models" when
-    /// `require_model_allowlist` is on.
+    /// `*` matches everything. A non-empty list always limits the tenant.
+    /// Empty means "no models" when `require_model_allowlist` is on, and
+    /// "any registry model" when it is off.
     #[serde(default)]
     pub allowed_models: Vec<String>,
     /// Model ids denied even if `allowed_models` would match. Deny wins.
@@ -552,6 +553,15 @@ pub fn qualify(suffix: &str, model: &str) -> String {
     }
 }
 
+/// Whether a tenant's `allowed_models` limits what it may call: always in
+/// strict mode, and otherwise whenever the tenant listed any models. A list
+/// the operator wrote is a limit even when the deployment does not require
+/// one; only a tenant with no list at all, outside strict mode, may call any
+/// registry model.
+fn allowlist_in_force(allowed_models: &[String], require_allowlist: bool) -> bool {
+    require_allowlist || !allowed_models.is_empty()
+}
+
 fn check_model_access(
     tenant: &Tenant,
     qualified_model: &str,
@@ -567,7 +577,7 @@ fn check_model_access(
             model: qualified_model.to_string(),
         });
     }
-    if require_allowlist {
+    if allowlist_in_force(&tenant.allowed_models, require_allowlist) {
         // Fail closed. An empty allowlist means "no models", not "every model":
         // this is the strict mode, and the permissive reading turned a present-
         // but-empty `allowed_models` list into full catalogue access. A tenant
@@ -696,7 +706,7 @@ pub fn validate_with_models(
             // either the deployment requires one, or this tenant supplied one.
             // With `require_allowlist` off and no list, there is nothing to be
             // outside of.
-            if (require_allowlist || !tenant.allowed_models.is_empty())
+            if allowlist_in_force(&tenant.allowed_models, require_allowlist)
                 && !glob_any(&tenant.allowed_models, &qualified)
             {
                 v.errors.push(format!(
@@ -732,8 +742,10 @@ pub fn validate_with_models(
                     folding.summarizer_model
                 ));
             }
+            // The same rule as a request: the summarizer reads the tenant's
+            // conversation, so it must be a model the tenant may call.
             if glob_any(&tenant.denied_models, &requested)
-                || (require_allowlist && !glob_any(&tenant.allowed_models, &requested))
+                || (allowlist_in_force(&tenant.allowed_models, require_allowlist) && !glob_any(&tenant.allowed_models, &requested))
             {
                 v.errors.push(format!(
                     "tenant `{id}` summarizer_model `{}` is not callable by the tenant",
@@ -1079,6 +1091,39 @@ mod tests {
         engine
             .authorize(&principal(), &registry(tenant(&[], &[])), "groq/anything", 1, 10)
             .expect("allowlist enforcement is off, so the empty list must not gate");
+    }
+
+    /// Outside strict mode, a list the tenant does have is still a limit: a
+    /// model it did not list is refused, and one it did is allowed.
+    #[test]
+    fn a_tenants_own_list_limits_it_when_not_required() {
+        let engine = PolicyEngine::new(false, crate::config::DEFAULT_LIMITS);
+        let reg = registry(tenant(&["groq/*"], &[]));
+        engine
+            .authorize(&principal(), &reg, "groq/gpt-oss-20b", 1, 10)
+            .expect("a listed model is allowed");
+        let err = engine
+            .authorize(&principal(), &reg, "openrouter/gpt-4.1-mini", 1, 10)
+            .expect_err("a model outside the tenant's own list must be refused");
+        assert!(matches!(err, AuthorizeError::ModelNotAllowed { .. }), "{err:?}");
+    }
+
+    /// The summarizer reads the conversation, so outside strict mode it must
+    /// still be on the tenant's own list when the tenant has one.
+    #[test]
+    fn a_summarizer_outside_the_tenants_own_list_is_refused_when_not_required() {
+        let mut t = tenant(&["groq/*"], &[]);
+        t.folding = Some(folding_config("openrouter/gpt-4.1-nano"));
+        let v = validate(&registry(t), false, &|_| true);
+        assert!(
+            v.errors.iter().any(|e| e.contains("summarizer_model") && e.contains("not callable")),
+            "{:?}",
+            v.errors
+        );
+        let mut listed = tenant(&["groq/*"], &[]);
+        listed.folding = Some(folding_config("groq/summarizer"));
+        let v = validate(&registry(listed), false, &|_| true);
+        assert!(!v.errors.iter().any(|e| e.contains("summarizer_model")), "{:?}", v.errors);
     }
 
     /// The request-time gate fails closed, so the empty case is also a

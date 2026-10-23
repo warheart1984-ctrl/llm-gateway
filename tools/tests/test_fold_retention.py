@@ -203,5 +203,48 @@ class Retrying(unittest.TestCase):
         self.assertEqual(waits, [])
 
 
+class Redirects(unittest.TestCase):
+    """A redirect is refused, so the API key never reaches the place it points to."""
+
+    def test_a_redirect_is_not_followed_and_the_key_goes_nowhere_else(self) -> None:
+        seen: list[str | None] = []
+
+        class Elsewhere(BaseHTTPRequestHandler):
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+            def do_GET(self) -> None:  # noqa: N802
+                seen.append(self.headers.get("x-api-key"))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"spent_nano_usd": 0}')
+
+        elsewhere = ThreadingHTTPServer(("127.0.0.1", 0), Elsewhere)
+        target = f"http://127.0.0.1:{elsewhere.server_address[1]}/v1/usage"
+
+        class Redirector(BaseHTTPRequestHandler):
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+            def do_GET(self) -> None:  # noqa: N802
+                self.send_response(302)
+                self.send_header("Location", target)
+                self.end_headers()
+
+        redirector = ThreadingHTTPServer(("127.0.0.1", 0), Redirector)
+        servers = [elsewhere, redirector]
+        for server in servers:
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with self.assertRaises(fr.BenchmarkError) as caught:
+                fr._request(f"http://127.0.0.1:{redirector.server_address[1]}", "/v1/usage", "secret-key", None, 5.0)
+            self.assertIn("302", str(caught.exception))
+            self.assertEqual(seen, [], "nothing, and so no key, reached the redirect target")
+        finally:
+            for server in servers:
+                server.shutdown()
+                server.server_close()
+
+
 if __name__ == "__main__":
     unittest.main()

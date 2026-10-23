@@ -18,9 +18,13 @@ received:
 
 `--headers` and `--prior-headers` are JSON objects of response headers (names in
 any case). The prior response supplies the summary being extended and how many
-turns it covered; without one, the fold started from nothing. A fold that was
-rejected sends no summary back, so its `turns_after` (the turns it tried to
-cover) must be given with `--turns-after`.
+turns it covered; without one, the fold started from nothing. `turns_after` is
+`x-gateway-fold-covered`; `--turns-after` is only for responses from gateways
+that did not send it.
+
+A request refused after its fold ran (402, 429, a reused Idempotency-Key)
+carries no `x-receipt-id`, only the salt and the fold's headers; then only the
+fold's receipts are checked.
 
 Exit status: 0 every digest matches, 1 a digest does not match or an entry is
 missing, 2 the input could not be read. Standard library only.
@@ -91,6 +95,16 @@ def folded_turns(headers: dict[str, str]) -> int | None:
         raise Unreadable("x-gateway-folded is not a number") from None
 
 
+def covered_turns(headers: dict[str, str]) -> int | None:
+    value = headers.get("x-gateway-fold-covered")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        raise Unreadable("x-gateway-fold-covered is not a number") from None
+
+
 def verify(log: list[dict], body: bytes, headers: dict, prior_headers: dict | None = None,
            turns_after: int | None = None) -> list[str]:
     """Every check that fails, as one line each. Empty when all match."""
@@ -98,9 +112,12 @@ def verify(log: list[dict], body: bytes, headers: dict, prior_headers: dict | No
     prior = lower_keys(prior_headers or {})
     try:
         salt = bytes.fromhex(headers["x-receipt-salt"])
-        receipt_id = headers["x-receipt-id"]
     except (KeyError, ValueError):
-        raise Unreadable("the headers need x-receipt-id and a hex x-receipt-salt") from None
+        raise Unreadable("the headers need a hex x-receipt-salt") from None
+    receipt_id = headers.get("x-receipt-id")
+    fold_id = headers.get("x-gateway-fold-receipt-id")
+    if receipt_id is None and fold_id is None:
+        raise Unreadable("the headers name no receipt: neither x-receipt-id nor x-gateway-fold-receipt-id")
     by_id = {entry.get("receipt_id"): entry for entry in log}
     outcomes = {entry.get("decision_receipt_id"): entry for entry in log if "decision_receipt_id" in entry}
     failures: list[str] = []
@@ -110,32 +127,38 @@ def verify(log: list[dict], body: bytes, headers: dict, prior_headers: dict | No
             failures.append(f"{what}: log has {actual!r}, recomputed {wanted!r}")
 
     call_digest = request_digest(salt, body)
-    allow = by_id.get(receipt_id)
-    if allow is None:
-        failures.append(f"no entry {receipt_id} in the log")
-    else:
-        expect("request allow call_digest", allow.get("call_digest"), call_digest)
-
     replaced = folded_turns(headers)
     summary = summary_of(headers)
-    if (replaced is None) != (summary is None):
-        failures.append("x-gateway-folded and x-gateway-fold-summary must come together")
-    outcome = outcomes.get(receipt_id)
-    if outcome is None:
-        failures.append(f"no outcome for {receipt_id}")
-    elif replaced is not None and summary is not None:
-        expect("request outcome request_sha256 (folded)", outcome.get("request_sha256"),
-               folded_request_digest(salt, call_digest, replaced, summary))
-    else:
-        expect("request outcome request_sha256", outcome.get("request_sha256"), call_digest)
+    if receipt_id is not None:
+        allow = by_id.get(receipt_id)
+        if allow is None:
+            failures.append(f"no entry {receipt_id} in the log")
+        else:
+            expect("request allow call_digest", allow.get("call_digest"), call_digest)
+        if (replaced is None) != (summary is None):
+            failures.append("x-gateway-folded and x-gateway-fold-summary must come together")
+        outcome = outcomes.get(receipt_id)
+        if outcome is None:
+            failures.append(f"no outcome for {receipt_id}")
+        elif replaced is not None and summary is not None:
+            expect("request outcome request_sha256 (folded)", outcome.get("request_sha256"),
+                   folded_request_digest(salt, call_digest, replaced, summary))
+        else:
+            expect("request outcome request_sha256", outcome.get("request_sha256"), call_digest)
 
-    fold_id = headers.get("x-gateway-fold-receipt-id")
     if fold_id is not None:
-        before = folded_turns(prior) or 0
+        # What the prior response's summary covered: the turns it sent folded,
+        # or, for a refusal whose fold committed, the turns that fold covered.
+        before = folded_turns(prior)
+        if before is None and summary_of(prior) is not None:
+            before = covered_turns(prior)
+        before = before or 0
         prior_summary = summary_of(prior) or ""
-        after = replaced if replaced is not None else turns_after
+        after = covered_turns(headers)
         if after is None:
-            raise Unreadable("this fold was rejected, so its turns_after is not in the headers: pass --turns-after")
+            after = replaced if replaced is not None else turns_after
+        if after is None:
+            raise Unreadable("no x-gateway-fold-covered for this fold: pass --turns-after")
         fold_allow = by_id.get(fold_id)
         wanted = fold_request_digest(salt, call_digest, before, after, prior_summary)
         if fold_allow is None:

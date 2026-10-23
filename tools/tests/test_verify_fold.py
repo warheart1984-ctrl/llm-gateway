@@ -70,6 +70,54 @@ class Verifying(unittest.TestCase):
         with self.assertRaises(vf.Unreadable):
             vf.verify(log, BODY, headers)
 
+    def test_a_rejected_fold_verifies_from_its_covered_header(self) -> None:
+        call = vf.request_digest(SALT, BODY)
+        fold_request = vf.fold_request_digest(SALT, call, 0, 28, "")
+        log = [
+            {"receipt_id": "f", "call_digest": fold_request},
+            {"receipt_id": "fo", "decision_receipt_id": "f", "status": "failed", "request_sha256": fold_request},
+            {"receipt_id": "a", "call_digest": call},
+            {"receipt_id": "o", "decision_receipt_id": "a", "request_sha256": call},
+        ]
+        headers = {"x-receipt-id": "a", "x-receipt-salt": SALT.hex(), "x-gateway-fold-receipt-id": "f",
+                   "x-gateway-fold-covered": "28"}
+        self.assertEqual(vf.verify(log, BODY, headers), [])
+        self.assertTrue(vf.verify(log, BODY, dict(headers, **{"x-gateway-fold-covered": "27"})))
+
+    def test_a_request_refused_after_its_fold_verifies_the_fold(self) -> None:
+        # No request allow was written; the refusal carries the salt and the
+        # fold's headers, including the summary of a fold that committed.
+        call = vf.request_digest(SALT, BODY)
+        fold_request = vf.fold_request_digest(SALT, call, 4, 8, PRIOR)
+        log = [
+            {"receipt_id": "f", "call_digest": fold_request},
+            {"receipt_id": "fo", "decision_receipt_id": "f", "status": "completed", "request_sha256": fold_request,
+             "response_sha256": vf.fold_reply_digest(SALT, SUMMARY)},
+        ]
+        refusal = {"x-receipt-salt": SALT.hex(), "x-gateway-fold-receipt-id": "f", "x-gateway-fold-covered": "8",
+                   "x-gateway-fold-summary": b64(SUMMARY)}
+        prior = {"x-gateway-folded": "4", "x-gateway-fold-summary": b64(PRIOR)}
+        self.assertEqual(vf.verify(log, BODY, refusal, prior), [])
+        self.assertTrue(vf.verify(log, BODY + b" ", refusal, prior), "the body sent")
+        with self.assertRaises(vf.Unreadable):
+            vf.verify(log, BODY, {"x-receipt-salt": SALT.hex()})
+
+    def test_a_refusal_whose_fold_committed_is_the_next_fold_prior(self) -> None:
+        # The prior response was a refusal: no x-gateway-folded, but its fold
+        # committed, so its covered count is where the next fold starts.
+        call = vf.request_digest(SALT, BODY)
+        fold_request = vf.fold_request_digest(SALT, call, 8, 12, SUMMARY)
+        log = [
+            {"receipt_id": "f2", "call_digest": fold_request},
+            {"receipt_id": "fo2", "decision_receipt_id": "f2", "status": "failed", "request_sha256": fold_request},
+            {"receipt_id": "a", "call_digest": call},
+            {"receipt_id": "o", "decision_receipt_id": "a", "request_sha256": call},
+        ]
+        prior = {"x-gateway-fold-covered": "8", "x-gateway-fold-summary": b64(SUMMARY)}
+        headers = {"x-receipt-id": "a", "x-receipt-salt": SALT.hex(), "x-gateway-fold-receipt-id": "f2",
+                   "x-gateway-fold-covered": "12"}
+        self.assertEqual(vf.verify(log, BODY, headers, prior), [])
+
     def test_one_changed_byte_in_any_input_fails(self) -> None:
         log, headers, prior = folded_case()
         changed_body = BODY.replace(b"mock", b"mocK")
