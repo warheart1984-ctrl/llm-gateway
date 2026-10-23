@@ -82,6 +82,8 @@ struct FoldCounters {
     failed: AtomicU64,
     unprofitable: AtomicU64,
     refused_admission: AtomicU64,
+    pinned_overflow: AtomicU64,
+    backed_off: AtomicU64,
     requests: AtomicU64,
     prompt_tokens_cut: AtomicU64,
     summarizer_prompt: AtomicU64,
@@ -192,6 +194,8 @@ impl Metrics {
             FoldAccounting::Failed => &counters.failed,
             FoldAccounting::Unprofitable => &counters.unprofitable,
             FoldAccounting::RefusedAdmission => &counters.refused_admission,
+            FoldAccounting::PinnedOverflow => &counters.pinned_overflow,
+            FoldAccounting::BackedOff => &counters.backed_off,
         };
         slot.fetch_add(1, Ordering::Relaxed);
         counters.summarizer_prompt.fetch_add(prompt_tokens, Ordering::Relaxed);
@@ -717,6 +721,8 @@ impl Metrics {
                     ("failed", counters.failed.load(Ordering::Relaxed)),
                     ("unprofitable", counters.unprofitable.load(Ordering::Relaxed)),
                     ("refused_admission", counters.refused_admission.load(Ordering::Relaxed)),
+                    ("pinned_overflow", counters.pinned_overflow.load(Ordering::Relaxed)),
+                    ("backoff", counters.backed_off.load(Ordering::Relaxed)),
                 ] {
                     outcome_series.push((
                         render_labels(&[("tenant", tenant_label), ("outcome", outcome)], &[]),

@@ -63,6 +63,7 @@ tenants:
     #   min_new_tokens: 400
     #   amortization_requests: 4
     #   min_saving_nano_usd: 0
+    #   backoff_turns: 8         # after a rejected fold, wait this many turns
 
   # Isolated benchmark tenant. Limits are intentionally high enough to expose
   # provider and gateway capacity at the selected test point, but remain finite

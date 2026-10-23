@@ -988,6 +988,59 @@ async fn a_summary_that_drops_a_pinned_value_is_rejected() {
 }
 
 #[tokio::test]
+async fn pinned_values_that_cannot_fit_skip_the_fold_before_it_is_paid_for() {
+    // Every turn carries an id, so the values a summary would have to keep run
+    // far past half of summary_chars (200). No summary could pass the check,
+    // so the summarizer is never called and the request goes out unfolded.
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(FOLDING_TENANT)).await;
+    let mut body = folding_body(30);
+    for (index, message) in body["messages"].as_array_mut().unwrap().iter_mut().enumerate() {
+        message["content"] = json!(format!("release build-{index}-candidate, ticket OPS-{index}"));
+    }
+    let before = spent(&gw, TEST_KEY).await;
+    let (status, headers, _) = gw.post_chat(TEST_KEY, body.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.get("x-gateway-folded").is_none());
+    assert!(summarizer_bodies(&upstream).is_empty(), "no summarizer call for a fold that cannot pass");
+    let sent = upstream.last_body().unwrap();
+    assert_eq!(sent["messages"], body["messages"], "the request goes out unfolded");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let charged = spent(&gw, TEST_KEY).await - before;
+    let reserved = reserved_of(&headers);
+    assert!(charged <= reserved, "only the main request was charged: {charged} > {reserved}");
+    let (_, metrics) = gw.get("/metrics", TEST_KEY).await;
+    assert_eq!(fold_counter(&metrics, "pinned_overflow"), 1, "{metrics}");
+    assert!(!metrics.contains("kind=\"prompt\"} 1"), "{metrics}");
+}
+
+#[tokio::test]
+async fn a_rejected_fold_backs_off_before_paying_again() {
+    // The first fold is rejected (its summary drops "15:30"). Until
+    // backoff_turns (8) more turns arrive, the conversation is not folded
+    // again; after that it is.
+    let upstream = MockUpstream::start(Scenario::SummarizerPinnedDrop).await;
+    let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(FOLDING_TENANT)).await;
+    let body = |turns: usize| {
+        let mut body = folding_body(turns);
+        body["messages"][0]["content"] = json!("The appointment moved to 15:30");
+        body
+    };
+    assert_eq!(gw.post_chat(TEST_KEY, body(6)).await.0, StatusCode::OK);
+    assert_eq!(summarizer_bodies(&upstream).len(), 1);
+    let (status, headers, _) = gw.post_chat(TEST_KEY, body(8)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.get("x-gateway-folded").is_none());
+    assert_eq!(summarizer_bodies(&upstream).len(), 1, "backing off: no second paid fold");
+    let (_, metrics) = gw.get("/metrics", TEST_KEY).await;
+    assert_eq!(fold_counter(&metrics, "rejected"), 1, "{metrics}");
+    assert_eq!(fold_counter(&metrics, "backoff"), 1, "{metrics}");
+    // 8 more turns than the head the rejected fold covered: fold again.
+    assert_eq!(gw.post_chat(TEST_KEY, body(14)).await.0, StatusCode::OK);
+    assert_eq!(summarizer_bodies(&upstream).len(), 2, "the backoff ends after backoff_turns");
+}
+
+#[tokio::test]
 async fn a_length_reply_twice_is_rejected_without_failing_the_main_request() {
     assert_summarizer_failure(Scenario::SummarizerLength, folding_body(6)).await;
 }

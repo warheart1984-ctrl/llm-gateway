@@ -82,12 +82,45 @@ pub fn extract_pinned_terms(text: &str) -> Vec<String> {
     }
     for pattern in durable_patterns() {
         for cap in pattern.captures_iter(text) {
-            if let Some(value) = cap.get(1).or_else(|| cap.get(0)) {
+            // A quoted string is kept as written; a bare match is dropped
+            // when it is only an ordinary hyphenated word.
+            if let Some(value) = cap.get(1) {
+                keep(value.as_str());
+            } else if let Some(value) = cap.get(0)
+                && !is_plain_hyphenated_word(value.as_str())
+            {
                 keep(value.as_str());
             }
         }
     }
     terms
+}
+
+/// First parts that make a lowercase hyphenated word ordinary English:
+/// prefixes ("re-run", "e-mail", "self-check") and the usual compound heads
+/// ("well-known", "follow-up", "built-in", "read-only", "end-to-end").
+const ENGLISH_HEADS: &[&str] = &[
+    "all", "anti", "back", "built", "check", "co", "counter", "cross", "day", "de", "down", "e", "end",
+    "ex", "first", "follow", "front", "full", "half", "high", "ill", "in", "inter", "last", "log",
+    "long", "low", "mid", "multi", "non", "off", "on", "one", "opt", "out", "over", "post", "pre",
+    "read", "real", "re", "self", "semi", "set", "short", "sign", "so", "sub", "two", "un", "under",
+    "up", "well", "write",
+];
+
+/// Deliberate divergence from 5-fold-engine, whose identifier pattern pins
+/// every hyphenated word. On ordinary prose that made the pinned list run past
+/// `summary_chars`, so every fold was paid for and refused. A match is an
+/// ordinary word, and not pinned, only when it is all lowercase letters and
+/// hyphens and its first part is a common English prefix or compound head.
+/// Anything with a digit, an underscore or a capital ("build-42",
+/// "api_key", "ACME-42") is still pinned, and so is a lowercase name like
+/// "staging-db" whose first part is not on the list.
+fn is_plain_hyphenated_word(value: &str) -> bool {
+    let mut parts = value.split('-');
+    let first = parts.next().unwrap_or_default();
+    value.contains('-')
+        && value.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+        && ENGLISH_HEADS.contains(&first)
 }
 
 /// Check if all pinned terms from the source text are present in the summary,
@@ -294,6 +327,19 @@ mod tests {
         for (text, expected) in cases {
             assert_eq!(extract_pinned_terms(text), expected, "{text}");
         }
+    }
+
+    #[test]
+    fn ordinary_hyphenated_words_are_not_values() {
+        assert!(
+            extract_pinned_terms("A well-known follow-up: e-mail the team and re-run the self-check.").is_empty(),
+            "{:?}",
+            extract_pinned_terms("A well-known follow-up: e-mail the team and re-run the self-check.")
+        );
+        assert_eq!(
+            extract_pinned_terms("Use staging-db, build-42, BLUE_TEAM and api_key_v2 by 2026-11-02 for $19.99."),
+            ["2026-11-02", "staging-db", "build-42", "BLUE_TEAM", "api_key_v2", "$19.99"]
+        );
     }
 
     #[test]

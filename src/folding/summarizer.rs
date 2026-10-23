@@ -90,12 +90,7 @@ fn build_summarizer_prompt(
     let new_turns = format_turns(pending_turns);
     // The same values the commit check will demand, so the summarizer is told
     // what it must keep instead of guessing (5-fold-engine's `fold_prompt`).
-    let mut source = checks::build_source_text(pending_turns);
-    if let Some(prior) = prior_summary {
-        source.push('\n');
-        source.push_str(prior);
-    }
-    let pinned = checks::extract_pinned_terms(&source);
+    let pinned = pinned_terms(prior_summary, pending_turns);
 
     let mut prompt = FOLD_PROMPT_TEMPLATE
         .replace("{budget}", &config.summary_chars.to_string())
@@ -107,6 +102,27 @@ fn build_summarizer_prompt(
         prompt.push('.');
     }
     prompt
+}
+
+/// The values a fold of `pending_turns` onto `prior_summary` must keep: the
+/// list the commit check demands and the prompt asks for.
+pub fn pinned_terms(prior_summary: Option<&str>, pending_turns: &[ChatMessage]) -> Vec<String> {
+    let mut source = checks::build_source_text(pending_turns);
+    if let Some(prior) = prior_summary {
+        source.push('\n');
+        source.push_str(prior);
+    }
+    checks::extract_pinned_terms(&source)
+}
+
+/// Whether `terms`, comma-separated, take at most half of `summary_chars`.
+/// Past that, a summary that keeps them all has almost no room left to say
+/// what they are, and in practice fails the check: such a fold is skipped
+/// before the summarizer is paid.
+pub fn pinned_terms_fit(terms: &[String], summary_chars: usize) -> bool {
+    let needed: usize =
+        terms.iter().map(|term| term.chars().count()).sum::<usize>() + 2 * terms.len().saturating_sub(1);
+    needed.saturating_mul(2) <= summary_chars
 }
 
 /// Format turns for the summarizer prompt.

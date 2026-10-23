@@ -552,6 +552,7 @@ folding:
   min_new_tokens: 400
   amortization_requests: 4
   min_saving_nano_usd: 0
+  backoff_turns: 8                     # after a rejected fold, wait this many more turns
 ```
 
 `[folding]` in `config/default.toml` bounds the in-memory store (`max_entries`, `max_total_chars`) and sets `background`. The default runs the fold before the request is forwarded. `background = true` answers with the summary already committed and folds afterwards, which spends the tenant's budget after the response.
@@ -560,7 +561,9 @@ What a fold costs and keeps:
 
 - **The summarizer call takes a rate slot.** It is admitted like any request, so a fold only runs when the tenant's rate window has room for it and for the request it serves. Near the limit, the request goes out unfolded rather than being refused. A request that is refused afterwards for budget or a repeated `Idempotency-Key` has still paid for its fold; the summary it made is kept for the next request.
 - **It is billed like a main call.** Summarizer prompt tokens are billed at no less than the gateway's estimate of what was sent, and a summarizer that reports no usage is billed the estimated output. `gw_fold_summarizer_tokens_total` counts what was billed.
-- **Values that must survive are pinned.** Times, dates, hyphenated or underscored identifiers, ticket ids, short quoted strings, amounts, and explicit updates ("moved to 15:30", "actually use Tromso instead of Oslo") must appear in the clipped summary, or the fold is refused and the previous summary stays. System messages are not pinned: they go out verbatim on every request.
+- **Values that must survive are pinned.** Times, dates, hyphenated or underscored identifiers, ticket ids, short quoted strings, amounts, and explicit updates ("moved to 15:30", "actually use Tromso instead of Oslo") must appear in the clipped summary, or the fold is refused and the previous summary stays. System messages are not pinned: they go out verbatim on every request. Ordinary hyphenated words ("well-known", "follow-up", "e-mail", "re-run") are not values; anything with a digit, an underscore or a capital still is.
+- **A fold that cannot pass is not paid for.** If the pinned values alone would take more than half of `summary_chars`, the fold is skipped before the summarizer is admitted (`gw_folds_total{outcome="pinned_overflow"}`). Raise `summary_chars` for conversations heavy in ids and codes.
+- **A rejected fold backs off.** After a summary fails its checks, comes back empty, or stops at the length limit, that conversation is not folded again until `backoff_turns` more turns have arrived (`outcome="backoff"`). A provider error does not back off; it is usually transient.
 - **One fold per conversation at a time.** A request that finds a fold running for its conversation goes out with the summary already committed.
 - **A conversation is keyed by tenant, API key, system messages and first turn.** Sessions behind different keys never share a summary.
 - **The store is shared by all tenants.** One busy tenant can evict others' summaries, which then pay to fold again. Size `max_entries` and `max_total_chars` for every folding tenant together.
