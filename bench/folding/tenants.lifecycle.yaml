@@ -17,6 +17,9 @@ tenants:
         scopes: [chat:stream, models:read]
     allowed_models: ["groq/gpt-oss-120b", "groq/gpt-oss-20b"]
     default_model: groq/gpt-oss-120b
+    # Receipts on, so the gateway returns the summary it sent
+    # (x-gateway-fold-summary) and the benchmark can keep it.
+    receipts: true
     folding:
       enabled: true
       summarizer_model: groq/gpt-oss-20b

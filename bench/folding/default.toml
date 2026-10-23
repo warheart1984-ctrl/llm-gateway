@@ -62,7 +62,10 @@ quota_split_replicas = 0
 quota_split_margin_percent = 100
 
 [receipts]
-enabled = false
+# On for the folded tenant, so the gateway returns the summary it sent
+# (x-gateway-fold-summary) and the benchmark can keep it. The local runner
+# points `directory` at the run's temporary folder.
+enabled = true
 directory = "receipts"
 anchor_every = 1000
 anchor_interval_secs = 60

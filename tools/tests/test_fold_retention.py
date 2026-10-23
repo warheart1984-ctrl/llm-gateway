@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -13,6 +14,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import fold_retention as fr  # noqa: E402
+import run_fold_retention_local as runner  # noqa: E402
 
 
 class StubState:
@@ -20,6 +22,10 @@ class StubState:
         self.spend = {"plain-key": 0, "folded-key": 0}
         self.calls: list[tuple[str, dict]] = []
         self.committed = 0
+        # What the folded arm answers instead of the facts, and the summary it
+        # is sent on each of its calls (none: no x-gateway-fold-summary).
+        self.folded_answer: dict | None = None
+        self.summaries: list[str] = []
 
 
 class StubHandler(BaseHTTPRequestHandler):
@@ -49,6 +55,9 @@ class StubHandler(BaseHTTPRequestHandler):
             body = "\n".join([
                 '# TYPE gw_folds_total counter',
                 f'gw_folds_total{{tenant="folded",outcome="committed"}} {self.state.committed}',
+                f'gw_fold_checks_failed_total{{tenant="folded",check="pinned_facts_present"}} {self.state.committed // 2}',
+                'gw_fold_checks_failed_total{tenant="folded",check="non_empty"} 0',
+                f'gw_fold_corrective_retries_total{{tenant="folded",result="committed"}} {self.state.committed // 3}',
                 'gw_folds_total{tenant="folded",outcome="rejected"} 0',
                 'gw_folds_total{tenant="folded",outcome="failed"} 0',
                 'gw_fold_summarizer_tokens_total{tenant="folded",kind="prompt"} 0',
@@ -70,13 +79,21 @@ class StubHandler(BaseHTTPRequestHandler):
         self.state.calls.append((key, body))
         self.state.spend[key] = self.state.spend.get(key, 0) + 100
         folded = key == "folded-key"
+        headers: dict[str, str] = {}
+        answer = fr.INITIAL
         if folded:
             self.state.committed += 1
+            headers = {"x-gateway-folded": "1", "x-request-id": f"req-{self.state.committed}"}
+            if self.state.summaries:
+                text = self.state.summaries[self.state.committed - 1]
+                headers["x-gateway-fold-summary"] = base64.urlsafe_b64encode(text.encode("utf-8")).decode().rstrip("=")
+            if self.state.folded_answer is not None:
+                answer = self.state.folded_answer
         self._json(
             200,
             {
                 "choices": [{
-                    "message": {"role": "assistant", "content": json.dumps(fr.INITIAL)},
+                    "message": {"role": "assistant", "content": json.dumps(answer)},
                     "finish_reason": "stop",
                 }],
                 # An unfolded conversation is mostly served from the provider's
@@ -87,7 +104,7 @@ class StubHandler(BaseHTTPRequestHandler):
                           {"prompt_tokens": 1000, "completion_tokens": 10,
                            "prompt_tokens_details": {"cached_tokens": 800}}),
             },
-            {"x-gateway-folded": "1"} if folded else {},
+            headers,
         )
 
 
@@ -213,6 +230,94 @@ class RetentionTests(unittest.TestCase):
         )
         self.assertIsNone(report["aggregates"]["caching"]["provider_cost_usd"])
         self.assertAlmostEqual(report["aggregates"]["caching"]["cached_share"]["plain"], 0.8)
+
+
+    def test_wrong_answers_summaries_and_fold_outcomes_are_recorded(self) -> None:
+        wrong = dict(fr.INITIAL, owner="Ana")
+        del wrong["city"]
+        self.state.folded_answer = wrong
+        # The second call is sent the same summary as the first; it is kept once.
+        self.state.summaries = ["Owner: Mira. City: Oslo.", "Owner: Mira. City: Oslo.", "Owner: Noor \u00e9."]
+        report, _code = fr.run_benchmark(
+            base_url=f"http://127.0.0.1:{self.server.server_port}",
+            plain_key="plain-key", folded_key="folded-key", admin_key="admin-secret",
+            model="test/model", scenario_name="fixed", profile="lifecycle",
+            output=Path(self.tmp.name) / "diagnostics.json", max_calls=3, timeout=2,
+        )
+        fields = report["calls"][0]["fields"]
+        self.assertEqual(fields["owner"]["folded_answer"], {"value": "Ana"})
+        self.assertEqual(fields["city"]["folded_answer"], {"missing": True})
+        self.assertNotIn("folded_answer", fields["project_id"])
+        self.assertTrue(all("plain_answer" not in field for field in fields.values()))
+
+        self.assertEqual(
+            [(entry["call"], entry["text"]) for entry in report["fold_summaries"]],
+            [(1, "Owner: Mira. City: Oslo."), (3, "Owner: Noor \u00e9.")],
+        )
+        self.assertEqual(report["fold_summaries"][1]["chars"], len("Owner: Noor \u00e9."))
+        folded = report["calls"][1]["folded"]
+        self.assertEqual(folded["request_id"], "req-2")
+        self.assertEqual(folded["fold_outcomes"], {"committed": 1})
+        # The stub counts a failed pinned-value check on every second call.
+        self.assertEqual(folded["failed_checks"], {"pinned_facts_present": 1})
+        self.assertEqual(report["calls"][0]["folded"]["failed_checks"], {})
+        self.assertEqual(report["aggregates"]["folds"]["failed_checks"], {"pinned_facts_present": 1})
+        # And a committed corrective retry on every third.
+        self.assertEqual(report["calls"][2]["folded"]["corrective_retries"], {"committed": 1})
+        self.assertEqual(report["calls"][1]["folded"]["corrective_retries"], {})
+        self.assertEqual(report["aggregates"]["folds"]["corrective_retries"], {"committed": 1})
+
+    def test_a_plain_arm_that_is_wrong_is_recorded_too(self) -> None:
+        self.assertEqual(fr.answered(fr.score_answer("not json", {"a": 1}, "stop"), "a"), {"missing": True})
+        self.assertEqual(fr.answered(fr.score_answer('{"a": null}', {"a": 1}, "stop"), "a"), {"value": None})
+
+
+class Diagnostics(unittest.TestCase):
+    def test_a_summary_header_decodes_without_padding(self) -> None:
+        text = "Owner is now Ines \u2014 caf\u00e9"
+        header = base64.urlsafe_b64encode(text.encode("utf-8")).decode().rstrip("=")
+        self.assertEqual(fr.decode_fold_summary(header), text)
+        with self.assertRaises(ValueError):
+            fr.decode_fold_summary(base64.urlsafe_b64encode(b"\xff\xfe").decode())
+
+    def test_fold_outcome_deltas_name_only_what_moved_for_the_tenant(self) -> None:
+        def key(outcome: str, tenant: str = "folded") -> tuple:
+            return ("gw_folds_total", tuple(sorted({"tenant": tenant, "outcome": outcome}.items())))
+        before = {key("committed"): 2, key("unprofitable"): 5, key("committed", "plain"): 0}
+        after = {key("committed"): 2, key("unprofitable"): 6, key("backoff"): 1, key("committed", "plain"): 9}
+        self.assertEqual(fr.fold_outcome_deltas(before, after), {"backoff": 1, "unprofitable": 1})
+
+    def test_a_replaced_summarizer_is_named_in_the_result_file(self) -> None:
+        self.assertEqual(runner.result_name("openrouter", "mutating", "lifecycle", "T1"),
+                         "fold_retention_openrouter_mutating_lifecycle_T1.json")
+        self.assertEqual(runner.result_name("openrouter", "mutating", "lifecycle", "T1", "openrouter/gpt-4.1-mini"),
+                         "fold_retention_openrouter_mutating_lifecycle_T1_sum-gpt-4.1-mini.json")
+
+    def test_the_runner_attaches_each_logged_fold_decision_by_request_id(self) -> None:
+        decision = {"outcome": "refused", "reason": "cost_check", "fold_count": 8}
+        log = "\n".join([
+            "not json",
+            json.dumps({"message": "stream complete", "request_id": "req-1", "tenant": "folded",
+                        "fold": json.dumps(decision)}),
+            json.dumps({"fields": {"message": "stream complete", "request_id": "req-2",
+                                   "fold": json.dumps(dict(decision, reason="max_folds"))}}),
+            json.dumps({"message": "stream complete", "request_id": "req-3"}),
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            result, log_path = Path(tmp) / "result.json", Path(tmp) / "gateway.log"
+            log_path.write_text(log, encoding="utf-8")
+            result.write_text(json.dumps({"calls": [
+                {"folded": {"request_id": "req-1"}},
+                {"folded": {"request_id": "req-2"}},
+                {"folded": {"request_id": "req-3"}},
+                {"folded": {"request_id": None}},
+            ]}), encoding="utf-8")
+            self.assertEqual(runner.attach_fold_decisions(result, log_path), 2)
+            calls = json.loads(result.read_text(encoding="utf-8"))["calls"]
+        self.assertEqual(calls[0]["folded"]["fold_decision"], decision)
+        self.assertEqual(calls[1]["folded"]["fold_decision"]["reason"], "max_folds")
+        self.assertNotIn("fold_decision", calls[2]["folded"])
+        self.assertNotIn("fold_decision", calls[3]["folded"])
 
 
 class Usage(unittest.TestCase):

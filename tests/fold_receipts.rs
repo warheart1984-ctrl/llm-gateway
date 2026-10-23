@@ -430,7 +430,9 @@ async fn a_rejected_fold_writes_a_failed_outcome_and_the_request_goes_out_unfold
     let body = conversation_with_pinned_value(30);
     let (status, headers, text) = gateway.post("/v1/chat/stream", &body, &[]).await;
     assert_eq!(status, StatusCode::OK, "{text}");
-    assert_eq!(mock.summarizer_calls(), 1);
+    // The summary and its corrective retry, under the fold's one allow, as a
+    // retry for a reply that ran out of tokens is.
+    assert_eq!(mock.summarizer_calls(), 2);
     let fold_id = header(&headers, "x-gateway-fold-receipt-id").expect("a fold ran");
     let fold_outcome = gateway.outcome_of(fold_id);
     assert_eq!(fold_outcome["status"], "failed");

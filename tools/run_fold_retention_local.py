@@ -20,7 +20,17 @@ Keys:
 
 `--provider` picks the models: `groq` uses `bench/folding/models.yaml`, and
 `openrouter` uses `bench/folding/models.openrouter.yaml`, with the same tenant
-files and the model ids swapped.
+files and the model ids swapped. `--summarizer` replaces the provider's
+summarizer with another model from the same file (`--summarizer
+openrouter/gpt-4.1-mini`); the result file's name then ends in
+`_sum-<model>`.
+
+Receipts are on for the folded tenant, so the gateway returns the summary it
+sent in `x-gateway-fold-summary` and the harness can keep it. The receipt
+files stay in the run's temporary config folder. After the run, each folded
+call's fold decision (outcome, reason code, turns, cost estimates; counts and
+hashes, no text) is read from the gateway log and added to the result file as
+`fold_decision`.
 
 Exit status is `tools/fold_retention.py`'s: 0 no regression, 1 regression, 2
 incomplete (including a missing key or a gateway that did not start).
@@ -29,6 +39,7 @@ incomplete (including a missing key or a gateway that did not start).
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import secrets
@@ -88,6 +99,57 @@ def model_prices(models_file: str, model: str) -> tuple[float, float]:
     return found[0], found[1]
 
 
+def fold_decisions(log_text: str) -> dict[str, dict]:
+    """The fold decision the gateway logged for each request id."""
+    decisions: dict[str, dict] = {}
+    for line in log_text.splitlines():
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        fields = entry.get("fields", entry) if isinstance(entry, dict) else {}
+        fold, request_id = fields.get("fold"), fields.get("request_id")
+        if not isinstance(fold, str) or not isinstance(request_id, str):
+            continue
+        try:
+            decision = json.loads(fold)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(decision, dict):
+            decisions[request_id] = decision
+    return decisions
+
+
+def attach_fold_decisions(result: Path, log: Path) -> int:
+    """Add each folded call's logged decision to the result file; returns how
+    many calls got one."""
+    report = json.loads(result.read_text(encoding="utf-8"))
+    decisions = fold_decisions(log.read_text(encoding="utf-8", errors="replace"))
+    attached = 0
+    for row in report.get("calls", report.get("rows", [])):
+        decision = decisions.get(row.get("folded", {}).get("request_id") or "")
+        if decision is not None:
+            row["folded"]["fold_decision"] = decision
+            attached += 1
+    result.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return attached
+
+
+def stop(gateway: subprocess.Popen | None) -> None:
+    if gateway is not None and gateway.poll() is None:
+        gateway.terminate()
+        try:
+            gateway.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            gateway.kill()
+
+
+def result_name(provider: str, scenario: str, profile: str, stamp: str, summarizer: str | None = None) -> str:
+    """The result file's name; a summarizer other than the provider's own is named in it."""
+    suffix = f"_sum-{summarizer.rsplit('/', 1)[-1]}" if summarizer else ""
+    return f"fold_retention_{provider}_{scenario}_{profile}_{stamp}{suffix}.json"
+
+
 def free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -113,6 +175,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scenario", choices=["fixed", "mutating"], default="fixed")
     parser.add_argument("--profile", choices=["lifecycle", "economics"], default="economics")
     parser.add_argument("--provider", choices=sorted(PROVIDERS), default="groq")
+    parser.add_argument("--summarizer", help="a model id from the provider's models file, in place of its summarizer")
     parser.add_argument("--max-calls", type=int)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--binary", type=Path, default=ROOT / "target" / "release" /
@@ -120,6 +183,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     provider = PROVIDERS[args.provider]
+    summarizer = args.summarizer or provider["summarizer"]
+    if f"  {summarizer}:" not in (BENCH / provider["models"]).read_text(encoding="utf-8"):
+        print(f"run-fold-retention: {summarizer} is not in {provider['models']}", file=sys.stderr)
+        return 2
     key = vendor_key(provider["key"])
     if not key:
         print(f"run-fold-retention: {provider['key']} is not set (environment or user environment)", file=sys.stderr)
@@ -141,12 +208,14 @@ def main(argv: list[str] | None = None) -> int:
         shutil.copy(BENCH / provider["models"], config / "models.yaml")
         tenants = "tenants.lifecycle.yaml" if args.profile == "lifecycle" else "tenants.yaml"
         text = (BENCH / tenants).read_text(encoding="utf-8")
-        text = text.replace(GROQ_SUMMARIZER, provider["summarizer"]).replace(GROQ_MAIN, provider["main"])
+        text = text.replace(GROQ_SUMMARIZER, summarizer).replace(GROQ_MAIN, provider["main"])
         (config / "tenants.yaml").write_text(text, encoding="utf-8")
 
         gateway_env = dict(os.environ, **gateway_keys, **{provider["key"]: key},
                            LLM_GATEWAY_CONFIG_DIR=str(config),
-                           LLM_GATEWAY__SERVER__PORT=str(port))
+                           LLM_GATEWAY__SERVER__PORT=str(port),
+                           LLM_GATEWAY__RECEIPTS__ENABLED="true",
+                           LLM_GATEWAY__RECEIPTS__DIRECTORY=str(config / "receipts"))
         with log_path.open("wb") as log:
             gateway = subprocess.Popen([str(args.binary)], cwd=ROOT, env=gateway_env,
                                        stdout=log, stderr=subprocess.STDOUT)
@@ -155,10 +224,10 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
         main_in, main_out = model_prices(provider["models"], provider["main"])
-        sum_in, sum_out = model_prices(provider["models"], provider["summarizer"])
+        sum_in, sum_out = model_prices(provider["models"], summarizer)
         stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
         output = args.output or (ROOT / "benchmark_results" /
-                                 f"fold_retention_{args.provider}_{args.scenario}_{args.profile}_{stamp}.json")
+                                 result_name(args.provider, args.scenario, args.profile, stamp, args.summarizer))
         command = [sys.executable, "-u", str(ROOT / "tools" / "fold_retention.py"),
                    "--base-url", base_url, "--model", provider["main"],
                    "--scenario", args.scenario, "--profile", args.profile,
@@ -175,14 +244,14 @@ def main(argv: list[str] | None = None) -> int:
         harness_env.update(LLM_GATEWAY_PLAIN_KEY=gateway_keys["GATEWAY_KEY_PLAIN"],
                            LLM_GATEWAY_FOLDED_KEY=gateway_keys["GATEWAY_KEY_FOLDED"],
                            LLM_GATEWAY_ADMIN_KEY=gateway_keys["GATEWAY_KEY_BENCH_ADMIN"])
-        return subprocess.run(command, cwd=ROOT, env=harness_env).returncode
+        code = subprocess.run(command, cwd=ROOT, env=harness_env).returncode
+        stop(gateway)
+        if output.exists():
+            attached = attach_fold_decisions(output, log_path)
+            print(f"run-fold-retention: fold decisions attached to {attached} calls", file=sys.stderr)
+        return code
     finally:
-        if gateway is not None and gateway.poll() is None:
-            gateway.terminate()
-            try:
-                gateway.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                gateway.kill()
+        stop(gateway)
         # The log may name request ids and errors; it never holds a key.
         print(f"run-fold-retention: gateway log kept at {log_path}", file=sys.stderr)
 
