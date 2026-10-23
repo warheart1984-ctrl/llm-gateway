@@ -104,6 +104,7 @@ fn build_summarizer_prompt(
     // what it must keep instead of guessing (5-fold-engine's `fold_prompt`).
     let pinned = pinned_terms(prior_summary, pending_turns);
     let fields = field_pins(pending_turns);
+    let replaced = superseded(prior_summary, pending_turns);
 
     let mut prompt = FOLD_PROMPT_TEMPLATE
         .replace("{budget}", &config.summary_chars.to_string())
@@ -112,6 +113,11 @@ fn build_summarizer_prompt(
     if !fields.is_empty() {
         prompt.push_str("\n\nCurrent facts must include these, each on its own line with this field name: ");
         prompt.push_str(&fields.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "));
+        prompt.push('.');
+    }
+    if !replaced.is_empty() {
+        prompt.push_str("\n\nThese values were replaced; never state them as current, only after \"(was\": ");
+        prompt.push_str(&replaced.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "));
         prompt.push('.');
     }
     if !pinned.is_empty() {
@@ -140,6 +146,13 @@ pub fn pinned_terms(prior_summary: Option<&str>, pending_turns: &[ChatMessage]) 
 /// so pinning both would demand a stale value.
 pub fn field_pins(pending_turns: &[ChatMessage]) -> Vec<checks::FieldPin> {
     checks::extract_field_pins(&checks::build_source_text(pending_turns))
+}
+
+/// The values a fold must not state as current: those the prior summary
+/// records as replaced, updated by the turns being folded.
+pub fn superseded(prior_summary: Option<&str>, pending_turns: &[ChatMessage]) -> Vec<checks::Superseded> {
+    let known = prior_summary.map(checks::superseded_in_summary).unwrap_or_default();
+    checks::apply_supersessions(known, &checks::build_source_text(pending_turns))
 }
 
 /// Whether `terms`, comma-separated, take at most half of `summary_chars`.
@@ -182,6 +195,9 @@ pub fn run_checks_with_prior(
     let clipped = checks::clip_to_chars(summary, config.summary_chars);
     if let Err(missing) = checks::check_field_pins(&clipped, &field_pins(turns_being_summarized)) {
         errors.extend(missing.into_iter().map(|pin| format!("field_value_present: missing '{pin}'")));
+    }
+    if let Err(stated) = checks::check_superseded(&clipped, &superseded(prior_summary, turns_being_summarized)) {
+        errors.extend(stated.into_iter().map(|value| format!("superseded_not_current: states '{value}'")));
     }
     if errors.is_empty() { Ok(clipped) } else { Err(errors) }
 }
@@ -276,6 +292,28 @@ mod tests {
         let summary = format!("Context: {}\nowner: Ines", "x".repeat(40));
         let err = run_checks_with_prior(&summary, None, &turns, &config).unwrap_err();
         assert!(err.iter().any(|e| e.contains("owner: Ines")), "{err:?}");
+    }
+
+    #[test]
+    fn run_checks_rejects_a_flipped_replacement() {
+        let config = PlanConfig { summary_chars: 1200, ..Default::default() };
+        let turns = vec![msg("user", "Ownership correction: Noor replaces Mira, and delivery moves to Bergen.")];
+        let flipped = "Current facts:\n- owner: Mira (was Noor)\n- delivery city: Bergen";
+        let err = run_checks_with_prior(flipped, None, &turns, &config).unwrap_err();
+        assert_eq!(err, ["superseded_not_current: states 'Mira (by Noor)'"]);
+        let right = "Current facts:\n- owner: Noor (was Mira)\n- delivery city: Bergen";
+        assert!(run_checks_with_prior(right, None, &turns, &config).is_ok());
+    }
+
+    #[test]
+    fn a_later_fold_cannot_flip_back_what_the_prior_summary_replaced() {
+        let config = PlanConfig { summary_chars: 1200, ..Default::default() };
+        let prior = "Current facts:\n- owner: Noor (was Mira)";
+        let turns = vec![msg("user", "Progress note: nothing changed.")];
+        let err = run_checks_with_prior("Current facts:\n- owner: Mira", Some(prior), &turns, &config).unwrap_err();
+        assert!(err.iter().any(|e| e.contains("superseded_not_current")), "{err:?}");
+        let prompt = build_summarizer_prompt(&config, Some(prior), &turns, 512);
+        assert!(prompt.contains("never state them as current, only after \"(was\": Mira (by Noor)."), "{prompt}");
     }
 
     #[test]

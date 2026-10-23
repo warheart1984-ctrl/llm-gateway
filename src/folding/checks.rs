@@ -87,9 +87,9 @@ const NOT_FIELDS: &[&str] = &[
     "we", "i", "you", "and", "or", "but", "now", "so", "then",
 ];
 
-/// The field/value pairs `text` sets, the latest value for each field, in the
-/// order each field first appears. Fields are lowercased.
-pub fn extract_field_pins(text: &str) -> Vec<FieldPin> {
+/// Every field update in `text` as (offset of the value, lowercased field,
+/// value), in text order.
+fn field_updates(text: &str) -> Vec<(usize, String, String)> {
     let mut found: Vec<(usize, String, String)> = Vec::new();
     for pattern in field_value_patterns() {
         for cap in pattern.captures_iter(text) {
@@ -102,8 +102,14 @@ pub fn extract_field_pins(text: &str) -> Vec<FieldPin> {
         }
     }
     found.sort_by_key(|(at, _, _)| *at);
+    found
+}
+
+/// The field/value pairs `text` sets, the latest value for each field, in the
+/// order each field first appears. Fields are lowercased.
+pub fn extract_field_pins(text: &str) -> Vec<FieldPin> {
     let mut pins: Vec<FieldPin> = Vec::new();
-    for (_, field, value) in found {
+    for (_, field, value) in field_updates(text) {
         match pins.iter_mut().find(|pin| pin.field == field) {
             Some(pin) => pin.value = value,
             None => pins.push(FieldPin { field, value }),
@@ -133,6 +139,138 @@ pub fn check_field_pins(summary: &str, pins: &[FieldPin]) -> Result<(), Vec<Stri
         .map(ToString::to_string)
         .collect();
     if missing.is_empty() { Ok(()) } else { Err(missing) }
+}
+
+/// A value the conversation replaced, which a summary must not state as
+/// current: "Noor replaces Mira" makes Mira one. An update that names no field
+/// gives no field pin, and in the folding benchmark the summarizer turned that
+/// very sentence into "owner: Mira (was Noor)": the pinned "Noor" was still
+/// there, after "(was".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Superseded {
+    pub old: String,
+    pub by: Option<String>,
+}
+
+impl std::fmt::Display for Superseded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.by {
+            Some(by) => write!(f, "{} (by {})", self.old, by),
+            None => write!(f, "{}", self.old),
+        }
+    }
+}
+
+/// A value that looks like one: it starts with a digit or a capital, so
+/// ordinary words ("now, not later") never count as replaced.
+const STRONG_VALUE: &str = r"\d{1,2}:\d{2}|[A-Z0-9][\w-]*";
+
+/// Sentences that replace one value with another. Each has an `old` group and,
+/// where the sentence says it, a `new` one.
+fn supersession_patterns() -> &'static [Regex] {
+    static RE: OnceLock<Vec<Regex>> = OnceLock::new();
+    RE.get_or_init(|| {
+        [
+            // "Noor replaces Mira", "Noor replaced Mira"
+            r"\b(?P<new>[A-Z][\w-]*)\s+replace[sd]\s+(?P<old>[A-Z][\w-]*)".to_string(),
+            // "deliver to Bergen instead of Oslo"
+            format!(r"\b(?P<new>{STRONG_VALUE})\s+(?:instead\s+of|rather\s+than)\s+(?P<old>{STRONG_VALUE})"),
+            // "staging now listens on 8444, not 8443"
+            format!(r"\b(?P<new>{STRONG_VALUE}),?\s+not\s+(?P<old>{STRONG_VALUE})"),
+            // "delivery moves to Tromso, superseding Bergen"
+            format!(r"\b(?P<new>{STRONG_VALUE})[,;]?\s+superseding\s+(?P<old>{STRONG_VALUE})"),
+            // "2400 USD is void", "1800 USD is obsolete"
+            r"\b(?P<old>\d[\d.,]*(?:\s?[A-Z]{2,4})?)\s+is\s+(?:now\s+)?(?:void|obsolete)\b".to_string(),
+        ]
+        .iter()
+        .map(|pattern| Regex::new(pattern).expect("supersession pattern compiles"))
+        .collect()
+    })
+}
+
+/// `known` (replaced values from earlier, such as a prior summary's), updated
+/// by `text` in order: each sentence that replaces a value adds it, and a later
+/// update that names a replaced value again (as the new value, or as a field's
+/// value) takes it back off the list.
+pub fn apply_supersessions(known: Vec<Superseded>, text: &str) -> Vec<Superseded> {
+    let mut events: Vec<(usize, Option<String>, Option<String>)> = Vec::new();
+    for pattern in supersession_patterns() {
+        for cap in pattern.captures_iter(text) {
+            let Some(old) = cap.name("old") else { continue };
+            let new = cap.name("new").map(|m| m.as_str().to_string());
+            events.push((old.start(), Some(old.as_str().trim().to_string()), new));
+        }
+    }
+    events.extend(field_updates(text).into_iter().map(|(at, _, value)| (at, None, Some(value))));
+    events.sort_by_key(|(at, _, _)| *at);
+    let mut replaced = known;
+    for (_, old, new) in events {
+        if let Some(new) = &new {
+            replaced.retain(|entry| !entry.old.eq_ignore_ascii_case(new));
+        }
+        if let Some(old) = old
+            && !replaced.iter().any(|entry| entry.old.eq_ignore_ascii_case(&old))
+        {
+            replaced.push(Superseded { old, by: new });
+        }
+    }
+    replaced
+}
+
+/// The replaced values a summary records itself, as "field: new (was old)"
+/// lines. Only values that look like one count, so a note such as
+/// "(was forbidden)" cannot stop another field from being forbidden. Notes
+/// that contradict each other ("Mira (was Noor)" and "Noor (was Mira)") give
+/// neither value.
+pub fn superseded_in_summary(summary: &str) -> Vec<Superseded> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r":[ \t]*(?P<new>[^(:\n]*?)[ \t]*\(was[ \t]+(?P<old>[^);\n]+)").expect("was-note pattern compiles")
+    });
+    static STRONG: OnceLock<Regex> = OnceLock::new();
+    let strong = STRONG.get_or_init(|| Regex::new(&format!("^(?:{STRONG_VALUE})")).expect("value pattern compiles"));
+    let mut replaced: Vec<Superseded> = Vec::new();
+    for cap in re.captures_iter(summary) {
+        let old = cap["old"].trim().to_string();
+        let new = cap["new"].trim().to_string();
+        if strong.is_match(&old) && !replaced.iter().any(|entry| entry.old.eq_ignore_ascii_case(&old)) {
+            replaced.push(Superseded { old, by: (!new.is_empty()).then_some(new) });
+        }
+    }
+    let news: Vec<String> = replaced.iter().filter_map(|entry| entry.by.as_ref()).map(|by| by.to_lowercase()).collect();
+    replaced.retain(|entry| !news.contains(&entry.old.to_lowercase()));
+    replaced
+}
+
+/// The lines of a summary's "Current facts:" block; the whole summary when it
+/// has no such block.
+fn current_fact_lines(summary: &str) -> Vec<&str> {
+    let lines: Vec<&str> = summary.lines().collect();
+    let starts = |line: &&str, word: &str| line.trim_start().to_lowercase().starts_with(word);
+    let Some(start) = lines.iter().position(|line| starts(line, "current facts")) else {
+        return lines;
+    };
+    lines[start + 1..].iter().take_while(|line| !starts(line, "context")).copied().collect()
+}
+
+/// Whether one line states `old` as current: it appears before any "(was",
+/// and the line does not itself mark it replaced ("2400 USD is void").
+fn states_as_current(line: &str, old: &str) -> bool {
+    let lower = line.to_lowercase();
+    lower.split("(was").next().unwrap_or(&lower).contains(&old.to_lowercase())
+        && !apply_supersessions(vec![], line).iter().any(|entry| entry.old.eq_ignore_ascii_case(old))
+}
+
+/// Check that no current fact states a replaced value. Like the other
+/// checks, done on the clipped summary.
+pub fn check_superseded(summary: &str, replaced: &[Superseded]) -> Result<(), Vec<String>> {
+    let lines = current_fact_lines(summary);
+    let stated: Vec<String> = replaced
+        .iter()
+        .filter(|entry| lines.iter().any(|line| states_as_current(line, &entry.old)))
+        .map(ToString::to_string)
+        .collect();
+    if stated.is_empty() { Ok(()) } else { Err(stated) }
 }
 
 /// Stable values a summary must keep even when not phrased as an update.
@@ -496,6 +634,77 @@ mod tests {
         assert!(check_field_pins("- owner: Noor (was Ines)", &pins).is_err());
         // Prose that says it on one line still counts.
         assert!(check_field_pins("The owner is now Ines.", &pins).is_ok());
+    }
+
+    fn replaced(old: &str, by: Option<&str>) -> Superseded {
+        Superseded { old: old.into(), by: by.map(Into::into) }
+    }
+
+    #[test]
+    fn supersessions_name_the_replaced_values() {
+        let text = "Ownership and destination correction: Noor replaces Mira, and delivery moves to Bergen.\n\
+                    Deliver to Bergen instead of Oslo.\n\
+                    Correction: staging now listens on 8444, not 8443.\n\
+                    Correction: delivery moves to Tromso, superseding Bergen.\n\
+                    Budget correction: the ceiling is now 1800 USD; 2400 USD is void.";
+        assert_eq!(
+            apply_supersessions(vec![], text),
+            [
+                replaced("Mira", Some("Noor")),
+                replaced("Oslo", Some("Bergen")),
+                replaced("8443", Some("8444")),
+                replaced("Bergen", Some("Tromso")),
+                replaced("2400 USD", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_later_update_takes_a_value_back() {
+        let text = "Noor replaces Mira. Later: Mira replaces Noor. Deliver to Bergen instead of Oslo. The new city is Oslo.";
+        assert_eq!(apply_supersessions(vec![], text), [replaced("Noor", Some("Mira"))]);
+        // A value replaced in an earlier summary comes back the same way.
+        let known = vec![replaced("Mira", Some("Noor"))];
+        assert_eq!(apply_supersessions(known.clone(), "Progress note: nothing changed."), known);
+        assert!(apply_supersessions(known, "Correction: owner is now Mira.").is_empty());
+    }
+
+    #[test]
+    fn ordinary_words_are_never_replaced_values() {
+        assert!(apply_supersessions(vec![], "Do it now, not later; use this instead of that.").is_empty());
+    }
+
+    #[test]
+    fn a_summary_records_its_own_replaced_values() {
+        let summary = "Current facts:\n- owner: Noor (was Mira)\n- uploads: permitted (was forbidden)\n\
+                       - ceiling: 1800 USD (was 2400 USD; 2400 USD is void)\n- city: Oslo\n\nContext:\nNothing else.";
+        assert_eq!(
+            superseded_in_summary(summary),
+            [replaced("Mira", Some("Noor")), replaced("2400 USD", Some("1800 USD"))]
+        );
+        // Notes that contradict each other are not trusted.
+        assert!(superseded_in_summary("- owner: Mira (was Noor)
+- owner: Noor (was Mira)").is_empty());
+    }
+
+    #[test]
+    fn a_replaced_value_must_not_be_a_current_fact() {
+        let mira = [replaced("Mira", Some("Noor"))];
+        // What the benchmark's summarizer wrote.
+        let flipped = "Current facts:\n- owner: Mira (was Noor)\n\nContext:\nNoor replaced Mira.";
+        assert_eq!(check_superseded(flipped, &mira).unwrap_err(), ["Mira (by Noor)"]);
+        // The context may tell the history; only current facts count.
+        let right = "Current facts:\n- owner: Noor (was Mira)\n\nContext:\nMira used to own it.";
+        assert!(check_superseded(right, &mira).is_ok());
+        // A line that says the value is replaced does not state it.
+        let void = [replaced("2400 USD", None)];
+        assert!(check_superseded("Current facts:
+- ceiling is now 1800 USD; 2400 USD is void", &void).is_ok());
+        assert!(check_superseded("Current facts:
+- owner: Noor (Noor replaced Mira)", &mira).is_ok());
+        // Without a facts block, every line counts.
+        assert!(check_superseded("Mira owns the project.", &mira).is_err());
+        assert!(check_superseded("CURRENT FACTS:\n- Owner: MIRA", &mira).is_err());
     }
 
     #[test]
