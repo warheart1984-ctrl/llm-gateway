@@ -130,13 +130,25 @@ fn build_summarizer_prompt(
 
 /// The values a fold of `pending_turns` onto `prior_summary` must keep: the
 /// list the commit check demands and the prompt asks for.
+/// Values the conversation replaced are left out: a summary keeping only the
+/// latest value need not repeat them.
 pub fn pinned_terms(prior_summary: Option<&str>, pending_turns: &[ChatMessage]) -> Vec<String> {
+    let replaced = superseded(prior_summary, pending_turns);
+    checks::extract_pinned_terms(&pin_source(prior_summary, pending_turns))
+        .into_iter()
+        .filter(|term| !checks::is_replaced(term, &replaced))
+        .collect()
+}
+
+/// The text values are pinned from: the turns being folded, then the prior
+/// summary.
+fn pin_source(prior_summary: Option<&str>, pending_turns: &[ChatMessage]) -> String {
     let mut source = checks::build_source_text(pending_turns);
     if let Some(prior) = prior_summary {
         source.push('\n');
         source.push_str(prior);
     }
-    checks::extract_pinned_terms(&source)
+    source
 }
 
 /// The field/value pairs a fold of `pending_turns` must state as current.
@@ -186,17 +198,15 @@ pub fn run_checks_with_prior(
     turns_being_summarized: &[ChatMessage],
     config: &PlanConfig,
 ) -> Result<String, Vec<String>> {
-    let mut source = checks::build_source_text(turns_being_summarized);
-    if let Some(prior) = prior_summary {
-        source.push('\n');
-        source.push_str(prior);
-    }
-    let mut errors = checks::check_summary(summary, &source, config.summary_chars).err().unwrap_or_default();
+    let source = pin_source(prior_summary, turns_being_summarized);
+    let replaced = superseded(prior_summary, turns_being_summarized);
+    let mut errors =
+        checks::check_summary_except(summary, &source, config.summary_chars, &replaced).err().unwrap_or_default();
     let clipped = checks::clip_to_chars(summary, config.summary_chars);
     if let Err(missing) = checks::check_field_pins(&clipped, &field_pins(turns_being_summarized)) {
         errors.extend(missing.into_iter().map(|pin| format!("field_value_present: missing '{pin}'")));
     }
-    if let Err(stated) = checks::check_superseded(&clipped, &superseded(prior_summary, turns_being_summarized)) {
+    if let Err(stated) = checks::check_superseded(&clipped, &replaced) {
         errors.extend(stated.into_iter().map(|value| format!("superseded_not_current: states '{value}'")));
     }
     if errors.is_empty() { Ok(clipped) } else { Err(errors) }
@@ -334,6 +344,75 @@ mod tests {
         let err = run_checks_with_prior(stale, None, &turns, &config).unwrap_err();
         assert!(err.iter().any(|e| e.starts_with("field_value_present")), "{err:?}");
         assert!(err.iter().any(|e| e.starts_with("superseded_not_current")), "{err:?}");
+    }
+
+    #[test]
+    fn a_later_fold_need_not_repeat_replaced_values() {
+        let config = PlanConfig { summary_chars: 1200, ..Default::default() };
+        let prior = "Current facts:\n- ceiling: 1250 USD (was 1800 USD)\n- staging port: 8444 (was 8443)\n- production port: 9443";
+        let turns = vec![msg("user", "Progress note 50: nothing changed.")];
+        let latest = "Current facts:\n- ceiling: 1250 USD\n- staging port: 8444\n- production port: 9443";
+        assert_eq!(run_checks_with_prior(latest, Some(prior), &turns, &config).unwrap(), latest);
+        // A current value is still required.
+        let dropped = "Current facts:\n- ceiling: 1250 USD\n- staging port: 8444";
+        let err = run_checks_with_prior(dropped, Some(prior), &turns, &config).unwrap_err();
+        assert_eq!(err, ["pinned_facts_present: missing term '9443'"]);
+        // The prompt does not ask for them either.
+        assert_eq!(pinned_terms(Some(prior), &turns), ["1250", "8444", "9443"]);
+    }
+
+    /// 8443, replaced by 9443, then restored: the history is optional, the
+    /// replaced 9443 cannot be current, and the restored 8443 is required.
+    #[test]
+    fn a_restored_value_is_current_again() {
+        let config = PlanConfig { summary_chars: 1200, ..Default::default() };
+        let turns = vec![
+            msg("user", "Staging listens on port 8443."),
+            msg("user", "Correction: staging now listens on 9443, not 8443."),
+            msg("user", "Correction: staging now listens on 8443 again."),
+        ];
+        let check = |summary: &str| run_checks_with_prior(summary, None, &turns, &config);
+        assert!(check("Current facts:\n- staging port: 8443").is_ok());
+        assert!(check("Current facts:\n- staging port: 8443 (was 9443)").is_ok());
+        let stale = check("Current facts:\n- staging port: 9443 (was 8443)").unwrap_err();
+        assert!(stale.iter().any(|e| e.starts_with("field_value_present")), "{stale:?}");
+        assert!(stale.contains(&"superseded_not_current: states '9443 (by 8443)'".to_string()), "{stale:?}");
+        let dropped = check("Current facts:\n- production port: 7000").unwrap_err();
+        assert!(dropped.contains(&"pinned_facts_present: missing term '8443'".to_string()), "{dropped:?}");
+    }
+
+    /// A restore in words no pattern knows leaves 8443 replaced. The right
+    /// summary is then rejected: the fold is lost, not the fact.
+    #[test]
+    fn a_restore_no_pattern_knows_fails_safe() {
+        let config = PlanConfig { summary_chars: 1200, ..Default::default() };
+        let turns = vec![
+            msg("user", "Correction: staging now listens on 9443, not 8443."),
+            msg("user", "We are back on the old staging port, 8443."),
+        ];
+        let err = run_checks_with_prior("Current facts:\n- staging port: 8443", None, &turns, &config).unwrap_err();
+        assert!(err.contains(&"superseded_not_current: states '8443 (by 9443)'".to_string()), "{err:?}");
+    }
+
+    /// A correction, a fold of the corrected state, then two more folds: no
+    /// later fold is asked to keep the old value, and each keeps the current
+    /// one.
+    #[test]
+    fn repeated_folds_do_not_bring_back_an_old_values_obligation() {
+        let config = PlanConfig { summary_chars: 1200, ..Default::default() };
+        let quiet = vec![msg("user", "Progress note 61: nothing changed.")];
+        // Fold 1: the correction itself.
+        let correction = vec![msg("user", "Staging listens on port 8443."), msg("user", "Correction: staging now listens on 8444, not 8443.")];
+        let first = "Current facts:\n- staging port: 8444 (was 8443)";
+        assert!(run_checks_with_prior(first, None, &correction, &config).is_ok());
+        // Fold 2 may drop the history, and may not state 8443 as current.
+        let second = "Current facts:\n- staging port: 8444";
+        assert!(run_checks_with_prior(second, Some(first), &quiet, &config).is_ok());
+        assert!(run_checks_with_prior("Current facts:\n- staging port: 8443", Some(first), &quiet, &config).is_err());
+        // Fold 3, after the history is gone, still needs the current value.
+        assert!(run_checks_with_prior(second, Some(second), &quiet, &config).is_ok());
+        let err = run_checks_with_prior("Current facts:\n- staging port: 8443", Some(second), &quiet, &config).unwrap_err();
+        assert_eq!(err, ["pinned_facts_present: missing term '8444'"]);
     }
 
     #[test]

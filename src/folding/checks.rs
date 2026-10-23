@@ -190,9 +190,11 @@ fn supersession_patterns() -> &'static [Regex] {
 }
 
 /// `known` (replaced values from earlier, such as a prior summary's), updated
-/// by `text` in order: each sentence that replaces a value adds it, and a later
-/// update that names a replaced value again (as the new value, or as a field's
-/// value) takes it back off the list.
+/// by `text` in order: each sentence that replaces a value adds it, and so does
+/// a field update for the field's previous value ("staging now listens on
+/// 9443", later "... on 8443 again" replaces 9443). A later update that names
+/// a replaced value again (as the new value, or as a field's value) takes it
+/// back off the list.
 pub fn apply_supersessions(known: Vec<Superseded>, text: &str) -> Vec<Superseded> {
     let mut events: Vec<(usize, Option<String>, Option<String>)> = Vec::new();
     for pattern in supersession_patterns() {
@@ -202,7 +204,11 @@ pub fn apply_supersessions(known: Vec<Superseded>, text: &str) -> Vec<Superseded
             events.push((old.start(), Some(old.as_str().trim().to_string()), new));
         }
     }
-    events.extend(field_updates(text).into_iter().map(|(at, _, value)| (at, None, Some(value))));
+    let mut last_value: BTreeMap<String, String> = BTreeMap::new();
+    for (at, field, value) in field_updates(text) {
+        let previous = last_value.insert(field, value.clone()).filter(|previous| !previous.eq_ignore_ascii_case(&value));
+        events.push((at, previous, Some(value)));
+    }
     events.sort_by_key(|(at, _, _)| *at);
     let mut replaced = known;
     for (_, old, new) in events {
@@ -432,7 +438,26 @@ fn is_plain_hyphenated_word(value: &str) -> bool {
 /// ignoring case as 5-fold-engine does. The check is done against the summary
 /// AFTER clipping to summary_chars.
 pub fn check_pinned_facts(summary: &str, source_text: &str) -> Result<(), Vec<String>> {
-    let pinned = extract_pinned_terms(source_text);
+    check_pinned_facts_except(summary, source_text, &[])
+}
+
+/// Whether a pinned term is one of the `replaced` values: equal to one, or its
+/// leading number ("2400" for a replaced "2400 USD"), ignoring case.
+pub fn is_replaced(term: &str, replaced: &[Superseded]) -> bool {
+    replaced.iter().any(|entry| {
+        entry.old.eq_ignore_ascii_case(term)
+            || entry.old.split_whitespace().next().is_some_and(|first| first.eq_ignore_ascii_case(term))
+    })
+}
+
+/// The pinned-value check, except for values the conversation replaced. A
+/// summary that keeps only the latest value need not repeat the old one; the
+/// supersession check already stops it being stated as current. Without this,
+/// every old value a prior summary kept as history was demanded again by each
+/// later fold, and in the folding benchmark most folds were rejected for it.
+pub fn check_pinned_facts_except(summary: &str, source_text: &str, replaced: &[Superseded]) -> Result<(), Vec<String>> {
+    let pinned: Vec<String> =
+        extract_pinned_terms(source_text).into_iter().filter(|term| !is_replaced(term, replaced)).collect();
     let mut missing = Vec::new();
     let folded = summary.to_lowercase();
 
@@ -454,6 +479,17 @@ pub fn check_summary(
     summary: &str,
     source_text: &str,
     summary_chars: usize,
+) -> Result<(), Vec<String>> {
+    check_summary_except(summary, source_text, summary_chars, &[])
+}
+
+/// All summary checks, with `replaced` values exempt from the pinned-value
+/// check.
+pub fn check_summary_except(
+    summary: &str,
+    source_text: &str,
+    summary_chars: usize,
+    replaced: &[Superseded],
 ) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
 
@@ -481,7 +517,7 @@ pub fn check_summary(
 
     // pinned_facts_present (checked on clipped text)
     let clipped = clip_to_chars(summary, summary_chars);
-    if let Err(missing) = check_pinned_facts(&clipped, source_text) {
+    if let Err(missing) = check_pinned_facts_except(&clipped, source_text, replaced) {
         for term in missing {
             errors.push(format!("pinned_facts_present: missing term '{}'", term));
         }
@@ -738,6 +774,14 @@ mod tests {
     }
 
     #[test]
+    fn a_field_update_replaces_the_fields_previous_value() {
+        let text = "Correction: staging now listens on 9443, not 8443. Later: staging now listens on 8443 again.";
+        assert_eq!(apply_supersessions(vec![], text), [replaced("9443", Some("8443"))]);
+        // The same value stated twice replaces nothing.
+        assert!(apply_supersessions(vec![], "The owner is now Noor. Again: the owner is now Noor.").is_empty());
+    }
+
+    #[test]
     fn ordinary_words_are_never_replaced_values() {
         assert!(apply_supersessions(vec![], "Do it now, not later; use this instead of that.").is_empty());
     }
@@ -810,6 +854,20 @@ mod tests {
             counts.into_iter().collect::<Vec<_>>(),
             [("other", 1), ("pinned_facts_present", 2), ("superseded_not_current", 1)]
         );
+    }
+
+    #[test]
+    fn replaced_values_are_not_required() {
+        let replaced = [replaced("2400 USD", None), replaced("8443", Some("8444"))];
+        assert!(is_replaced("2400", &replaced));
+        assert!(is_replaced("2400 usd", &replaced));
+        assert!(is_replaced("8443", &replaced));
+        assert!(!is_replaced("8444", &replaced));
+        assert!(!is_replaced("USD", &replaced));
+        let source = "Staging listens on 8443, then 8444. Production on 9443. The ceiling was 2400 USD.";
+        assert!(check_pinned_facts_except("staging 8444, production 9443", source, &replaced).is_ok());
+        assert_eq!(check_pinned_facts_except("staging 8444", source, &replaced).unwrap_err(), ["9443"]);
+        assert!(check_pinned_facts("staging 8444, production 9443", source).is_err());
     }
 
     #[test]
