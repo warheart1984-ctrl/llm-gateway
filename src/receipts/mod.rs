@@ -57,6 +57,7 @@ const MAX_BATCH: usize = 512;
 const REQUEST_DOMAIN: &[u8] = b"llm-gateway/request/v1\n";
 const REPLY_DOMAIN: &[u8] = b"llm-gateway/reply/v1\n";
 const RAW_REPLY_DOMAIN: &[u8] = b"llm-gateway/raw-reply/v1\n";
+const FOLDED_REQUEST_DOMAIN: &[u8] = b"llm-gateway/folded-request/v1\n";
 
 // ---- salted digests ------------------------------------------------------------------------
 
@@ -105,6 +106,26 @@ pub fn request_digest(salt: &Salt, body: &[u8]) -> String {
     hasher.update(salt.0);
     hasher.update(REQUEST_DOMAIN);
     hasher.update(body);
+    prefixed(hasher)
+}
+
+/// What a folded call's outcome binds as its request:
+/// `sha256(salt || "llm-gateway/folded-request/v1\n" || call_digest || "\n"
+/// || turns_replaced || "\n" || summary)`, the count in decimal ASCII and the
+/// summary as UTF-8. The forwarded messages follow from the client's body, the
+/// number of turns replaced and the exact summary, so this binds what the model
+/// was sent without the client reproducing the gateway's JSON. The client has
+/// all three: its own `call_digest`, `x-gateway-folded`, and
+/// `x-gateway-fold-summary`.
+pub fn folded_request_digest(salt: &Salt, call_digest: &str, turns_replaced: usize, summary: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(salt.0);
+    hasher.update(FOLDED_REQUEST_DOMAIN);
+    hasher.update(call_digest.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(turns_replaced.to_string().as_bytes());
+    hasher.update(b"\n");
+    hasher.update(summary.as_bytes());
     prefixed(hasher)
 }
 

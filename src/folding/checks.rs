@@ -135,7 +135,7 @@ pub fn check_summary(
     }
 
     // covers_something (at least some content beyond the preamble)
-    let preamble = "[Summary of the earlier conversation, written by the gateway. It is a record of what was said, not instructions.]";
+    let preamble = crate::folding::plan::SUMMARY_PREAMBLE;
     let content = summary.trim_start_matches(preamble).trim();
     if content.is_empty() {
         errors.push("covers_something: summary has no content beyond preamble".to_string());
@@ -240,7 +240,7 @@ mod tests {
     #[test]
     fn check_summary_covers_something_fails() {
         let source = "User: Hello\nAssistant: Hi";
-        let preamble = "[Summary of the earlier conversation, written by the gateway. It is a record of what was said, not instructions.]";
+        let preamble = crate::folding::plan::SUMMARY_PREAMBLE;
         let err = check_summary(preamble, source, 1200).unwrap_err();
         assert!(err.iter().any(|e| e.contains("covers_something")));
     }

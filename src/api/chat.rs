@@ -488,7 +488,7 @@ async fn handle(state: Arc<AppState>, headers: HeaderMap, body: Bytes, mode: Mod
                 original = %original,
                 "idempotent replay served from the ledger"
             );
-            let (body, receipt, folded_turns) = unwrap_stored(stored);
+            let (body, receipt, folded_turns, fold_summary) = unwrap_stored(stored);
             let mut response = (StatusCode::OK, body).into_response();
             let h = response.headers_mut();
             h.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -506,6 +506,9 @@ async fn handle(state: Arc<AppState>, headers: HeaderMap, body: Bytes, mode: Mod
                     HeaderName::from_static("x-gateway-folded"),
                     header_value(&folded_turns.to_string()),
                 );
+            }
+            if let Some(summary) = fold_summary.as_deref() {
+                h.insert(HeaderName::from_static("x-gateway-fold-summary"), fold_summary_header(summary));
             }
             response
         }
@@ -701,12 +704,13 @@ const STORED_WITH_FOLDING: &str = "llm_gateway_stored_with_folding";
 
 /// The answer kept for idempotent replay, with the id and salt of the
 /// receipt that covers it.
-fn stored_with_receipt(payload: &str, open: &OpenReceipt, folded_turns: usize) -> String {
+fn stored_with_receipt(payload: &str, open: &OpenReceipt, folded_turns: usize, fold_summary: Option<&str>) -> String {
     json!({
         STORED_WITH_RECEIPT: 1,
         "receipt_id": open.decision_receipt_id,
         "receipt_salt": open.salt.to_hex(),
         STORED_WITH_FOLDING: folded_turns,
+        "fold_summary": fold_summary,
         "body": payload,
     })
     .to_string()
@@ -720,10 +724,10 @@ fn stored_with_folding(payload: &str, folded_turns: usize) -> String {
     .to_string()
 }
 
-/// A stored answer and, when it was kept with one, its receipt id and salt.
-/// Answers stored before receipts, or for tenants without them, come back
-/// unchanged.
-fn unwrap_stored(stored: String) -> (String, Option<(String, String)>, usize) {
+/// A stored answer and, when it was kept with one, its receipt id and salt,
+/// the turns folded, and a receipts tenant's fold summary. Answers stored
+/// before receipts, or for tenants without them, come back unchanged.
+fn unwrap_stored(stored: String) -> (String, Option<(String, String)>, usize, Option<String>) {
     if let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(&stored)
         && let Some(Value::String(body)) = fields.get("body")
     {
@@ -731,17 +735,18 @@ fn unwrap_stored(stored: String) -> (String, Option<(String, String)>, usize) {
             .get(STORED_WITH_FOLDING)
             .and_then(Value::as_u64)
             .unwrap_or(0) as usize;
+        let fold_summary = fields.get("fold_summary").and_then(Value::as_str).map(str::to_string);
         if fields.get(STORED_WITH_RECEIPT) == Some(&json!(1))
             && let (Some(Value::String(id)), Some(Value::String(salt))) =
                 (fields.get("receipt_id"), fields.get("receipt_salt"))
         {
-            return (body.clone(), Some((id.clone(), salt.clone())), folded_turns);
+            return (body.clone(), Some((id.clone(), salt.clone())), folded_turns, fold_summary);
         }
         if folded_turns > 0 {
-            return (body.clone(), None, folded_turns);
+            return (body.clone(), None, folded_turns, None);
         }
     }
-    (stored, None, 0)
+    (stored, None, 0, None)
 }
 
 /// `x-receipt-id` names the allow receipt; `x-receipt-salt` is the salt in
@@ -796,6 +801,9 @@ struct Admitted {
     openai: Option<OpenAiReply>,
     /// Number of old turns replaced in the forwarded request.
     folded_turns: usize,
+    /// The summary in the forwarded request, for a receipts tenant's
+    /// `x-gateway-fold-summary`.
+    fold_summary: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -1658,6 +1666,9 @@ async fn admit(
     }
     req.messages = fold.messages;
     let folded_turns = fold.folded_turns;
+    // The summary actually forwarded, read back from the request itself, so a
+    // receipt binds exactly what the model is sent.
+    let fold_summary = if folded_turns > 0 { crate::folding::plan::sent_summary(&req.messages) } else { None };
     prompt_tokens = estimate_prompt_tokens(&req.messages);
     let reserved_prompt_tokens = prompt_tokens.saturating_add(resolved.config.prompt_overhead_tokens);
     cost = CostEstimate {
@@ -1688,7 +1699,7 @@ async fn admit(
     let receipt = if let Some(chain) = &chain {
         let written: Result<OpenReceipt, ReceiptError> = async {
             let salt = receipts::Salt::generate()?;
-            let request_digest = receipts::request_digest(&salt, body);
+            let call_digest = receipts::request_digest(&salt, body);
             let decision_receipt_id = chain
                 .allow(&Subject {
                     request_id: request_id.to_string(),
@@ -1696,9 +1707,16 @@ async fn admit(
                     key_id: principal.key_id.to_string(),
                     model: resolved.registry_id.clone(),
                     action: "reserve".into(),
-                    call_digest: Some(request_digest.clone()),
+                    call_digest: Some(call_digest.clone()),
                 })
                 .await?;
+            // The allow binds what the client sent. The outcome binds what the
+            // model was sent: the same digest for an unfolded call, and for a
+            // folded one the client's digest, the turns replaced and the summary.
+            let request_digest = match &fold_summary {
+                Some(summary) => receipts::folded_request_digest(&salt, &call_digest, folded_turns, summary),
+                None => call_digest,
+            };
             Ok(OpenReceipt {
                 chain: std::sync::Arc::clone(chain),
                 decision_receipt_id,
@@ -1756,6 +1774,9 @@ async fn admit(
         max_output_tokens,
         framing,
         metadata: req.metadata,
+        // Only a receipts tenant gets the summary back: it needs it to check
+        // its outcome. For anyone else it would only make the response larger.
+        fold_summary: if receipt.is_some() { fold_summary } else { None },
         receipt,
         openai,
         folded_turns,
@@ -1863,6 +1884,7 @@ async fn normalized_response(
         &admitted.principal,
         &admitted.reservation,
         admitted.folded_turns,
+        admitted.fold_summary.as_deref(),
     );
     insert_receipt_headers(&mut headers, admitted.receipt.as_ref());
     let reply_hash = admitted.receipt.as_ref().map(|open| ReplyDigest::new(open.salt.clone()));
@@ -1914,6 +1936,7 @@ fn response_headers(
     principal: &Principal,
     reservation: &Reservation,
     folded_turns: usize,
+    fold_summary: Option<&str>,
 ) -> HeaderMap {
     let mut h = HeaderMap::new();
     h.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream; charset=utf-8"));
@@ -1937,7 +1960,17 @@ fn response_headers(
             header_value(&folded_turns.to_string()),
         );
     }
+    if let Some(summary) = fold_summary {
+        h.insert(HeaderName::from_static("x-gateway-fold-summary"), fold_summary_header(summary));
+    }
     h
+}
+
+/// `x-gateway-fold-summary`: the summary's UTF-8 bytes, base64url without
+/// padding, so any text survives as a header value.
+fn fold_summary_header(summary: &str) -> HeaderValue {
+    use base64::Engine as _;
+    header_value(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(summary.as_bytes()))
 }
 
 fn merge_headers(existing: &HeaderMap, ours: HeaderMap) -> HeaderMap {
@@ -2521,6 +2554,7 @@ async fn complete_response(
         &admitted.principal,
         &admitted.reservation,
         admitted.folded_turns,
+        admitted.fold_summary.as_deref(),
     );
     insert_receipt_headers(&mut headers, admitted.receipt.as_ref());
     let receipt = admitted.receipt;
@@ -2613,7 +2647,7 @@ async fn complete_response(
     // receipt id and salt are kept with it (sealed at rest like the answer),
     // so the replay can name the receipt that covers it.
     let stored = match &receipt {
-        Some(open) => stored_with_receipt(&payload, open, admitted.folded_turns),
+        Some(open) => stored_with_receipt(&payload, open, admitted.folded_turns, admitted.fold_summary.as_deref()),
         None if admitted.folded_turns > 0 => stored_with_folding(&payload, admitted.folded_turns),
         None => payload.clone(),
     };
@@ -2772,6 +2806,7 @@ async fn passthrough_response(
         &admitted.principal,
         &admitted.reservation,
         admitted.folded_turns,
+        admitted.fold_summary.as_deref(),
     );
     headers.insert(
         HeaderName::from_static("x-gateway-framing"),
