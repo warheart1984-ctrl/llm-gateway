@@ -1193,7 +1193,13 @@ async fn a_rejected_fold_backs_off_before_paying_again() {
     assert_eq!(fold_counter(&metrics, "backoff"), 1, "{metrics}");
     // 8 more turns than the head the rejected fold covered: fold again.
     assert_eq!(gw.post_chat(TEST_KEY, body(14)).await.0, StatusCode::OK);
-    assert!(summarizer_bodies(&upstream).len() > 2, "the backoff ends after backoff_turns");
+    assert_eq!(summarizer_bodies(&upstream).len(), 4, "the backoff ends after backoff_turns");
+    // That fold was rejected too: the next wait is twice as long (16 turns
+    // past the 12-turn head it covered, so not at 20, but at 28).
+    assert_eq!(gw.post_chat(TEST_KEY, body(22)).await.0, StatusCode::OK);
+    assert_eq!(summarizer_bodies(&upstream).len(), 4, "a second rejection backs off twice as long");
+    assert_eq!(gw.post_chat(TEST_KEY, body(30)).await.0, StatusCode::OK);
+    assert_eq!(summarizer_bodies(&upstream).len(), 6, "and then folds again");
 }
 
 #[tokio::test]

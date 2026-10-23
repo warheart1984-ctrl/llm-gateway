@@ -81,7 +81,9 @@ pub struct FoldingStore {
     shutdown: watch::Sender<bool>,
     /// Conversations whose last fold was rejected, with the head length that
     /// fold covered. Bounded by `max_entries`, like the summaries.
-    backoffs: DashMap<[u8; 32], usize>,
+    /// Per conversation: the head length the last rejected fold covered, and
+    /// how many folds in a row were rejected.
+    backoffs: DashMap<[u8; 32], (usize, u32)>,
 }
 
 impl FoldingStore {
@@ -117,11 +119,13 @@ impl FoldingStore {
                 self.backoffs.remove(&victim);
             }
         }
-        self.backoffs.insert(key, head_turns);
+        let rejections = self.backoffs.get(&key).map(|item| item.value().1).unwrap_or(0).saturating_add(1);
+        self.backoffs.insert(key, (head_turns, rejections));
     }
 
-    /// The head length the last rejected fold of this conversation covered.
-    pub fn backed_off_at(&self, key: &[u8; 32]) -> Option<usize> {
+    /// The head length the last rejected fold of this conversation covered,
+    /// and how many folds of it in a row were rejected.
+    pub fn backed_off_at(&self, key: &[u8; 32]) -> Option<(usize, u32)> {
         self.backoffs.get(key).map(|item| *item.value())
     }
 
@@ -661,6 +665,19 @@ mod tests {
             summarizer_model: "model".into(),
             last_accessed: Instant::now(),
         }
+    }
+
+    #[test]
+    fn rejections_in_a_row_are_counted_until_a_fold_commits() {
+        let store = FoldingStore::new(10, 1000);
+        let key = [6u8; 32];
+        assert_eq!(store.backed_off_at(&key), None);
+        store.back_off(key, 10);
+        store.back_off(key, 18);
+        assert_eq!(store.backed_off_at(&key), Some((18, 2)));
+        store.clear_backoff(&key);
+        store.back_off(key, 30);
+        assert_eq!(store.backed_off_at(&key), Some((30, 1)));
     }
 
     #[test]

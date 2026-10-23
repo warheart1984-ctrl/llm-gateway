@@ -1410,8 +1410,8 @@ async fn foreground_fold(
         return skip("not_due", "shutdown", None);
     }
     if folding.backoff_turns > 0
-        && let Some(rejected_at) = state.folding.backed_off_at(&key)
-        && head.len() < rejected_at.saturating_add(folding.backoff_turns)
+        && let Some((rejected_at, rejections)) = state.folding.backed_off_at(&key)
+        && head.len() < rejected_at.saturating_add(crate::folding::backoff_span(folding.backoff_turns, rejections))
     {
         return skip("skipped", "backoff", Some(FoldAccounting::BackedOff));
     }
