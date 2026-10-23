@@ -64,6 +64,11 @@ pub struct FoldFacts {
     /// Names and counts only, never the values a check found missing.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub failed_checks: std::collections::BTreeMap<&'static str, u32>,
+    /// When the first summary failed its checks and the summarizer got one
+    /// corrective retry: the checks that first summary failed. With outcome
+    /// "applied", the retry fixed them.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub corrected_checks: std::collections::BTreeMap<&'static str, u32>,
 }
 
 /// Real summarizer usage attached to the single accounting outcome of an attempt.

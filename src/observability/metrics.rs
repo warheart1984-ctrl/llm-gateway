@@ -88,8 +88,10 @@ struct FoldCounters {
     prompt_tokens_cut: AtomicU64,
     summarizer_prompt: AtomicU64,
     summarizer_completion: AtomicU64,
-    /// Rejected folds that failed each check, in `checks::CHECK_NAMES` order.
+    /// Summaries that failed each check, in `checks::CHECK_NAMES` order.
     checks_failed: [AtomicU64; crate::folding::checks::CHECK_NAMES.len()],
+    corrective_committed: AtomicU64,
+    corrective_rejected: AtomicU64,
 }
 
 /// Per-tenant rollup, for the governed view: who is spending what.
@@ -206,7 +208,14 @@ impl Metrics {
             .fetch_add(completion_tokens, Ordering::Relaxed);
     }
 
-    /// A rejected fold's failed checks: each named check counts the fold once.
+    /// A corrective retry that ended: its summary committed, or rejected again.
+    pub fn record_corrective_retry(&self, tenant: &str, committed: bool) {
+        let counters = self.fold_counters(tenant);
+        let slot = if committed { &counters.corrective_committed } else { &counters.corrective_rejected };
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A summary's failed checks: each named check counts the summary once.
     pub fn record_fold_checks(&self, tenant: &str, failed: &BTreeMap<&'static str, u32>) {
         let counters = self.fold_counters(tenant);
         for (slot, name) in crate::folding::checks::CHECK_NAMES.iter().enumerate() {
@@ -726,6 +735,7 @@ impl Metrics {
             let mut prompt_series = Vec::new();
             let mut completion_series = Vec::new();
             let mut check_series = Vec::new();
+            let mut retry_series = Vec::new();
             for (tenant, counters) in &folds {
                 let tenant_label = safe_label(tenant);
                 for (outcome, value) in [
@@ -753,6 +763,12 @@ impl Metrics {
                     render_labels(&[("tenant", tenant_label), ("kind", "completion")], &[]),
                     counters.summarizer_completion.load(Ordering::Relaxed),
                 ));
+                for (result, value) in [
+                    ("committed", counters.corrective_committed.load(Ordering::Relaxed)),
+                    ("rejected", counters.corrective_rejected.load(Ordering::Relaxed)),
+                ] {
+                    retry_series.push((render_labels(&[("tenant", tenant_label), ("result", result)], &[]), value));
+                }
                 for (slot, check) in crate::folding::checks::CHECK_NAMES.iter().enumerate() {
                     check_series.push((
                         render_labels(&[("tenant", tenant_label), ("check", check)], &[]),
@@ -795,8 +811,15 @@ impl Metrics {
                 &mut out,
                 "gw_fold_checks_failed_total",
                 "counter",
-                "Rejected folds by summary check failed; a fold failing several counts once for each.",
+                "Summaries by check failed, a corrective retry's included; one failing several counts once for each.",
                 check_series.iter().map(|(l, v)| (l.as_str(), *v)),
+            );
+            family(
+                &mut out,
+                "gw_fold_corrective_retries_total",
+                "counter",
+                "Corrective retries of a summary that failed its checks, by whether the retry committed.",
+                retry_series.iter().map(|(l, v)| (l.as_str(), *v)),
             );
         }
 

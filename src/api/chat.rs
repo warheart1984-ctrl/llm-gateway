@@ -892,6 +892,7 @@ fn bare_fold(messages: Vec<ChatMessage>, outcome: &'static str, reason: &str, at
             fold_count: 0,
             prefix_hash: String::new(),
             failed_checks: Default::default(),
+            corrected_checks: Default::default(),
         }),
         attempt,
     }
@@ -938,6 +939,7 @@ fn describe_fold(
             fold_count: u64::from(stamp.fold_count),
             prefix_hash: stamp.prefix_hash.map(|hash| crate::folding::prefix_hex(&hash)).unwrap_or_default(),
             failed_checks: Default::default(),
+            corrected_checks: Default::default(),
         }),
         attempt: stamp.attempt,
     }
@@ -1002,6 +1004,8 @@ enum AppliedFold {
         prefix_hash: [u8; 32],
         prompt_tokens: u64,
         completion_tokens: u64,
+        /// Which checks the first summary failed, when a corrective retry fixed them.
+        corrected_checks: std::collections::BTreeMap<&'static str, u32>,
     },
     Stopped {
         outcome: &'static str,
@@ -1011,6 +1015,8 @@ enum AppliedFold {
         completion_tokens: u64,
         /// Which checks a rejected summary failed, by name.
         failed_checks: std::collections::BTreeMap<&'static str, u32>,
+        /// Which checks the first summary failed, when a corrective retry ran.
+        corrected_checks: std::collections::BTreeMap<&'static str, u32>,
     },
 }
 
@@ -1048,6 +1054,12 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
     let mut attempt_no = 0u8;
     let mut used_prompt = 0u64;
     let mut used_completion = 0u64;
+    // One corrective retry: a summary that fails its checks is sent back to
+    // the summarizer with what it got wrong. In the folding benchmark the
+    // summarizer read corrections backwards on most first folds, and each
+    // rejection then held the conversation unfolded for `backoff_turns`.
+    let mut correction: Option<(String, Vec<String>)> = None;
+    let mut corrected_checks: std::collections::BTreeMap<&'static str, u32> = Default::default();
 
     loop {
         if *shutdown.borrow() {
@@ -1058,15 +1070,27 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
                 prompt_tokens: used_prompt,
                 completion_tokens: used_completion,
                 failed_checks: Default::default(),
+                corrected_checks: corrected_checks.clone(),
             };
         }
         attempt_no += 1;
-        let budget = if attempt_no == 1 {
+        // The doubled budget is for a reply that ran out of tokens; a
+        // corrective retry gets the usual one.
+        let budget = if attempt_no == 1 || correction.is_some() {
             work.summarizer_max_tokens
         } else {
             work.summarizer_max_tokens.saturating_mul(2)
         };
-        let prompt_messages = summarizer::prompt_messages(&work.plan_config, work.prior_text.as_deref(), &work.pending);
+        let prompt_messages = match &correction {
+            Some((rejected, errors)) => summarizer::retry_messages(
+                &work.plan_config,
+                work.prior_text.as_deref(),
+                &work.pending,
+                rejected,
+                errors,
+            ),
+            None => summarizer::prompt_messages(&work.plan_config, work.prior_text.as_deref(), &work.pending),
+        };
         let prompt_tokens = estimate_prompt_tokens(&prompt_messages);
         let estimate = CostEstimate {
             prompt_nano_usd: estimate_cost_nano_usd(&work.cost, prompt_tokens, 0),
@@ -1094,6 +1118,7 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
                 prompt_tokens: used_prompt,
                 completion_tokens: used_completion,
                 failed_checks: Default::default(),
+                corrected_checks: corrected_checks.clone(),
             };
         };
         if *shutdown.borrow() {
@@ -1105,6 +1130,7 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
                 prompt_tokens: used_prompt,
                 completion_tokens: used_completion,
                 failed_checks: Default::default(),
+                corrected_checks: corrected_checks.clone(),
             };
         }
 
@@ -1129,6 +1155,7 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
                     prompt_tokens: used_prompt,
                     completion_tokens: used_completion,
                     failed_checks: Default::default(),
+                    corrected_checks: corrected_checks.clone(),
                 };
             }
             result = &mut pending => result,
@@ -1148,6 +1175,7 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
                     prompt_tokens: used_prompt,
                     completion_tokens: used_completion,
                     failed_checks: Default::default(),
+                    corrected_checks: corrected_checks.clone(),
                 };
             }
         };
@@ -1178,6 +1206,7 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
                 prompt_tokens: used_prompt,
                 completion_tokens: used_completion,
                 failed_checks: Default::default(),
+                corrected_checks: corrected_checks.clone(),
             };
         }
         let summary = match summarizer::run_checks_with_prior(
@@ -1190,6 +1219,12 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
             Err(errors) => {
                 let failed_checks = crate::folding::checks::failed_check_counts(&errors);
                 work.state.metrics.record_fold_checks(&work.tenant_id, &failed_checks);
+                if correction.is_none() {
+                    corrected_checks = failed_checks;
+                    correction = Some((content, errors));
+                    continue;
+                }
+                work.state.metrics.record_corrective_retry(&work.tenant_id, false);
                 return AppliedFold::Stopped {
                     outcome: "refused",
                     reason: "checks_failed",
@@ -1197,6 +1232,7 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
                     prompt_tokens: used_prompt,
                     completion_tokens: used_completion,
                     failed_checks,
+                    corrected_checks: corrected_checks.clone(),
                 };
             }
         };
@@ -1225,13 +1261,18 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
                 prompt_tokens: used_prompt,
                 completion_tokens: used_completion,
                 failed_checks: Default::default(),
+                corrected_checks: corrected_checks.clone(),
             };
+        }
+        if correction.is_some() {
+            work.state.metrics.record_corrective_retry(&work.tenant_id, true);
         }
         return AppliedFold::Committed {
             summary,
             prefix_hash,
             prompt_tokens: used_prompt,
             completion_tokens: used_completion,
+            corrected_checks,
         };
     }
 }
@@ -1469,6 +1510,7 @@ async fn foreground_fold(
                     .map(|summary| crate::folding::prefix_hex(&summary.prefix_hash))
                     .unwrap_or_default(),
                 failed_checks: Default::default(),
+                corrected_checks: Default::default(),
             }),
             attempt: None,
         };
@@ -1550,9 +1592,9 @@ async fn foreground_fold(
     let fold_receipt_id = fold_receipt.map(|open| open.decision_receipt_id);
 
     let mut result = match applied {
-        AppliedFold::Committed { summary, prefix_hash, prompt_tokens, completion_tokens } => {
+        AppliedFold::Committed { summary, prefix_hash, prompt_tokens, completion_tokens, corrected_checks } => {
             let forwarded = crate::folding::plan::build_forwarded_messages(&protected, Some(&summary), &[], &tail);
-            describe_fold(
+            let mut applied = describe_fold(
                 messages,
                 forwarded,
                 &plan,
@@ -1568,9 +1610,13 @@ async fn foreground_fold(
                     prefix_hash: Some(prefix_hash),
                     folded_turns: plan.turns_replaced,
                 },
-            )
+            );
+            if let Some(facts) = applied.facts.as_mut() {
+                facts.corrected_checks = corrected_checks;
+            }
+            applied
         }
-        AppliedFold::Stopped { outcome, reason, accounting, prompt_tokens, completion_tokens, failed_checks } => {
+        AppliedFold::Stopped { outcome, reason, accounting, prompt_tokens, completion_tokens, failed_checks, corrected_checks } => {
             let mut stopped = describe_fold(
                 messages,
                 messages.to_vec(),
@@ -1586,6 +1632,7 @@ async fn foreground_fold(
             );
             if let Some(facts) = stopped.facts.as_mut() {
                 facts.failed_checks = failed_checks;
+                facts.corrected_checks = corrected_checks;
             }
             stopped
         }

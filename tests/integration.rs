@@ -971,7 +971,10 @@ async fn assert_summarizer_failure(scenario: Scenario, body: Value) {
     let (status, headers, _) = gw.post_chat(TEST_KEY, body).await;
     assert_eq!(status, StatusCode::OK);
     assert!(headers.get("x-gateway-folded").is_none());
-    let expected_calls = if scenario == Scenario::SummarizerLength { 3 } else { 2 };
+    // A length reply is retried at double the budget; a summary that fails
+    // its checks gets one corrective retry (the mock's second reply, "Hello,
+    // world", fails them again).
+    let expected_calls = if matches!(scenario, Scenario::SummarizerLength | Scenario::SummarizerPinnedDrop) { 3 } else { 2 };
     assert_eq!(upstream.calls(), expected_calls, "the failed summarizer must not fail the main request");
 }
 
@@ -981,8 +984,29 @@ async fn empty_summarizer_reply_is_rejected_without_failing_the_main_request() {
 }
 
 #[tokio::test]
-async fn overlong_summarizer_reply_is_rejected_without_failing_the_main_request() {
-    assert_summarizer_failure(Scenario::SummarizerTooLong, folding_body(6)).await;
+async fn an_overlong_summary_is_fixed_by_its_corrective_retry() {
+    let upstream = MockUpstream::start(Scenario::SummarizerTooLong).await;
+    let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(FOLDING_TENANT)).await;
+    let (status, headers, _) = gw.post_chat(TEST_KEY, folding_body(6)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.get("x-gateway-folded").is_some(), "the retried summary is committed");
+    let summarizer = summarizer_bodies(&upstream);
+    assert_eq!(summarizer.len(), 2);
+    // The retry shows the summarizer its rejected summary and what was wrong.
+    let retry = summarizer[1]["messages"].as_array().unwrap();
+    assert_eq!(retry.len(), 4);
+    assert_eq!(summarizer[1]["max_tokens"], summarizer[0]["max_tokens"], "a corrective retry gets the usual budget");
+    assert_eq!(retry[2]["role"], "assistant");
+    assert_eq!(retry[2]["content"], "x".repeat(400));
+    assert!(retry[3]["content"].as_str().unwrap().contains("It is too long."), "{}", retry[3]);
+    let (decision, fold) = decision_record(prompt_tokens_of(&upstream.last_body().unwrap()));
+    assert_eq!(fold["outcome"], "applied", "{decision}");
+    assert_eq!(fold["corrected_checks"]["within_length_bound"], 1, "{fold}");
+    assert!(fold.get("failed_checks").is_none(), "{fold}");
+    let (_, metrics) = gw.get("/metrics", TEST_KEY).await;
+    assert!(metrics.contains("gw_fold_corrective_retries_total{tenant=\"acme\",result=\"committed\"} 1"), "{metrics}");
+    assert!(metrics.contains("gw_fold_corrective_retries_total{tenant=\"acme\",result=\"rejected\"} 0"), "{metrics}");
+    assert_eq!(fold_counter(&metrics, "committed"), 1, "{metrics}");
 }
 
 #[tokio::test]
@@ -1002,12 +1026,20 @@ async fn a_rejected_summary_names_the_checks_it_failed_and_nothing_else() {
     assert_eq!(status, StatusCode::OK);
     let (decision, fold) = decision_record(prompt_tokens_of(&upstream.last_body().unwrap()));
     assert_eq!(fold["reason"], "checks_failed");
+    // Both the summary and its corrective retry dropped 15:30.
     assert_eq!(fold["failed_checks"]["pinned_facts_present"], 1, "{fold}");
+    assert_eq!(fold["corrected_checks"]["pinned_facts_present"], 1, "{fold}");
     assert!(!decision.contains("15:30"), "a missing value reached the decision line: {decision}");
+    // The summarizer itself is told what is missing.
+    let summarizer = summarizer_bodies(&upstream);
+    assert_eq!(summarizer.len(), 2);
+    assert!(summarizer[1]["messages"][3]["content"].as_str().unwrap().contains("It leaves out '15:30'"), "{}", summarizer[1]);
     let (_, metrics) = gw.get("/metrics", TEST_KEY).await;
     let series = |check: &str| format!("gw_fold_checks_failed_total{{tenant=\"acme\",check=\"{check}\"}} ");
-    assert!(metrics.contains(&format!("{}1", series("pinned_facts_present"))), "{metrics}");
+    assert!(metrics.contains(&format!("{}2", series("pinned_facts_present"))), "{metrics}");
     assert!(metrics.contains(&format!("{}0", series("non_empty"))), "{metrics}");
+    assert!(metrics.contains("gw_fold_corrective_retries_total{tenant=\"acme\",result=\"rejected\"} 1"), "{metrics}");
+    assert_eq!(fold_counter(&metrics, "rejected"), 1, "{metrics}");
 }
 
 #[tokio::test]
@@ -1068,18 +1100,19 @@ async fn a_rejected_fold_backs_off_before_paying_again() {
         body["messages"][0]["content"] = json!("The appointment moved to 15:30");
         body
     };
+    // The summary and its corrective retry both drop 15:30.
     assert_eq!(gw.post_chat(TEST_KEY, body(6)).await.0, StatusCode::OK);
-    assert_eq!(summarizer_bodies(&upstream).len(), 1);
+    assert_eq!(summarizer_bodies(&upstream).len(), 2);
     let (status, headers, _) = gw.post_chat(TEST_KEY, body(8)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(headers.get("x-gateway-folded").is_none());
-    assert_eq!(summarizer_bodies(&upstream).len(), 1, "backing off: no second paid fold");
+    assert_eq!(summarizer_bodies(&upstream).len(), 2, "backing off: no second paid fold");
     let (_, metrics) = gw.get("/metrics", TEST_KEY).await;
     assert_eq!(fold_counter(&metrics, "rejected"), 1, "{metrics}");
     assert_eq!(fold_counter(&metrics, "backoff"), 1, "{metrics}");
     // 8 more turns than the head the rejected fold covered: fold again.
     assert_eq!(gw.post_chat(TEST_KEY, body(14)).await.0, StatusCode::OK);
-    assert_eq!(summarizer_bodies(&upstream).len(), 2, "the backoff ends after backoff_turns");
+    assert!(summarizer_bodies(&upstream).len() > 2, "the backoff ends after backoff_turns");
 }
 
 #[tokio::test]

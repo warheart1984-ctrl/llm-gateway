@@ -167,6 +167,52 @@ pub fn superseded(prior_summary: Option<&str>, pending_turns: &[ChatMessage]) ->
     checks::apply_supersessions(known, &checks::build_source_text(pending_turns))
 }
 
+/// What a rejected summary got wrong, in words the summarizer can act on,
+/// for its one corrective retry. It names the conversation's own values, so it
+/// goes only to the summarizer, which has already seen them; logs and metrics
+/// get the check names alone.
+pub fn correction_prompt(errors: &[String]) -> String {
+    let lines: Vec<String> = errors
+        .iter()
+        .map(|error| {
+            let (check, detail) = error.split_once(": ").unwrap_or((error.as_str(), ""));
+            let item = detail.trim_start_matches("missing term ").trim_start_matches("missing ").trim_start_matches("states ");
+            match check {
+                "pinned_facts_present" => format!("- It leaves out {item}. Keep it verbatim."),
+                "field_value_present" => format!("- It has no current-facts line stating {item}. Add one."),
+                "superseded_not_current" => format!(
+                    "- It states {item} as current, but that value was replaced by the one in brackets. State the new value; the old one may only follow it as \"(was ...)\"."
+                ),
+                "within_length_bound" => "- It is too long. Stay within the character budget.".to_string(),
+                "non_empty" | "covers_something" => "- It is empty. Write the summary.".to_string(),
+                _ => format!("- It fails the {check} check."),
+            }
+        })
+        .collect();
+    format!(
+        "That summary was rejected:\n{}\n\nWrite the whole summary again, in the same two-part form, with these fixed.",
+        lines.join("\n")
+    )
+}
+
+/// The messages for the corrective retry: the original request, the rejected
+/// summary as the summarizer's own reply, and what it got wrong.
+pub fn retry_messages(
+    config: &PlanConfig,
+    prior_summary: Option<&str>,
+    pending_turns: &[ChatMessage],
+    rejected: &str,
+    errors: &[String],
+) -> Vec<ChatMessage> {
+    let mut messages = prompt_messages(config, prior_summary, pending_turns);
+    messages.push(ChatMessage::Assistant {
+        content: Some(crate::providers::Content::Text(rejected.into())),
+        tool_calls: vec![],
+    });
+    messages.push(ChatMessage::User { content: crate::providers::Content::Text(correction_prompt(errors)) });
+    messages
+}
+
 /// Whether `terms`, comma-separated, take at most half of `summary_chars`.
 /// Past that, a summary that keeps them all has almost no room left to say
 /// what they are, and in practice fails the check: such a fold is skipped
@@ -413,6 +459,35 @@ mod tests {
         assert!(run_checks_with_prior(second, Some(second), &quiet, &config).is_ok());
         let err = run_checks_with_prior("Current facts:\n- staging port: 8443", Some(second), &quiet, &config).unwrap_err();
         assert_eq!(err, ["pinned_facts_present: missing term '8444'"]);
+    }
+
+    #[test]
+    fn the_correction_says_what_was_wrong() {
+        let errors = vec![
+            "pinned_facts_present: missing term '9443'".to_string(),
+            "field_value_present: missing 'owner: Ines'".to_string(),
+            "superseded_not_current: states 'Mira (by Noor)'".to_string(),
+            "within_length_bound: summary is 2000 chars, max allowed 1800".to_string(),
+        ];
+        let prompt = correction_prompt(&errors);
+        assert!(prompt.starts_with("That summary was rejected:\n"), "{prompt}");
+        assert!(prompt.contains("- It leaves out '9443'. Keep it verbatim."), "{prompt}");
+        assert!(prompt.contains("- It has no current-facts line stating 'owner: Ines'. Add one."), "{prompt}");
+        assert!(prompt.contains("- It states 'Mira (by Noor)' as current, but that value was replaced"), "{prompt}");
+        assert!(prompt.contains("- It is too long."), "{prompt}");
+        assert!(prompt.ends_with("with these fixed."), "{prompt}");
+    }
+
+    #[test]
+    fn the_retry_shows_the_summarizer_its_rejected_summary() {
+        let config = PlanConfig { summary_chars: 1200, ..Default::default() };
+        let turns = vec![msg("user", "Correction: owner is now Ines.")];
+        let errors = vec!["field_value_present: missing 'owner: Ines'".to_string()];
+        let messages = retry_messages(&config, None, &turns, "Current facts:\n- owner: Mira", &errors);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[..2], prompt_messages(&config, None, &turns)[..]);
+        assert!(matches!(&messages[2], ChatMessage::Assistant { content: Some(Content::Text(text)), .. } if text == "Current facts:\n- owner: Mira"));
+        assert!(matches!(&messages[3], ChatMessage::User { content: Content::Text(text) } if *text == correction_prompt(&errors)));
     }
 
     #[test]

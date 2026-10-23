@@ -671,6 +671,8 @@ def run_benchmark(
                     "fold_outcomes": fold_outcome_deltas(metrics_before, metrics_after),
                     # Which checks a rejected summary failed, by name only.
                     "failed_checks": metric_deltas(metrics_before, metrics_after, "gw_fold_checks_failed_total", "check"),
+                    # A summary that failed its checks gets one corrective retry.
+                    "corrective_retries": metric_deltas(metrics_before, metrics_after, "gw_fold_corrective_retries_total", "result"),
                     "fold_count": _metric(metrics_after, "gw_folds_total", {"tenant": "folded", "outcome": "committed"}),
                     "summarizer_prompt_tokens": _metric(metrics_after, "gw_fold_summarizer_tokens_total", {"tenant": "folded", "kind": "prompt"})
                     - _metric(metrics_before, "gw_fold_summarizer_tokens_total", {"tenant": "folded", "kind": "prompt"}),
@@ -755,6 +757,7 @@ def run_benchmark(
                 "pinned_overflow": _metric(final_metrics, "gw_folds_total", {"tenant": "folded", "outcome": "pinned_overflow"}),
                 "backoff": _metric(final_metrics, "gw_folds_total", {"tenant": "folded", "outcome": "backoff"}),
                 "failed_checks": metric_deltas({}, final_metrics, "gw_fold_checks_failed_total", "check"),
+                "corrective_retries": metric_deltas({}, final_metrics, "gw_fold_corrective_retries_total", "result"),
             },
             "reached": reached,
             "caching": caching,
