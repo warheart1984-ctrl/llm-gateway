@@ -56,7 +56,9 @@ class FoldingConfigBoot(unittest.TestCase):
                 env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=180,
+                # CI builds the gateway in an earlier step, so this is a no-op
+                # there; a cold local debug build can take several minutes.
+                timeout=900,
             )
             self.assertEqual(build.returncode, 0, "gateway build failed")
             binary = root / "target" / "debug" / "llm-gateway"

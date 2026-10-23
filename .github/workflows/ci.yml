@@ -138,7 +138,8 @@ jobs:
     name: anchor-publisher and folding tools (${{ matrix.os }})
     # tools/anchor_publisher.py against real git repositories: append-only
     # publishing, refusing rewritten anchors and keys, detecting a rewritten
-    # or deleted branch, and `verify`.
+    # or deleted branch, and `verify`. Also the folding benchmark's harness,
+    # scoring, and a gateway booted with its bench configuration.
     strategy:
       fail-fast: false
       matrix:
@@ -149,7 +150,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Publisher tests
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Built here, cached, so the boot test's own `cargo build` has nothing
+      # left to do: a cold debug build on Windows runs past any sensible
+      # per-test timeout.
+      - name: Build gateway
+        run: cargo build --locked --bin llm-gateway
+      - name: Publisher and folding tool tests
         run: python -m unittest discover -s tools/tests -v
 
   receipts-demo:
