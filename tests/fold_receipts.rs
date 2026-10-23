@@ -537,8 +537,48 @@ async fn the_client_verifier_checks_every_fold_digest_the_gateway_wrote() {
     assert_eq!(verify_fold(&gateway, &second_body, &second, Some(&first), None), Some(0), "incremental fold");
     assert_eq!(verify_fold(&gateway, &reused_body, &reused, None, None), Some(0), "reused summary");
     assert_eq!(verify_fold(&gateway, &plain_body, &plain, None, None), Some(0), "unfolded");
-    assert_eq!(verify_fold(&gateway, &rejected_body, &rejected, None, Some(28)), Some(0), "rejected fold");
+    // `x-gateway-fold-covered` gives a rejected fold's count; nothing else needed.
+    assert_eq!(verify_fold(&gateway, &rejected_body, &rejected, None, None), Some(0), "rejected fold");
     // And it notices: the wrong body, or the wrong prior summary.
     assert_eq!(verify_fold(&gateway, &first_body, &second, Some(&first), None), Some(1));
     assert_eq!(verify_fold(&gateway, &second_body, &second, None, None), Some(1));
+}
+
+#[tokio::test]
+async fn a_request_refused_after_its_fold_still_lets_the_caller_check_the_fold() {
+    let (upstream, mock) = mock_upstream().await;
+    let gateway = Gateway::boot(&upstream).await;
+    let key = [("idempotency-key", "fold-then-refused")];
+    let first_body = conversation(30, true);
+    let (status, first, text) = gateway.post("/v1/chat/stream", &first_body, &key).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    // The same key for a longer conversation: the fold runs (and is paid
+    // for), then the ledger refuses the reused key.
+    *mock.summary.lock().unwrap() = "The conversation went on with more filler.".into();
+    let body = conversation(34, true);
+    let (status, refused, text) = gateway.post("/v1/chat/stream", &body, &key).await;
+    assert_ne!(status, StatusCode::OK, "{text}");
+    assert_eq!(mock.summarizer_calls(), 2, "the second fold ran before the refusal");
+    assert!(header(&refused, "x-receipt-id").is_none(), "no request allow was written");
+    assert!(header(&refused, "x-receipt-salt").is_some(), "the refusal carries the salt");
+    assert_eq!(header(&refused, "x-gateway-fold-covered"), Some("32"));
+    let fold_id = header(&refused, "x-gateway-fold-receipt-id").expect("the fold's receipt id");
+    assert_eq!(gateway.outcome_of(fold_id)["status"], "completed");
+    assert_eq!(decoded_summary(&refused), "The conversation went on with more filler.");
+    if let Some(code) = verify_fold(&gateway, &body, &refused, Some(&first), None) {
+        assert_eq!(code, 0, "the caller can check the fold it was charged for");
+    }
+}
+
+#[tokio::test]
+async fn a_refusal_before_any_fold_carries_no_fold_headers() {
+    let (upstream, _mock) = mock_upstream().await;
+    let gateway = Gateway::boot(&upstream).await;
+    let key = [("idempotency-key", "short-then-refused")];
+    assert_eq!(gateway.post("/v1/chat/stream", &conversation(2, true), &key).await.0, StatusCode::OK);
+    let (status, refused, text) = gateway.post("/v1/chat/stream", &conversation(3, true), &key).await;
+    assert_ne!(status, StatusCode::OK, "{text}");
+    for name in ["x-receipt-salt", "x-gateway-fold-receipt-id", "x-gateway-fold-covered", "x-gateway-fold-summary"] {
+        assert!(header(&refused, name).is_none(), "{name}");
+    }
 }

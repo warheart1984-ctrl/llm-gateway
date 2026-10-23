@@ -711,7 +711,8 @@ request (folded) = sha256( salt || "llm-gateway/folded-request/v1\n" || call_dig
 
 The forwarded messages follow from the body, the number of turns replaced and
 the summary, so the caller can check this without reproducing the gateway's
-JSON. A request that runs a fold also carries `x-gateway-fold-receipt-id`.
+JSON. A request that runs a fold also carries `x-gateway-fold-receipt-id`
+and `x-gateway-fold-covered`, the turns the fold set out to cover.
 That fold is a model call of its own, so it gets its own `allow`, written
 before the summarizer is called (if it cannot be written, nothing is folded
 and the request meets the stopped chain), and its own outcome, under the same
@@ -726,7 +727,15 @@ fold outcome = completed, reply = sha256( salt || "llm-gateway/fold-reply/v1\n" 
 
 `tools/verify_fold.py` recomputes all of these from the body, the headers, and
 the previous response's headers (for the summary being extended). A request
-that runs a fold writes four entries instead of two. Someone reading only the
+that runs a fold writes four entries instead of two.
+
+A fold runs before the request's own admission, so a request can be refused
+(402, 429, a reused `Idempotency-Key`) after its fold was paid for. That
+refusal has no `x-receipt-id`, since no `allow` was written for the request,
+but it still carries `x-receipt-salt`, `x-gateway-fold-receipt-id`,
+`x-gateway-fold-covered`, and `x-gateway-fold-summary` if the fold committed,
+so the caller can check the fold it was charged for. `verify_fold.py` then
+checks only the fold's entries. Someone reading only the
 log cannot tell a fold's `allow` from a request's: the action is inside the
 proposal hash. The caller can, from the headers.
 
@@ -938,6 +947,9 @@ stream_read_timeout_ms = 120000
 max_response_bytes = 8388608
 
 [governance]
+# On: a tenant may call only the models in its `allowed_models`, and an empty
+# list means none. Off: an empty list means any registry model, but a
+# non-empty list still limits that tenant, and its folding `summarizer_model`.
 require_model_allowlist = true
 on_max_tokens_exceeded = "clamp"   # or "reject"
 

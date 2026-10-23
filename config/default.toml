@@ -49,6 +49,8 @@ allow_anonymous = false
 
 [governance]
 # Deny by default: a tenant calling a model not on its allowlist is a 403.
+# Off, an empty `allowed_models` means any registry model, but a tenant that
+# lists models is still held to its list (and so is its summarizer).
 require_model_allowlist = true
 # Clamp silently and log, or 400. Clamp is friendlier for a UI that always
 # sends a generous max_tokens.

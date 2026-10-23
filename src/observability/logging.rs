@@ -30,6 +30,10 @@ pub struct RequestSpan {
     /// JSON object of fold counts and hashes, present only when the tenant
     /// has folding on. Never summary text and never message text.
     pub fold: Option<String>,
+    /// Response headers a refusal must still carry: when a receipts tenant's
+    /// fold ran and the request was then refused, the caller needs the salt
+    /// and the fold's receipt id to check what it was charged for. Not logged.
+    pub refusal_headers: Vec<(&'static str, String)>,
 }
 
 impl RequestSpan {
@@ -45,6 +49,7 @@ impl RequestSpan {
             started: Instant::now(),
             ttft: None,
             fold: None,
+            refusal_headers: Vec::new(),
         }
     }
 

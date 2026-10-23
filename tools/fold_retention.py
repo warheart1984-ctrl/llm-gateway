@@ -22,7 +22,21 @@ import sys
 import time
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+
+class _NoRedirects(HTTPRedirectHandler):
+    """Refuse every redirect. urllib's own handler re-sends a request's
+    headers, `x-api-key` included, to wherever a 30x points, so a misconfigured
+    or hostile `--base-url` could collect the key. A redirect becomes an
+    `HTTPError` instead, reported like any other refusal."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401, ARG002
+        return None
+
+
+#: Every request goes through this opener, never `urlopen`.
+_OPENER = build_opener(_NoRedirects)
 
 
 SYSTEM = (
@@ -333,7 +347,7 @@ def _request(base_url: str, path: str, key: str, body: dict[str, Any] | None, ti
     if body is not None:
         request.add_header("content-type", "application/json")
     try:
-        with urlopen(request, timeout=timeout) as response:
+        with _OPENER.open(request, timeout=timeout) as response:
             text = response.read().decode("utf-8")
             try:
                 payload: Any = json.loads(text)
