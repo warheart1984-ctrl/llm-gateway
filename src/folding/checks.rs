@@ -36,6 +36,105 @@ fn update_value_patterns() -> &'static [Regex] {
     })
 }
 
+/// A current value and the field it belongs to: "owner is now Ines" pins
+/// `owner: Ines`. A pinned value alone can survive in a summary that no longer
+/// says what it is: in the folding benchmark a summary that kept "Ines", but
+/// still told the story as "Mira owns the project ... later Ines", passed the
+/// value check and lost the fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldPin {
+    pub field: String,
+    pub value: String,
+}
+
+impl std::fmt::Display for FieldPin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.field, self.value)
+    }
+}
+
+/// Updates that name their field. Each has `field` and `value` groups; the
+/// field is one word.
+fn field_value_patterns() -> &'static [Regex] {
+    static RE: OnceLock<Vec<Regex>> = OnceLock::new();
+    RE.get_or_init(|| {
+        const FIELD: &str = r"(?P<field>[A-Za-z][A-Za-z0-9_-]*)";
+        const VALUE: &str = r"(?P<value>\d{1,2}:\d{2}|[A-Za-z0-9][\w-]*)";
+        [
+            // "the owner is now Ines", "external uploads are now permitted"
+            format!(r"\b{FIELD}\s+(?:is|are)\s+now\s+{VALUE}"),
+            // "Noor replaces Mira as owner"
+            r"\b(?P<value>[A-Z][\w-]*)\s+replaces\s+[A-Z][\w-]*\s+as\s+(?:the\s+)?(?P<field>[a-z][a-z0-9_-]*)".to_string(),
+            // "delivery moves to Tromso", "release slipped to 2027-03-04"
+            format!(
+                r"\b{FIELD}\s+(?:has\s+)?(?:moves?|moved|slipped|changed|switched|was\s+set|is\s+set)\s+to\s+{VALUE}"
+            ),
+            // "the new city is Bergen"
+            format!(r"(?i:\b(?:the\s+)?(?:new|correct|right|updated)\s+){FIELD}\s+(?:is|should\s+be|will\s+be)\s+{VALUE}"),
+            // "staging now listens on 8444"
+            format!(r"\b{FIELD}\s+now\s+listens\s+on\s+(?:port\s+)?{VALUE}"),
+        ]
+        .iter()
+        .map(|pattern| Regex::new(pattern).expect("field update pattern compiles"))
+        .collect()
+    })
+}
+
+/// Words that point at something else rather than name a field, in any case
+/// ("It is now 15:30").
+const NOT_FIELDS: &[&str] = &[
+    "it", "this", "that", "these", "those", "which", "what", "who", "there", "here", "he", "she", "they",
+    "we", "i", "you", "and", "or", "but", "now", "so", "then",
+];
+
+/// The field/value pairs `text` sets, the latest value for each field, in the
+/// order each field first appears. Fields are lowercased.
+pub fn extract_field_pins(text: &str) -> Vec<FieldPin> {
+    let mut found: Vec<(usize, String, String)> = Vec::new();
+    for pattern in field_value_patterns() {
+        for cap in pattern.captures_iter(text) {
+            let (Some(field), Some(value)) = (cap.name("field"), cap.name("value")) else { continue };
+            let field = field.as_str().to_lowercase();
+            if NOT_FIELDS.contains(&field.as_str()) {
+                continue;
+            }
+            found.push((value.start(), field, value.as_str().to_string()));
+        }
+    }
+    found.sort_by_key(|(at, _, _)| *at);
+    let mut pins: Vec<FieldPin> = Vec::new();
+    for (_, field, value) in found {
+        match pins.iter_mut().find(|pin| pin.field == field) {
+            Some(pin) => pin.value = value,
+            None => pins.push(FieldPin { field, value }),
+        }
+    }
+    pins
+}
+
+/// Whether one line of a summary states `pin` as current: it names the field,
+/// and the value follows it before any "(was ...)" note of an older value.
+fn line_states(line: &str, pin: &FieldPin) -> bool {
+    let field = pin.field.to_lowercase();
+    let value = pin.value.to_lowercase();
+    line.match_indices(&field).any(|(at, _)| {
+        let rest = &line[at + field.len()..];
+        rest.split("(was").next().unwrap_or(rest).contains(&value)
+    })
+}
+
+/// Check that every pin is stated as current on some line of the summary,
+/// ignoring case. Like the value check, done on the clipped summary.
+pub fn check_field_pins(summary: &str, pins: &[FieldPin]) -> Result<(), Vec<String>> {
+    let lines: Vec<String> = summary.lines().map(str::to_lowercase).collect();
+    let missing: Vec<String> = pins
+        .iter()
+        .filter(|pin| !lines.iter().any(|line| line_states(line, pin)))
+        .map(ToString::to_string)
+        .collect();
+    if missing.is_empty() { Ok(()) } else { Err(missing) }
+}
+
 /// Stable values a summary must keep even when not phrased as an update.
 /// 5-fold-engine's `_DURABLE_PATTERNS` (dates, times, hyphenated or
 /// underscored identifiers, ticket ids, short quoted strings), plus currency
@@ -346,6 +445,57 @@ mod tests {
     fn apostrophes_in_ordinary_words_pin_nothing() {
         assert!(extract_pinned_terms("I don't know, it's late.").is_empty());
         assert_eq!(extract_pinned_terms("call it 'Project Blue' now"), ["Project Blue"]);
+    }
+
+    fn pin(field: &str, value: &str) -> FieldPin {
+        FieldPin { field: field.into(), value: value.into() }
+    }
+
+    #[test]
+    fn field_pins_name_what_each_update_sets() {
+        let text = "Correction: owner is now Ines, superseding the earlier value.\n\
+                    Ownership correction: Noor replaces Mira as owner.\n\
+                    Budget correction: the ceiling is now 1800 USD.\n\
+                    Correction: external uploads are now permitted.\n\
+                    Correction: delivery moves to Bergen. Release slipped to 2027-03-04.\n\
+                    The new city is Tromso. Correction: staging now listens on 8444.";
+        assert_eq!(
+            extract_field_pins(text),
+            [
+                pin("owner", "Noor"),
+                pin("ceiling", "1800"),
+                pin("uploads", "permitted"),
+                pin("delivery", "Bergen"),
+                pin("release", "2027-03-04"),
+                pin("city", "Tromso"),
+                pin("staging", "8444"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_latest_update_of_a_field_wins() {
+        let text = "Delivery moves to Bergen. Later: delivery moves to Tromso. The OWNER is now Noor, owner is now Ines.";
+        assert_eq!(extract_field_pins(text), [pin("delivery", "Tromso"), pin("owner", "Ines")]);
+    }
+
+    #[test]
+    fn pointing_words_and_sentence_starts_are_not_fields() {
+        assert!(extract_field_pins("It is now 15:30. Then it is now late, and that is now done.").is_empty());
+        assert!(extract_field_pins("Noor replaces Mira, and the team moves on.").is_empty());
+    }
+
+    #[test]
+    fn a_field_pin_needs_its_value_on_the_fields_line() {
+        let pins = [pin("owner", "Ines")];
+        assert!(check_field_pins("Current facts:\n- Owner: Ines (was Noor)\n- City: Oslo", &pins).is_ok());
+        // The value is kept, but not as the owner: what the benchmark saw.
+        let err = check_field_pins("Current facts:\n- Owner: Mira\n- Note: Ines joined", &pins).unwrap_err();
+        assert_eq!(err, ["owner: Ines"]);
+        // An older value only.
+        assert!(check_field_pins("- owner: Noor (was Ines)", &pins).is_err());
+        // Prose that says it on one line still counts.
+        assert!(check_field_pins("The owner is now Ines.", &pins).is_ok());
     }
 
     #[test]

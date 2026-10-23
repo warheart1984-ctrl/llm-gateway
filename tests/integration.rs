@@ -1020,6 +1020,25 @@ async fn pinned_values_that_cannot_fit_skip_the_fold_before_it_is_paid_for() {
 }
 
 #[tokio::test]
+async fn field_pins_count_towards_the_overflow_check() {
+    // "the new lead7 is Q" pins `lead7: Q` and no bare value ("lead" is not
+    // one of the words the value patterns know), so only the field pins run
+    // past half of summary_chars.
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(FOLDING_TENANT)).await;
+    let mut body = folding_body(30);
+    for (index, message) in body["messages"].as_array_mut().unwrap().iter_mut().enumerate() {
+        message["content"] = json!(format!("the new lead{index} is Q"));
+    }
+    let (status, headers, _) = gw.post_chat(TEST_KEY, body.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.get("x-gateway-folded").is_none());
+    assert!(summarizer_bodies(&upstream).is_empty(), "no summarizer call for a fold that cannot pass");
+    let (_, metrics) = gw.get("/metrics", TEST_KEY).await;
+    assert_eq!(fold_counter(&metrics, "pinned_overflow"), 1, "{metrics}");
+}
+
+#[tokio::test]
 async fn a_rejected_fold_backs_off_before_paying_again() {
     // The first fold is rejected (its summary drops "15:30"). Until
     // backoff_turns (8) more turns arrive, the conversation is not folded
