@@ -71,7 +71,9 @@ startup_verify = "full"
 [folding]
 max_entries = 10000
 max_total_chars = 20000000
-background = true
+# Foreground, the shipped default: each call's measured spend then includes
+# its own fold. In the background a fold's cost lands in a later call's window.
+background = false
 
 [telemetry]
 service_name = "llm-gateway-folding-retention"

@@ -47,14 +47,22 @@ jobs:
           else
             cp bench/folding/tenants.yaml "$RUNNER_TEMP/folding-config/tenants.yaml"
           fi
+      # The gateway lives for this job only, so its three client keys are made
+      # fresh here and masked, not stored as repository secrets. GROQ_API_KEY
+      # is the only real credential.
+      - name: Generate per-run gateway keys
+        shell: bash
+        run: |
+          for name in GATEWAY_KEY_PLAIN GATEWAY_KEY_FOLDED GATEWAY_KEY_BENCH_ADMIN; do
+            value="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+            echo "::add-mask::$value"
+            echo "$name=$value" >> "$GITHUB_ENV"
+          done
       - name: Start gateway
         shell: bash
         env:
           LLM_GATEWAY_CONFIG_DIR: ${{ runner.temp }}/folding-config
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          GATEWAY_KEY_PLAIN: ${{ secrets.GATEWAY_KEY_PLAIN }}
-          GATEWAY_KEY_FOLDED: ${{ secrets.GATEWAY_KEY_FOLDED }}
-          GATEWAY_KEY_BENCH_ADMIN: ${{ secrets.GATEWAY_KEY_BENCH_ADMIN }}
         run: |
           cargo run --locked --release --bin llm-gateway > "$RUNNER_TEMP/folding-gateway.log" 2>&1 &
           echo $! > "$RUNNER_TEMP/folding-gateway.pid"
@@ -74,10 +82,9 @@ jobs:
         env:
           LLM_GATEWAY_CONFIG_DIR: ${{ runner.temp }}/folding-config
           LLM_GATEWAY_BASE_URL: http://127.0.0.1:8080
-          LLM_GATEWAY_PLAIN_KEY: ${{ secrets.GATEWAY_KEY_PLAIN }}
-          LLM_GATEWAY_FOLDED_KEY: ${{ secrets.GATEWAY_KEY_FOLDED }}
-          LLM_GATEWAY_ADMIN_KEY: ${{ secrets.GATEWAY_KEY_BENCH_ADMIN }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          LLM_GATEWAY_PLAIN_KEY: ${{ env.GATEWAY_KEY_PLAIN }}
+          LLM_GATEWAY_FOLDED_KEY: ${{ env.GATEWAY_KEY_FOLDED }}
+          LLM_GATEWAY_ADMIN_KEY: ${{ env.GATEWAY_KEY_BENCH_ADMIN }}
         run: |
           python -u tools/fold_retention.py \
             --model groq/gpt-oss-120b \

@@ -167,5 +167,41 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual(report["calls"][0]["folded"]["folded_turns"], 1)
 
 
+class Retrying(unittest.TestCase):
+    """A vendor rate limit is waited out; any other refusal ends the run."""
+
+    def arm(self, answers: list, waits: list) -> dict:
+        def request(*_args, **_kwargs):
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+        original = fr._request, fr._usage
+        fr._request, fr._usage = request, lambda *_args: 0
+        try:
+            return fr._arm("http://stub", "key", {}, 1.0, sleep=waits.append)
+        finally:
+            fr._request, fr._usage = original
+
+    def test_a_rate_limited_call_is_retried_and_the_retries_recorded(self) -> None:
+        ok = (200, {}, {"choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}]})
+        waits: list = []
+        result = self.arm([fr.TransientError("HTTP 502"), fr.TransientError("HTTP 429"), ok], waits)
+        self.assertEqual(result["retries"], 2)
+        self.assertEqual(waits, list(fr.RETRY_WAITS_SECONDS[:2]))
+
+    def test_a_call_still_refused_after_every_wait_ends_the_run(self) -> None:
+        refusals = [fr.TransientError("HTTP 502")] * (len(fr.RETRY_WAITS_SECONDS) + 1)
+        with self.assertRaises(fr.TransientError):
+            self.arm(refusals, [])
+
+    def test_a_plain_refusal_is_not_retried(self) -> None:
+        waits: list = []
+        with self.assertRaises(fr.BenchmarkError) as caught:
+            self.arm([fr.BenchmarkError("HTTP 400")], waits)
+        self.assertNotIsInstance(caught.exception, fr.TransientError)
+        self.assertEqual(waits, [])
+
+
 if __name__ == "__main__":
     unittest.main()

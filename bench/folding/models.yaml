@@ -1,5 +1,6 @@
 # Real Groq catalogue for the retention benchmark.
-# Prices checked 2026-10-22 against https://groq.com/pricing/.
+# Prices checked 2026-10-22 against https://console.groq.com/docs/models
+# (the per-model prices; https://groq.com/pricing/ did not list these models).
 schema_version: 1
 
 models:

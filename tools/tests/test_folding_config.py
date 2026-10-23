@@ -14,14 +14,21 @@ from urllib.request import urlopen
 
 
 class FoldingConfigBoot(unittest.TestCase):
-    def test_manual_workflow_is_dispatch_only_and_uses_secret_references(self) -> None:
+    def test_manual_workflow_is_dispatch_only_and_makes_its_own_gateway_keys(self) -> None:
         workflow = (Path(__file__).resolve().parents[2] / ".github" / "workflows" / "fold-retention.yml").read_text(
             encoding="utf-8"
         )
         self.assertIn("workflow_dispatch:", workflow)
         self.assertNotIn("\n  push:", workflow)
-        for name in ("GROQ_API_KEY", "GATEWAY_KEY_PLAIN", "GATEWAY_KEY_FOLDED", "GATEWAY_KEY_BENCH_ADMIN"):
-            self.assertIn(f"secrets.{name}", workflow)
+        # The vendor key is the only repository secret.
+        self.assertIn("secrets.GROQ_API_KEY", workflow)
+        # The gateway lives for one job, so its client keys are made per run
+        # and masked, never stored as secrets.
+        for name in ("GATEWAY_KEY_PLAIN", "GATEWAY_KEY_FOLDED", "GATEWAY_KEY_BENCH_ADMIN"):
+            self.assertNotIn(f"secrets.{name}", workflow)
+            self.assertIn(name, workflow)
+        self.assertIn("secrets.token_urlsafe", workflow)
+        self.assertIn("::add-mask::", workflow)
         self.assertNotIn("gsk_", workflow)
         self.assertNotIn("gwk_", workflow)
 

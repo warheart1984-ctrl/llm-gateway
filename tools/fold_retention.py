@@ -19,6 +19,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -308,6 +309,19 @@ class BenchmarkError(RuntimeError):
     pass
 
 
+class TransientError(BenchmarkError):
+    """A refusal worth retrying: the vendor's rate limit (sent on as 429 or
+    502) or a 503. The gateway refunds a request refused before streaming, so
+    a retried call is billed once."""
+
+
+#: Statuses retried, and the waits between attempts. Groq's on-demand tier
+#: allows 8,000 tokens a minute on gpt-oss-120b, about one call pair, so the
+#: waits add up to a little over a minute's window several times over.
+TRANSIENT_STATUSES = {429, 502, 503}
+RETRY_WAITS_SECONDS = (10, 20, 30, 45, 60, 60, 60, 60)
+
+
 def _url(base_url: str, path: str) -> str:
     return base_url.rstrip("/") + path
 
@@ -327,6 +341,8 @@ def _request(base_url: str, path: str, key: str, body: dict[str, Any] | None, ti
                 payload = text
             return response.status, {key.lower(): value for key, value in response.headers.items()}, payload
     except HTTPError as exc:
+        if exc.code in TRANSIENT_STATUSES:
+            raise TransientError(f"HTTP {exc.code} from {path}") from None
         raise BenchmarkError(f"HTTP {exc.code} from {path}") from None
     except (URLError, TimeoutError, OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise BenchmarkError(f"request to {path} failed: {type(exc).__name__}") from None
@@ -396,9 +412,18 @@ def _git_commit() -> str | None:
     return value or None
 
 
-def _arm(base_url: str, tenant_key: str, body: dict[str, Any], timeout: float) -> dict[str, Any]:
+def _arm(base_url: str, tenant_key: str, body: dict[str, Any], timeout: float, sleep=time.sleep) -> dict[str, Any]:
     before = _usage(base_url, tenant_key, timeout)
-    status, headers, payload = _request(base_url, "/v1/chat/completions", tenant_key, body, timeout)
+    retries = 0
+    while True:
+        try:
+            status, headers, payload = _request(base_url, "/v1/chat/completions", tenant_key, deepcopy(body), timeout)
+            break
+        except TransientError:
+            if retries == len(RETRY_WAITS_SECONDS):
+                raise
+            sleep(RETRY_WAITS_SECONDS[retries])
+            retries += 1
     after = _usage(base_url, tenant_key, timeout)
     if status != 200:
         raise BenchmarkError(f"chat request returned HTTP {status}")
@@ -412,6 +437,7 @@ def _arm(base_url: str, tenant_key: str, body: dict[str, Any], timeout: float) -
         "finish_reason": finish_reason,
         "spend_delta_nano_usd": after - before,
         "folded_turns": folded_turns,
+        "retries": retries,
         "content": content,
         "payload": payload,
     }
@@ -475,6 +501,7 @@ def run_benchmark(
                     "containment_correct": plain_score["correct_containment"],
                     "finish_reason": plain["finish_reason"],
                     "spend_delta_nano_usd": plain["spend_delta_nano_usd"],
+                    "retries": plain["retries"],
                     "error": plain_score["error"],
                     "extra_keys": plain_score["extra_keys"],
                 },
@@ -485,6 +512,7 @@ def run_benchmark(
                     "finish_reason": folded["finish_reason"],
                     "spend_delta_nano_usd": folded["spend_delta_nano_usd"],
                     "folded_turns": folded["folded_turns"],
+                    "retries": folded["retries"],
                     "fold_count": _metric(metrics_after, "gw_folds_total", {"tenant": "folded", "outcome": "committed"}),
                     "summarizer_prompt_tokens": _metric(metrics_after, "gw_fold_summarizer_tokens_total", {"tenant": "folded", "kind": "prompt"})
                     - _metric(metrics_before, "gw_fold_summarizer_tokens_total", {"tenant": "folded", "kind": "prompt"}),
