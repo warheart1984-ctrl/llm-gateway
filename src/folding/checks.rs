@@ -90,7 +90,7 @@ const NOT_FIELDS: &[&str] = &[
 
 /// Every field update in `text` as (offset of the value, lowercased field,
 /// value), in text order.
-fn field_updates(text: &str) -> Vec<(usize, String, String)> {
+pub(crate) fn field_updates(text: &str) -> Vec<(usize, String, String)> {
     let mut found: Vec<(usize, String, String)> = Vec::new();
     for pattern in field_value_patterns() {
         for cap in pattern.captures_iter(text) {
@@ -384,7 +384,14 @@ fn bare_numbers(text: &str) -> Vec<&str> {
 }
 
 /// Every check a summary can fail, by the name its errors start with.
-pub const CHECK_NAMES: [&str; 7] = [
+pub const CHECK_NAMES: [&str; 14] = [
+    "format",
+    "ledger_field",
+    "ledger_evidence",
+    "ledger_backwards",
+    "ledger_misfiled",
+    "ledger_duplicate",
+    "ledger_stale",
     "non_empty",
     "within_length_bound",
     "covers_something",

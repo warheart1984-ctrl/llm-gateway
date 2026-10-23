@@ -8,6 +8,7 @@
 //! client sent it.
 
 pub mod checks;
+pub mod ledger;
 pub mod plan;
 pub mod store;
 pub mod summarizer;

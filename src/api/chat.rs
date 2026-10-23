@@ -990,6 +990,8 @@ struct FoldWork {
     pending: Vec<ChatMessage>,
     covered: usize,
     prior_text: Option<String>,
+    /// The facts the prior summary was written from.
+    prior_ledger: crate::folding::ledger::Ledger,
     started_prefix: Option<[u8; 32]>,
     old_spent: u64,
     old_saved: u64,
@@ -1209,13 +1211,15 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
                 corrected_checks: corrected_checks.clone(),
             };
         }
-        let summary = match summarizer::run_checks_with_prior(
+        let (summary, ledger) = match summarizer::run_fold_checks(
             &content,
             work.prior_text.as_deref(),
+            &work.prior_ledger,
             &work.pending,
+            work.covered,
             &work.plan_config,
         ) {
-            Ok(summary) => summary,
+            Ok(made) => made,
             Err(errors) => {
                 let failed_checks = crate::folding::checks::failed_check_counts(&errors);
                 work.state.metrics.record_fold_checks(&work.tenant_id, &failed_checks);
@@ -1246,6 +1250,7 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
                 turns_covered: new_covered,
                 prefix_hash,
                 summary: summary.clone(),
+                ledger,
                 fold_count: work.new_fold_count,
                 tokens_spent: work.old_spent.saturating_add(used_prompt.saturating_add(used_completion)),
                 tokens_saved: work.old_saved.saturating_add(u64::from(work.prompt_tokens_cut)),
@@ -1457,6 +1462,7 @@ async fn foreground_fold(
         pending: pending.clone(),
         covered,
         prior_text: prior.as_ref().map(|summary| summary.summary.clone()),
+        prior_ledger: existing.as_ref().map(|entry| entry.lock().ledger.clone()).unwrap_or_default(),
         started_prefix: prior.as_ref().map(|summary| summary.prefix_hash),
         old_spent,
         old_saved,
