@@ -452,9 +452,75 @@ def _arm(base_url: str, tenant_key: str, body: dict[str, Any], timeout: float, s
         "spend_delta_nano_usd": after - before,
         "folded_turns": folded_turns,
         "retries": retries,
+        "usage": _usage_of(payload),
         "content": content,
         "payload": payload,
     }
+
+
+def _usage_of(payload: Any) -> dict[str, int]:
+    """Prompt, cached and completion tokens as the provider reported them."""
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    usage = usage if isinstance(usage, dict) else {}
+    details = usage.get("prompt_tokens_details")
+    details = details if isinstance(details, dict) else {}
+
+    def count(value: Any) -> int:
+        return value if isinstance(value, int) and value >= 0 else 0
+
+    return {
+        "prompt_tokens": count(usage.get("prompt_tokens")),
+        "cached_tokens": count(details.get("cached_tokens")),
+        "completion_tokens": count(usage.get("completion_tokens")),
+    }
+
+
+def provider_cost_usd(usage: dict[str, int], input_rate: float, cached_rate: float, output_rate: float) -> float:
+    """What the provider charges for one call, prompt-cache discount included.
+    Rates are USD per million tokens."""
+    fresh = usage["prompt_tokens"] - usage["cached_tokens"]
+    return (fresh * input_rate + usage["cached_tokens"] * cached_rate
+            + usage["completion_tokens"] * output_rate) / 1_000_000
+
+
+def _caching_aggregates(rows: list[dict[str, Any]], prices: dict[str, float | None]) -> dict[str, Any]:
+    """Cached share of each arm's main-call prompts and, when every price is
+    known, what the provider charges with its prompt-cache discount. The
+    gateway's own ledger bills without that discount, so `total_spend_nano_usd`
+    overstates what an unfolded conversation, whose growing prefix the provider
+    caches, really costs. Summarizer calls are priced without any cache
+    discount, which, if anything, overstates the folded arm."""
+    def share(arm: str) -> float | None:
+        prompt = sum(row[arm]["usage"]["prompt_tokens"] for row in rows)
+        cached = sum(row[arm]["usage"]["cached_tokens"] for row in rows)
+        return cached / prompt if prompt else None
+
+    result: dict[str, Any] = {
+        "cached_share": {"plain": share("plain"), "folded": share("folded")},
+        "cached_tokens": {arm: sum(row[arm]["usage"]["cached_tokens"] for row in rows) for arm in ("plain", "folded")},
+    }
+    names = ("main_input_per_mtok_usd", "main_cached_input_per_mtok_usd", "main_output_per_mtok_usd",
+             "summarizer_input_per_mtok_usd", "summarizer_output_per_mtok_usd")
+    if any(prices.get(name) is None for name in names):
+        result["provider_cost_usd"] = None
+        return result
+    main = (prices["main_input_per_mtok_usd"], prices["main_cached_input_per_mtok_usd"], prices["main_output_per_mtok_usd"])
+    plain = sum(provider_cost_usd(row["plain"]["usage"], *main) for row in rows)
+    folded_main = sum(provider_cost_usd(row["folded"]["usage"], *main) for row in rows)
+    summarizer = sum(
+        (row["folded"]["summarizer_prompt_tokens"] * prices["summarizer_input_per_mtok_usd"]
+         + row["folded"]["summarizer_completion_tokens"] * prices["summarizer_output_per_mtok_usd"]) / 1_000_000
+        for row in rows
+    )
+    result["provider_cost_usd"] = {
+        "plain": plain,
+        "folded": folded_main + summarizer,
+        "folded_main_calls": folded_main,
+        "folded_summarizer_calls": summarizer,
+        "saving": plain - (folded_main + summarizer),
+        "saving_share": (plain - (folded_main + summarizer)) / plain if plain else None,
+    }
+    return result
 
 
 def run_benchmark(
@@ -488,8 +554,15 @@ def run_benchmark(
             committed_before = _metric(metrics_before, "gw_folds_total", {"tenant": "folded", "outcome": "committed"})
             scenario.advance(call, committed_before, profile_data["max_folds"])
             body = scenario.request(model, max_tokens)
-            plain = _arm(base_url, plain_key, deepcopy(body), timeout)
-            folded = _arm(base_url, folded_key, deepcopy(body), timeout)
+            # Alternate which arm goes first, so neither always meets the
+            # provider (and its prompt cache, and its load) second.
+            plain_first = call % 2 == 1
+            if plain_first:
+                plain = _arm(base_url, plain_key, deepcopy(body), timeout)
+                folded = _arm(base_url, folded_key, deepcopy(body), timeout)
+            else:
+                folded = _arm(base_url, folded_key, deepcopy(body), timeout)
+                plain = _arm(base_url, plain_key, deepcopy(body), timeout)
             plain_score = score_answer(plain["content"], scenario.expected, plain["finish_reason"])
             folded_score = score_answer(folded["content"], scenario.expected, folded["finish_reason"])
             fields = {
@@ -509,12 +582,14 @@ def run_benchmark(
             metrics_after = _metrics(base_url, admin_key, timeout)
             row = {
                 "call": call,
+                "order": "plain-first" if plain_first else "folded-first",
                 "plain": {
                     "correct": plain_score["correct"],
                     "total": plain_score["total"],
                     "containment_correct": plain_score["correct_containment"],
                     "finish_reason": plain["finish_reason"],
                     "spend_delta_nano_usd": plain["spend_delta_nano_usd"],
+                    "usage": plain["usage"],
                     "retries": plain["retries"],
                     "error": plain_score["error"],
                     "extra_keys": plain_score["extra_keys"],
@@ -526,6 +601,7 @@ def run_benchmark(
                     "finish_reason": folded["finish_reason"],
                     "spend_delta_nano_usd": folded["spend_delta_nano_usd"],
                     "folded_turns": folded["folded_turns"],
+                    "usage": folded["usage"],
                     "retries": folded["retries"],
                     "fold_count": _metric(metrics_after, "gw_folds_total", {"tenant": "folded", "outcome": "committed"}),
                     "summarizer_prompt_tokens": _metric(metrics_after, "gw_fold_summarizer_tokens_total", {"tenant": "folded", "kind": "prompt"})
@@ -570,6 +646,7 @@ def run_benchmark(
         "frozen" if max_fold_count >= profile_data["max_folds"] else "warm"
     )
     final_metrics = _metrics(base_url, admin_key, timeout)
+    caching = _caching_aggregates(rows, prices or {})
     report = {
         "schema": "folding.retention.v1",
         "started_utc": started,
@@ -607,6 +684,7 @@ def run_benchmark(
                 "refused_admission": _metric(final_metrics, "gw_folds_total", {"tenant": "folded", "outcome": "refused_admission"}),
             },
             "reached": reached,
+            "caching": caching,
         },
     }
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -630,6 +708,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=240.0)
     parser.add_argument("--main-input-per-mtok-usd", type=float)
     parser.add_argument("--main-output-per-mtok-usd", type=float)
+    parser.add_argument("--main-cached-input-per-mtok-usd", type=float,
+                        help="the provider's price for prompt tokens served from its cache")
     parser.add_argument("--summarizer-input-per-mtok-usd", type=float)
     parser.add_argument("--summarizer-output-per-mtok-usd", type=float)
     parser.add_argument("--output", type=Path)
@@ -655,6 +735,7 @@ def main(argv: list[str] | None = None) -> int:
             prices={
                 "main_input_per_mtok_usd": args.main_input_per_mtok_usd,
                 "main_output_per_mtok_usd": args.main_output_per_mtok_usd,
+                "main_cached_input_per_mtok_usd": args.main_cached_input_per_mtok_usd,
                 "summarizer_input_per_mtok_usd": args.summarizer_input_per_mtok_usd,
                 "summarizer_output_per_mtok_usd": args.summarizer_output_per_mtok_usd,
             },

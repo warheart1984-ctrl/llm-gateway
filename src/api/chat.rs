@@ -2918,6 +2918,12 @@ fn openai_completion_payload(completion: &Completion, usage: &Usage, openai: &Op
             "prompt_tokens": usage.prompt_tokens,
             "completion_tokens": usage.completion_tokens,
             "total_tokens": usage.total_tokens,
+            // What the provider served from its prompt cache, as OpenAI reports
+            // it. Informational: the gateway bills without the cache discount
+            // (see `billable_usage`), but a client sees what the vendor charged.
+            "prompt_tokens_details": {
+                "cached_tokens": completion.usage.and_then(|reported| reported.cached_prompt_tokens).unwrap_or(0),
+            },
             "completion_tokens_details": { "reasoning_tokens": usage.reasoning_tokens.unwrap_or(0) },
         },
     })
