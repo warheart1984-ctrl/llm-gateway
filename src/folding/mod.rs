@@ -22,6 +22,12 @@ pub enum FoldAccounting {
     Failed,
     Unprofitable,
     RefusedAdmission,
+    /// The values the summary would have to keep cannot fit in it, so no
+    /// summary could pass the check: skipped before anything is paid.
+    PinnedOverflow,
+    /// A fold of this conversation was rejected recently: skipped until
+    /// `backoff_turns` more turns arrive.
+    BackedOff,
 }
 
 impl FoldAccounting {
@@ -32,6 +38,8 @@ impl FoldAccounting {
             FoldAccounting::Failed => "failed",
             FoldAccounting::Unprofitable => "unprofitable",
             FoldAccounting::RefusedAdmission => "refused_admission",
+            FoldAccounting::PinnedOverflow => "pinned_overflow",
+            FoldAccounting::BackedOff => "backoff",
         }
     }
 }

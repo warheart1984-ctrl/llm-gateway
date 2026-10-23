@@ -159,6 +159,10 @@ pub struct FoldingConfig {
     pub amortization_requests: u32,
     /// Cost check floor in nano-USD.
     pub min_saving_nano_usd: u64,
+    /// After a fold is rejected (its summary failed a check, came back
+    /// empty, or stopped at the length limit), do not fold this conversation
+    /// again until this many more turns have arrived. `0` turns it off.
+    pub backoff_turns: usize,
 }
 
 impl Default for FoldingConfig {
@@ -175,6 +179,7 @@ impl Default for FoldingConfig {
             min_new_tokens: 400,
             amortization_requests: 4,
             min_saving_nano_usd: 0,
+            backoff_turns: 8,
         }
     }
 }

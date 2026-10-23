@@ -952,9 +952,24 @@ impl Drop for EndFold {
     }
 }
 
+/// Run a fold and keep its backoff: a rejected fold holds off its
+/// conversation until `backoff_turns` more turns arrive; a committed one
+/// clears that.
+async fn run_applied_fold(work: FoldWork) -> AppliedFold {
+    let store = Arc::clone(&work.state.folding);
+    let (key, head_turns) = (work.key, work.head.len());
+    let result = run_summarizer_attempts(work).await;
+    match &result {
+        AppliedFold::Committed { .. } => store.clear_backoff(&key),
+        AppliedFold::Stopped { accounting: FoldAccounting::Rejected, .. } => store.back_off(key, head_turns),
+        AppliedFold::Stopped { .. } => {}
+    }
+    result
+}
+
 /// Run the summarizer. The store lock is never held across the provider call.
 /// On shutdown the reservation is released, not abandoned.
-async fn run_applied_fold(work: FoldWork) -> AppliedFold {
+async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
     let mut shutdown = work.state.folding.subscribe_shutdown();
     let mut attempt_no = 0u8;
     let mut used_prompt = 0u64;
@@ -1239,6 +1254,38 @@ async fn foreground_fold(
     let covered = prior.as_ref().map(|summary| summary.turns_covered.min(head.len())).unwrap_or(0);
     let pending = head[covered..].to_vec();
 
+    // Checks that skip a fold before anything is admitted or paid. Each sends
+    // the request with the summary it already has, or unfolded.
+    let skip = |outcome: &'static str, reason: &'static str, accounting: Option<FoldAccounting>| {
+        let (forwarded, folded_turns) = with_current_summary(messages, &protected, prior.as_ref(), &pending, &tail);
+        describe_fold(
+            messages,
+            forwarded,
+            &plan,
+            FoldStamp {
+                outcome,
+                reason,
+                attempt: accounting.map(|outcome| FoldAttempt { outcome, prompt_tokens: 0, completion_tokens: 0 }),
+                fold_count: prior.as_ref().map(|summary| summary.fold_count).unwrap_or(0),
+                prefix_hash: prior.as_ref().map(|summary| summary.prefix_hash),
+                folded_turns,
+            },
+        )
+    };
+    if state.folding.shutting_down() {
+        return skip("not_due", "shutdown", None);
+    }
+    if folding.backoff_turns > 0
+        && let Some(rejected_at) = state.folding.backed_off_at(&key)
+        && head.len() < rejected_at.saturating_add(folding.backoff_turns)
+    {
+        return skip("skipped", "backoff", Some(FoldAccounting::BackedOff));
+    }
+    let pinned = summarizer::pinned_terms(prior.as_ref().map(|summary| summary.summary.as_str()), &pending);
+    if !summarizer::pinned_terms_fit(&pinned, plan_config.summary_chars) {
+        return skip("skipped", "pinned_overflow", Some(FoldAccounting::PinnedOverflow));
+    }
+
     // The summarizer is admitted like any request: it takes a rate slot and
     // prompt tokens from the tenant's window. Fold only when the window has
     // room for it and for the request it serves, so a fold never turns an
@@ -1255,24 +1302,7 @@ async fn foreground_fold(
         2,
         summarizer_prompt.saturating_add(estimate_prompt_tokens(messages)),
     ) {
-        let (forwarded, folded_turns) = with_current_summary(messages, &protected, prior.as_ref(), &pending, &tail);
-        return describe_fold(
-            messages,
-            forwarded,
-            &plan,
-            FoldStamp {
-                outcome: "refused",
-                reason: "no_rate_headroom",
-                attempt: Some(FoldAttempt {
-                    outcome: FoldAccounting::RefusedAdmission,
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                }),
-                fold_count: prior.as_ref().map(|summary| summary.fold_count).unwrap_or(0),
-                prefix_hash: prior.as_ref().map(|summary| summary.prefix_hash),
-                folded_turns,
-            },
-        );
+        return skip("refused", "no_rate_headroom", Some(FoldAccounting::RefusedAdmission));
     }
 
     let (old_spent, old_saved) = existing
@@ -1355,21 +1385,10 @@ async fn foreground_fold(
     // One fold per conversation at a time, as in background mode. A request
     // that finds one running goes out with the summary it already has: two
     // concurrent folds would both be paid for and only one could commit.
+    // `try_begin` also refuses once shutdown has begun; say which it was.
     if !state.folding.try_begin(key) {
-        let (forwarded, folded_turns) = with_current_summary(messages, &protected, prior.as_ref(), &pending, &tail);
-        return describe_fold(
-            messages,
-            forwarded,
-            &plan,
-            FoldStamp {
-                outcome: "not_due",
-                reason: "fold_in_flight",
-                attempt: None,
-                fold_count: prior.as_ref().map(|summary| summary.fold_count).unwrap_or(0),
-                prefix_hash: prior.as_ref().map(|summary| summary.prefix_hash),
-                folded_turns,
-            },
-        );
+        let reason = if state.folding.shutting_down() { "shutdown" } else { "fold_in_flight" };
+        return skip("not_due", reason, None);
     }
     let _end = EndFold { store: Arc::clone(&state.folding), key };
 

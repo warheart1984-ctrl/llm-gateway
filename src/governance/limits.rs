@@ -597,8 +597,6 @@ impl LimitEngine {
         .await
     }
 
-    /// Pre-flight gate. Every rejection names the ceiling that was hit, so a
-    /// tenant can tell "slow down" apart from "you cannot afford this".
     /// Whether this tenant's rate window has room for `requests` more
     /// admissions carrying `prompt_tokens` in total. Advisory: it records and
     /// reserves nothing. A conversation fold asks before spending, so its
@@ -615,6 +613,8 @@ impl LimitEngine {
             && (tokens_per_minute == 0 || window.tokens().saturating_add(prompt_tokens) <= tokens_per_minute)
     }
 
+    /// Pre-flight gate. Every rejection names the ceiling that was hit, so a
+    /// tenant can tell "slow down" apart from "you cannot afford this".
     pub async fn admit_request(self: &Arc<Self>, req: AdmitRequest<'_>) -> Result<Reservation, LimitError> {
         let limits = req.limits;
         let estimated_cost_nano_usd = req.estimate.total();

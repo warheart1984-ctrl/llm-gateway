@@ -69,6 +69,9 @@ pub struct FoldingStore {
     in_flight: DashSet<[u8; 32]>,
     /// `true` once shutdown has asked every fold task to stop.
     shutdown: watch::Sender<bool>,
+    /// Conversations whose last fold was rejected, with the head length that
+    /// fold covered. Bounded by `max_entries`, like the summaries.
+    backoffs: DashMap<[u8; 32], usize>,
 }
 
 impl FoldingStore {
@@ -85,7 +88,36 @@ impl FoldingStore {
             prefix_mismatches: std::sync::atomic::AtomicU64::new(0),
             in_flight: DashSet::new(),
             shutdown: watch::channel(false).0,
+            backoffs: DashMap::new(),
         }
+    }
+
+    /// Whether shutdown has asked folds to stop.
+    pub fn shutting_down(&self) -> bool {
+        *self.shutdown.borrow()
+    }
+
+    /// A fold covering `head_turns` turns was rejected: hold off this
+    /// conversation. When the map is full an arbitrary mark is dropped, which
+    /// only costs that conversation one more paid attempt.
+    pub fn back_off(&self, key: [u8; 32], head_turns: usize) {
+        if self.backoffs.len() >= self.max_entries && !self.backoffs.contains_key(&key) {
+            let victim = self.backoffs.iter().next().map(|item| *item.key());
+            if let Some(victim) = victim {
+                self.backoffs.remove(&victim);
+            }
+        }
+        self.backoffs.insert(key, head_turns);
+    }
+
+    /// The head length the last rejected fold of this conversation covered.
+    pub fn backed_off_at(&self, key: &[u8; 32]) -> Option<usize> {
+        self.backoffs.get(key).map(|item| *item.value())
+    }
+
+    /// A fold of this conversation committed: no more backing off.
+    pub fn clear_backoff(&self, key: &[u8; 32]) {
+        self.backoffs.remove(key);
     }
 
     /// Reserve the right to fold this conversation. False when a fold is
