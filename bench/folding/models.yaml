@@ -1,0 +1,30 @@
+# Real Groq catalogue for the retention benchmark.
+# Prices checked 2026-10-22 against https://groq.com/pricing/.
+schema_version: 1
+
+models:
+  groq/gpt-oss-120b:
+    provider: groq
+    display_name: GPT-OSS 120B (Groq)
+    upstream_model: openai/gpt-oss-120b
+    default_params:
+      temperature: 0.0
+      max_tokens: 1024
+    cost:
+      input_per_mtok_usd: 0.15
+      output_per_mtok_usd: 0.60
+    max_context_tokens: 131072
+    max_output_tokens: 65536
+
+  groq/gpt-oss-20b:
+    provider: groq
+    display_name: GPT-OSS 20B summarizer (Groq)
+    upstream_model: openai/gpt-oss-20b
+    default_params:
+      temperature: 0.0
+      max_tokens: 512
+    cost:
+      input_per_mtok_usd: 0.075
+      output_per_mtok_usd: 0.30
+    max_context_tokens: 131072
+    max_output_tokens: 65536

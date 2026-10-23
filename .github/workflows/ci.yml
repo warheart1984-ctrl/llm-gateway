@@ -135,6 +135,7 @@ jobs:
         run: docker compose logs gateway
 
   anchor-publisher:
+    name: anchor-publisher and folding tools (${{ matrix.os }})
     # tools/anchor_publisher.py against real git repositories: append-only
     # publishing, refusing rewritten anchors and keys, detecting a rewritten
     # or deleted branch, and `verify`.
