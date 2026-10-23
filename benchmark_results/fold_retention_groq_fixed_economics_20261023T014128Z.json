@@ -1,0 +1,23 @@
+{
+  "schema": "folding.retention.v1",
+  "started_utc": "2026-10-23T01:41:30.191455+00:00",
+  "finished_utc": "2026-10-23T01:47:16.118799+00:00",
+  "settings": {
+    "model": "groq/gpt-oss-120b",
+    "scenario": "fixed",
+    "profile": "economics",
+    "label": "economics",
+    "git_commit": "d239784fdf5c67ba5e794667fecc9603a6322d08",
+    "prices": {
+      "main_input_per_mtok_usd": 0.15,
+      "main_output_per_mtok_usd": 0.6,
+      "summarizer_input_per_mtok_usd": 0.075,
+      "summarizer_output_per_mtok_usd": 0.3
+    }
+  },
+  "rows": [],
+  "error": {
+    "type": "TransientError",
+    "message": "HTTP 502 from /v1/chat/completions"
+  }
+}

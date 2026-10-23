@@ -1,0 +1,5998 @@
+{
+  "schema": "folding.retention.v1",
+  "started_utc": "2026-10-23T01:08:56.331494+00:00",
+  "finished_utc": "2026-10-23T01:25:19.843583+00:00",
+  "settings": {
+    "model": "groq/gpt-oss-120b",
+    "scenario": "fixed",
+    "profile": "lifecycle",
+    "label": "lifecycle, not economics",
+    "max_calls": 50,
+    "max_tokens": 1024,
+    "temperature": 0,
+    "fold_cap": 5,
+    "refold_threshold": 8,
+    "secrets_written": false,
+    "git_commit": "d239784fdf5c67ba5e794667fecc9603a6322d08",
+    "prices": {
+      "main_input_per_mtok_usd": 0.15,
+      "main_output_per_mtok_usd": 0.6,
+      "summarizer_input_per_mtok_usd": 0.075,
+      "summarizer_output_per_mtok_usd": 0.3
+    }
+  },
+  "calls": [
+    {
+      "call": 1,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1049400,
+        "retries": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1452300,
+        "folded_turns": 0,
+        "retries": 0,
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 5692,
+        "summarizer_completion_tokens": 1536,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Mira",
+          "introduced_at": 2,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Oslo",
+          "introduced_at": 2,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 2400,
+          "introduced_at": 3,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 2,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1052700,
+        "retries": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1056300,
+        "folded_turns": 49,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 2904,
+        "summarizer_completion_tokens": 504,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Mira",
+          "introduced_at": 2,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Oslo",
+          "introduced_at": 2,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 2400,
+          "introduced_at": 3,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 3,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1056000,
+        "retries": 1,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 690600,
+        "folded_turns": 49,
+        "retries": 1,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Mira",
+          "introduced_at": 2,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Oslo",
+          "introduced_at": 2,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 4,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1059300,
+        "retries": 1,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 693900,
+        "folded_turns": 49,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Mira",
+          "introduced_at": 2,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Oslo",
+          "introduced_at": 2,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 5,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1064100,
+        "retries": 1,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 698550,
+        "folded_turns": 49,
+        "retries": 1,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 6,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1067400,
+        "retries": 1,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 701850,
+        "folded_turns": 49,
+        "retries": 1,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 7,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1070700,
+        "retries": 1,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 705300,
+        "folded_turns": 49,
+        "retries": 1,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 8,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1074000,
+        "retries": 2,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 708600,
+        "folded_turns": 49,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 9,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 633450,
+        "retries": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 711900,
+        "folded_turns": 49,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 10,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1080750,
+        "retries": 2,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 715200,
+        "folded_turns": 49,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 11,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1084050,
+        "retries": 1,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 718650,
+        "folded_turns": 49,
+        "retries": 1,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 12,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 671100,
+        "retries": 1,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 338550,
+        "folded_turns": 49,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 13,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 664200,
+        "retries": 1,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 725250,
+        "folded_turns": 49,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 14,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1094100,
+        "retries": 1,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 728700,
+        "folded_turns": 49,
+        "retries": 1,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 15,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1097400,
+        "retries": 1,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 732000,
+        "folded_turns": 49,
+        "retries": 1,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 16,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1100850,
+        "retries": 2,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 735300,
+        "folded_turns": 49,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 17,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1104150,
+        "retries": 1,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 738600,
+        "folded_turns": 49,
+        "retries": 1,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 18,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1107450,
+        "retries": 1,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 312450,
+        "folded_turns": 49,
+        "retries": 1,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 19,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1110900,
+        "retries": 2,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 745350,
+        "folded_turns": 49,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 20,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 709200,
+        "retries": 1,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 748650,
+        "folded_turns": 49,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 21,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1117500,
+        "retries": 1,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 752100,
+        "folded_turns": 49,
+        "retries": 1,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 22,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1120800,
+        "retries": 2,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 755400,
+        "folded_turns": 49,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 23,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1124250,
+        "retries": 1,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 758700,
+        "folded_turns": 49,
+        "retries": 1,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 24,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1127550,
+        "retries": 2,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 762000,
+        "folded_turns": 49,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 25,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1130850,
+        "retries": 2,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 765450,
+        "folded_turns": 49,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 26,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1134300,
+        "retries": 1,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 768750,
+        "folded_turns": 49,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 27,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1137600,
+        "retries": 1,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 772050,
+        "folded_turns": 49,
+        "retries": 1,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 28,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 746700,
+        "retries": 2,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 775500,
+        "folded_turns": 49,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 29,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1144200,
+        "retries": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 345600,
+        "folded_turns": 49,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 30,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1147650,
+        "retries": 2,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 782100,
+        "folded_turns": 49,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 31,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1150950,
+        "retries": 2,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 785400,
+        "folded_turns": 49,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 32,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1154250,
+        "retries": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 788850,
+        "folded_turns": 49,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 33,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1157700,
+        "retries": 1,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 792150,
+        "folded_turns": 49,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 34,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1161000,
+        "retries": 2,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 365250,
+        "folded_turns": 49,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 35,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1164300,
+        "retries": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 798900,
+        "folded_turns": 49,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 36,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1167600,
+        "retries": 1,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 802200,
+        "folded_turns": 49,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": true,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 37,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1171050,
+        "retries": 1,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2065050,
+        "folded_turns": 0,
+        "retries": 1,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 5056,
+        "summarizer_completion_tokens": 3072,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 38,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1174350,
+        "retries": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2481750,
+        "folded_turns": 0,
+        "retries": 2,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 5144,
+        "summarizer_completion_tokens": 3072,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 39,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 748650,
+        "retries": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1429350,
+        "folded_turns": 0,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 1308,
+        "summarizer_completion_tokens": 512,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 40,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 751500,
+        "retries": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1434450,
+        "folded_turns": 0,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 1330,
+        "summarizer_completion_tokens": 512,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 41,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1184400,
+        "retries": 1,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1439400,
+        "folded_turns": 0,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 1352,
+        "summarizer_completion_tokens": 512,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 42,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1187700,
+        "retries": 2,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1854600,
+        "folded_turns": 0,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 2748,
+        "summarizer_completion_tokens": 1536,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 43,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1191000,
+        "retries": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1449300,
+        "folded_turns": 0,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 1396,
+        "summarizer_completion_tokens": 512,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 44,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1194450,
+        "retries": 1,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2387850,
+        "folded_turns": 0,
+        "retries": 2,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 5672,
+        "summarizer_completion_tokens": 2560,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 45,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 778950,
+        "retries": 1,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1459350,
+        "folded_turns": 0,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 1440,
+        "summarizer_completion_tokens": 512,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 46,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 809850,
+        "retries": 1,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1984650,
+        "folded_turns": 0,
+        "retries": 2,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 5848,
+        "summarizer_completion_tokens": 2560,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 47,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 777900,
+        "retries": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1887900,
+        "folded_turns": 0,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 2968,
+        "summarizer_completion_tokens": 1536,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 48,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1207800,
+        "retries": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1207800,
+        "folded_turns": 0,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 49,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1211100,
+        "retries": 1,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1065300,
+        "folded_turns": 0,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 1528,
+        "summarizer_completion_tokens": 512,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    },
+    {
+      "call": 50,
+      "plain": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1214400,
+        "retries": 1,
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 10,
+        "total": 10,
+        "containment_correct": 10,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1484250,
+        "folded_turns": 0,
+        "retries": 0,
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 1550,
+        "summarizer_completion_tokens": 512,
+        "error": null,
+        "extra_keys": []
+      },
+      "fields": {
+        "project_id": {
+          "expected": "CEDAR-731",
+          "introduced_at": 1,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "owner": {
+          "expected": "Noor",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "city": {
+          "expected": "Bergen",
+          "introduced_at": 55,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "budget_usd": {
+          "expected": 1800,
+          "introduced_at": 53,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "external_upload_allowed": {
+          "expected": false,
+          "introduced_at": 4,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "staging_port": {
+          "expected": 8443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "production_port": {
+          "expected": 9443,
+          "introduced_at": 5,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "release_date": {
+          "expected": "2027-02-18",
+          "introduced_at": 6,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "recovery_phrase": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        },
+        "approval_ticket": {
+          "expected": null,
+          "introduced_at": 0,
+          "eligible": false,
+          "plain_correct": true,
+          "folded_correct": true,
+          "plain_containment_correct": true,
+          "folded_containment_correct": true
+        }
+      }
+    }
+  ],
+  "aggregates": {
+    "retention_rate": 1.0,
+    "eligible_fields": 182,
+    "folded_correct_eligible_fields": 182,
+    "accuracy": {
+      "plain": 1.0,
+      "folded": 1.0
+    },
+    "total_spend_nano_usd": {
+      "plain": 52441500,
+      "folded": 49859400
+    },
+    "net_saving_nano_usd": 2582100,
+    "folds": {
+      "committed": 1,
+      "rejected": 9,
+      "failed": 13,
+      "unprofitable": 46,
+      "refused_admission": 0
+    },
+    "reached": "warm"
+  }
+}

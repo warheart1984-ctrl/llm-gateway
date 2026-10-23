@@ -565,6 +565,30 @@ What a fold costs and keeps:
 - **A conversation is keyed by tenant, API key, system messages and first turn.** Sessions behind different keys never share a summary.
 - **The store is shared by all tenants.** One busy tenant can evict others' summaries, which then pay to fold again. Size `max_entries` and `max_total_chars` for every folding tenant together.
 
+### Folding: measured
+
+`tools/fold_retention.py` sends every call twice: once to a tenant without folding and once to a tenant with it. Both use the same model, the same messages and `temperature: 0`. It asks for ten facts that the conversation states, corrects and confuses with a second project (5-fold-engine's scenarios). Answers are scored by strict typed equality. A fact counts towards retention only if:
+- it was last stated inside the turns the summary replaced;
+- and the unfolded tenant got it right on the same call.
+
+Spend is each tenant's own ledger, so summarizer calls and failed folds are included. Run it with `python tools/run_fold_retention_local.py --provider openrouter --scenario fixed --profile economics`. The result files are in `benchmark_results/`.
+
+OpenRouter, 2026-10-23. Main model `openai/gpt-4.1-mini` ($0.40 / $1.60 per Mtok), summarizer `openai/gpt-4.1-nano` ($0.10 / $0.40). Each run is 50 calls:
+
+| Run | Facts kept | Accuracy, unfolded / folded | Spend, unfolded → folded | Saving | Folds committed |
+|---|---|---|---|---|---|
+| fixed, lifecycle | 356 / 356 | 100% / 100% | $0.136 → $0.088 | 36% | 4 (46 refused as unprofitable) |
+| mutating, lifecycle | 322 / 322 | 100% / 100% | $0.128 → $0.083 | 35% | 4 (3 rejected, 43 unprofitable) |
+| fixed, economics | 356 / 356 | 100% / 100% | $0.127 → $0.076 | 41% | 3 (3 unprofitable) |
+
+How to read these:
+
+- **Only the economics run measures cost.** The lifecycle runs lower the fold thresholds (`min_new_turns: 1`, `min_new_tokens: 0`) to exercise folding in a short run, so most of their fold attempts are cost checks that refuse a fold of one new turn.
+- **No run reached the fold cap.** None got to the frozen or re-fold stage, so this does not cover a summary that has stopped growing. The mutating scenario's correction at the cap was never sent.
+- **The scenario is synthetic:** ten facts, one second project to confuse them with. It shows that a cheap summarizer kept every fact here, not that summaries keep facts in general.
+
+Groq (`openai/gpt-oss-120b` main, `openai/gpt-oss-20b` summarizer, 2026-10-23) finished only the fixed lifecycle run. That run kept 182 of 182 facts and saved 5%, but committed just 1 fold of 69 attempts: 46 unprofitable, 9 rejected, 13 failed. The summarizer is a reasoning model priced at half the main model. The other two runs stopped at the account's 200,000-tokens-a-day limit for `gpt-oss-120b`. Their incomplete results are kept and exit `2`.
+
 ## Receipts
 
 To see all of this end to end, run the receipts demo: `python demo/receipts/run_local.py`,
