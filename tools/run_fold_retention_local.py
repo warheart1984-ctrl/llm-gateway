@@ -22,6 +22,13 @@ Keys:
 `openrouter` uses `bench/folding/models.openrouter.yaml`, with the same tenant
 files and the model ids swapped.
 
+Receipts are on for the folded tenant, so the gateway returns the summary it
+sent in `x-gateway-fold-summary` and the harness can keep it. The receipt
+files stay in the run's temporary config folder. After the run, each folded
+call's fold decision (outcome, reason code, turns, cost estimates; counts and
+hashes, no text) is read from the gateway log and added to the result file as
+`fold_decision`.
+
 Exit status is `tools/fold_retention.py`'s: 0 no regression, 1 regression, 2
 incomplete (including a missing key or a gateway that did not start).
 """
@@ -29,6 +36,7 @@ incomplete (including a missing key or a gateway that did not start).
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import secrets
@@ -86,6 +94,51 @@ def model_prices(models_file: str, model: str) -> tuple[float, float]:
         for field in ("input_per_mtok_usd", "output_per_mtok_usd")
     ]
     return found[0], found[1]
+
+
+def fold_decisions(log_text: str) -> dict[str, dict]:
+    """The fold decision the gateway logged for each request id."""
+    decisions: dict[str, dict] = {}
+    for line in log_text.splitlines():
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        fields = entry.get("fields", entry) if isinstance(entry, dict) else {}
+        fold, request_id = fields.get("fold"), fields.get("request_id")
+        if not isinstance(fold, str) or not isinstance(request_id, str):
+            continue
+        try:
+            decision = json.loads(fold)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(decision, dict):
+            decisions[request_id] = decision
+    return decisions
+
+
+def attach_fold_decisions(result: Path, log: Path) -> int:
+    """Add each folded call's logged decision to the result file; returns how
+    many calls got one."""
+    report = json.loads(result.read_text(encoding="utf-8"))
+    decisions = fold_decisions(log.read_text(encoding="utf-8", errors="replace"))
+    attached = 0
+    for row in report.get("calls", report.get("rows", [])):
+        decision = decisions.get(row.get("folded", {}).get("request_id") or "")
+        if decision is not None:
+            row["folded"]["fold_decision"] = decision
+            attached += 1
+    result.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return attached
+
+
+def stop(gateway: subprocess.Popen | None) -> None:
+    if gateway is not None and gateway.poll() is None:
+        gateway.terminate()
+        try:
+            gateway.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            gateway.kill()
 
 
 def free_port() -> int:
@@ -146,7 +199,9 @@ def main(argv: list[str] | None = None) -> int:
 
         gateway_env = dict(os.environ, **gateway_keys, **{provider["key"]: key},
                            LLM_GATEWAY_CONFIG_DIR=str(config),
-                           LLM_GATEWAY__SERVER__PORT=str(port))
+                           LLM_GATEWAY__SERVER__PORT=str(port),
+                           LLM_GATEWAY__RECEIPTS__ENABLED="true",
+                           LLM_GATEWAY__RECEIPTS__DIRECTORY=str(config / "receipts"))
         with log_path.open("wb") as log:
             gateway = subprocess.Popen([str(args.binary)], cwd=ROOT, env=gateway_env,
                                        stdout=log, stderr=subprocess.STDOUT)
@@ -175,14 +230,14 @@ def main(argv: list[str] | None = None) -> int:
         harness_env.update(LLM_GATEWAY_PLAIN_KEY=gateway_keys["GATEWAY_KEY_PLAIN"],
                            LLM_GATEWAY_FOLDED_KEY=gateway_keys["GATEWAY_KEY_FOLDED"],
                            LLM_GATEWAY_ADMIN_KEY=gateway_keys["GATEWAY_KEY_BENCH_ADMIN"])
-        return subprocess.run(command, cwd=ROOT, env=harness_env).returncode
+        code = subprocess.run(command, cwd=ROOT, env=harness_env).returncode
+        stop(gateway)
+        if output.exists():
+            attached = attach_fold_decisions(output, log_path)
+            print(f"run-fold-retention: fold decisions attached to {attached} calls", file=sys.stderr)
+        return code
     finally:
-        if gateway is not None and gateway.poll() is None:
-            gateway.terminate()
-            try:
-                gateway.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                gateway.kill()
+        stop(gateway)
         # The log may name request ids and errors; it never holds a key.
         print(f"run-fold-retention: gateway log kept at {log_path}", file=sys.stderr)
 

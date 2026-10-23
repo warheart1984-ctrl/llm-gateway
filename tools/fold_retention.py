@@ -5,11 +5,17 @@ history to a plain tenant and a folding tenant, reads spend from each tenant's
 gateway ledger, and writes an artifact containing only synthetic facts and
 aggregate measurements. API keys are accepted from arguments or environment
 variables but are never printed or serialized.
+
+To show why a fact was lost, the artifact also keeps what each arm answered
+for a field it got wrong, every summary the folded tenant was sent (from
+`x-gateway-fold-summary`, which the gateway returns to a tenant with receipts
+on), and each call's fold outcomes. All of it is the scenario's synthetic text.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
@@ -447,15 +453,51 @@ def _arm(base_url: str, tenant_key: str, body: dict[str, Any], timeout: float, s
         folded_turns = int(folded_header) if folded_header is not None else 0
     except ValueError:
         raise BenchmarkError("x-gateway-folded was not an integer") from None
+    summary_header = headers.get("x-gateway-fold-summary")
+    try:
+        fold_summary = decode_fold_summary(summary_header) if summary_header else None
+    except ValueError:
+        raise BenchmarkError("x-gateway-fold-summary was not base64url UTF-8") from None
     return {
         "finish_reason": finish_reason,
         "spend_delta_nano_usd": after - before,
         "folded_turns": folded_turns,
+        "request_id": headers.get("x-request-id"),
+        "fold_summary": fold_summary,
         "retries": retries,
         "usage": _usage_of(payload),
         "content": content,
         "payload": payload,
     }
+
+
+def decode_fold_summary(header: str) -> str:
+    """`x-gateway-fold-summary`: the summary as UTF-8, base64url without padding."""
+    raw = base64.urlsafe_b64decode(header + "=" * (-len(header) % 4))
+    return raw.decode("utf-8")
+
+
+def answered(score: dict[str, Any], key: str) -> dict[str, Any]:
+    """What one arm answered for one field: its value as parsed, or that the
+    field was missing (including an answer that was not a JSON object)."""
+    parsed = score["parsed"]
+    if isinstance(parsed, dict) and key in parsed:
+        return {"value": parsed[key]}
+    return {"missing": True}
+
+
+def fold_outcome_deltas(before: dict, after: dict, tenant: str = "folded") -> dict[str, int]:
+    """How each `gw_folds_total` outcome of `tenant` moved between two scrapes,
+    leaving out those that did not."""
+    deltas: dict[str, int] = {}
+    for (name, labels), value in after.items():
+        found = dict(labels)
+        if name != "gw_folds_total" or found.get("tenant") != tenant:
+            continue
+        delta = value - before.get((name, labels), 0)
+        if delta:
+            deltas[found.get("outcome", "")] = delta
+    return dict(sorted(deltas.items()))
 
 
 def _usage_of(payload: Any) -> dict[str, int]:
@@ -548,6 +590,10 @@ def run_benchmark(
     profile_data = PROFILES[profile]
     started = datetime.now(timezone.utc).isoformat()
     rows: list[dict[str, Any]] = []
+    # Each distinct summary the folded tenant was sent, from the call it first
+    # appeared on: the summary in force at call n is the last one at or before n.
+    summaries: list[dict[str, Any]] = []
+    last_summary: str | None = None
     try:
         for call in range(1, max_calls + 1):
             metrics_before = _metrics(base_url, admin_key, timeout)
@@ -579,6 +625,19 @@ def run_benchmark(
                 }
                 for key, value in scenario.expected.items()
             }
+            for key, field in fields.items():
+                if not field["plain_correct"]:
+                    field["plain_answer"] = answered(plain_score, key)
+                if not field["folded_correct"]:
+                    field["folded_answer"] = answered(folded_score, key)
+            if folded["fold_summary"] is not None and folded["fold_summary"] != last_summary:
+                last_summary = folded["fold_summary"]
+                summaries.append({
+                    "call": call,
+                    "folded_turns": folded["folded_turns"],
+                    "chars": len(last_summary),
+                    "text": last_summary,
+                })
             metrics_after = _metrics(base_url, admin_key, timeout)
             row = {
                 "call": call,
@@ -603,6 +662,8 @@ def run_benchmark(
                     "folded_turns": folded["folded_turns"],
                     "usage": folded["usage"],
                     "retries": folded["retries"],
+                    "request_id": folded["request_id"],
+                    "fold_outcomes": fold_outcome_deltas(metrics_before, metrics_after),
                     "fold_count": _metric(metrics_after, "gw_folds_total", {"tenant": "folded", "outcome": "committed"}),
                     "summarizer_prompt_tokens": _metric(metrics_after, "gw_fold_summarizer_tokens_total", {"tenant": "folded", "kind": "prompt"})
                     - _metric(metrics_before, "gw_fold_summarizer_tokens_total", {"tenant": "folded", "kind": "prompt"}),
@@ -628,6 +689,7 @@ def run_benchmark(
                 "prices": prices or {},
             },
             "rows": rows,
+            "fold_summaries": summaries,
             "error": {"type": type(exc).__name__, "message": str(exc)},
         }
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -666,6 +728,7 @@ def run_benchmark(
             "prices": prices or {},
         },
         "calls": rows,
+        "fold_summaries": summaries,
         "aggregates": {
             "retention_rate": folded_correct / len(eligible) if eligible else None,
             "eligible_fields": len(eligible),
@@ -682,6 +745,8 @@ def run_benchmark(
                 "failed": _metric(final_metrics, "gw_folds_total", {"tenant": "folded", "outcome": "failed"}),
                 "unprofitable": _metric(final_metrics, "gw_folds_total", {"tenant": "folded", "outcome": "unprofitable"}),
                 "refused_admission": _metric(final_metrics, "gw_folds_total", {"tenant": "folded", "outcome": "refused_admission"}),
+                "pinned_overflow": _metric(final_metrics, "gw_folds_total", {"tenant": "folded", "outcome": "pinned_overflow"}),
+                "backoff": _metric(final_metrics, "gw_folds_total", {"tenant": "folded", "outcome": "backoff"}),
             },
             "reached": reached,
             "caching": caching,

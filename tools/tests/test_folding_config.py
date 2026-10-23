@@ -44,6 +44,7 @@ class FoldingConfigBoot(unittest.TestCase):
             env.update({
                 "LLM_GATEWAY_CONFIG_DIR": str(config),
                 "LLM_GATEWAY__SERVER__PORT": str(port),
+                "LLM_GATEWAY__RECEIPTS__DIRECTORY": str(Path(directory) / "receipts"),
                 "GROQ_API_KEY": "stub-groq-key",
                 "GATEWAY_KEY_PLAIN": "stub-plain-key",
                 "GATEWAY_KEY_FOLDED": "stub-folded-key",
