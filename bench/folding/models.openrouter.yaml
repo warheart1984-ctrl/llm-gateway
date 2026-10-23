@@ -1,0 +1,37 @@
+# OpenRouter catalogue for the retention benchmark (`--provider openrouter`).
+# Prices checked 2026-10-23 against https://openrouter.ai/api/v1/models
+# (pricing.prompt / pricing.completion, per token).
+#
+# Neither model is a reasoning model, so a summarizer cannot spend its whole
+# budget thinking and return nothing. The summarizer costs a quarter of the
+# main model.
+schema_version: 1
+
+models:
+  openrouter/gpt-4.1-mini:
+    provider: openrouter
+    display_name: GPT-4.1 mini (OpenRouter)
+    upstream_model: openai/gpt-4.1-mini
+    default_params:
+      temperature: 0.0
+      max_tokens: 1024
+    prompt_overhead_tokens: 16
+    cost:
+      input_per_mtok_usd: 0.40
+      output_per_mtok_usd: 1.60
+    max_context_tokens: 1047576
+    max_output_tokens: 32768
+
+  openrouter/gpt-4.1-nano:
+    provider: openrouter
+    display_name: GPT-4.1 nano summarizer (OpenRouter)
+    upstream_model: openai/gpt-4.1-nano
+    default_params:
+      temperature: 0.0
+      max_tokens: 512
+    prompt_overhead_tokens: 16
+    cost:
+      input_per_mtok_usd: 0.10
+      output_per_mtok_usd: 0.40
+    max_context_tokens: 1047576
+    max_output_tokens: 32768

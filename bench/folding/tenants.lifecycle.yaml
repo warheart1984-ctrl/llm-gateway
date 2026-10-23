@@ -1,0 +1,38 @@
+# Lifecycle profile: deliberately lowers batching thresholds to exercise warm,
+# frozen, and re-folded states. This run is not an economics measurement.
+tenants:
+  - tenant_id: plain
+    enabled: true
+    credentials:
+      - key_id: ak_bench_plain
+        key_env: GATEWAY_KEY_PLAIN
+        scopes: [chat:stream, models:read]
+    allowed_models: ["groq/gpt-oss-120b"]
+    default_model: groq/gpt-oss-120b
+  - tenant_id: folded
+    enabled: true
+    credentials:
+      - key_id: ak_bench_folded
+        key_env: GATEWAY_KEY_FOLDED
+        scopes: [chat:stream, models:read]
+    allowed_models: ["groq/gpt-oss-120b", "groq/gpt-oss-20b"]
+    default_model: groq/gpt-oss-120b
+    folding:
+      enabled: true
+      summarizer_model: groq/gpt-oss-20b
+      keep_last: 4
+      summary_chars: 1200
+      summarizer_max_tokens: 512
+      max_folds: 5
+      refold_threshold: 8
+      min_new_turns: 1
+      min_new_tokens: 0
+      amortization_requests: 4
+      min_saving_nano_usd: 0
+  - tenant_id: benchmark-admin
+    enabled: true
+    credentials:
+      - key_id: ak_bench_admin
+        key_env: GATEWAY_KEY_BENCH_ADMIN
+        scopes: [admin]
+    allowed_models: ["groq/gpt-oss-120b"]

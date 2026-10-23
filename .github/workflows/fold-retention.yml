@@ -1,0 +1,113 @@
+name: fold-retention
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "Retention scenario"
+        required: true
+        type: choice
+        options: [fixed, mutating]
+        default: fixed
+      profile:
+        description: "lifecycle exercises state transitions; economics measures spend"
+        required: true
+        type: choice
+        options: [lifecycle, economics]
+        default: economics
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  run:
+    name: retention (${{ inputs.scenario }}, ${{ inputs.profile }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build gateway
+        run: cargo build --locked --release
+      - name: Prepare benchmark configuration
+        shell: bash
+        run: |
+          rm -rf "$RUNNER_TEMP/folding-config"
+          mkdir -p "$RUNNER_TEMP/folding-config"
+          cp bench/folding/default.toml bench/folding/models.yaml "$RUNNER_TEMP/folding-config/"
+          if [ "${{ inputs.profile }}" = lifecycle ]; then
+            cp bench/folding/tenants.lifecycle.yaml "$RUNNER_TEMP/folding-config/tenants.yaml"
+          else
+            cp bench/folding/tenants.yaml "$RUNNER_TEMP/folding-config/tenants.yaml"
+          fi
+      # The gateway lives for this job only, so its three client keys are made
+      # fresh here and masked, not stored as repository secrets. GROQ_API_KEY
+      # is the only real credential.
+      - name: Generate per-run gateway keys
+        shell: bash
+        run: |
+          for name in GATEWAY_KEY_PLAIN GATEWAY_KEY_FOLDED GATEWAY_KEY_BENCH_ADMIN; do
+            value="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+            echo "::add-mask::$value"
+            echo "$name=$value" >> "$GITHUB_ENV"
+          done
+      - name: Start gateway
+        shell: bash
+        env:
+          LLM_GATEWAY_CONFIG_DIR: ${{ runner.temp }}/folding-config
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          cargo run --locked --release --bin llm-gateway > "$RUNNER_TEMP/folding-gateway.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/folding-gateway.pid"
+          python - <<'PY'
+          import time
+          import urllib.request
+          for _ in range(120):
+              try:
+                  with urllib.request.urlopen("http://127.0.0.1:8080/health/live", timeout=1) as response:
+                      if response.status == 200:
+                          raise SystemExit(0)
+              except Exception:
+                  time.sleep(0.5)
+          raise SystemExit("gateway did not become live")
+          PY
+      - name: Run retention benchmark
+        env:
+          LLM_GATEWAY_CONFIG_DIR: ${{ runner.temp }}/folding-config
+          LLM_GATEWAY_BASE_URL: http://127.0.0.1:8080
+          LLM_GATEWAY_PLAIN_KEY: ${{ env.GATEWAY_KEY_PLAIN }}
+          LLM_GATEWAY_FOLDED_KEY: ${{ env.GATEWAY_KEY_FOLDED }}
+          LLM_GATEWAY_ADMIN_KEY: ${{ env.GATEWAY_KEY_BENCH_ADMIN }}
+        run: |
+          python -u tools/fold_retention.py \
+            --model groq/gpt-oss-120b \
+            --scenario "${{ inputs.scenario }}" \
+            --profile "${{ inputs.profile }}" \
+            --main-input-per-mtok-usd 0.15 \
+            --main-output-per-mtok-usd 0.60 \
+            --summarizer-input-per-mtok-usd 0.075 \
+            --summarizer-output-per-mtok-usd 0.30 \
+            --output "$RUNNER_TEMP/fold_retention_${{ inputs.scenario }}_${{ inputs.profile }}.json"
+      - name: Stop gateway
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/folding-gateway.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/folding-gateway.pid")" 2>/dev/null || true
+          fi
+      - name: Upload benchmark artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: folding-retention-${{ inputs.scenario }}-${{ inputs.profile }}
+          path: |
+            ${{ runner.temp }}/fold_retention_${{ inputs.scenario }}_${{ inputs.profile }}.json
+            ${{ runner.temp }}/folding-gateway.log
+          if-no-files-found: ignore

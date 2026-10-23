@@ -1,0 +1,82 @@
+[server]
+bind_addr = "127.0.0.1"
+port = 8080
+request_body_limit_bytes = 1048576
+keep_alive_interval_ms = 15000
+max_concurrent_streams_global = 512
+shutdown_grace_ms = 20000
+metrics_enabled = true
+
+[registry]
+models_path = "models.yaml"
+tenants_path = "tenants.yaml"
+hot_reload = false
+reload_interval_ms = 60000
+
+[auth]
+mode = "api_key"
+api_key_header = "x-api-key"
+accept_bearer = true
+allow_anonymous = false
+
+[governance]
+require_model_allowlist = true
+on_max_tokens_exceeded = "clamp"
+cost_tracking_enabled = true
+
+[governance.default_limits]
+requests_per_minute = 100000
+tokens_per_minute = 10000000
+max_concurrent_streams = 64
+max_output_tokens = 4096
+daily_budget_nano_usd = 50000000000
+max_messages = 512
+max_prompt_chars = 200000
+
+[upstream]
+connect_timeout_ms = 5000
+stream_read_timeout_ms = 120000
+tcp_keepalive_secs = 75
+pool_max_idle_per_host = 16
+pool_idle_timeout_ms = 90000
+user_agent = "llm-gateway/folding-retention-benchmark"
+request_usage = true
+max_response_bytes = 8388608
+
+[ledger]
+backend = "sqlite"
+url_env = "LLM_GATEWAY_DATABASE_URL"
+schema = "public"
+max_connections = 4
+timeout_ms = 1000
+max_pending_closings = 10000
+lease_secs = 60
+sweep_interval_secs = 60
+idempotency_retention_secs = 86400
+reservation_retention_days = 1
+response_keys_env = "LLM_GATEWAY_RESPONSE_KEYS"
+fingerprint_keys_env = "LLM_GATEWAY_FINGERPRINT_KEYS"
+decision_retention_days = 1
+sqlite_path = "ledger.sqlite3"
+quota_split_replicas = 0
+quota_split_margin_percent = 100
+
+[receipts]
+enabled = false
+directory = "receipts"
+anchor_every = 1000
+anchor_interval_secs = 60
+startup_verify = "full"
+
+[folding]
+max_entries = 10000
+max_total_chars = 20000000
+# Foreground, the shipped default: each call's measured spend then includes
+# its own fold. In the background a fold's cost lands in a later call's window.
+background = false
+
+[telemetry]
+service_name = "llm-gateway-folding-retention"
+service_version = "0.1.0"
+log_format = "json"
+log_filter = "warn,llm_gateway=info"
