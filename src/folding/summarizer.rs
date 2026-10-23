@@ -317,6 +317,26 @@ mod tests {
     }
 
     #[test]
+    fn a_superseded_number_may_stay_as_history_but_not_as_current() {
+        let config = PlanConfig { summary_chars: 1200, ..Default::default() };
+        let turns = vec![
+            msg("user", "Staging listens on port 8443. Production listens on port 9443. The ceiling is 2400 USD."),
+            msg("user", "Correction: staging now listens on 8444, not 8443."),
+        ];
+        let right = "Current facts:\n- staging port: 8444 (was 8443)\n- production port: 9443\n- ceiling: 2400 USD";
+        assert!(run_checks_with_prior(right, None, &turns, &config).is_ok());
+        // Dropping a number stated once fails the value check.
+        let dropped = "Current facts:\n- staging port: 8444 (was 8443)\n- ceiling: 2400 USD";
+        let err = run_checks_with_prior(dropped, None, &turns, &config).unwrap_err();
+        assert_eq!(err, ["pinned_facts_present: missing term '9443'"]);
+        // The old number stated as current fails twice over.
+        let stale = "Current facts:\n- staging port: 8443\n- production port: 9443\n- ceiling: 2400 USD, 8444 spare";
+        let err = run_checks_with_prior(stale, None, &turns, &config).unwrap_err();
+        assert!(err.iter().any(|e| e.starts_with("field_value_present")), "{err:?}");
+        assert!(err.iter().any(|e| e.starts_with("superseded_not_current")), "{err:?}");
+    }
+
+    #[test]
     fn format_turns_includes_roles() {
         let turns = vec![msg("user", "hello"), msg("assistant", "hi")];
         let formatted = format_turns(&turns);

@@ -993,6 +993,24 @@ async fn a_summary_that_drops_a_pinned_value_is_rejected() {
 }
 
 #[tokio::test]
+async fn a_rejected_summary_names_the_checks_it_failed_and_nothing_else() {
+    let upstream = MockUpstream::start(Scenario::SummarizerPinnedDrop).await;
+    let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(FOLDING_TENANT)).await;
+    let mut body = folding_body(6);
+    body["messages"][0]["content"] = json!("The appointment moved to 15:30");
+    let (status, _, _) = gw.post_chat(TEST_KEY, body.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let (decision, fold) = decision_record(prompt_tokens_of(&upstream.last_body().unwrap()));
+    assert_eq!(fold["reason"], "checks_failed");
+    assert_eq!(fold["failed_checks"]["pinned_facts_present"], 1, "{fold}");
+    assert!(!decision.contains("15:30"), "a missing value reached the decision line: {decision}");
+    let (_, metrics) = gw.get("/metrics", TEST_KEY).await;
+    let series = |check: &str| format!("gw_fold_checks_failed_total{{tenant=\"acme\",check=\"{check}\"}} ");
+    assert!(metrics.contains(&format!("{}1", series("pinned_facts_present"))), "{metrics}");
+    assert!(metrics.contains(&format!("{}0", series("non_empty"))), "{metrics}");
+}
+
+#[tokio::test]
 async fn pinned_values_that_cannot_fit_skip_the_fold_before_it_is_paid_for() {
     // Every turn carries an id, so the values a summary would have to keep run
     // far past half of summary_chars (200). No summary could pass the check,

@@ -891,6 +891,7 @@ fn bare_fold(messages: Vec<ChatMessage>, outcome: &'static str, reason: &str, at
             summarizer_completion_tokens: attempt.map(|item| item.completion_tokens).unwrap_or(0),
             fold_count: 0,
             prefix_hash: String::new(),
+            failed_checks: Default::default(),
         }),
         attempt,
     }
@@ -936,6 +937,7 @@ fn describe_fold(
             summarizer_completion_tokens: stamp.attempt.map(|item| item.completion_tokens).unwrap_or(0),
             fold_count: u64::from(stamp.fold_count),
             prefix_hash: stamp.prefix_hash.map(|hash| crate::folding::prefix_hex(&hash)).unwrap_or_default(),
+            failed_checks: Default::default(),
         }),
         attempt: stamp.attempt,
     }
@@ -1007,6 +1009,8 @@ enum AppliedFold {
         accounting: FoldAccounting,
         prompt_tokens: u64,
         completion_tokens: u64,
+        /// Which checks a rejected summary failed, by name.
+        failed_checks: std::collections::BTreeMap<&'static str, u32>,
     },
 }
 
@@ -1053,6 +1057,7 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
                 accounting: FoldAccounting::Failed,
                 prompt_tokens: used_prompt,
                 completion_tokens: used_completion,
+                failed_checks: Default::default(),
             };
         }
         attempt_no += 1;
@@ -1088,6 +1093,7 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
                 accounting: FoldAccounting::RefusedAdmission,
                 prompt_tokens: used_prompt,
                 completion_tokens: used_completion,
+                failed_checks: Default::default(),
             };
         };
         if *shutdown.borrow() {
@@ -1098,6 +1104,7 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
                 accounting: FoldAccounting::Failed,
                 prompt_tokens: used_prompt,
                 completion_tokens: used_completion,
+                failed_checks: Default::default(),
             };
         }
 
@@ -1121,6 +1128,7 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
                     accounting: FoldAccounting::Failed,
                     prompt_tokens: used_prompt,
                     completion_tokens: used_completion,
+                    failed_checks: Default::default(),
                 };
             }
             result = &mut pending => result,
@@ -1139,6 +1147,7 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
                     accounting: FoldAccounting::Failed,
                     prompt_tokens: used_prompt,
                     completion_tokens: used_completion,
+                    failed_checks: Default::default(),
                 };
             }
         };
@@ -1168,21 +1177,28 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
                 accounting: FoldAccounting::Rejected,
                 prompt_tokens: used_prompt,
                 completion_tokens: used_completion,
+                failed_checks: Default::default(),
             };
         }
-        let Ok(summary) = summarizer::run_checks_with_prior(
+        let summary = match summarizer::run_checks_with_prior(
             &content,
             work.prior_text.as_deref(),
             &work.pending,
             &work.plan_config,
-        ) else {
-            return AppliedFold::Stopped {
-                outcome: "refused",
-                reason: "checks_failed",
-                accounting: FoldAccounting::Rejected,
-                prompt_tokens: used_prompt,
-                completion_tokens: used_completion,
-            };
+        ) {
+            Ok(summary) => summary,
+            Err(errors) => {
+                let failed_checks = crate::folding::checks::failed_check_counts(&errors);
+                work.state.metrics.record_fold_checks(&work.tenant_id, &failed_checks);
+                return AppliedFold::Stopped {
+                    outcome: "refused",
+                    reason: "checks_failed",
+                    accounting: FoldAccounting::Rejected,
+                    prompt_tokens: used_prompt,
+                    completion_tokens: used_completion,
+                    failed_checks,
+                };
+            }
         };
 
         let new_covered = work.covered + work.pending.len();
@@ -1208,6 +1224,7 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
                 accounting: FoldAccounting::Failed,
                 prompt_tokens: used_prompt,
                 completion_tokens: used_completion,
+                failed_checks: Default::default(),
             };
         }
         return AppliedFold::Committed {
@@ -1451,6 +1468,7 @@ async fn foreground_fold(
                     .as_ref()
                     .map(|summary| crate::folding::prefix_hex(&summary.prefix_hash))
                     .unwrap_or_default(),
+                failed_checks: Default::default(),
             }),
             attempt: None,
         };
@@ -1552,19 +1570,25 @@ async fn foreground_fold(
                 },
             )
         }
-        AppliedFold::Stopped { outcome, reason, accounting, prompt_tokens, completion_tokens } => describe_fold(
-            messages,
-            messages.to_vec(),
-            &plan,
-            FoldStamp {
-                outcome,
-                reason,
-                attempt: Some(FoldAttempt { outcome: accounting, prompt_tokens, completion_tokens }),
-                fold_count: prior.as_ref().map(|summary| summary.fold_count).unwrap_or(0),
-                prefix_hash: prior.as_ref().map(|summary| summary.prefix_hash),
-                folded_turns: 0,
-            },
-        ),
+        AppliedFold::Stopped { outcome, reason, accounting, prompt_tokens, completion_tokens, failed_checks } => {
+            let mut stopped = describe_fold(
+                messages,
+                messages.to_vec(),
+                &plan,
+                FoldStamp {
+                    outcome,
+                    reason,
+                    attempt: Some(FoldAttempt { outcome: accounting, prompt_tokens, completion_tokens }),
+                    fold_count: prior.as_ref().map(|summary| summary.fold_count).unwrap_or(0),
+                    prefix_hash: prior.as_ref().map(|summary| summary.prefix_hash),
+                    folded_turns: 0,
+                },
+            );
+            if let Some(facts) = stopped.facts.as_mut() {
+                facts.failed_checks = failed_checks;
+            }
+            stopped
+        }
     };
     result.fold_receipt_id = fold_receipt_id;
     result.fold_covered = fold_covered;

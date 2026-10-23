@@ -88,6 +88,8 @@ struct FoldCounters {
     prompt_tokens_cut: AtomicU64,
     summarizer_prompt: AtomicU64,
     summarizer_completion: AtomicU64,
+    /// Rejected folds that failed each check, in `checks::CHECK_NAMES` order.
+    checks_failed: [AtomicU64; crate::folding::checks::CHECK_NAMES.len()],
 }
 
 /// Per-tenant rollup, for the governed view: who is spending what.
@@ -202,6 +204,16 @@ impl Metrics {
         counters
             .summarizer_completion
             .fetch_add(completion_tokens, Ordering::Relaxed);
+    }
+
+    /// A rejected fold's failed checks: each named check counts the fold once.
+    pub fn record_fold_checks(&self, tenant: &str, failed: &BTreeMap<&'static str, u32>) {
+        let counters = self.fold_counters(tenant);
+        for (slot, name) in crate::folding::checks::CHECK_NAMES.iter().enumerate() {
+            if failed.contains_key(name) {
+                counters.checks_failed[slot].fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     /// A main request that was sent with a summary in place of old turns.
@@ -713,6 +725,7 @@ impl Metrics {
             let mut cut_series = Vec::new();
             let mut prompt_series = Vec::new();
             let mut completion_series = Vec::new();
+            let mut check_series = Vec::new();
             for (tenant, counters) in &folds {
                 let tenant_label = safe_label(tenant);
                 for (outcome, value) in [
@@ -740,6 +753,12 @@ impl Metrics {
                     render_labels(&[("tenant", tenant_label), ("kind", "completion")], &[]),
                     counters.summarizer_completion.load(Ordering::Relaxed),
                 ));
+                for (slot, check) in crate::folding::checks::CHECK_NAMES.iter().enumerate() {
+                    check_series.push((
+                        render_labels(&[("tenant", tenant_label), ("check", check)], &[]),
+                        counters.checks_failed[slot].load(Ordering::Relaxed),
+                    ));
+                }
             }
             family(
                 &mut out,
@@ -771,6 +790,13 @@ impl Metrics {
                     .iter()
                     .chain(completion_series.iter())
                     .map(|(l, v)| (l.as_str(), *v)),
+            );
+            family(
+                &mut out,
+                "gw_fold_checks_failed_total",
+                "counter",
+                "Rejected folds by summary check failed; a fold failing several counts once for each.",
+                check_series.iter().map(|(l, v)| (l.as_str(), *v)),
             );
         }
 

@@ -55,6 +55,8 @@ class StubHandler(BaseHTTPRequestHandler):
             body = "\n".join([
                 '# TYPE gw_folds_total counter',
                 f'gw_folds_total{{tenant="folded",outcome="committed"}} {self.state.committed}',
+                f'gw_fold_checks_failed_total{{tenant="folded",check="pinned_facts_present"}} {self.state.committed // 2}',
+                'gw_fold_checks_failed_total{tenant="folded",check="non_empty"} 0',
                 'gw_folds_total{tenant="folded",outcome="rejected"} 0',
                 'gw_folds_total{tenant="folded",outcome="failed"} 0',
                 'gw_fold_summarizer_tokens_total{tenant="folded",kind="prompt"} 0',
@@ -255,6 +257,10 @@ class RetentionTests(unittest.TestCase):
         folded = report["calls"][1]["folded"]
         self.assertEqual(folded["request_id"], "req-2")
         self.assertEqual(folded["fold_outcomes"], {"committed": 1})
+        # The stub counts a failed pinned-value check on every second call.
+        self.assertEqual(folded["failed_checks"], {"pinned_facts_present": 1})
+        self.assertEqual(report["calls"][0]["folded"]["failed_checks"], {})
+        self.assertEqual(report["aggregates"]["folds"]["failed_checks"], {"pinned_facts_present": 1})
 
     def test_a_plain_arm_that_is_wrong_is_recorded_too(self) -> None:
         self.assertEqual(fr.answered(fr.score_answer("not json", {"a": 1}, "stop"), "a"), {"missing": True})

@@ -486,18 +486,23 @@ def answered(score: dict[str, Any], key: str) -> dict[str, Any]:
     return {"missing": True}
 
 
-def fold_outcome_deltas(before: dict, after: dict, tenant: str = "folded") -> dict[str, int]:
-    """How each `gw_folds_total` outcome of `tenant` moved between two scrapes,
-    leaving out those that did not."""
+def metric_deltas(before: dict, after: dict, metric: str, label: str, tenant: str = "folded") -> dict[str, int]:
+    """How each series of `metric` for `tenant` moved between two scrapes,
+    keyed by its `label`, leaving out those that did not."""
     deltas: dict[str, int] = {}
     for (name, labels), value in after.items():
         found = dict(labels)
-        if name != "gw_folds_total" or found.get("tenant") != tenant:
+        if name != metric or found.get("tenant") != tenant:
             continue
         delta = value - before.get((name, labels), 0)
         if delta:
-            deltas[found.get("outcome", "")] = delta
+            deltas[found.get(label, "")] = delta
     return dict(sorted(deltas.items()))
+
+
+def fold_outcome_deltas(before: dict, after: dict, tenant: str = "folded") -> dict[str, int]:
+    """How each `gw_folds_total` outcome of `tenant` moved between two scrapes."""
+    return metric_deltas(before, after, "gw_folds_total", "outcome", tenant)
 
 
 def _usage_of(payload: Any) -> dict[str, int]:
@@ -664,6 +669,8 @@ def run_benchmark(
                     "retries": folded["retries"],
                     "request_id": folded["request_id"],
                     "fold_outcomes": fold_outcome_deltas(metrics_before, metrics_after),
+                    # Which checks a rejected summary failed, by name only.
+                    "failed_checks": metric_deltas(metrics_before, metrics_after, "gw_fold_checks_failed_total", "check"),
                     "fold_count": _metric(metrics_after, "gw_folds_total", {"tenant": "folded", "outcome": "committed"}),
                     "summarizer_prompt_tokens": _metric(metrics_after, "gw_fold_summarizer_tokens_total", {"tenant": "folded", "kind": "prompt"})
                     - _metric(metrics_before, "gw_fold_summarizer_tokens_total", {"tenant": "folded", "kind": "prompt"}),
@@ -747,6 +754,7 @@ def run_benchmark(
                 "refused_admission": _metric(final_metrics, "gw_folds_total", {"tenant": "folded", "outcome": "refused_admission"}),
                 "pinned_overflow": _metric(final_metrics, "gw_folds_total", {"tenant": "folded", "outcome": "pinned_overflow"}),
                 "backoff": _metric(final_metrics, "gw_folds_total", {"tenant": "folded", "outcome": "backoff"}),
+                "failed_checks": metric_deltas({}, final_metrics, "gw_fold_checks_failed_total", "check"),
             },
             "reached": reached,
             "caching": caching,

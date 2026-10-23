@@ -3,6 +3,7 @@
 //! Ported from 5-fold-engine's `check_summary`, `required_fold_terms`.
 
 use regex::Regex;
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 /// Explicit replacement values ("moved to 15:30", "is now 8443", "actually
@@ -330,7 +331,74 @@ pub fn extract_pinned_terms(text: &str) -> Vec<String> {
             }
         }
     }
+    for number in bare_numbers(text) {
+        keep(number);
+    }
     terms
+}
+
+/// Words after which a number counts something rather than states a value:
+/// "Progress note 101", "step 300", "No. 123".
+const COUNTER_WORDS: &[&str] = &[
+    "note", "notes", "item", "items", "step", "steps", "page", "pages", "line", "lines", "no", "number",
+    "chapter", "section", "row", "turn", "call", "version", "attempt",
+];
+
+/// Bare numbers of three or more digits: "Production listens on port 9443",
+/// "2400 USD". A deliberate divergence from 5-fold-engine, which pins no bare
+/// number: in the folding benchmark a summary dropped "production port: 9443",
+/// stated once and never updated, and nothing required it. Not pinned: digits
+/// that are part of an identifier, date, time, decimal or grouped number
+/// ("CEDAR-731", "2027-03-04", "1.250", "18,977"; those are pinned whole or not
+/// at all), after "$" or "#", or after a counter word.
+fn bare_numbers(text: &str) -> Vec<&str> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"\d{3,}").expect("number pattern compiles"));
+    let joins = |c: char| c.is_alphanumeric() || matches!(c, '-' | '_' | ':' | '/' | '$' | '#' | '.' | ',');
+    re.find_iter(text)
+        .filter(|found| {
+            let before = text[..found.start()].chars().next_back();
+            let mut after = text[found.end()..].chars();
+            let next = after.next();
+            // A "." or "," ends a sentence or clause unless a digit follows it.
+            let next_joins = match next {
+                Some('.' | ',') => after.next().is_some_and(|c| c.is_ascii_digit()),
+                Some(c) => joins(c),
+                None => false,
+            };
+            let previous_word = text[..found.start()]
+                .split_whitespace()
+                .next_back()
+                .map(|word| word.trim_end_matches('.').to_lowercase())
+                .unwrap_or_default();
+            !before.is_some_and(joins) && !next_joins && !COUNTER_WORDS.contains(&previous_word.as_str())
+        })
+        .map(|found| found.as_str())
+        .collect()
+}
+
+/// Every check a summary can fail, by the name its errors start with.
+pub const CHECK_NAMES: [&str; 7] = [
+    "non_empty",
+    "within_length_bound",
+    "covers_something",
+    "pinned_facts_present",
+    "field_value_present",
+    "superseded_not_current",
+    "other",
+];
+
+/// How many errors each failed check gave. Check names and counts only,
+/// never the values an error names, so it can go in the decision log and
+/// metrics.
+pub fn failed_check_counts(errors: &[String]) -> BTreeMap<&'static str, u32> {
+    let mut counts = BTreeMap::new();
+    for error in errors {
+        let name = error.split(':').next().unwrap_or_default();
+        let name = CHECK_NAMES.iter().copied().find(|known| *known == name).unwrap_or("other");
+        *counts.entry(name).or_insert(0) += 1;
+    }
+    counts
 }
 
 /// First parts that make a lowercase hyphenated word ordinary English:
@@ -705,6 +773,43 @@ mod tests {
         // Without a facts block, every line counts.
         assert!(check_superseded("Mira owns the project.", &mira).is_err());
         assert!(check_superseded("CURRENT FACTS:\n- Owner: MIRA", &mira).is_err());
+    }
+
+    #[test]
+    fn bare_numbers_of_three_digits_are_values() {
+        assert_eq!(
+            extract_pinned_terms("Production listens on port 9443. The ceiling is 2400 USD, staging 8443."),
+            ["9443", "2400", "8443"]
+        );
+        // Parts of ids, dates, times, decimals and grouped numbers are not.
+        assert!(
+            extract_pinned_terms("Ticket ACME_1234 at 12:300 costs 1.250 or 18,977 on 2027/03/04, a1234b.").iter().all(
+                |term| !["1234", "300", "250", "977", "2027"].contains(&term.as_str())
+            ),
+            "{:?}",
+            extract_pinned_terms("Ticket ACME_1234 at 12:300 costs 1.250 or 18,977 on 2027/03/04, a1234b.")
+        );
+        // Counters are not values.
+        assert!(extract_pinned_terms("Progress note 101: no change. See No. 123, step 300 and #456.").is_empty());
+        // Nor the whole part of a decimal or the first group of a grouped number.
+        assert!(extract_pinned_terms("It costs 1024.50 for 123,456 seats.").is_empty());
+        // Two digits are not enough; a number ending a clause still counts.
+        assert_eq!(extract_pinned_terms("Seats: 42, then 512, and 1024."), ["512", "1024"]);
+    }
+
+    #[test]
+    fn failed_checks_are_counted_by_name_only() {
+        let errors = vec![
+            "pinned_facts_present: missing term '9443'".to_string(),
+            "pinned_facts_present: missing term 'Ines'".to_string(),
+            "superseded_not_current: states 'Mira (by Noor)'".to_string(),
+            "something new: detail".to_string(),
+        ];
+        let counts = failed_check_counts(&errors);
+        assert_eq!(
+            counts.into_iter().collect::<Vec<_>>(),
+            [("other", 1), ("pinned_facts_present", 2), ("superseded_not_current", 1)]
+        );
     }
 
     #[test]
