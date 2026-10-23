@@ -46,6 +46,12 @@ fails.
    with the newest three entries removed, checked against equally doctored
    local anchors, still verifies. Checked against the published anchor, it is
    `NOT VERIFIED`: the log is shorter than what was anchored.
+10. **A folded conversation is checked by the caller.** A tenant with receipts
+    and conversation folding sends 30 turns; the 28 oldest reach the model as
+    one summary. The response carries the summary and the fold's receipt id,
+    the log holds four entries, and `tools/verify_fold.py` recomputes every
+    digest from the body, the salt and the headers. A body changed by one
+    character does not verify.
 
 Then the official OpenAI Python SDK, with only its `base_url` changed, calls
 `/v1/chat/completions`: a completion, a stream with usage, the receipt id in

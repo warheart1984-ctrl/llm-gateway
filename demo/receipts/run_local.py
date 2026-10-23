@@ -27,6 +27,7 @@ ROOT = HERE.parent.parent
 EXE = ".exe" if os.name == "nt" else ""
 DEMO_KEY = "demo-receipts-key-not-a-secret"
 SHOESTRING_KEY = "shoestring-receipts-key-not-a-secret"
+FOLDING_KEY = "folding-receipts-key-not-a-secret"
 
 
 def free_port() -> int:
@@ -78,6 +79,7 @@ def main(argv: list[str] | None = None) -> int:
         LLM_GATEWAY_CONFIG_DIR=str(work / "config"),
         RECEIPTS_DEMO_KEY=DEMO_KEY,
         RECEIPTS_SHOESTRING_KEY=SHOESTRING_KEY,
+        RECEIPTS_FOLDING_KEY=FOLDING_KEY,
         MOCK_ADDR=f"127.0.0.1:{mock}",
         MOCK_TOKEN_DELAY_MS="5",
     )
@@ -97,7 +99,8 @@ def main(argv: list[str] | None = None) -> int:
             [sys.executable, str(HERE / "walkthrough.py"),
              "--gateway", f"http://127.0.0.1:{port}",
              "--published-dir", str(published),
-             "--verifier", str(ROOT / "vendor" / "wicket" / "verifier" / "ickverify.py")],
+             "--verifier", str(ROOT / "vendor" / "wicket" / "verifier" / "ickverify.py"),
+             "--verify-fold", str(ROOT / "tools" / "verify_fold.py")],
             env=env,
         )
         code = walkthrough.returncode

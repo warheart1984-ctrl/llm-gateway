@@ -466,3 +466,79 @@ async fn the_unchanged_verifier_accepts_a_log_with_folds() {
         .expect("run ickverify.py");
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stdout));
 }
+
+// ---- Phase 3: the client-side verifier -------------------------------------------------------
+
+/// Runs tools/verify_fold.py on this gateway's log for one response. `None`
+/// when there is no python outside CI.
+fn verify_fold(
+    gateway: &Gateway,
+    body: &str,
+    headers: &reqwest::header::HeaderMap,
+    prior: Option<&reqwest::header::HeaderMap>,
+    turns_after: Option<usize>,
+) -> Option<i32> {
+    let python = llm_gateway::receipts::test_python()?;
+    let dir = std::env::temp_dir().join(format!("llm-gw-verify-fold-{}", Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let as_json = |headers: &reqwest::header::HeaderMap| {
+        let map: serde_json::Map<String, Value> =
+            headers.iter().map(|(name, value)| (name.to_string(), json!(value.to_str().unwrap()))).collect();
+        Value::Object(map).to_string()
+    };
+    std::fs::write(dir.join("body.json"), body).unwrap();
+    std::fs::write(dir.join("headers.json"), as_json(headers)).unwrap();
+    let mut command = std::process::Command::new(python);
+    command
+        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/verify_fold.py"))
+        .arg("--log")
+        .arg(gateway.chain.log_path())
+        .arg("--body")
+        .arg(dir.join("body.json"))
+        .arg("--headers")
+        .arg(dir.join("headers.json"));
+    if let Some(prior) = prior {
+        std::fs::write(dir.join("prior.json"), as_json(prior)).unwrap();
+        command.arg("--prior-headers").arg(dir.join("prior.json"));
+    }
+    if let Some(turns_after) = turns_after {
+        command.arg("--turns-after").arg(turns_after.to_string());
+    }
+    let out = command.output().expect("run verify_fold.py");
+    Some(out.status.code().unwrap_or(-1))
+}
+
+#[tokio::test]
+async fn the_client_verifier_checks_every_fold_digest_the_gateway_wrote() {
+    let (upstream, mock) = mock_upstream().await;
+    let gateway = Gateway::boot(&upstream).await;
+
+    // A first fold, then an incremental one that extends it.
+    let first_body = conversation(30, true);
+    let (_, first, _) = gateway.post("/v1/chat/stream", &first_body, &[]).await;
+    *mock.summary.lock().unwrap() = "The conversation went on with more filler.".into();
+    let second_body = conversation(34, true);
+    let (_, second, _) = gateway.post("/v1/chat/stream", &second_body, &[]).await;
+    // A reused summary (no fold of its own) and a plain request.
+    let reused_body = conversation(35, true);
+    let (_, reused, _) = gateway.post("/v1/chat/stream", &reused_body, &[]).await;
+    let plain_body = conversation(2, true);
+    let (_, plain, _) = gateway.post("/v1/chat/stream", &plain_body, &[]).await;
+    // A rejected fold: the summary drops a pinned value; it tried to cover
+    // turns 0 to 28.
+    *mock.summary.lock().unwrap() = "Filler was exchanged.".into();
+    let rejected_body = conversation_with_pinned_value(30);
+    let (_, rejected, _) = gateway.post("/v1/chat/stream", &rejected_body, &[]).await;
+
+    let Some(code) = verify_fold(&gateway, &first_body, &first, None, None) else {
+        return;
+    };
+    assert_eq!(code, 0, "first fold");
+    assert_eq!(verify_fold(&gateway, &second_body, &second, Some(&first), None), Some(0), "incremental fold");
+    assert_eq!(verify_fold(&gateway, &reused_body, &reused, None, None), Some(0), "reused summary");
+    assert_eq!(verify_fold(&gateway, &plain_body, &plain, None, None), Some(0), "unfolded");
+    assert_eq!(verify_fold(&gateway, &rejected_body, &rejected, None, Some(28)), Some(0), "rejected fold");
+    // And it notices: the wrong body, or the wrong prior summary.
+    assert_eq!(verify_fold(&gateway, &first_body, &second, Some(&first), None), Some(1));
+    assert_eq!(verify_fold(&gateway, &second_body, &second, None, None), Some(1));
+}

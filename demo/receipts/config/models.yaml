@@ -27,6 +27,19 @@ models:
       output_per_mtok_usd: 8.0
     max_output_tokens: 1024
 
+  # The folding tenant's summarizer: the same mock, priced as a small model.
+  mock/summarizer:
+    provider: nvidia
+    display_name: Mock summarizer
+    endpoint: http://mock:9000/v1/chat/completions
+    upstream_model: mock-model
+    default_params:
+      max_tokens: 64
+    cost:
+      input_per_mtok_usd: 0.01
+      output_per_mtok_usd: 0.02
+    max_output_tokens: 1024
+
   mock/broken:
     provider: nvidia
     display_name: Mock model that fails part-way through

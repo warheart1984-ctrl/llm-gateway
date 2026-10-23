@@ -881,6 +881,11 @@ async fn foreground_folding_summarizes_before_the_main_upstream_call() {
     let (status, headers, body) = gw.post_chat(TEST_KEY, folding_body(30)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(headers.get("x-gateway-folded").unwrap(), "28");
+    // The summary and fold receipt headers are for receipts tenants only:
+    // without receipts nobody checks them, and the summary could be 8,000
+    // characters in a header.
+    assert!(headers.get("x-gateway-fold-summary").is_none());
+    assert!(headers.get("x-gateway-fold-receipt-id").is_none());
     assert_eq!(upstream.calls(), 2, "one summarizer call and one main call");
 
     let sent = upstream.last_body().expect("main request body");
