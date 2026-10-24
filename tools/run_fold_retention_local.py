@@ -22,6 +22,11 @@ Keys:
 benchmark (standing rules given in the conversation, checked on every
 answer), instead of the fact-recall one; `--max-success-drop` is passed to it.
 
+`--corpus` replays JSONL conversations (`tools/corpus_replay.py`) instead of
+a synthetic scenario. `--scrub` redacts emails, phones and URLs first.
+`--extract-facts` writes the answer key; `--extract-only` stops so it can be
+edited before a second run. `--probe-every` is passed through.
+
 `--provider` picks the models: `groq` uses `bench/folding/models.yaml`, and
 `openrouter` uses `bench/folding/models.openrouter.yaml`, with the same tenant
 files and the model ids swapped. `--summarizer` replaces the provider's
@@ -123,6 +128,11 @@ def fold_decisions(log_text: str) -> dict[str, dict]:
             continue
         if isinstance(decision, dict):
             decisions[request_id] = decision
+            client = fields.get("client_request_id")
+            if isinstance(client, str) and client not in ("", "-"):
+                # Replay sends its own x-request-id. The gateway logs that as
+                # client_request_id and echoes it, which is what the harness stores.
+                decisions.setdefault(client, decision)
     return decisions
 
 
@@ -203,6 +213,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="the folded tenant's amortization_requests, in place of the profile's")
     parser.add_argument("--max-calls", type=int)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--corpus", type=Path,
+                        help="replay this directory of JSONL conversations instead of a synthetic scenario")
+    parser.add_argument("--extract-facts", action="store_true")
+    parser.add_argument("--extract-only", action="store_true")
+    parser.add_argument("--probe-every", type=int)
+    parser.add_argument("--max-tokens", type=int)
+    parser.add_argument("--scrub", action="store_true")
     parser.add_argument("--binary", type=Path, default=ROOT / "target" / "release" /
                         ("llm-gateway.exe" if sys.platform == "win32" else "llm-gateway"))
     args = parser.parse_args(argv)
@@ -253,22 +270,37 @@ def main(argv: list[str] | None = None) -> int:
         main_in, main_out = model_prices(provider["models"], provider["main"])
         sum_in, sum_out = model_prices(provider["models"], summarizer)
         stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
+        scenario_name = "corpus" if args.corpus else args.scenario
         output = args.output or (ROOT / "benchmark_results" /
-                                 result_name(args.provider, args.scenario, args.profile, stamp, args.summarizer,
+                                 result_name(args.provider, scenario_name, args.profile, stamp, args.summarizer,
                                              args.amortization_requests))
-        harness = "fold_tasks.py" if args.scenario == "constraints" else "fold_retention.py"
+        harness = "fold_tasks.py" if args.scenario == "constraints" and not args.corpus else "fold_retention.py"
         command = [sys.executable, "-u", str(ROOT / "tools" / harness),
                    "--base-url", base_url, "--model", provider["main"],
-                   "--scenario", args.scenario, "--profile", args.profile,
+                   "--profile", args.profile,
                    "--main-input-per-mtok-usd", str(main_in), "--main-output-per-mtok-usd", str(main_out),
                    "--summarizer-input-per-mtok-usd", str(sum_in), "--summarizer-output-per-mtok-usd", str(sum_out),
                    "--output", str(output)]
+        if args.corpus:
+            command += ["--corpus", str(args.corpus)]
+            if args.extract_facts:
+                command.append("--extract-facts")
+            if args.extract_only:
+                command.append("--extract-only")
+            if args.scrub:
+                command.append("--scrub")
+            if args.probe_every:
+                command += ["--probe-every", str(args.probe_every)]
+        else:
+            command += ["--scenario", args.scenario]
         cached = cached_price(provider["models"], provider["main"])
         if cached is not None:
             command += ["--main-cached-input-per-mtok-usd", str(cached)]
-        if args.max_calls:
+        if args.max_tokens:
+            command += ["--max-tokens", str(args.max_tokens)]
+        if args.max_calls and not args.corpus:
             command += ["--max-calls", str(args.max_calls)]
-        if args.max_success_drop is not None and args.scenario == "constraints":
+        if args.max_success_drop is not None and args.scenario == "constraints" and not args.corpus:
             command += ["--max-success-drop", str(args.max_success_drop)]
         # The harness gets the gateway keys, never the vendor key.
         harness_env = {k: v for k, v in os.environ.items() if k != provider["key"]}
@@ -280,6 +312,15 @@ def main(argv: list[str] | None = None) -> int:
         if output.exists():
             attached = attach_fold_decisions(output, log_path)
             print(f"run-fold-retention: fold decisions attached to {attached} calls", file=sys.stderr)
+            report = json.loads(output.read_text(encoding="utf-8"))
+            if report.get("conversations"):
+                from corpus_replay import refresh_conversation_totals
+                import fold_retention as harness_mod
+                try:
+                    refresh_conversation_totals(output)
+                except harness_mod.BenchmarkError as exc:
+                    print(f"run-fold-retention: {exc}", file=sys.stderr)
+                    return 2
         return code
     finally:
         stop(gateway)

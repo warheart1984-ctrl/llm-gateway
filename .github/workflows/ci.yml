@@ -158,7 +158,10 @@ jobs:
       - name: Build gateway
         run: cargo build --locked --bin llm-gateway
       - name: Publisher and folding tool tests
-        run: python -m unittest discover -s tools/tests -v
+        run: |
+          python -m pip install pytest
+          python -m unittest discover -s tools/tests -v
+          python -m pytest tools/tests/test_corpus_replay.py -q
 
   receipts-demo:
     # The receipts demo, end to end: a gateway with receipts on, a publisher

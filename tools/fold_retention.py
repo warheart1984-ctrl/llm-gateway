@@ -10,6 +10,13 @@ To show why a fact was lost, the artifact also keeps what each arm answered
 for a field it got wrong, every summary the folded tenant was sent (from
 `x-gateway-fold-summary`, which the gateway returns to a tenant with receipts
 on), and each call's fold outcomes. All of it is the scenario's synthetic text.
+
+`--corpus` replays real conversations instead of a synthetic scenario. Each
+JSONL file is one chat. Recorded user turns are sent to both tenants;
+recorded assistant turns are not used as model output. Each tenant's own
+reply is appended to that tenant's history. `--extract-facts` asks the
+unfolded tenant, once, for a reviewable `<conversation>.facts.json` and
+leaves the file alone when it already exists. See `tools/corpus_replay.py`.
 """
 
 from __future__ import annotations
@@ -346,10 +353,21 @@ def _url(base_url: str, path: str) -> str:
     return base_url.rstrip("/") + path
 
 
-def _request(base_url: str, path: str, key: str, body: dict[str, Any] | None, timeout: float) -> tuple[int, dict[str, str], Any]:
+def _request(
+    base_url: str,
+    path: str,
+    key: str,
+    body: dict[str, Any] | None,
+    timeout: float,
+    request_id: str | None = None,
+) -> tuple[int, dict[str, str], Any]:
     data = None if body is None else canonical_json(body)
     request = Request(_url(base_url, path), data=data, method="GET" if body is None else "POST")
     request.add_header("x-api-key", key)
+    # A caller-supplied id is echoed and logged as client_request_id. Replay
+    # sets one per chat call so each arm can be found in the gateway log.
+    if request_id:
+        request.add_header("x-request-id", request_id)
     if body is not None:
         request.add_header("content-type", "application/json")
     try:
@@ -432,12 +450,21 @@ def _git_commit() -> str | None:
     return value or None
 
 
-def _arm(base_url: str, tenant_key: str, body: dict[str, Any], timeout: float, sleep=time.sleep) -> dict[str, Any]:
+def _arm(
+    base_url: str,
+    tenant_key: str,
+    body: dict[str, Any],
+    timeout: float,
+    sleep=time.sleep,
+    request_id: str | None = None,
+) -> dict[str, Any]:
     before = _usage(base_url, tenant_key, timeout)
     retries = 0
     while True:
         try:
-            status, headers, payload = _request(base_url, "/v1/chat/completions", tenant_key, deepcopy(body), timeout)
+            status, headers, payload = _request(
+                base_url, "/v1/chat/completions", tenant_key, deepcopy(body), timeout, request_id=request_id,
+            )
             break
         except TransientError:
             if retries == len(RETRY_WAITS_SECONDS):
@@ -770,7 +797,7 @@ def run_benchmark(
     return report, 2 if incomplete else (1 if regressed else 0)
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--base-url", default=os.environ.get("LLM_GATEWAY_BASE_URL", "http://127.0.0.1:8080"))
     parser.add_argument("--plain-key", default=os.environ.get("LLM_GATEWAY_PLAIN_KEY"))
@@ -789,13 +816,58 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--summarizer-input-per-mtok-usd", type=float)
     parser.add_argument("--summarizer-output-per-mtok-usd", type=float)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--corpus", type=Path,
+                        help="directory of conversation JSONL files to replay instead of a synthetic scenario")
+    parser.add_argument("--extract-facts", action="store_true",
+                        help="write <conversation>.facts.json from one unfolded gpt-4.1-mini call when the file is absent")
+    parser.add_argument("--extract-only", action="store_true",
+                        help="with --corpus, write fact files and stop so they can be reviewed before replay")
+    parser.add_argument("--probe-every", type=int, default=10,
+                        help="ask folded-away fact questions every N user turns (default 10)")
+    parser.add_argument("--scrub", action="store_true",
+                        help="redact emails, phone numbers and URLs in the corpus before replay")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
     missing = [name for name, value in (("--plain-key", args.plain_key), ("--folded-key", args.folded_key), ("--admin-key", args.admin_key)) if not value]
     if missing:
         parser.error(f"missing secret references: {', '.join(missing)}")
+    if args.probe_every <= 0:
+        parser.error("--probe-every must be positive")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    output = (args.output or Path("benchmark_results") / f"fold_retention_{args.scenario}_{args.profile}_{stamp}.json").resolve()
+    label = "corpus" if args.corpus else args.scenario
+    output = (args.output or Path("benchmark_results") / f"fold_retention_{label}_{args.profile}_{stamp}.json").resolve()
+    prices = {
+        "main_input_per_mtok_usd": args.main_input_per_mtok_usd,
+        "main_output_per_mtok_usd": args.main_output_per_mtok_usd,
+        "main_cached_input_per_mtok_usd": args.main_cached_input_per_mtok_usd,
+        "summarizer_input_per_mtok_usd": args.summarizer_input_per_mtok_usd,
+        "summarizer_output_per_mtok_usd": args.summarizer_output_per_mtok_usd,
+    }
     try:
+        if args.corpus:
+            from corpus_replay import run_corpus
+
+            return run_corpus(
+                base_url=args.base_url,
+                plain_key=args.plain_key,
+                folded_key=args.folded_key,
+                admin_key=args.admin_key,
+                model=args.model,
+                corpus=args.corpus,
+                profile=args.profile,
+                output=output,
+                probe_every=args.probe_every,
+                extract_facts=args.extract_facts,
+                extract_only=args.extract_only,
+                scrub=args.scrub,
+                max_tokens=args.max_tokens,
+                timeout=args.timeout,
+                prices=prices,
+            )[1]
         return run_benchmark(
             base_url=args.base_url,
             plain_key=args.plain_key,
@@ -808,13 +880,7 @@ def main(argv: list[str] | None = None) -> int:
             max_calls=args.max_calls,
             max_tokens=args.max_tokens,
             timeout=args.timeout,
-            prices={
-                "main_input_per_mtok_usd": args.main_input_per_mtok_usd,
-                "main_output_per_mtok_usd": args.main_output_per_mtok_usd,
-                "main_cached_input_per_mtok_usd": args.main_cached_input_per_mtok_usd,
-                "summarizer_input_per_mtok_usd": args.summarizer_input_per_mtok_usd,
-                "summarizer_output_per_mtok_usd": args.summarizer_output_per_mtok_usd,
-            },
+            prices=prices,
         )[1]
     except BenchmarkError as exc:
         print(f"fold-retention: {exc}", file=sys.stderr)
