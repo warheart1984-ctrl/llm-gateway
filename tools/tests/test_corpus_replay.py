@@ -492,3 +492,109 @@ def test_replay_regenerates_assistant_turns_and_probes_on_checkpoints(tmp_path: 
     serialized = output.read_text(encoding="utf-8")
     for secret in ("plain-key", "folded-key", "admin-secret", recorded):
         assert secret not in serialized
+
+
+# ---- conversation text stays where git cannot commit it ----
+
+REPO = Path(__file__).resolve().parent.parent.parent
+
+PRIVATE_REPORT = {
+    "settings": {"model": "m"},
+    "calls": [{
+        "fields": {"home_city": {"expected": "Bergen", "folded_answer": {"value": "Oslo"},
+                                 "plain_answer": {"value": "Bergen"}, "eligible": True, "folded_correct": False}},
+        "wrong_answers": [{"field": "home_city", "expected": "Bergen", "plain_text": "You live in Bergen.",
+                           "folded_text": "You live in Oslo.", "plain_answer": {"value": "Bergen"},
+                           "folded_answer": {"value": "Oslo"}, "eligible": True}],
+    }],
+    "conversations": [{"name": "c", "totals": {"wrong_answers": [{"expected": "Bergen", "folded_text": "Oslo."}]}}],
+    "fold_summaries": [{"call": 3, "folded_turns": 4, "chars": 30, "text": "The user lives in Bergen."}],
+}
+
+
+def _git(cwd: Path, *args: str) -> None:
+    import subprocess
+    subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True)
+
+
+def test_strip_text_removes_every_piece_of_conversation_text() -> None:
+    stripped = cr.strip_text(PRIVATE_REPORT)
+    text = json.dumps(stripped)
+    for private in ("Bergen", "Oslo", "lives in", "You live"):
+        assert private not in text, text
+    # What the benchmark measures stays.
+    field = stripped["calls"][0]["fields"]["home_city"]
+    assert field == {"eligible": True, "folded_correct": False}
+    assert stripped["fold_summaries"] == [{"call": 3, "folded_turns": 4, "chars": 30}]
+    assert stripped["calls"][0]["wrong_answers"][0]["field"] == "home_city"
+    assert stripped["settings"]["text_stripped"] is True
+    assert "text_stripped" not in PRIVATE_REPORT["settings"], "the caller's report is not changed"
+
+
+def test_a_report_keeps_its_text_only_where_git_cannot_commit_it(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / ".gitignore").write_text("/private/\n", encoding="utf-8")
+
+    tracked = repo / "results" / "report.json"
+    cr.write_json(tracked, PRIVATE_REPORT)
+    assert "Bergen" not in tracked.read_text(encoding="utf-8")
+    assert json.loads(tracked.read_text(encoding="utf-8"))["settings"]["text_stripped"] is True
+
+    ignored = repo / "private" / "report.json"
+    cr.write_json(ignored, PRIVATE_REPORT)
+    assert "The user lives in Bergen." in ignored.read_text(encoding="utf-8")
+
+    outside = tmp_path / "scratch" / "report.json"
+    cr.write_json(outside, PRIVATE_REPORT)
+    assert "The user lives in Bergen." in outside.read_text(encoding="utf-8")
+
+
+def test_when_git_cannot_answer_the_text_is_stripped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_git(*_args: object, **_kwargs: object) -> None:
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(cr.subprocess, "run", no_git)
+    assert cr.may_hold_text(tmp_path / "report.json") is False
+
+
+def test_any_other_answer_from_git_means_the_text_is_stripped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    # Inside .git, git says it is not in the work tree.
+    assert cr.may_hold_text(repo / ".git" / "report.json") is False
+
+    import subprocess
+
+    def refused(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(args, 128, "", "fatal: detected dubious ownership in repository")
+
+    monkeypatch.setattr(cr.subprocess, "run", refused)
+    assert cr.may_hold_text(tmp_path / "report.json") is False
+
+
+def test_in_this_repository_only_corpus_results_may_hold_text() -> None:
+    assert cr.may_hold_text(cr.RESULTS_DIR / "report.json")
+    assert cr.RESULTS_DIR == REPO / "corpus" / "results"
+    assert not cr.may_hold_text(REPO / "benchmark_results" / "report.json")
+
+
+def test_a_corpus_run_writes_under_corpus_results_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, Path] = {}
+
+    def fake_run_corpus(**kwargs: object) -> tuple[dict, int]:
+        seen["output"] = kwargs["output"]  # type: ignore[assignment]
+        return {}, 0
+
+    monkeypatch.setattr(cr, "run_corpus", fake_run_corpus)
+    code = fr.main(["--model", "m", "--plain-key", "p", "--folded-key", "f", "--admin-key", "a",
+                    "--corpus", str(tmp_path)])
+    assert code == 0
+    assert seen["output"].parent == REPO / "corpus" / "results", seen["output"]
+
+
+def test_the_local_runner_puts_corpus_reports_under_corpus_results() -> None:
+    assert runner.results_dir(corpus=True) == REPO / "corpus" / "results"
+    assert runner.results_dir(corpus=False) == REPO / "benchmark_results"

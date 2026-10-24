@@ -16,7 +16,9 @@ JSONL file is one chat. Recorded user turns are sent to both tenants;
 recorded assistant turns are not used as model output. Each tenant's own
 reply is appended to that tenant's history. `--extract-facts` asks the
 unfolded tenant, once, for a reviewable `<conversation>.facts.json` and
-leaves the file alone when it already exists. See `tools/corpus_replay.py`.
+leaves the file alone when it already exists. Its report goes to the
+gitignored `corpus/results/` by default, and is written without conversation
+text anywhere git would commit it. See `tools/corpus_replay.py`.
 """
 
 from __future__ import annotations
@@ -839,7 +841,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--probe-every must be positive")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     label = "corpus" if args.corpus else args.scenario
-    output = (args.output or Path("benchmark_results") / f"fold_retention_{label}_{args.profile}_{stamp}.json").resolve()
+    # A corpus report can hold real conversation text, so by default it goes
+    # under the gitignored `corpus/`, never into `benchmark_results/`.
+    results = Path(__file__).resolve().parent.parent / "corpus" / "results" if args.corpus else Path("benchmark_results")
+    output = (args.output or results / f"fold_retention_{label}_{args.profile}_{stamp}.json").resolve()
     prices = {
         "main_input_per_mtok_usd": args.main_input_per_mtok_usd,
         "main_output_per_mtok_usd": args.main_output_per_mtok_usd,
