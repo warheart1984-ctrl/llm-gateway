@@ -2,10 +2,11 @@
 //!
 //! A tenant that opts in can send long conversations through the gateway
 //! and have the old turns replaced by a rolling summary, so each request
-//! sends fewer prompt tokens. The fold only runs when it is expected to
-//! save money. Every folded call is visible to the caller and the operator.
-//! A fold that fails or does not pay leaves the request exactly as the
-//! client sent it.
+//! sends fewer prompt tokens. `fold_mode: shadow` runs the same fold and
+//! keeps it in a separate store, then forwards the request unfolded.
+//! The fold only runs when it is expected to save money. Every folded call
+//! is visible to the caller and the operator. A fold that fails or does not
+//! pay leaves the request exactly as the client sent it.
 
 pub mod checks;
 pub mod ledger;

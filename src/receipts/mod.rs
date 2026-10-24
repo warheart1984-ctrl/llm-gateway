@@ -1063,6 +1063,16 @@ fn proposal_for(subject: &Subject, effect: &str, requires_approval: bool) -> Pro
     }
 }
 
+/// Proposal hash an allow receipt stores for `subject`.
+///
+/// The kernel log keeps this hash and not the action text, so `fold` and
+/// `fold_shadow` are distinct there only by recomputing it.
+pub fn allow_proposal_hash(subject: &Subject) -> String {
+    let proposal = proposal_for(subject, "read", false);
+    infinity_kernel::hash_value(&serde_json::to_value(&proposal).expect("proposal serializes"))
+        .expect("proposal hash")
+}
+
 // ---- startup verification -----------------------------------------------------------------
 
 fn verify_snapshot(

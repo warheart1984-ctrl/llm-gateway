@@ -489,7 +489,7 @@ async fn handle(state: Arc<AppState>, headers: HeaderMap, body: Bytes, mode: Mod
                 original = %original,
                 "idempotent replay served from the ledger"
             );
-            let Stored { body, receipt, folded_turns, fold_summary, fold_receipt_id, fold_covered } = unwrap_stored(stored);
+            let Stored { body, receipt, folded_turns, fold_summary, fold_receipt_id, fold_covered, fold_shadow } = unwrap_stored(stored);
             let mut response = (StatusCode::OK, body).into_response();
             let h = response.headers_mut();
             h.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -516,6 +516,9 @@ async fn handle(state: Arc<AppState>, headers: HeaderMap, body: Bytes, mode: Mod
             }
             if let Some(covered) = fold_covered {
                 h.insert(HeaderName::from_static("x-gateway-fold-covered"), header_value(&covered.to_string()));
+            }
+            if let Some(shadow) = fold_shadow.as_deref() {
+                h.insert(HeaderName::from_static("x-gateway-fold-shadow"), header_value(shadow));
             }
             response
         }
@@ -721,6 +724,7 @@ fn stored_with_receipt(
     fold_summary: Option<&str>,
     fold_receipt_id: Option<&str>,
     fold_covered: Option<usize>,
+    fold_shadow: Option<&str>,
 ) -> String {
     json!({
         STORED_WITH_RECEIPT: 1,
@@ -730,14 +734,16 @@ fn stored_with_receipt(
         "fold_summary": fold_summary,
         "fold_receipt_id": fold_receipt_id,
         "fold_covered": fold_covered,
+        "fold_shadow": fold_shadow,
         "body": payload,
     })
     .to_string()
 }
 
-fn stored_with_folding(payload: &str, folded_turns: usize) -> String {
+fn stored_with_folding(payload: &str, folded_turns: usize, fold_shadow: Option<&str>) -> String {
     json!({
         STORED_WITH_FOLDING: folded_turns,
+        "fold_shadow": fold_shadow,
         "body": payload,
     })
     .to_string()
@@ -755,6 +761,7 @@ struct Stored {
     fold_summary: Option<String>,
     fold_receipt_id: Option<String>,
     fold_covered: Option<usize>,
+    fold_shadow: Option<String>,
 }
 
 /// Read back a stored answer. Answers stored before receipts, or for tenants
@@ -778,10 +785,12 @@ fn unwrap_stored(stored: String) -> Stored {
                 fold_summary: fields.get("fold_summary").and_then(Value::as_str).map(str::to_string),
                 fold_receipt_id: fields.get("fold_receipt_id").and_then(Value::as_str).map(str::to_string),
                 fold_covered: fields.get("fold_covered").and_then(Value::as_u64).map(|n| n as usize),
+                fold_shadow: fields.get("fold_shadow").and_then(Value::as_str).map(str::to_string),
             };
         }
-        if folded_turns > 0 {
-            return Stored { body: body.clone(), folded_turns, ..Stored::default() };
+        let fold_shadow = fields.get("fold_shadow").and_then(Value::as_str).map(str::to_string);
+        if folded_turns > 0 || fold_shadow.is_some() {
+            return Stored { body: body.clone(), folded_turns, fold_shadow, ..Stored::default() };
         }
     }
     Stored { body: stored, ..Stored::default() }
@@ -839,6 +848,8 @@ struct Admitted {
     openai: Option<OpenAiReply>,
     /// Number of old turns replaced in the forwarded request.
     folded_turns: usize,
+    /// `x-gateway-fold-shadow` when the tenant is in shadow mode.
+    shadow_header: Option<String>,
     /// The summary in the forwarded request, for a receipts tenant's
     /// `x-gateway-fold-summary`.
     fold_summary: Option<String>,
@@ -860,6 +871,23 @@ struct FoldResult {
     /// With it, the turns that fold set out to cover (its allow binds the
     /// count): `x-gateway-fold-covered`.
     fold_covered: Option<usize>,
+    /// `x-gateway-fold-shadow` for a shadow tenant. No summary text.
+    shadow_header: Option<String>,
+    /// Counts written into the decision log beside the fold facts.
+    shadow: Option<ShadowRecord>,
+    /// Summarizer prices, so a shadow record can price the call it made.
+    summarizer_rates: Option<crate::router::CostModel>,
+}
+
+/// What a shadow fold would have done. The request itself stays unfolded.
+#[derive(Debug)]
+struct ShadowRecord {
+    would_fold: bool,
+    tokens_unfolded: u64,
+    tokens_folded: u64,
+    estimated_saving_nano_usd: u64,
+    summarizer_cost_nano_usd: u64,
+    net_saving_nano_usd: i64,
 }
 
 /// What a receipts tenant's fold needs to write its own allow and outcome:
@@ -896,7 +924,49 @@ fn bare_fold(messages: Vec<ChatMessage>, outcome: &'static str, reason: &str, at
             corrected_checks: Default::default(),
         }),
         attempt,
+        shadow_header: None,
+        shadow: None,
+        summarizer_rates: None,
     }
+}
+
+/// Keep the fold's decision and send the client's messages. The estimated
+/// saving uses the cached prompt price when the model has one, otherwise the
+/// normal prompt price: a repeated conversation is what a prompt cache bills.
+fn finish_shadow(
+    original: &[ChatMessage],
+    mut result: FoldResult,
+    main: &crate::router::CostModel,
+) -> FoldResult {
+    let tokens_unfolded = u64::from(estimate_prompt_tokens(original));
+    let tokens_folded = u64::from(estimate_prompt_tokens(&result.messages));
+    let estimated = tokens_unfolded
+        .saturating_sub(tokens_folded)
+        .saturating_mul(main.cached_input_nano_usd_per_token());
+    let summarizer_cost = match (result.attempt, result.summarizer_rates.as_ref()) {
+        (Some(attempt), Some(cost)) => attempt
+            .prompt_tokens
+            .saturating_mul(cost.input_nano_usd_per_token())
+            .saturating_add(attempt.completion_tokens.saturating_mul(cost.output_nano_usd_per_token())),
+        _ => 0,
+    };
+    let net = estimated as i64 - summarizer_cost as i64;
+    let outcome = result.facts.as_ref().map(|facts| facts.outcome).unwrap_or("not_due");
+    let reason = result.facts.as_ref().map(|facts| facts.reason.as_str()).unwrap_or("none");
+    result.shadow = Some(ShadowRecord {
+        would_fold: result.folded_turns > 0,
+        tokens_unfolded,
+        tokens_folded,
+        estimated_saving_nano_usd: estimated,
+        summarizer_cost_nano_usd: summarizer_cost,
+        net_saving_nano_usd: net,
+    });
+    result.shadow_header = Some(format!("outcome={outcome};reason={reason};net_saving_nano_usd={net}"));
+    result.messages = original.to_vec();
+    result.folded_turns = 0;
+    result.fold_receipt_id = None;
+    result.fold_covered = None;
+    result
 }
 
 struct FoldStamp<'a> {
@@ -943,6 +1013,9 @@ fn describe_fold(
             corrected_checks: Default::default(),
         }),
         attempt: stamp.attempt,
+        shadow_header: None,
+        shadow: None,
+        summarizer_rates: None,
     }
 }
 
@@ -978,6 +1051,10 @@ fn with_current_summary(
 /// Owns everything a fold needs after the request that planned it has moved on.
 struct FoldWork {
     state: Arc<AppState>,
+    /// The on-mode store, or the shadow store. A shadow fold never writes the other.
+    store: Arc<crate::folding::store::FoldingStore>,
+    /// A shadow fold: its counters go to the `gw_shadow_*` metrics.
+    shadow: bool,
     tenant_id: String,
     limits: crate::config::LimitProfile,
     summarizer_model_id: String,
@@ -1039,7 +1116,7 @@ impl Drop for EndFold {
 /// conversation until `backoff_turns` more turns arrive; a committed one
 /// clears that.
 async fn run_applied_fold(work: FoldWork) -> AppliedFold {
-    let store = Arc::clone(&work.state.folding);
+    let store = Arc::clone(&work.store);
     let (key, head_turns) = (work.key, work.head.len());
     let result = run_summarizer_attempts(work).await;
     match &result {
@@ -1053,7 +1130,7 @@ async fn run_applied_fold(work: FoldWork) -> AppliedFold {
 /// Run the summarizer. The store lock is never held across the provider call.
 /// On shutdown the reservation is released, not abandoned.
 async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
-    let mut shutdown = work.state.folding.subscribe_shutdown();
+    let mut shutdown = work.store.subscribe_shutdown();
     let mut attempt_no = 0u8;
     let mut used_prompt = 0u64;
     let mut used_completion = 0u64;
@@ -1223,13 +1300,13 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
             Ok(made) => made,
             Err(errors) => {
                 let failed_checks = crate::folding::checks::failed_check_counts(&errors);
-                work.state.metrics.record_fold_checks(&work.tenant_id, &failed_checks);
+                work.state.metrics.record_fold_checks(&work.tenant_id, &failed_checks, work.shadow);
                 if correction.is_none() {
                     corrected_checks = failed_checks;
                     correction = Some((content, errors));
                     continue;
                 }
-                work.state.metrics.record_corrective_retry(&work.tenant_id, false);
+                work.state.metrics.record_corrective_retry(&work.tenant_id, false, work.shadow);
                 return AppliedFold::Stopped {
                     outcome: "refused",
                     reason: "checks_failed",
@@ -1243,8 +1320,8 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
         };
 
         let new_covered = work.covered + work.pending.len();
-        let prefix_hash = work.state.folding.prefix_hash(&work.tenant_id, &work.head[..new_covered]);
-        let committed = work.state.folding.commit_if_current(
+        let prefix_hash = work.store.prefix_hash(&work.tenant_id, &work.head[..new_covered]);
+        let committed = work.store.commit_if_current(
             work.key,
             work.started_prefix,
             crate::folding::store::SummaryEntry {
@@ -1271,7 +1348,7 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
             };
         }
         if correction.is_some() {
-            work.state.metrics.record_corrective_retry(&work.tenant_id, true);
+            work.state.metrics.record_corrective_retry(&work.tenant_id, true, work.shadow);
         }
         return AppliedFold::Committed {
             summary,
@@ -1285,6 +1362,7 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
 
 /// Run one foreground fold. Every failure returns the client messages
 /// unchanged; the main request is never made dependent on summarization.
+#[allow(clippy::too_many_arguments)]
 async fn foreground_fold(
     state: &Arc<AppState>,
     generation: &crate::state::RegistryGeneration,
@@ -1293,28 +1371,37 @@ async fn foreground_fold(
     key_id: &str,
     messages: &[ChatMessage],
     receipts: Option<&FoldReceipts>,
+    main_reserve_nano_usd: u64,
 ) -> FoldResult {
-    let Some(folding) = decision.tenant.folding.as_ref().filter(|f| f.enabled) else {
+    let Some(folding) = decision.tenant.folding.as_ref().filter(|f| f.mode().enabled()) else {
         return FoldResult { messages: messages.to_vec(), ..FoldResult::default() };
+    };
+    let shadow = folding.mode() == crate::governance::policy::FoldMode::Shadow;
+    // Shadow state lives in its own store. Turning the tenant to `on` later
+    // starts from the on-mode store, which this path never writes.
+    let store = if shadow { Arc::clone(&state.shadow_folding) } else { Arc::clone(&state.folding) };
+    // Shared so the seal closure stays Send across the awaits below. A
+    // RefCell would make the chat handlers' futures not Send.
+    let summarizer_rates = Arc::new(std::sync::Mutex::new(None::<crate::router::CostModel>));
+    let rates_slot = Arc::clone(&summarizer_rates);
+    let seal = move |mut result: FoldResult| -> FoldResult {
+        result.summarizer_rates = rates_slot.lock().unwrap_or_else(|poison| poison.into_inner()).clone();
+        if shadow { finish_shadow(messages, result, &resolved.config.cost) } else { result }
     };
 
     let (protected, turns) = crate::folding::split_messages(messages);
     let Some(first_turn) = turns.first() else {
-        return bare_fold(messages.to_vec(), "not_due", "no_turns", None);
+        return seal(bare_fold(messages.to_vec(), "not_due", "no_turns", None));
     };
-    let key = state
-        .folding
-        .conversation_key(&decision.tenant.tenant_id, key_id, &protected, Some(first_turn));
+    let key = store.conversation_key(&decision.tenant.tenant_id, key_id, &protected, Some(first_turn));
 
-    let existing = state
-        .folding
-        .lookup(&key, &decision.tenant.tenant_id, &turns);
+    let existing = store.lookup(&key, &decision.tenant.tenant_id, &turns);
     let existing = existing.and_then(|entry| {
         let same_model = entry.lock().summarizer_model == folding.summarizer_model;
         if same_model {
             Some(entry)
         } else {
-            state.folding.remove(&key);
+            store.remove(&key);
             None
         }
     });
@@ -1325,22 +1412,23 @@ async fn foreground_fold(
     // it and as the tenant's own requests are resolved.
     let summarizer_id = crate::governance::policy::qualify(&decision.tenant.model_suffix, &folding.summarizer_model);
     let Some(summarizer_model) = generation.models.resolve(&summarizer_id).ok() else {
-        return bare_fold(
+        return seal(bare_fold(
             messages.to_vec(),
             "failed",
             "summarizer_unavailable",
             Some(FoldAttempt { outcome: FoldAccounting::Failed, prompt_tokens: 0, completion_tokens: 0 }),
-        );
+        ));
     };
     let Ok(summarizer_provider) = router::provider_for(&summarizer_model, &state.providers) else {
-        return bare_fold(
+        return seal(bare_fold(
             messages.to_vec(),
             "failed",
             "summarizer_unavailable",
             Some(FoldAttempt { outcome: FoldAccounting::Failed, prompt_tokens: 0, completion_tokens: 0 }),
-        );
+        ));
     };
     let summarizer_provider = Arc::clone(summarizer_provider);
+    *summarizer_rates.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(summarizer_model.config.cost.clone());
 
     let plan = crate::folding::plan::plan_fold(
         &plan_config,
@@ -1368,7 +1456,7 @@ async fn foreground_fold(
             prompt_tokens: 0,
             completion_tokens: 0,
         });
-        return describe_fold(
+        return seal(describe_fold(
             messages,
             forwarded,
             &plan,
@@ -1380,7 +1468,7 @@ async fn foreground_fold(
                 prefix_hash: prior.as_ref().map(|summary| summary.prefix_hash),
                 folded_turns: plan.turns_replaced,
             },
-        );
+        ));
     }
 
     let split = turns.len().saturating_sub(folding.keep_last);
@@ -1407,19 +1495,19 @@ async fn foreground_fold(
             },
         )
     };
-    if state.folding.shutting_down() {
-        return skip("not_due", "shutdown", None);
+    if store.shutting_down() {
+        return seal(skip("not_due", "shutdown", None));
     }
     if folding.backoff_turns > 0
-        && let Some((rejected_at, rejections)) = state.folding.backed_off_at(&key)
+        && let Some((rejected_at, rejections)) = store.backed_off_at(&key)
         && head.len() < rejected_at.saturating_add(crate::folding::backoff_span(folding.backoff_turns, rejections))
     {
-        return skip("skipped", "backoff", Some(FoldAccounting::BackedOff));
+        return seal(skip("skipped", "backoff", Some(FoldAccounting::BackedOff)));
     }
     let mut pinned = summarizer::pinned_terms(prior.as_ref().map(|summary| summary.summary.as_str()), &pending);
     pinned.extend(summarizer::field_pins(&pending).iter().map(ToString::to_string));
     if !summarizer::pinned_terms_fit(&pinned, plan_config.summary_chars) {
-        return skip("skipped", "pinned_overflow", Some(FoldAccounting::PinnedOverflow));
+        return seal(skip("skipped", "pinned_overflow", Some(FoldAccounting::PinnedOverflow)));
     }
 
     // The summarizer is admitted like any request: it takes a rate slot and
@@ -1438,7 +1526,25 @@ async fn foreground_fold(
         2,
         summarizer_prompt.saturating_add(estimate_prompt_tokens(messages)),
     ) {
-        return skip("refused", "no_rate_headroom", Some(FoldAccounting::RefusedAdmission));
+        return seal(skip("refused", "no_rate_headroom", Some(FoldAccounting::RefusedAdmission)));
+    }
+    // Shadow spends the summarizer against the same budget, and still has to
+    // leave enough for the request it is only observing. A shortfall skips
+    // the summarizer; it does not refuse the request.
+    if shadow {
+        let summarizer_estimate = estimate_cost_nano_usd(
+            &summarizer_model.config.cost,
+            summarizer_prompt,
+            folding.summarizer_max_tokens.saturating_mul(2),
+        );
+        let need = summarizer_estimate.saturating_mul(2).saturating_add(main_reserve_nano_usd);
+        match state.limits.snapshot(&decision.tenant.tenant_id, &decision.limits).await {
+            Ok(snap) if snap.budget_nano_usd > 0 && snap.remaining_nano_usd() < need => {
+                return seal(skip("refused", "no_budget_headroom", Some(FoldAccounting::RefusedAdmission)));
+            }
+            Err(_) => return seal(skip("failed", "budget_unknown", Some(FoldAccounting::Failed))),
+            _ => {}
+        }
     }
 
     let (old_spent, old_saved) = existing
@@ -1450,6 +1556,8 @@ async fn foreground_fold(
         .unwrap_or_default();
     let work = FoldWork {
         state: Arc::clone(state),
+        store: Arc::clone(&store),
+        shadow,
         tenant_id: decision.tenant.tenant_id.clone(),
         limits: decision.limits.clone(),
         summarizer_model_id: folding.summarizer_model.clone(),
@@ -1474,10 +1582,11 @@ async fn foreground_fold(
 
     if state.settings.folding.background {
         let (immediate, folded_turns) = with_current_summary(messages, &protected, prior.as_ref(), &pending, &tail);
-        if state.folding.try_begin(key) {
+        if store.try_begin(key) {
             let tenant_id = work.tenant_id.clone();
             let metrics = Arc::clone(&state.metrics);
-            let store = Arc::clone(&state.folding);
+            let store = Arc::clone(&store);
+            let summarizer_cost = summarizer_model.config.cost.clone();
             tokio::spawn(async move {
                 let _end = EndFold { store, key };
                 let result = run_applied_fold(work).await;
@@ -1489,13 +1598,30 @@ async fn foreground_fold(
                         (accounting, prompt_tokens, completion_tokens)
                     }
                 };
-                metrics.record_fold(&tenant_id, accounting, prompt_tokens, completion_tokens);
+                metrics.record_fold(&tenant_id, accounting, prompt_tokens, completion_tokens, shadow);
+                // The request that started this fold has already logged its
+                // decision, so a shadow fold's summarizer spend gets a line of
+                // its own; without it the shadow report shows the saving and
+                // not what it cost.
+                if shadow {
+                    let cost = prompt_tokens
+                        .saturating_mul(summarizer_cost.input_nano_usd_per_token())
+                        .saturating_add(completion_tokens.saturating_mul(summarizer_cost.output_nano_usd_per_token()));
+                    let fold = json!({
+                        "shadow": true,
+                        "background": true,
+                        "committed": matches!(accounting, FoldAccounting::Committed),
+                        "summarizer_cost_nano_usd": cost,
+                        "net_saving_nano_usd": -(cost as i64),
+                    });
+                    tracing::info!(tenant = %tenant_id, fold = %fold, "shadow fold finished");
+                }
             });
         }
         let sent_cut = u64::from(
             estimate_prompt_tokens(messages).saturating_sub(estimate_prompt_tokens(&immediate)),
         );
-        return FoldResult {
+        return seal(FoldResult {
             messages: immediate,
             folded_turns,
             fold_receipt_id: None,
@@ -1520,18 +1646,21 @@ async fn foreground_fold(
                 corrected_checks: Default::default(),
             }),
             attempt: None,
-        };
+            shadow_header: None,
+            shadow: None,
+            summarizer_rates: None,
+        });
     }
 
     // One fold per conversation at a time, as in background mode. A request
     // that finds one running goes out with the summary it already has: two
     // concurrent folds would both be paid for and only one could commit.
     // `try_begin` also refuses once shutdown has begun; say which it was.
-    if !state.folding.try_begin(key) {
-        let reason = if state.folding.shutting_down() { "shutdown" } else { "fold_in_flight" };
-        return skip("not_due", reason, None);
+    if !store.try_begin(key) {
+        let reason = if store.shutting_down() { "shutdown" } else { "fold_in_flight" };
+        return seal(skip("not_due", reason, None));
     }
-    let _end = EndFold { store: Arc::clone(&state.folding), key };
+    let _end = EndFold { store: Arc::clone(&store), key };
 
     // A receipts tenant's summarizer call is a model call carrying its
     // content, so it gets its own allow first, under this request's salt. If
@@ -1553,7 +1682,7 @@ async fn foreground_fold(
                     tenant_id: receipts.tenant_id.clone(),
                     key_id: receipts.key_id.clone(),
                     model: summarizer_id.clone(),
-                    action: "fold".into(),
+                    action: if shadow { "fold_shadow".into() } else { "fold".into() },
                     call_digest: Some(digest.clone()),
                 })
                 .await;
@@ -1565,7 +1694,10 @@ async fn foreground_fold(
                     salt: receipts.salt.clone(),
                 }),
                 Err(_) => {
-                    return describe_fold(
+                    // Shadow still answers the client. A stopped chain refuses
+                    // the request's own receipt the same way an unfolded tenant's
+                    // would; the summarizer is not called.
+                    return seal(describe_fold(
                         messages,
                         messages.to_vec(),
                         &plan,
@@ -1577,7 +1709,7 @@ async fn foreground_fold(
                             prefix_hash: prior.as_ref().map(|summary| summary.prefix_hash),
                             folded_turns: 0,
                         },
-                    );
+                    ));
                 }
             }
         }
@@ -1646,7 +1778,7 @@ async fn foreground_fold(
     };
     result.fold_receipt_id = fold_receipt_id;
     result.fold_covered = fold_covered;
-    result
+    seal(result)
 }
 
 /// The fold headers of an admitted request's response.
@@ -1656,6 +1788,7 @@ struct FoldHeaders<'a> {
     summary: Option<&'a str>,
     receipt_id: Option<&'a str>,
     covered: Option<usize>,
+    shadow: Option<&'a str>,
 }
 
 impl Admitted {
@@ -1665,6 +1798,7 @@ impl Admitted {
             summary: self.fold_summary.as_deref(),
             receipt_id: self.fold_receipt_id.as_deref(),
             covered: self.fold_covered,
+            shadow: self.shadow_header.as_deref(),
         }
     }
 }
@@ -1898,13 +2032,14 @@ async fn admit(
     // Holds are deliberately resolved before folding: a held request must not
     // spend a summarizer reservation, and idempotency still fingerprints the
     // original client body below.
+    let original_messages = req.messages.clone();
     let fold = foreground_fold(
         state,
         &generation,
         &decision,
         &resolved,
         &principal.key_id,
-        &req.messages,
+        &original_messages,
         match (&chain, &receipt_salt, &call_digest) {
             (Some(chain), Some(salt), Some(call_digest)) => Some(FoldReceipts {
                 chain: Arc::clone(chain),
@@ -1917,10 +2052,21 @@ async fn admit(
             _ => None,
         }
         .as_ref(),
+        unfolded_cost.total(),
     )
     .await;
     if let Some(facts) = &fold.facts {
-        span.fold = Some(serde_json::to_string(facts).unwrap_or_else(|_| "{}".to_string()));
+        let mut value = serde_json::to_value(facts).unwrap_or_else(|_| json!({}));
+        if let (Some(record), Some(object)) = (&fold.shadow, value.as_object_mut()) {
+            object.insert("shadow".into(), json!(true));
+            object.insert("would_fold".into(), json!(record.would_fold));
+            object.insert("tokens_unfolded".into(), json!(record.tokens_unfolded));
+            object.insert("tokens_folded".into(), json!(record.tokens_folded));
+            object.insert("estimated_saving_nano_usd".into(), json!(record.estimated_saving_nano_usd));
+            object.insert("summarizer_cost_nano_usd".into(), json!(record.summarizer_cost_nano_usd));
+            object.insert("net_saving_nano_usd".into(), json!(record.net_saving_nano_usd));
+        }
+        span.fold = Some(value.to_string());
     }
     if let Some(attempt) = fold.attempt {
         state.metrics.record_fold(
@@ -1928,6 +2074,7 @@ async fn admit(
             attempt.outcome,
             attempt.prompt_tokens,
             attempt.completion_tokens,
+            fold.shadow.is_some(),
         );
     }
     if fold.folded_turns > 0 {
@@ -1955,6 +2102,10 @@ async fn admit(
         if let Some(summary) = &fold_summary {
             span.refusal_headers.push(("x-gateway-fold-summary", fold_summary_text(summary)));
         }
+    }
+    let shadow_header = fold.shadow_header.clone();
+    if let Some(header) = &shadow_header {
+        span.refusal_headers.push(("x-gateway-fold-shadow", header.clone()));
     }
     prompt_tokens = estimate_prompt_tokens(&req.messages);
     let reserved_prompt_tokens = prompt_tokens.saturating_add(resolved.config.prompt_overhead_tokens);
@@ -2069,6 +2220,7 @@ async fn admit(
         receipt,
         openai,
         folded_turns,
+        shadow_header,
     })
 }
 
@@ -2225,7 +2377,7 @@ fn response_headers(
     reservation: &Reservation,
     fold: FoldHeaders<'_>,
 ) -> HeaderMap {
-    let FoldHeaders { folded_turns, summary: fold_summary, receipt_id: fold_receipt_id, covered: fold_covered } = fold;
+    let FoldHeaders { folded_turns, summary: fold_summary, receipt_id: fold_receipt_id, covered: fold_covered, shadow } = fold;
     let mut h = HeaderMap::new();
     h.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream; charset=utf-8"));
     // `no-transform` forbids an intermediary from buffering or re-encoding.
@@ -2256,6 +2408,9 @@ fn response_headers(
     }
     if let Some(covered) = fold_covered {
         h.insert(HeaderName::from_static("x-gateway-fold-covered"), header_value(&covered.to_string()));
+    }
+    if let Some(shadow) = shadow {
+        h.insert(HeaderName::from_static("x-gateway-fold-shadow"), header_value(shadow));
     }
     h
 }
@@ -2951,8 +3106,11 @@ async fn complete_response(
             admitted.fold_summary.as_deref(),
             admitted.fold_receipt_id.as_deref(),
             admitted.fold_covered,
+            admitted.shadow_header.as_deref(),
         ),
-        None if admitted.folded_turns > 0 => stored_with_folding(&payload, admitted.folded_turns),
+        None if admitted.folded_turns > 0 || admitted.shadow_header.is_some() => {
+            stored_with_folding(&payload, admitted.folded_turns, admitted.shadow_header.as_deref())
+        }
         None => payload.clone(),
     };
     guard.reservation.keep_response(stored);

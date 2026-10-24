@@ -112,6 +112,10 @@ const FOLDING: &str = r#"    folding:
 "#;
 
 fn config_dir(upstream: &str) -> std::path::PathBuf {
+    config_dir_folding(upstream, FOLDING)
+}
+
+fn config_dir_folding(upstream: &str, folding: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("llm-gw-fold-receipts-{}", Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
     let models = format!(
@@ -147,7 +151,8 @@ models:
         key: test-key-acme
         scopes: [chat:stream, chat:complete, receipts:read]
     allowed_models: ["mock/chat", "mock/summarizer"]
-{FOLDING}"#
+{folding}"#,
+        folding = folding
     );
     std::fs::write(dir.join("models.yaml"), models).unwrap();
     std::fs::write(dir.join("tenants.yaml"), tenants).unwrap();
@@ -170,7 +175,11 @@ fn settings(dir: &std::path::Path) -> llm_gateway::Settings {
 
 impl Gateway {
     async fn boot(upstream: &str) -> Self {
-        let dir = config_dir(upstream);
+        Self::boot_folding(upstream, FOLDING).await
+    }
+
+    async fn boot_folding(upstream: &str, folding: &str) -> Self {
+        let dir = config_dir_folding(upstream, folding);
         let state = llm_gateway::bootstrap::build(settings(&dir)).await.expect("boot");
         let chain = state.receipts.as_ref().unwrap().chain("acme").unwrap();
         let app = llm_gateway::api::router(Arc::clone(&state));
@@ -361,6 +370,47 @@ async fn background_folding_with_a_receipts_tenant_refuses_to_start() {
 }
 
 // ---- Phase 2: the summarizer's own receipt (D3) --------------------------------------------
+
+#[tokio::test]
+async fn a_shadow_fold_receipt_is_not_a_real_fold_and_the_request_stays_unfolded() {
+    let (upstream, mock) = mock_upstream().await;
+    let folding = FOLDING.replace("enabled: true", "fold_mode: shadow");
+    let gateway = Gateway::boot_folding(&upstream, &folding).await;
+    let body = conversation(30, true);
+    let (status, headers, text) = gateway.post("/v1/chat/stream", &body, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(header(&headers, "x-gateway-folded").is_none());
+    assert!(header(&headers, "x-gateway-fold-summary").is_none());
+    assert!(header(&headers, "x-gateway-fold-receipt-id").is_none());
+    let shadow = header(&headers, "x-gateway-fold-shadow").expect("shadow header");
+    assert!(shadow.contains("outcome="), "{shadow}");
+    assert!(!shadow.contains("Summary"), "{shadow}");
+    let main = mock.last_main();
+    assert_eq!(main["messages"].as_array().unwrap().len(), 30, "the upstream request is the client's turns");
+    // The receipt line stores a proposal hash, not the action text.
+    let request_id = header(&headers, "x-request-id").expect("request id");
+    let hash_for = |action: &str| {
+        llm_gateway::receipts::allow_proposal_hash(&llm_gateway::receipts::Subject {
+            request_id: format!("{request_id}:fold"),
+            tenant_id: "acme".into(),
+            key_id: "ak_test".into(),
+            model: "mock/summarizer".into(),
+            action: action.into(),
+            call_digest: None,
+        })
+    };
+    let rows = gateway.rows();
+    let shadow_hash = hash_for("fold_shadow");
+    let fold_hash = hash_for("fold");
+    assert!(
+        rows.iter().any(|row| row["proposal_hash"] == shadow_hash.as_str()),
+        "shadow fold must be receipted as fold_shadow\n{rows:?}"
+    );
+    assert!(
+        rows.iter().all(|row| row["proposal_hash"] != fold_hash.as_str()),
+        "shadow must not use the real fold action\n{rows:?}"
+    );
+}
 
 #[tokio::test]
 async fn a_fold_writes_its_allow_then_calls_then_writes_its_outcome() {
