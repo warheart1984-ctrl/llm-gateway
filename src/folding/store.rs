@@ -38,9 +38,19 @@ pub struct SummaryEntry {
     pub tokens_saved: u64,
     /// The summarizer model this summary was made with.
     pub summarizer_model: String,
+    /// The facts the summary's "Current facts" block is written from.
+    #[serde(default)]
+    pub ledger: crate::folding::ledger::Ledger,
     /// When this entry was last accessed (for LRU).
     #[serde(skip, default = "instant_now")]
     pub last_accessed: Instant,
+}
+
+impl SummaryEntry {
+    /// What the entry holds, for the store's `max_total_chars`.
+    pub fn chars(&self) -> usize {
+        self.summary.len() + self.ledger.chars()
+    }
 }
 
 fn instant_now() -> Instant {
@@ -71,7 +81,9 @@ pub struct FoldingStore {
     shutdown: watch::Sender<bool>,
     /// Conversations whose last fold was rejected, with the head length that
     /// fold covered. Bounded by `max_entries`, like the summaries.
-    backoffs: DashMap<[u8; 32], usize>,
+    /// Per conversation: the head length the last rejected fold covered, and
+    /// how many folds in a row were rejected.
+    backoffs: DashMap<[u8; 32], (usize, u32)>,
 }
 
 impl FoldingStore {
@@ -107,11 +119,13 @@ impl FoldingStore {
                 self.backoffs.remove(&victim);
             }
         }
-        self.backoffs.insert(key, head_turns);
+        let rejections = self.backoffs.get(&key).map(|item| item.value().1).unwrap_or(0).saturating_add(1);
+        self.backoffs.insert(key, (head_turns, rejections));
     }
 
-    /// The head length the last rejected fold of this conversation covered.
-    pub fn backed_off_at(&self, key: &[u8; 32]) -> Option<usize> {
+    /// The head length the last rejected fold of this conversation covered,
+    /// and how many folds of it in a row were rejected.
+    pub fn backed_off_at(&self, key: &[u8; 32]) -> Option<(usize, u32)> {
         self.backoffs.get(key).map(|item| *item.value())
     }
 
@@ -280,13 +294,13 @@ impl FoldingStore {
     fn remove_entry(&self, key: &[u8; 32]) {
         if let Some((_, entry)) = self.entries.remove(key) {
             self.total_chars
-                .fetch_sub(entry.lock().summary.len(), std::sync::atomic::Ordering::AcqRel);
+                .fetch_sub(entry.lock().chars(), std::sync::atomic::Ordering::AcqRel);
         }
     }
 
     /// Insert or update an entry, evicting LRU entries if necessary.
     pub fn insert(&self, key: [u8; 32], entry: SummaryEntry) {
-        let chars = entry.summary.len();
+        let chars = entry.chars();
         let entry = Arc::new(Mutex::new(entry));
 
         // Replacing an existing key must not double-count its characters.
@@ -507,6 +521,7 @@ mod tests {
             fold_count: 1,
             tokens_spent: 100,
             tokens_saved: 500,
+            ledger: Default::default(),
             summarizer_model: "model".into(),
             last_accessed: Instant::now(),
         };
@@ -543,6 +558,7 @@ mod tests {
                 fold_count: 1,
                 tokens_spent: 0,
                 tokens_saved: 0,
+                ledger: Default::default(),
                 summarizer_model: "model".into(),
                 last_accessed: Instant::now(),
             },
@@ -594,6 +610,7 @@ mod tests {
                 fold_count: 1,
                 tokens_spent: 100,
                 tokens_saved: 500,
+                ledger: Default::default(),
                 summarizer_model: "model".into(),
                 last_accessed: Instant::now() - std::time::Duration::from_secs(30 - i as u64),
             };
@@ -624,6 +641,7 @@ mod tests {
                 fold_count: 1,
                 tokens_spent: 100,
                 tokens_saved: 500,
+                ledger: Default::default(),
                 summarizer_model: "model".into(),
                 last_accessed: Instant::now(),
             };
@@ -643,9 +661,35 @@ mod tests {
             fold_count: 1,
             tokens_spent: 0,
             tokens_saved: 0,
+            ledger: Default::default(),
             summarizer_model: "model".into(),
             last_accessed: Instant::now(),
         }
+    }
+
+    #[test]
+    fn rejections_in_a_row_are_counted_until_a_fold_commits() {
+        let store = FoldingStore::new(10, 1000);
+        let key = [6u8; 32];
+        assert_eq!(store.backed_off_at(&key), None);
+        store.back_off(key, 10);
+        store.back_off(key, 18);
+        assert_eq!(store.backed_off_at(&key), Some((18, 2)));
+        store.clear_backoff(&key);
+        store.back_off(key, 30);
+        assert_eq!(store.backed_off_at(&key), Some((30, 1)));
+    }
+
+    #[test]
+    fn the_ledger_counts_towards_the_stores_size() {
+        let mut entry = stored([1u8; 32], "short");
+        entry.ledger.context = "x".repeat(200);
+        assert_eq!(entry.chars(), 205);
+        // Too big for the store with its ledger, though not by its summary.
+        let store = FoldingStore::new(10, 150);
+        store.insert([5u8; 32], entry);
+        assert!(store.entries.get(&[5u8; 32]).is_none());
+        assert_eq!(store.total_chars.load(std::sync::atomic::Ordering::Acquire), 0);
     }
 
     #[test]

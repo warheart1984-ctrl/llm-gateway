@@ -72,6 +72,9 @@ enum Scenario {
     SummarizerThenDown,
     /// Non-streaming calls wait on the gate. Streams return immediately.
     SummarizerHold,
+    /// The first summarizer call reports a fact ("appointment" = 15:30); the
+    /// next reports none. Streams stay happy.
+    SummarizerFacts,
 }
 
 /// Stands in for the operator's provider account id in [`Scenario::LeakyReject`]
@@ -167,7 +170,36 @@ fn sse_stream(items: Vec<String>, tail_delay: Option<Duration>) -> impl Stream<I
     )
 }
 
-async fn handle(State(state): State<MockState>, Json(body): Json<Value>) -> Response {
+/// The gateway's summarizer asks for a JSON object of fact updates and a
+/// context note. The scenarios below answer it in text; a summarizer reply is
+/// wrapped as that object with no updates, so each scenario keeps its meaning.
+/// `SummarizerTooLong`'s first reply is left as it is: not the JSON asked for.
+async fn handle(state: State<MockState>, body: Json<Value>) -> Response {
+    let summarizer = body.0["messages"][0]["content"]
+        .as_str()
+        .is_some_and(|text| text.starts_with("You keep the record of a conversation"));
+    let unwrapped_first = state.0.scenario == Scenario::SummarizerTooLong && state.0.complete_calls.load(Ordering::SeqCst) == 0;
+    let response = handle_upstream(state, body).await;
+    if !summarizer || unwrapped_first {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, usize::MAX).await.expect("mock body");
+    let Ok(mut answer) = serde_json::from_slice::<Value>(&bytes) else {
+        return Response::from_parts(parts, Body::from(bytes));
+    };
+    if let Some(text) = answer["choices"][0]["message"]["content"].as_str().map(str::to_string)
+        && !text.is_empty()
+        && !serde_json::from_str::<Value>(&text).is_ok_and(|parsed| parsed.is_object())
+    {
+        answer["choices"][0]["message"]["content"] = json!(json!({"updates": [], "context": text}).to_string());
+    }
+    let mut parts = parts;
+    parts.headers.remove(header::CONTENT_LENGTH);
+    Response::from_parts(parts, Body::from(answer.to_string()))
+}
+
+async fn handle_upstream(State(state): State<MockState>, Json(body): Json<Value>) -> Response {
     state.calls.fetch_add(1, Ordering::SeqCst);
     let streaming = body["stream"] != json!(false);
     state.last_body.lock().unwrap().push(body);
@@ -200,6 +232,21 @@ async fn handle(State(state): State<MockState>, Json(body): Json<Value>) -> Resp
             Json(json!({ "error": { "message": "summarizer down", "code": "upstream_error" } })),
         )
             .into_response();
+    }
+    if !streaming && state.scenario == Scenario::SummarizerFacts {
+        let reply = if complete_call == 1 {
+            json!({"updates": [{"field": "appointment", "value": "15:30", "evidence": "The appointment moved to 15:30"}],
+                   "context": "first note"})
+        } else {
+            json!({"updates": [], "context": "second note"})
+        };
+        return Json(json!({
+            "id": "summarizer-facts",
+            "model": "mock-summarizer",
+            "choices": [{ "index": 0, "message": { "role": "assistant", "content": reply.to_string() }, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 7, "completion_tokens": 4, "total_tokens": 11 }
+        }))
+        .into_response();
     }
     if !streaming && state.scenario == Scenario::SummarizerDown && complete_call == 1 {
         return (
@@ -295,7 +342,8 @@ async fn handle(State(state): State<MockState>, Json(body): Json<Value>) -> Resp
         | Scenario::SummarizerLength
         | Scenario::SummarizerReasoningRetry
         | Scenario::SummarizerDown
-        | Scenario::SummarizerThenEmpty => sse_response(vec![
+        | Scenario::SummarizerThenEmpty
+        | Scenario::SummarizerFacts => sse_response(vec![
             chunk("c1", "Hello"),
             chunk("c1", ", "),
             chunk("c1", "world"),
@@ -447,7 +495,8 @@ async fn completion_answer(scenario: Scenario) -> Response {
         | Scenario::SummarizerDown
         | Scenario::SummarizerThenEmpty
         | Scenario::SummarizerThenDown
-        | Scenario::SummarizerHold => unreachable!("handled by the caller"),
+        | Scenario::SummarizerHold
+        | Scenario::SummarizerFacts => unreachable!("handled by the caller"),
     };
     Json(body).into_response()
 }
@@ -931,6 +980,38 @@ async fn a_committed_summary_is_reused_until_a_new_batch_is_due() {
 }
 
 #[tokio::test]
+async fn a_later_fold_forwards_the_facts_its_summarizer_did_not_mention() {
+    let upstream = MockUpstream::start(Scenario::SummarizerFacts).await;
+    let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(FOLDING_TENANT)).await;
+    let body = |turns: usize| {
+        let mut body = folding_body(turns);
+        body["messages"][0]["content"] = json!("The appointment moved to 15:30");
+        body
+    };
+    let summary_sent = |upstream: &MockUpstream| {
+        let main = upstream.last_body().unwrap();
+        main["messages"].as_array().unwrap().iter().find_map(|message| {
+            message["content"].as_str().filter(|text| text.contains("Summary of the earlier conversation")).map(str::to_string)
+        })
+    };
+    let (status, headers, _) = gw.post_chat(TEST_KEY, body(6)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get("x-gateway-folded").unwrap(), "4");
+    let first = summary_sent(&upstream).expect("folded");
+    assert!(first.ends_with("Current facts:\n- appointment: 15:30\n\nContext:\nfirst note"), "{first}");
+
+    // Two more turns: a second fold, whose summarizer reports no facts.
+    let (status, headers, _) = gw.post_chat(TEST_KEY, body(8)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get("x-gateway-folded").unwrap(), "6");
+    assert_eq!(summarizer_bodies(&upstream).len(), 2);
+    // It was shown the facts the gateway keeps.
+    assert!(summarizer_bodies(&upstream)[1].to_string().contains("appointment: 15:30"));
+    let second = summary_sent(&upstream).expect("folded");
+    assert!(second.ends_with("Current facts:\n- appointment: 15:30\n\nContext:\nsecond note"), "{second}");
+}
+
+#[tokio::test]
 async fn a_tenant_without_folding_keeps_the_upstream_body_byte_for_byte() {
     let baseline_upstream = MockUpstream::start(Scenario::Happy).await;
     let baseline = Gateway::start(&baseline_upstream).await;
@@ -984,7 +1065,7 @@ async fn empty_summarizer_reply_is_rejected_without_failing_the_main_request() {
 }
 
 #[tokio::test]
-async fn an_overlong_summary_is_fixed_by_its_corrective_retry() {
+async fn a_reply_that_is_not_json_is_fixed_by_its_corrective_retry() {
     let upstream = MockUpstream::start(Scenario::SummarizerTooLong).await;
     let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(FOLDING_TENANT)).await;
     let (status, headers, _) = gw.post_chat(TEST_KEY, folding_body(6)).await;
@@ -998,10 +1079,10 @@ async fn an_overlong_summary_is_fixed_by_its_corrective_retry() {
     assert_eq!(summarizer[1]["max_tokens"], summarizer[0]["max_tokens"], "a corrective retry gets the usual budget");
     assert_eq!(retry[2]["role"], "assistant");
     assert_eq!(retry[2]["content"], "x".repeat(400));
-    assert!(retry[3]["content"].as_str().unwrap().contains("It is too long."), "{}", retry[3]);
+    assert!(retry[3]["content"].as_str().unwrap().contains("It is not the JSON object asked for."), "{}", retry[3]);
     let (decision, fold) = decision_record(prompt_tokens_of(&upstream.last_body().unwrap()));
     assert_eq!(fold["outcome"], "applied", "{decision}");
-    assert_eq!(fold["corrected_checks"]["within_length_bound"], 1, "{fold}");
+    assert_eq!(fold["corrected_checks"]["format"], 1, "{fold}");
     assert!(fold.get("failed_checks").is_none(), "{fold}");
     let (_, metrics) = gw.get("/metrics", TEST_KEY).await;
     assert!(metrics.contains("gw_fold_corrective_retries_total{tenant=\"acme\",result=\"committed\"} 1"), "{metrics}");
@@ -1112,7 +1193,13 @@ async fn a_rejected_fold_backs_off_before_paying_again() {
     assert_eq!(fold_counter(&metrics, "backoff"), 1, "{metrics}");
     // 8 more turns than the head the rejected fold covered: fold again.
     assert_eq!(gw.post_chat(TEST_KEY, body(14)).await.0, StatusCode::OK);
-    assert!(summarizer_bodies(&upstream).len() > 2, "the backoff ends after backoff_turns");
+    assert_eq!(summarizer_bodies(&upstream).len(), 4, "the backoff ends after backoff_turns");
+    // That fold was rejected too: the next wait is twice as long (16 turns
+    // past the 12-turn head it covered, so not at 20, but at 28).
+    assert_eq!(gw.post_chat(TEST_KEY, body(22)).await.0, StatusCode::OK);
+    assert_eq!(summarizer_bodies(&upstream).len(), 4, "a second rejection backs off twice as long");
+    assert_eq!(gw.post_chat(TEST_KEY, body(30)).await.0, StatusCode::OK);
+    assert_eq!(summarizer_bodies(&upstream).len(), 6, "and then folds again");
 }
 
 #[tokio::test]
@@ -2251,9 +2338,8 @@ async fn metric_labels_come_from_config_never_from_the_request() {
     );
 }
 
-/// The middleware stamps its own `x-request-id`, which is not the id on the
-/// decision line. The line's `prompt_tokens` is the estimate of the messages
-/// that were forwarded, so that count is the correlation.
+/// The decision line of a request, found by its `prompt_tokens` (the estimate
+/// of the messages that were forwarded), for tests that do not have its id.
 fn decision_record(prompt_tokens: u32) -> (String, Value) {
     let needle = format!("\"prompt_tokens\":{prompt_tokens},");
     let logs = captured_logs::contents();
@@ -2313,6 +2399,51 @@ fn marked_folding_body(turns: usize, tail_pad: usize) -> Value {
     let content = body["messages"][last]["content"].as_str().unwrap().to_string();
     body["messages"][last]["content"] = json!(format!("{content}{}", "y".repeat(tail_pad)));
     body
+}
+
+/// The "stream complete" line whose `field` is `value`.
+fn completion_line(field: &str, value: &str) -> Option<Value> {
+    captured_logs::contents().lines().rev().find_map(|line| {
+        let event: Value = serde_json::from_str(line).ok()?;
+        let fields = event.get("fields").unwrap_or(&event);
+        (fields["message"] == "stream complete" && fields[field] == value).then(|| fields.clone())
+    })
+}
+
+#[tokio::test]
+async fn the_request_id_a_response_carries_is_the_one_in_the_log() {
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let gw = Gateway::start(&upstream).await;
+    let (status, headers, _) = gw.post_chat(TEST_KEY, folding_body(3)).await;
+    assert_eq!(status, StatusCode::OK);
+    let id = headers.get("x-request-id").unwrap().to_str().unwrap().to_string();
+    assert!(uuid::Uuid::parse_str(&id).is_ok(), "{id}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let line = completion_line("request_id", &id).unwrap_or_else(|| panic!("no log line for {id}"));
+    assert_eq!(line["client_request_id"], "-");
+}
+
+#[tokio::test]
+async fn a_client_request_id_is_echoed_and_logged_beside_the_gateways() {
+    // A folding tenant, so the line with fold facts carries it too.
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(FOLDING_TENANT)).await;
+    let resp = reqwest::Client::new()
+        .post(gw.url("/v1/chat/stream"))
+        .header("x-api-key", TEST_KEY)
+        .header("x-request-id", "client-trace-7f3a")
+        .json(&folding_body(3))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("x-request-id").unwrap(), "client-trace-7f3a");
+    let _ = resp.text().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let line = completion_line("client_request_id", "client-trace-7f3a").expect("logged with the client's id");
+    assert!(line.get("fold").is_some(), "{line}");
+    let gateway_id = line["request_id"].as_str().unwrap();
+    assert!(uuid::Uuid::parse_str(gateway_id).is_ok(), "the gateway's own id stays its record: {gateway_id}");
 }
 
 #[tokio::test]

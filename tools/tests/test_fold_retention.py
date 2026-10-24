@@ -292,6 +292,18 @@ class Diagnostics(unittest.TestCase):
                          "fold_retention_openrouter_mutating_lifecycle_T1.json")
         self.assertEqual(runner.result_name("openrouter", "mutating", "lifecycle", "T1", "openrouter/gpt-4.1-mini"),
                          "fold_retention_openrouter_mutating_lifecycle_T1_sum-gpt-4.1-mini.json")
+        self.assertEqual(runner.result_name("openrouter", "mutating", "lifecycle", "T1", "openrouter/gpt-4.1-mini", 16),
+                         "fold_retention_openrouter_mutating_lifecycle_T1_sum-gpt-4.1-mini_amort-16.json")
+
+    def test_the_amortization_is_set_in_the_tenants_file(self) -> None:
+        for name in ("tenants.yaml", "tenants.lifecycle.yaml"):
+            text = (runner.BENCH / name).read_text(encoding="utf-8")
+            changed = runner.with_amortization(text, 16)
+            self.assertIn("      amortization_requests: 16\n", changed)
+            self.assertEqual(changed.count("amortization_requests:"), 1)
+            self.assertEqual(len(changed.splitlines()), len(text.splitlines()))
+        with self.assertRaises(ValueError):
+            runner.with_amortization("tenants: []\n", 16)
 
     def test_the_runner_attaches_each_logged_fold_decision_by_request_id(self) -> None:
         decision = {"outcome": "refused", "reason": "cost_check", "fold_count": 8}

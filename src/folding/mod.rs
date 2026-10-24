@@ -8,11 +8,23 @@
 //! client sent it.
 
 pub mod checks;
+pub mod ledger;
 pub mod plan;
 pub mod store;
 pub mod summarizer;
 
 use serde::Serialize;
+
+/// How many more turns a conversation waits after `rejections` folds of it
+/// in a row were rejected: `backoff_turns`, doubled for each rejection after
+/// the first, at most 16 times over. A conversation whose summaries keep
+/// failing (in the folding benchmark, one the summarizer could not read)
+/// otherwise paid the summarizer every `backoff_turns` turns and cost more
+/// than not folding.
+pub fn backoff_span(backoff_turns: usize, rejections: u32) -> usize {
+    let doublings = rejections.saturating_sub(1).min(4);
+    backoff_turns.saturating_mul(1 << doublings)
+}
 
 /// How one fold attempt is counted. Every attempt lands on exactly one of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +126,13 @@ pub fn estimate_tokens(messages: &[ChatMessage]) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_backoff_doubles_with_each_rejection_up_to_sixteen_times() {
+        let spans: Vec<usize> = (1..=7).map(|rejections| super::backoff_span(8, rejections)).collect();
+        assert_eq!(spans, [8, 16, 32, 64, 128, 128, 128]);
+        assert_eq!(super::backoff_span(0, 3), 0);
+    }
+
     use super::*;
     use crate::providers::{ChatMessage, Content};
 

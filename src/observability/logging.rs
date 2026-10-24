@@ -19,6 +19,9 @@ use crate::config::{LogFormat, TelemetryConfig};
 #[derive(Debug, Clone)]
 pub struct RequestSpan {
     pub request_id: String,
+    /// The caller's own `x-request-id`, echoed back and logged beside the
+    /// gateway's id so a caller can find its request. Trusted for nothing else.
+    pub client_request_id: Option<String>,
     pub tenant_id: String,
     pub key_id: String,
     pub scheme: String,
@@ -40,6 +43,7 @@ impl RequestSpan {
     pub fn new(request_id: String) -> Self {
         Self {
             request_id,
+            client_request_id: None,
             tenant_id: String::new(),
             key_id: String::new(),
             scheme: String::new(),
@@ -199,6 +203,7 @@ pub fn log_stream_complete(span: &RequestSpan, outcome: &StreamSummary) {
     if let Some(fold) = &span.fold {
         tracing::info!(
             request_id = %span.request_id,
+            client_request_id = span.client_request_id.as_deref().unwrap_or("-"),
             tenant = %span.tenant_id,
             key = %span.key_id,
             scheme = %span.scheme,
@@ -228,6 +233,7 @@ pub fn log_stream_complete(span: &RequestSpan, outcome: &StreamSummary) {
     }
     tracing::info!(
         request_id = %span.request_id,
+        client_request_id = span.client_request_id.as_deref().unwrap_or("-"),
         tenant = %span.tenant_id,
         key = %span.key_id,
         scheme = %span.scheme,

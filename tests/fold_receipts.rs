@@ -62,7 +62,9 @@ async fn mock_upstream() -> (String, Mock) {
 async fn handle(State(state): State<Mock>, Json(body): Json<Value>) -> Response {
     state.bodies.lock().unwrap().push(body.clone());
     if body["model"] == "mock-summarizer" {
-        let summary = state.summary.lock().unwrap().clone();
+        // The summarizer replies with fact updates and a context note; these
+        // tests set only the note.
+        let summary = json!({"updates": [], "context": state.summary.lock().unwrap().clone()}).to_string();
         return Json(json!({
             "id": "s1", "object": "chat.completion", "model": "mock-summarizer",
             "choices": [{"index": 0, "finish_reason": "stop",
@@ -566,7 +568,7 @@ async fn a_request_refused_after_its_fold_still_lets_the_caller_check_the_fold()
     assert_eq!(header(&refused, "x-gateway-fold-covered"), Some("32"));
     let fold_id = header(&refused, "x-gateway-fold-receipt-id").expect("the fold's receipt id");
     assert_eq!(gateway.outcome_of(fold_id)["status"], "completed");
-    assert_eq!(decoded_summary(&refused), "The conversation went on with more filler.");
+    assert_eq!(decoded_summary(&refused), "Context:\nThe conversation went on with more filler.");
     if let Some(code) = verify_fold(&gateway, &body, &refused, Some(&first), None) {
         assert_eq!(code, 0, "the caller can check the fold it was charged for");
     }

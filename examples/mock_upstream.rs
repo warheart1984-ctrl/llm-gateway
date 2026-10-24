@@ -97,10 +97,20 @@ async fn completions(Json(body): Json<Value>, delay: Duration) -> Response {
     // the stream would have taken, so a client can see it waits.
     if body["stream"] != json!(true) {
         tokio::time::sleep(delay * completion_tokens as u32).await;
+        // The gateway's summarizer asks for fact updates and a context note as
+        // JSON; the demo's conversation states no facts, so it reports none.
+        let summarizer = body["messages"][0]["content"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("You keep the record of a conversation"));
+        let (content, finish) = if summarizer {
+            (json!({ "updates": [], "context": ANSWER }).to_string(), "stop")
+        } else {
+            (words.concat(), finish)
+        };
         return Json(json!({
             "id": "mock-1", "object": "chat.completion", "model": model,
             "choices": [{ "index": 0, "finish_reason": finish,
-                          "message": { "role": "assistant", "content": words.concat() } }],
+                          "message": { "role": "assistant", "content": content } }],
             "usage": usage
         }))
         .into_response();
