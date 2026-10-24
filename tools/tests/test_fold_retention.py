@@ -294,6 +294,8 @@ class Diagnostics(unittest.TestCase):
                          "fold_retention_openrouter_mutating_lifecycle_T1_sum-gpt-4.1-mini.json")
         self.assertEqual(runner.result_name("openrouter", "mutating", "lifecycle", "T1", "openrouter/gpt-4.1-mini", 16),
                          "fold_retention_openrouter_mutating_lifecycle_T1_sum-gpt-4.1-mini_amort-16.json")
+        self.assertEqual(runner.result_name("openrouter", "constraints", "lifecycle", "T1"),
+                         "fold_tasks_openrouter_constraints_lifecycle_T1.json")
 
     def test_the_amortization_is_set_in_the_tenants_file(self) -> None:
         for name in ("tenants.yaml", "tenants.lifecycle.yaml"):

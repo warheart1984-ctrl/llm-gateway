@@ -675,6 +675,31 @@ At 16 both runs reached the fold cap at call 85, were sent "owner is now Ines" a
 
 Each fault a round found became a rule with its own test. What the rounds show: the ledger turns the summarizer's mistakes into refused folds rather than wrong answers, and the summarizer's quality then decides how much a conversation with corrections saves. With `gpt-4.1-nano` that is nothing; with `gpt-4.1-mini` it is 54–55%, once `amortization_requests` is set near how often a summary is really reused. A summarizer that costs as much as the main model needs a higher value than the default; one that costs a quarter of it, a lower one.
 
+#### Task success: standing rules
+
+Fact recall is not the whole job: a summary can keep every fact and still drop "never mention BIRCH-204". `tools/fold_tasks.py` runs the same paired calls on the mutating conversation, with five standing rules given in its user turns:
+- answer in at most three `- ` bullets;
+- never mention BIRCH-204 or Ana;
+- end with `Ref: CEDAR-731`;
+- from call 15, dates as DD.MM.YYYY;
+- at call 60, a change to `Ref: CEDAR-731/B`.
+
+Calls alternate between a status update and "which projects and budgets have come up?". A deterministic checker scores every answer against every rule in force. A call succeeds when it obeys all of them. A rule counts against folding only where it was folded away and the unfolded tenant obeyed it. The run exits `1` if the folded tenant broke such a rule, or, with `--max-success-drop`, if its success rate fell further than that below the unfolded tenant's. Run it with `python tools/run_fold_retention_local.py --provider openrouter --scenario constraints --profile lifecycle --max-calls 120`.
+
+OpenRouter, 2026-10-24, `gpt-4.1-mini` answering, 120 calls each:
+
+| Summarizer | Folds | Task success, unfolded → folded | Bullets rule, unfolded / folded | Footer and date rules | Saving with caching |
+|---|---|---|---|---|---|
+| `gpt-4.1-nano` | none | 34% → 31% | 82% / 79% | kept in both | −3% |
+| `gpt-4.1-mini`, `amortization_requests: 16` | 7, re-folded | 32% → 13% | 82% / 59%; broken 30 times after it was folded away | kept in both | 58% |
+| same, repeat | 8, re-folded | 40% → 53% | 87% / 91%; broken 10 times | kept in both | 54% |
+
+What this shows:
+
+- **The bullets rule is the one folding loses.** It was the rule the summarizer kept only as a sentence in the context note ("Standing rules include answers limited to three bullet points"). The footer and the date format, which it filed as ledger facts (`answer ending line: Ref: CEDAR-731/B`, `date format rule: DD.MM.YYYY`), were obeyed on every call, including after the footer changed. The fix this points to is to keep standing instructions as their own kind of ledger entry, carried forward word for word.
+- **The two mini runs disagree by 31 points of success.** The cost saving repeats; compliance with a format rule does not, at temperature 0. Judge from more than one run.
+- **Even unfolded, the main model breaks "never mention BIRCH-204" whenever the question asks which projects came up**: 50% compliance on both tenants. Those calls never count against folding, and the low baseline success rate (32–40%) is mostly theirs. Compare the tenants with each other, not with 100%.
+
 ## Receipts
 
 To see all of this end to end, run the receipts demo: `python demo/receipts/run_local.py`,
