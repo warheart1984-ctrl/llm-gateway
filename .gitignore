@@ -23,3 +23,7 @@ signing.priv
 
 # Python bytecode from tools/ and demo scripts
 __pycache__/
+
+# Real-conversation corpora for tools/fold_retention.py --corpus.
+# Raw chat exports stay here and are never committed.
+/corpus/

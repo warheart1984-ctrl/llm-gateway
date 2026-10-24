@@ -1,0 +1,1386 @@
+{
+  "schema": "folding.retention.v1",
+  "started_utc": "2026-10-24T16:35:15.723430+00:00",
+  "finished_utc": "2026-10-24T16:36:30.905521+00:00",
+  "settings": {
+    "model": "openrouter/gpt-4.1-mini",
+    "scenario": "corpus",
+    "profile": "lifecycle",
+    "label": "lifecycle, not economics",
+    "corpus": "corpus",
+    "probe_every": 3,
+    "extract_facts": true,
+    "scrubbed": true,
+    "max_tokens": 256,
+    "temperature": 0,
+    "fold_cap": 5,
+    "refold_threshold": 8,
+    "secrets_written": false,
+    "git_commit": "99c8c472788146888c18722c70e98fca6e434028",
+    "prices": {
+      "main_input_per_mtok_usd": 0.4,
+      "main_output_per_mtok_usd": 1.6,
+      "main_cached_input_per_mtok_usd": 0.1,
+      "summarizer_input_per_mtok_usd": 0.1,
+      "summarizer_output_per_mtok_usd": 0.4
+    }
+  },
+  "conversations": [
+    {
+      "name": "cedar",
+      "file": "cedar.jsonl",
+      "user_turns": 6,
+      "facts": 10,
+      "facts_file": "cedar.facts.json",
+      "totals": {
+        "facts_kept": {
+          "correct": 0,
+          "eligible": 0
+        },
+        "saving_with_caching": {
+          "plain": 0.0032196000000000004,
+          "folded": 0.0042825,
+          "folded_main_calls": 0.0036272,
+          "folded_summarizer_calls": 0.0006552999999999999,
+          "saving": -0.0010628999999999994,
+          "saving_share": -0.33013417815877727
+        },
+        "folds": {
+          "attempted": 2,
+          "applied": 0,
+          "refused": {
+            "backoff": 2,
+            "rejected": 1,
+            "unprofitable": 1
+          },
+          "reasons": {
+            "backoff": 2,
+            "checks_failed": 1,
+            "cost_check": 1
+          },
+          "backoff_cost_nano_usd": 2164000,
+          "backoff_cost_usd": 0.0017816000000000002
+        },
+        "wrong_answers": []
+      }
+    },
+    {
+      "name": "harbor",
+      "file": "harbor.jsonl",
+      "user_turns": 6,
+      "facts": 10,
+      "facts_file": "harbor.facts.json",
+      "totals": {
+        "facts_kept": {
+          "correct": 0,
+          "eligible": 0
+        },
+        "saving_with_caching": {
+          "plain": 0.0036184000000000003,
+          "folded": 0.0038612000000000004,
+          "folded_main_calls": 0.0033260000000000004,
+          "folded_summarizer_calls": 0.0005352,
+          "saving": -0.00024280000000000005,
+          "saving_share": -0.06710148131770949
+        },
+        "folds": {
+          "attempted": 2,
+          "applied": 0,
+          "refused": {
+            "backoff": 2,
+            "rejected": 1,
+            "unprofitable": 1
+          },
+          "reasons": {
+            "backoff": 2,
+            "checks_failed": 1,
+            "cost_check": 1
+          },
+          "backoff_cost_nano_usd": 1866800,
+          "backoff_cost_usd": 0.0016652
+        },
+        "wrong_answers": []
+      }
+    },
+    {
+      "name": "lumen",
+      "file": "lumen.jsonl",
+      "user_turns": 6,
+      "facts": 9,
+      "facts_file": "lumen.facts.json",
+      "totals": {
+        "facts_kept": {
+          "correct": 0,
+          "eligible": 0
+        },
+        "saving_with_caching": {
+          "plain": 0.0031716,
+          "folded": 0.0036064,
+          "folded_main_calls": 0.0030528,
+          "folded_summarizer_calls": 0.0005536,
+          "saving": -0.00043479999999999994,
+          "saving_share": -0.1370916887375457
+        },
+        "folds": {
+          "attempted": 2,
+          "applied": 0,
+          "refused": {
+            "backoff": 2,
+            "rejected": 1,
+            "unprofitable": 1
+          },
+          "reasons": {
+            "backoff": 2,
+            "checks_failed": 1,
+            "cost_check": 1
+          },
+          "backoff_cost_nano_usd": 2134800,
+          "backoff_cost_usd": 0.0013540000000000002
+        },
+        "wrong_answers": []
+      }
+    }
+  ],
+  "calls": [
+    {
+      "call": 1,
+      "conversation": "cedar",
+      "kind": "turn",
+      "user_turn": 1,
+      "order": "plain-first",
+      "plain": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 506000,
+        "usage": {
+          "prompt_tokens": 225,
+          "cached_tokens": 0,
+          "completion_tokens": 79
+        },
+        "retries": 0,
+        "request_id": "9c452775-ce91-4726-a0d7-c3d9bd22ebe7",
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 506000,
+        "usage": {
+          "prompt_tokens": 225,
+          "cached_tokens": 0,
+          "completion_tokens": 79
+        },
+        "retries": 0,
+        "request_id": "d5911fa4-91b5-401b-ad8e-d87cc7ca3568",
+        "error": null,
+        "extra_keys": [],
+        "folded_turns": 0,
+        "fold_outcomes": {},
+        "failed_checks": {},
+        "corrective_retries": {},
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "outcome": "not_due",
+          "reason": "no_head",
+          "turns_replaced": 0,
+          "turns_covered": 0,
+          "prompt_tokens_cut": 0,
+          "benefit_nano_usd": 0,
+          "overhead_nano_usd": 0,
+          "min_saving_nano_usd": 0,
+          "summarizer_prompt_tokens": 0,
+          "summarizer_completion_tokens": 0,
+          "fold_count": 0,
+          "prefix_hash": ""
+        }
+      },
+      "fields": {},
+      "wrong_answers": []
+    },
+    {
+      "call": 2,
+      "conversation": "cedar",
+      "kind": "turn",
+      "user_turn": 2,
+      "order": "folded-first",
+      "plain": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 622400,
+        "usage": {
+          "prompt_tokens": 516,
+          "cached_tokens": 0,
+          "completion_tokens": 113
+        },
+        "retries": 0,
+        "request_id": "97b87605-47d6-4323-85bb-eb525f2dc0c1",
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 622400,
+        "usage": {
+          "prompt_tokens": 516,
+          "cached_tokens": 0,
+          "completion_tokens": 119
+        },
+        "retries": 0,
+        "request_id": "b5c469b0-38af-42b7-94fa-fe80bd5391c4",
+        "error": null,
+        "extra_keys": [],
+        "folded_turns": 0,
+        "fold_outcomes": {},
+        "failed_checks": {},
+        "corrective_retries": {},
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "outcome": "not_due",
+          "reason": "no_head",
+          "turns_replaced": 0,
+          "turns_covered": 0,
+          "prompt_tokens_cut": 0,
+          "benefit_nano_usd": 0,
+          "overhead_nano_usd": 0,
+          "min_saving_nano_usd": 0,
+          "summarizer_prompt_tokens": 0,
+          "summarizer_completion_tokens": 0,
+          "fold_count": 0,
+          "prefix_hash": ""
+        }
+      },
+      "fields": {},
+      "wrong_answers": []
+    },
+    {
+      "call": 3,
+      "conversation": "cedar",
+      "kind": "turn",
+      "user_turn": 3,
+      "order": "plain-first",
+      "plain": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 746000,
+        "usage": {
+          "prompt_tokens": 825,
+          "cached_tokens": 0,
+          "completion_tokens": 126
+        },
+        "retries": 0,
+        "request_id": "fc90b586-2fc4-4a4d-9055-555afaa2b333",
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 748000,
+        "usage": {
+          "prompt_tokens": 830,
+          "cached_tokens": 0,
+          "completion_tokens": 132
+        },
+        "retries": 0,
+        "request_id": "e1711b8d-06b6-4dbc-9425-cf86e7021cb5",
+        "error": null,
+        "extra_keys": [],
+        "folded_turns": 0,
+        "fold_outcomes": {
+          "unprofitable": 1
+        },
+        "failed_checks": {},
+        "corrective_retries": {},
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "outcome": "refused",
+          "reason": "cost_check",
+          "turns_replaced": 0,
+          "turns_covered": 0,
+          "prompt_tokens_cut": 0,
+          "benefit_nano_usd": 0,
+          "overhead_nano_usd": 430500,
+          "min_saving_nano_usd": 0,
+          "summarizer_prompt_tokens": 0,
+          "summarizer_completion_tokens": 0,
+          "fold_count": 0,
+          "prefix_hash": ""
+        }
+      },
+      "fields": {},
+      "wrong_answers": []
+    },
+    {
+      "call": 4,
+      "conversation": "cedar",
+      "kind": "turn",
+      "user_turn": 4,
+      "order": "folded-first",
+      "plain": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 873600,
+        "usage": {
+          "prompt_tokens": 1144,
+          "cached_tokens": 0,
+          "completion_tokens": 137
+        },
+        "retries": 0,
+        "request_id": "14db2720-96ba-4aed-8394-943816af9a02",
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1533300,
+        "usage": {
+          "prompt_tokens": 1155,
+          "cached_tokens": 0,
+          "completion_tokens": 142
+        },
+        "retries": 0,
+        "request_id": "cef624b2-d276-4807-ad52-5d3e2c1f9ed6",
+        "error": null,
+        "extra_keys": [],
+        "folded_turns": 0,
+        "fold_outcomes": {
+          "rejected": 1
+        },
+        "failed_checks": {
+          "instruction_evidence": 2,
+          "ledger_evidence": 1
+        },
+        "corrective_retries": {
+          "rejected": 1
+        },
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 3073,
+        "summarizer_completion_tokens": 870,
+        "fold_decision": {
+          "outcome": "refused",
+          "reason": "checks_failed",
+          "turns_replaced": 0,
+          "turns_covered": 3,
+          "prompt_tokens_cut": 121,
+          "benefit_nano_usd": 774400,
+          "overhead_nano_usd": 459600,
+          "min_saving_nano_usd": 0,
+          "summarizer_prompt_tokens": 3073,
+          "summarizer_completion_tokens": 870,
+          "fold_count": 0,
+          "prefix_hash": "",
+          "failed_checks": {
+            "instruction_evidence": 1
+          },
+          "corrected_checks": {
+            "instruction_evidence": 1,
+            "ledger_evidence": 1
+          }
+        }
+      },
+      "fields": {},
+      "wrong_answers": []
+    },
+    {
+      "call": 5,
+      "conversation": "cedar",
+      "kind": "turn",
+      "user_turn": 5,
+      "order": "plain-first",
+      "plain": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1007200,
+        "usage": {
+          "prompt_tokens": 1478,
+          "cached_tokens": 0,
+          "completion_tokens": 144
+        },
+        "retries": 0,
+        "request_id": "f73d8ace-315a-4510-8290-590cd38892a3",
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1012800,
+        "usage": {
+          "prompt_tokens": 1492,
+          "cached_tokens": 0,
+          "completion_tokens": 149
+        },
+        "retries": 0,
+        "request_id": "488b1b64-b3cc-43a5-94d2-475567813f2c",
+        "error": null,
+        "extra_keys": [],
+        "folded_turns": 0,
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "corrective_retries": {},
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "outcome": "skipped",
+          "reason": "backoff",
+          "turns_replaced": 0,
+          "turns_covered": 5,
+          "prompt_tokens_cut": 435,
+          "benefit_nano_usd": 2784000,
+          "overhead_nano_usd": 491000,
+          "min_saving_nano_usd": 0,
+          "summarizer_prompt_tokens": 0,
+          "summarizer_completion_tokens": 0,
+          "fold_count": 0,
+          "prefix_hash": ""
+        }
+      },
+      "fields": {},
+      "wrong_answers": []
+    },
+    {
+      "call": 6,
+      "conversation": "cedar",
+      "kind": "turn",
+      "user_turn": 6,
+      "order": "folded-first",
+      "plain": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1144400,
+        "usage": {
+          "prompt_tokens": 1821,
+          "cached_tokens": 1152,
+          "completion_tokens": 127
+        },
+        "retries": 0,
+        "request_id": "28a3d858-a761-4472-8896-36c7ac3cb207",
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1151200,
+        "usage": {
+          "prompt_tokens": 1838,
+          "cached_tokens": 0,
+          "completion_tokens": 132
+        },
+        "retries": 0,
+        "request_id": "874cb1cc-5109-4375-9dd0-74beb0900a50",
+        "error": null,
+        "extra_keys": [],
+        "folded_turns": 0,
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "corrective_retries": {},
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "outcome": "skipped",
+          "reason": "backoff",
+          "turns_replaced": 0,
+          "turns_covered": 7,
+          "prompt_tokens_cut": 760,
+          "benefit_nano_usd": 4864000,
+          "overhead_nano_usd": 523500,
+          "min_saving_nano_usd": 0,
+          "summarizer_prompt_tokens": 0,
+          "summarizer_completion_tokens": 0,
+          "fold_count": 0,
+          "prefix_hash": ""
+        }
+      },
+      "fields": {},
+      "wrong_answers": []
+    },
+    {
+      "call": 7,
+      "conversation": "harbor",
+      "kind": "turn",
+      "user_turn": 1,
+      "order": "plain-first",
+      "plain": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 235200,
+        "usage": {
+          "prompt_tokens": 204,
+          "cached_tokens": 0,
+          "completion_tokens": 96
+        },
+        "retries": 0,
+        "request_id": "3177afbe-1a08-498f-8c00-0a3a75819cfd",
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 497600,
+        "usage": {
+          "prompt_tokens": 204,
+          "cached_tokens": 0,
+          "completion_tokens": 96
+        },
+        "retries": 0,
+        "request_id": "d786017c-dbce-49a4-a24e-957db5ea6862",
+        "error": null,
+        "extra_keys": [],
+        "folded_turns": 0,
+        "fold_outcomes": {},
+        "failed_checks": {},
+        "corrective_retries": {},
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "outcome": "not_due",
+          "reason": "no_head",
+          "turns_replaced": 0,
+          "turns_covered": 0,
+          "prompt_tokens_cut": 0,
+          "benefit_nano_usd": 0,
+          "overhead_nano_usd": 0,
+          "min_saving_nano_usd": 0,
+          "summarizer_prompt_tokens": 0,
+          "summarizer_completion_tokens": 0,
+          "fold_count": 0,
+          "prefix_hash": ""
+        }
+      },
+      "fields": {},
+      "wrong_answers": []
+    },
+    {
+      "call": 8,
+      "conversation": "harbor",
+      "kind": "turn",
+      "user_turn": 2,
+      "order": "folded-first",
+      "plain": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 413600,
+        "usage": {
+          "prompt_tokens": 526,
+          "cached_tokens": 0,
+          "completion_tokens": 127
+        },
+        "retries": 0,
+        "request_id": "8b9f1137-70f1-46fc-871f-5f3a8e7fe9c6",
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 626400,
+        "usage": {
+          "prompt_tokens": 526,
+          "cached_tokens": 0,
+          "completion_tokens": 93
+        },
+        "retries": 0,
+        "request_id": "734e4873-e55c-41aa-9b0b-7d0b054d126c",
+        "error": null,
+        "extra_keys": [],
+        "folded_turns": 0,
+        "fold_outcomes": {},
+        "failed_checks": {},
+        "corrective_retries": {},
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "outcome": "not_due",
+          "reason": "no_head",
+          "turns_replaced": 0,
+          "turns_covered": 0,
+          "prompt_tokens_cut": 0,
+          "benefit_nano_usd": 0,
+          "overhead_nano_usd": 0,
+          "min_saving_nano_usd": 0,
+          "summarizer_prompt_tokens": 0,
+          "summarizer_completion_tokens": 0,
+          "fold_count": 0,
+          "prefix_hash": ""
+        }
+      },
+      "fields": {},
+      "wrong_answers": []
+    },
+    {
+      "call": 9,
+      "conversation": "harbor",
+      "kind": "turn",
+      "user_turn": 3,
+      "order": "plain-first",
+      "plain": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 762800,
+        "usage": {
+          "prompt_tokens": 867,
+          "cached_tokens": 0,
+          "completion_tokens": 145
+        },
+        "retries": 0,
+        "request_id": "fb0993e6-64b1-4583-90f2-7b245166f6e3",
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 750400,
+        "usage": {
+          "prompt_tokens": 836,
+          "cached_tokens": 0,
+          "completion_tokens": 88
+        },
+        "retries": 0,
+        "request_id": "05b53845-8cbe-4c26-be9f-5c99086fbec8",
+        "error": null,
+        "extra_keys": [],
+        "folded_turns": 0,
+        "fold_outcomes": {
+          "unprofitable": 1
+        },
+        "failed_checks": {},
+        "corrective_retries": {},
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "outcome": "refused",
+          "reason": "cost_check",
+          "turns_replaced": 0,
+          "turns_covered": 0,
+          "prompt_tokens_cut": 0,
+          "benefit_nano_usd": 0,
+          "overhead_nano_usd": 430000,
+          "min_saving_nano_usd": 0,
+          "summarizer_prompt_tokens": 0,
+          "summarizer_completion_tokens": 0,
+          "fold_count": 0,
+          "prefix_hash": ""
+        }
+      },
+      "fields": {},
+      "wrong_answers": []
+    },
+    {
+      "call": 10,
+      "conversation": "harbor",
+      "kind": "turn",
+      "user_turn": 4,
+      "order": "folded-first",
+      "plain": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 908800,
+        "usage": {
+          "prompt_tokens": 1232,
+          "cached_tokens": 0,
+          "completion_tokens": 147
+        },
+        "retries": 0,
+        "request_id": "c2f04c37-fb58-4820-bf4c-48cffd452c12",
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1412800,
+        "usage": {
+          "prompt_tokens": 1154,
+          "cached_tokens": 0,
+          "completion_tokens": 81
+        },
+        "retries": 0,
+        "request_id": "6b873e1b-9f4e-4403-a239-792756395c8d",
+        "error": null,
+        "extra_keys": [],
+        "folded_turns": 0,
+        "fold_outcomes": {
+          "rejected": 1
+        },
+        "failed_checks": {
+          "instruction_evidence": 2
+        },
+        "corrective_retries": {
+          "rejected": 1
+        },
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 2992,
+        "summarizer_completion_tokens": 590,
+        "fold_decision": {
+          "outcome": "refused",
+          "reason": "checks_failed",
+          "turns_replaced": 0,
+          "turns_covered": 3,
+          "prompt_tokens_cut": 148,
+          "benefit_nano_usd": 947200,
+          "overhead_nano_usd": 462200,
+          "min_saving_nano_usd": 0,
+          "summarizer_prompt_tokens": 2992,
+          "summarizer_completion_tokens": 590,
+          "fold_count": 0,
+          "prefix_hash": "",
+          "failed_checks": {
+            "instruction_evidence": 1
+          },
+          "corrected_checks": {
+            "instruction_evidence": 1
+          }
+        }
+      },
+      "fields": {},
+      "wrong_answers": []
+    },
+    {
+      "call": 11,
+      "conversation": "harbor",
+      "kind": "turn",
+      "user_turn": 5,
+      "order": "plain-first",
+      "plain": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1052800,
+        "usage": {
+          "prompt_tokens": 1592,
+          "cached_tokens": 0,
+          "completion_tokens": 171
+        },
+        "retries": 0,
+        "request_id": "9d0cb168-9516-4cc8-9cdd-f9ca3744d4ed",
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 998400,
+        "usage": {
+          "prompt_tokens": 1456,
+          "cached_tokens": 0,
+          "completion_tokens": 98
+        },
+        "retries": 0,
+        "request_id": "bf027c3e-ee5d-46c0-b868-f90e95568274",
+        "error": null,
+        "extra_keys": [],
+        "folded_turns": 0,
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "corrective_retries": {},
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "outcome": "skipped",
+          "reason": "backoff",
+          "turns_replaced": 0,
+          "turns_covered": 5,
+          "prompt_tokens_cut": 458,
+          "benefit_nano_usd": 2931200,
+          "overhead_nano_usd": 493200,
+          "min_saving_nano_usd": 0,
+          "summarizer_prompt_tokens": 0,
+          "summarizer_completion_tokens": 0,
+          "fold_count": 0,
+          "prefix_hash": ""
+        }
+      },
+      "fields": {},
+      "wrong_answers": []
+    },
+    {
+      "call": 12,
+      "conversation": "harbor",
+      "kind": "turn",
+      "user_turn": 6,
+      "order": "folded-first",
+      "plain": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1098000,
+        "usage": {
+          "prompt_tokens": 1985,
+          "cached_tokens": 1152,
+          "completion_tokens": 190
+        },
+        "retries": 0,
+        "request_id": "f7f35776-aa3c-4f61-8413-b631ed01edfa",
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 868400,
+        "usage": {
+          "prompt_tokens": 1779,
+          "cached_tokens": 0,
+          "completion_tokens": 134
+        },
+        "retries": 0,
+        "request_id": "39b7d09a-17e3-4d35-abca-009db912a40f",
+        "error": null,
+        "extra_keys": [],
+        "folded_turns": 0,
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "corrective_retries": {},
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "outcome": "skipped",
+          "reason": "backoff",
+          "turns_replaced": 0,
+          "turns_covered": 7,
+          "prompt_tokens_cut": 777,
+          "benefit_nano_usd": 4972800,
+          "overhead_nano_usd": 525000,
+          "min_saving_nano_usd": 0,
+          "summarizer_prompt_tokens": 0,
+          "summarizer_completion_tokens": 0,
+          "fold_count": 0,
+          "prefix_hash": ""
+        }
+      },
+      "fields": {},
+      "wrong_answers": []
+    },
+    {
+      "call": 13,
+      "conversation": "lumen",
+      "kind": "turn",
+      "user_turn": 1,
+      "order": "plain-first",
+      "plain": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 496000,
+        "usage": {
+          "prompt_tokens": 200,
+          "cached_tokens": 0,
+          "completion_tokens": 93
+        },
+        "retries": 0,
+        "request_id": "83d98f58-9bb7-4ff2-aeab-704c0e6833b9",
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 496000,
+        "usage": {
+          "prompt_tokens": 200,
+          "cached_tokens": 0,
+          "completion_tokens": 93
+        },
+        "retries": 0,
+        "request_id": "17d037fa-ab44-4dc8-b1bc-fb639a4c7fae",
+        "error": null,
+        "extra_keys": [],
+        "folded_turns": 0,
+        "fold_outcomes": {},
+        "failed_checks": {},
+        "corrective_retries": {},
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "outcome": "not_due",
+          "reason": "no_head",
+          "turns_replaced": 0,
+          "turns_covered": 0,
+          "prompt_tokens_cut": 0,
+          "benefit_nano_usd": 0,
+          "overhead_nano_usd": 0,
+          "min_saving_nano_usd": 0,
+          "summarizer_prompt_tokens": 0,
+          "summarizer_completion_tokens": 0,
+          "fold_count": 0,
+          "prefix_hash": ""
+        }
+      },
+      "fields": {},
+      "wrong_answers": []
+    },
+    {
+      "call": 14,
+      "conversation": "lumen",
+      "kind": "turn",
+      "user_turn": 2,
+      "order": "folded-first",
+      "plain": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 362800,
+        "usage": {
+          "prompt_tokens": 507,
+          "cached_tokens": 0,
+          "completion_tokens": 100
+        },
+        "retries": 0,
+        "request_id": "24a57e6e-ec39-4a23-a319-73e7fa3ab8c5",
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 618800,
+        "usage": {
+          "prompt_tokens": 507,
+          "cached_tokens": 0,
+          "completion_tokens": 98
+        },
+        "retries": 0,
+        "request_id": "2e0a1cf4-3dea-4645-80de-b67fc86e1edc",
+        "error": null,
+        "extra_keys": [],
+        "folded_turns": 0,
+        "fold_outcomes": {},
+        "failed_checks": {},
+        "corrective_retries": {},
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "outcome": "not_due",
+          "reason": "no_head",
+          "turns_replaced": 0,
+          "turns_covered": 0,
+          "prompt_tokens_cut": 0,
+          "benefit_nano_usd": 0,
+          "overhead_nano_usd": 0,
+          "min_saving_nano_usd": 0,
+          "summarizer_prompt_tokens": 0,
+          "summarizer_completion_tokens": 0,
+          "fold_count": 0,
+          "prefix_hash": ""
+        }
+      },
+      "fields": {},
+      "wrong_answers": []
+    },
+    {
+      "call": 15,
+      "conversation": "lumen",
+      "kind": "turn",
+      "user_turn": 3,
+      "order": "plain-first",
+      "plain": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 746000,
+        "usage": {
+          "prompt_tokens": 825,
+          "cached_tokens": 0,
+          "completion_tokens": 93
+        },
+        "retries": 0,
+        "request_id": "8383b647-e57a-4c27-ac6d-e147ce6fa5f6",
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 748000,
+        "usage": {
+          "prompt_tokens": 830,
+          "cached_tokens": 0,
+          "completion_tokens": 94
+        },
+        "retries": 0,
+        "request_id": "67de40ee-9940-4e63-b3c2-7b81bf45f09f",
+        "error": null,
+        "extra_keys": [],
+        "folded_turns": 0,
+        "fold_outcomes": {
+          "unprofitable": 1
+        },
+        "failed_checks": {},
+        "corrective_retries": {},
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "outcome": "refused",
+          "reason": "cost_check",
+          "turns_replaced": 0,
+          "turns_covered": 0,
+          "prompt_tokens_cut": 0,
+          "benefit_nano_usd": 0,
+          "overhead_nano_usd": 429600,
+          "min_saving_nano_usd": 0,
+          "summarizer_prompt_tokens": 0,
+          "summarizer_completion_tokens": 0,
+          "fold_count": 0,
+          "prefix_hash": ""
+        }
+      },
+      "fields": {},
+      "wrong_answers": []
+    },
+    {
+      "call": 16,
+      "conversation": "lumen",
+      "kind": "turn",
+      "user_turn": 4,
+      "order": "folded-first",
+      "plain": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 875200,
+        "usage": {
+          "prompt_tokens": 1148,
+          "cached_tokens": 0,
+          "completion_tokens": 111
+        },
+        "retries": 0,
+        "request_id": "9dc29f15-6cb0-4c74-bfee-3afbd6ff25c4",
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1431200,
+        "usage": {
+          "prompt_tokens": 1154,
+          "cached_tokens": 0,
+          "completion_tokens": 104
+        },
+        "retries": 0,
+        "request_id": "619d36ae-6b3d-4b34-967f-b54e5da7ca55",
+        "error": null,
+        "extra_keys": [],
+        "folded_turns": 0,
+        "fold_outcomes": {
+          "rejected": 1
+        },
+        "failed_checks": {
+          "instruction_evidence": 2,
+          "ledger_misfiled": 2
+        },
+        "corrective_retries": {
+          "rejected": 1
+        },
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 2924,
+        "summarizer_completion_tokens": 653,
+        "fold_decision": {
+          "outcome": "refused",
+          "reason": "checks_failed",
+          "turns_replaced": 0,
+          "turns_covered": 3,
+          "prompt_tokens_cut": 129,
+          "benefit_nano_usd": 825600,
+          "overhead_nano_usd": 460300,
+          "min_saving_nano_usd": 0,
+          "summarizer_prompt_tokens": 2924,
+          "summarizer_completion_tokens": 653,
+          "fold_count": 0,
+          "prefix_hash": "",
+          "failed_checks": {
+            "instruction_evidence": 1,
+            "ledger_misfiled": 2
+          },
+          "corrected_checks": {
+            "instruction_evidence": 1,
+            "ledger_misfiled": 2
+          }
+        }
+      },
+      "fields": {},
+      "wrong_answers": []
+    },
+    {
+      "call": 17,
+      "conversation": "lumen",
+      "kind": "turn",
+      "user_turn": 5,
+      "order": "plain-first",
+      "plain": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 765200,
+        "usage": {
+          "prompt_tokens": 1469,
+          "cached_tokens": 0,
+          "completion_tokens": 111
+        },
+        "retries": 0,
+        "request_id": "322cc62b-174d-4077-b42e-e8453203a12b",
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1002400,
+        "usage": {
+          "prompt_tokens": 1466,
+          "cached_tokens": 0,
+          "completion_tokens": 104
+        },
+        "retries": 0,
+        "request_id": "b03d6f8e-496d-492d-b24c-513138f28578",
+        "error": null,
+        "extra_keys": [],
+        "folded_turns": 0,
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "corrective_retries": {},
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "outcome": "skipped",
+          "reason": "backoff",
+          "turns_replaced": 0,
+          "turns_covered": 5,
+          "prompt_tokens_cut": 451,
+          "benefit_nano_usd": 2886400,
+          "overhead_nano_usd": 492600,
+          "min_saving_nano_usd": 0,
+          "summarizer_prompt_tokens": 0,
+          "summarizer_completion_tokens": 0,
+          "fold_count": 0,
+          "prefix_hash": ""
+        }
+      },
+      "fields": {},
+      "wrong_answers": []
+    },
+    {
+      "call": 18,
+      "conversation": "lumen",
+      "kind": "turn",
+      "user_turn": 6,
+      "order": "folded-first",
+      "plain": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1006400,
+        "usage": {
+          "prompt_tokens": 1804,
+          "cached_tokens": 1024,
+          "completion_tokens": 178
+        },
+        "retries": 0,
+        "request_id": "3e26b58c-afb4-40a6-bff8-f444e6b28ea7",
+        "error": null,
+        "extra_keys": []
+      },
+      "folded": {
+        "correct": 0,
+        "total": 0,
+        "containment_correct": 0,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1132400,
+        "usage": {
+          "prompt_tokens": 1791,
+          "cached_tokens": 1024,
+          "completion_tokens": 120
+        },
+        "retries": 0,
+        "request_id": "ad030a0c-79e6-46ac-adbe-10d503688bc8",
+        "error": null,
+        "extra_keys": [],
+        "folded_turns": 0,
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "corrective_retries": {},
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "outcome": "skipped",
+          "reason": "backoff",
+          "turns_replaced": 0,
+          "turns_covered": 7,
+          "prompt_tokens_cut": 776,
+          "benefit_nano_usd": 4966400,
+          "overhead_nano_usd": 525000,
+          "min_saving_nano_usd": 0,
+          "summarizer_prompt_tokens": 0,
+          "summarizer_completion_tokens": 0,
+          "fold_count": 0,
+          "prefix_hash": ""
+        }
+      },
+      "fields": {},
+      "wrong_answers": []
+    }
+  ],
+  "fold_summaries": [],
+  "aggregates": {
+    "retention_rate": null,
+    "eligible_fields": 0,
+    "folded_correct_eligible_fields": 0,
+    "accuracy": {
+      "plain": null,
+      "folded": null
+    },
+    "total_spend_nano_usd": {
+      "plain": 13622400,
+      "folded": 16156500
+    },
+    "net_saving_nano_usd": -2534100,
+    "folds": {
+      "committed": 0,
+      "rejected": 3,
+      "failed": 0,
+      "unprofitable": 3,
+      "refused_admission": 0,
+      "pinned_overflow": 0,
+      "backoff": 6,
+      "failed_checks": {
+        "instruction_evidence": 6,
+        "ledger_evidence": 1,
+        "ledger_misfiled": 2
+      },
+      "corrective_retries": {
+        "rejected": 3
+      },
+      "attempted": 6,
+      "applied": 0,
+      "refused": {
+        "backoff": 6,
+        "rejected": 3,
+        "unprofitable": 3
+      },
+      "reasons": {
+        "backoff": 6,
+        "checks_failed": 3,
+        "cost_check": 3
+      },
+      "backoff_cost_nano_usd": 6165600,
+      "backoff_cost_usd": 0.0048008
+    },
+    "reached": "warm",
+    "caching": {
+      "cached_share": {
+        "plain": 0.18118466898954705,
+        "folded": 0.057018764964641686
+      },
+      "cached_tokens": {
+        "plain": 3328,
+        "folded": 1024
+      },
+      "provider_cost_usd": {
+        "plain": 0.0100096,
+        "folded": 0.011750100000000001,
+        "folded_main_calls": 0.010006000000000001,
+        "folded_summarizer_calls": 0.0017441,
+        "saving": -0.0017405000000000007,
+        "saving_share": -0.17388307225063945
+      }
+    }
+  }
+}
