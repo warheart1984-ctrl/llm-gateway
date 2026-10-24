@@ -235,7 +235,8 @@ async fn handle_upstream(State(state): State<MockState>, Json(body): Json<Value>
     }
     if !streaming && state.scenario == Scenario::SummarizerFacts {
         let reply = if complete_call == 1 {
-            json!({"updates": [{"field": "appointment", "value": "15:30", "evidence": "The appointment moved to 15:30"}],
+            json!({"instructions": [{"text": "Standing rule: always answer in one sentence."}],
+                   "updates": [{"field": "appointment", "value": "15:30", "evidence": "The appointment moved to 15:30"}],
                    "context": "first note"})
         } else {
             json!({"updates": [], "context": "second note"})
@@ -986,6 +987,7 @@ async fn a_later_fold_forwards_the_facts_its_summarizer_did_not_mention() {
     let body = |turns: usize| {
         let mut body = folding_body(turns);
         body["messages"][0]["content"] = json!("The appointment moved to 15:30");
+        body["messages"][1]["content"] = json!("standing   rule: always answer in one sentence.");
         body
     };
     let summary_sent = |upstream: &MockUpstream| {
@@ -998,7 +1000,9 @@ async fn a_later_fold_forwards_the_facts_its_summarizer_did_not_mention() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers.get("x-gateway-folded").unwrap(), "4");
     let first = summary_sent(&upstream).expect("folded");
-    assert!(first.ends_with("Current facts:\n- appointment: 15:30\n\nContext:\nfirst note"), "{first}");
+    // The instruction in the conversation's own words, not the summarizer's.
+    let kept = "Standing instructions from the user, still in force:\n- standing rule: always answer in one sentence.\n\n";
+    assert!(first.ends_with(&format!("{kept}Current facts:\n- appointment: 15:30\n\nContext:\nfirst note")), "{first}");
 
     // Two more turns: a second fold, whose summarizer reports no facts.
     let (status, headers, _) = gw.post_chat(TEST_KEY, body(8)).await;
@@ -1008,7 +1012,7 @@ async fn a_later_fold_forwards_the_facts_its_summarizer_did_not_mention() {
     // It was shown the facts the gateway keeps.
     assert!(summarizer_bodies(&upstream)[1].to_string().contains("appointment: 15:30"));
     let second = summary_sent(&upstream).expect("folded");
-    assert!(second.ends_with("Current facts:\n- appointment: 15:30\n\nContext:\nsecond note"), "{second}");
+    assert!(second.ends_with(&format!("{kept}Current facts:\n- appointment: 15:30\n\nContext:\nsecond note")), "{second}");
 }
 
 #[tokio::test]

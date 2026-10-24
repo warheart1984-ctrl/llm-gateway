@@ -384,8 +384,11 @@ fn bare_numbers(text: &str) -> Vec<&str> {
 }
 
 /// Every check a summary can fail, by the name its errors start with.
-pub const CHECK_NAMES: [&str; 14] = [
+pub const CHECK_NAMES: [&str; 17] = [
     "format",
+    "instruction_evidence",
+    "instruction_replaces",
+    "instruction_missing",
     "ledger_field",
     "ledger_evidence",
     "ledger_backwards",
