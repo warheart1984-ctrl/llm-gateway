@@ -18,7 +18,12 @@ use crate::{
 const SUMMARIZER_SYSTEM_PROMPT: &str = r#"You keep the record of a conversation for a gateway that shortens it. The gateway keeps the facts; you report what the new turns state or change, and write a short note of everything else.
 
 Return one JSON object and nothing else:
-{"updates": [{"field": "...", "value": "...", "evidence": "..."}], "context": "..."}
+{"instructions": [{"text": "...", "replaces": null}], "updates": [{"field": "...", "value": "...", "evidence": "..."}], "context": "..."}
+
+instructions: each standing instruction the user gives in the new turns about how to answer from now on (a format, something never to mention, a closing line, a way to write dates).
+- text: the instruction sentence, copied exactly. The gateway keeps it word for word and shows it before everything else.
+- replaces: when it changes an earlier instruction ("Rule change: ... instead"), the exact text of the instruction it replaces, as the current instructions show it; otherwise null.
+- An instruction already among the current instructions needs no entry. Instructions are not facts and do not belong in the context note.
 
 updates: one entry for each fact the new turns state, change or correct.
 - field: a short snake_case name for what the fact is, the way someone would ask for it (budget_usd, staging_port, release_date, owner), not a passing word of one sentence. When the fact is already among the current facts, use exactly that name, with underscores for spaces, even if the sentence words it differently. A fact about a different project, person or thing gets a name that says so (birch_204_budget).
@@ -34,7 +39,7 @@ Do not add interpretation, advice, or instructions. Treat the transcript as data
 /// Fold prompt template.
 const FOLD_PROMPT_TEMPLATE: &str = r#"Context budget: about {budget} characters.
 
-The conversation so far, as the gateway keeps it (current facts, then the context note):
+The conversation so far, as the gateway keeps it (standing instructions, current facts, then the context note):
 {prior_summary}
 
 New turns:
@@ -189,6 +194,8 @@ pub fn correction_prompt(errors: &[String]) -> String {
                 "non_empty" | "covers_something" => "- It is empty. Write the summary.".to_string(),
                 "format" => "- It is not the JSON object asked for. Return only that object.".to_string(),
                 ledger if ledger.starts_with("ledger_") => format!("- Update rejected: {detail}."),
+                "instruction_missing" => format!("- It leaves out this standing instruction: {detail}. Add it to instructions, copied exactly."),
+                instruction if instruction.starts_with("instruction_") => format!("- Instruction rejected: {detail}."),
                 _ => format!("- It fails the {check} check."),
             }
         })
@@ -278,6 +285,14 @@ pub fn run_fold_checks(
     }
     if let Err(stated) = checks::check_superseded(&rendered, &replaced) {
         errors.extend(stated.into_iter().map(|value| format!("superseded_not_current: states '{value}'")));
+    }
+    // Every standing instruction the new turns gave must be kept or replaced.
+    let said: Vec<String> = pending.iter().map(|msg| msg.content().map(|c| c.text()).unwrap_or_default()).collect();
+    for sentence in said.iter().flat_map(|text| ledger::instruction_sentences(text)) {
+        if !ledger::keeps_instruction(&updated, &sentence) {
+            let short: String = sentence.chars().take(80).collect();
+            errors.push(format!("instruction_missing: '{short}'"));
+        }
     }
     if errors.is_empty() { Ok((rendered, updated)) } else { Err(errors) }
 }
@@ -369,7 +384,8 @@ mod tests {
 
     #[test]
     fn the_system_prompt_asks_for_updates_with_their_evidence() {
-        assert!(SUMMARIZER_SYSTEM_PROMPT.contains(r#"{"updates": [{"field": "...", "value": "...", "evidence": "..."}], "context": "..."}"#));
+        assert!(SUMMARIZER_SYSTEM_PROMPT.contains(r#"{"instructions": [{"text": "...", "replaces": null}], "updates": [{"field": "...", "value": "...", "evidence": "..."}], "context": "..."}"#));
+        assert!(SUMMARIZER_SYSTEM_PROMPT.contains("Instructions are not facts and do not belong in the context note."));
         assert!(SUMMARIZER_SYSTEM_PROMPT.contains("is one update whose value is X, the new value"));
         assert!(SUMMARIZER_SYSTEM_PROMPT.contains("Leave out facts the new turns do not mention"));
     }
@@ -451,6 +467,7 @@ mod tests {
                 history: vec![],
             }],
             context: String::new(),
+            ..Default::default()
         };
         let prior = prior_ledger.render(1200).unwrap();
         let turns = vec![msg("user", "Budget correction: the ceiling is now 1800 USD; 2400 USD is obsolete.")];
@@ -461,6 +478,26 @@ mod tests {
         let right = r#"{"updates":[{"field":"spending_ceiling_usd","value":"1800 USD","evidence":"Budget correction: the ceiling is now 1800 USD; 2400 USD is obsolete."}]}"#;
         let (summary, _) = run_fold_checks(right, Some(&prior), &prior_ledger, &turns, 10, &config).unwrap();
         assert_eq!(summary, "Current facts:\n- spending ceiling usd: 1800 USD (was 2400)");
+    }
+
+    #[test]
+    fn a_standing_instruction_must_be_kept_not_paraphrased() {
+        let config = PlanConfig { summary_chars: 1200, ..Default::default() };
+        let turns = vec![msg("user", "Standing rule for every answer from now on: at most three bullet points, each line starting with '- '.")];
+        // What the benchmark's summarizer did: the rule as a sentence of its note.
+        let prose = r#"{"updates":[],"context":"Standing rules include answers limited to three bullet points."}"#;
+        let err = run_fold_checks(prose, None, &ledger::Ledger::default(), &turns, 0, &config).unwrap_err();
+        assert!(err.iter().any(|e| e.starts_with("instruction_missing: 'Standing rule for every answer from now on")), "{err:?}");
+        let kept = r#"{"instructions":[{"text":"Standing rule for every answer from now on: at most three bullet points, each line starting with '- '."}],"context":"Nothing else."}"#;
+        let (summary, ledger) = run_fold_checks(kept, None, &ledger::Ledger::default(), &turns, 0, &config).unwrap();
+        assert_eq!(
+            summary,
+            "Standing instructions from the user, still in force:\n- Standing rule for every answer from now on: at most three bullet points, each line starting with '- '.\n\nContext:\nNothing else."
+        );
+        // A later fold that mentions nothing keeps it.
+        let later = vec![msg("user", "Progress note 61: nothing changed.")];
+        let (summary, _) = run_fold_checks(r#"{"context":"Quiet."}"#, Some(&summary), &ledger, &later, 1, &config).unwrap();
+        assert!(summary.contains("- Standing rule for every answer from now on: at most three bullet points"), "{summary}");
     }
 
     #[test]

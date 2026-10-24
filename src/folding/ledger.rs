@@ -16,10 +16,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::{folding::checks, providers::ChatMessage};
 
-/// A conversation's facts and its context note.
+/// A conversation's facts, its standing instructions, and its context note.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ledger {
     pub facts: Vec<Fact>,
+    /// What the user told the model to do from now on ("answer in at most
+    /// three bullets"), word for word as the conversation has it. A summary
+    /// that kept such a rule only as a sentence of its context note lost it:
+    /// in the task-success benchmark the folded model then broke it.
+    #[serde(default)]
+    pub instructions: Vec<Instruction>,
+    /// Instructions a later one replaced, the most recent last.
+    #[serde(default)]
+    pub retired: Vec<Instruction>,
     /// The summarizer's note of what else matters, rewritten each fold.
     pub context: String,
 }
@@ -38,6 +47,13 @@ pub struct Fact {
     pub history: Vec<Replaced>,
 }
 
+/// A standing instruction, as the conversation worded it, and its turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Instruction {
+    pub text: String,
+    pub turn: usize,
+}
+
 /// A value a fact used to have, and the turn that set it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Replaced {
@@ -54,9 +70,20 @@ pub struct Update {
     pub evidence: String,
 }
 
+/// One standing instruction as the summarizer returns it: the sentence, and
+/// the earlier instruction it changes, if any.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InstructionUpdate {
+    pub text: String,
+    #[serde(default)]
+    pub replaces: Option<String>,
+}
+
 /// The summarizer's reply.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Reply {
+    #[serde(default)]
+    pub instructions: Vec<InstructionUpdate>,
     #[serde(default)]
     pub updates: Vec<Update>,
     #[serde(default)]
@@ -68,11 +95,14 @@ const MAX_VALUE_CHARS: usize = 200;
 /// Replaced values kept per fact. Only the latest is shown; the rest are
 /// provenance, and the oldest go first.
 const MAX_HISTORY: usize = 8;
+/// Replaced instructions kept, the oldest going first.
+const MAX_RETIRED: usize = 8;
 
 impl Ledger {
     /// Characters the ledger holds, for the store's bound.
     pub fn chars(&self) -> usize {
         self.context.len()
+            + self.instructions.iter().chain(&self.retired).map(|instruction| instruction.text.len()).sum::<usize>()
             + self
                 .facts
                 .iter()
@@ -106,15 +136,34 @@ impl Ledger {
         block
     }
 
-    /// The summary the model is sent: the facts block, then the context note
-    /// cut to what `summary_chars` leaves. Facts are never cut: a ledger whose
+    /// The standing instructions block, each word for word. Empty when there
+    /// are none.
+    pub fn instructions_block(&self) -> String {
+        if self.instructions.is_empty() {
+            return String::new();
+        }
+        let mut block = String::from("Standing instructions from the user, still in force:");
+        for instruction in &self.instructions {
+            block.push_str("\n- ");
+            block.push_str(&instruction.text);
+        }
+        block
+    }
+
+    /// The summary the model is sent: the standing instructions, the facts
+    /// block, then the context note cut to what `summary_chars` leaves.
+    /// Instructions and facts are never cut: a ledger whose instructions and
     /// facts alone run past `summary_chars` cannot be folded.
     pub fn render(&self, summary_chars: usize) -> Result<String, String> {
-        let facts = self.facts_block();
+        let facts = [self.instructions_block(), self.facts_block()]
+            .into_iter()
+            .filter(|block| !block.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
         let facts_chars = facts.chars().count();
         if facts_chars > summary_chars {
             return Err(format!(
-                "within_length_bound: the current facts alone are {facts_chars} chars, over the {summary_chars} allowed"
+                "within_length_bound: the instructions and facts alone are {facts_chars} chars, over the {summary_chars} allowed"
             ));
         }
         let context = self.context.trim();
@@ -306,7 +355,7 @@ pub fn apply(
     // The conversation's order, not the reply's, decides which value is latest.
     placed.sort_by_key(|update| (update.turn, update.offset));
 
-    let mut ledger = Ledger { facts: prior.facts.clone(), context: reply.context.trim().to_string() };
+    let mut ledger = Ledger { facts: prior.facts.clone(), context: reply.context.trim().to_string(), ..Default::default() };
     for update in placed {
         if let Some(fact) = ledger.facts.iter_mut().find(|fact| fact.field == update.field) {
             if update.turn < fact.turn || fact.value.eq_ignore_ascii_case(&update.value) {
@@ -362,7 +411,138 @@ pub fn apply(
             history: Vec::new(),
         });
     }
+    apply_instructions(&mut ledger, prior, reply, pending, first_turn, &mut errors);
     if errors.is_empty() { Ok(ledger) } else { Err(errors) }
+}
+
+/// An instruction's sentence as the conversation has it: found in a pending
+/// turn ignoring case and runs of whitespace, and copied from the turn, so
+/// the gateway keeps the user's words, not the summarizer's copy of them.
+fn verbatim(pending: &[ChatMessage], text: &str) -> Option<(usize, usize, String)> {
+    let wanted = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let wanted = wanted.trim_end_matches(['.', '!', '?', ';', ',', ' ']);
+    if wanted.chars().count() < 8 {
+        return None;
+    }
+    pending.iter().enumerate().find_map(|(index, msg)| {
+        let turn = msg.content().map(|c| c.text()).unwrap_or_default().split_whitespace().collect::<Vec<_>>().join(" ");
+        if !turn.is_ascii() || !wanted.is_ascii() {
+            return None;
+        }
+        let at = turn.to_ascii_lowercase().find(&wanted.to_ascii_lowercase())?;
+        let mut end = at + wanted.len();
+        // Keep the sentence's own closing mark.
+        if turn[end..].starts_with(['.', '!', '?']) {
+            end += 1;
+        }
+        Some((index, at, turn[at..end].to_string()))
+    })
+}
+
+/// Words that say a sentence changes an earlier rule.
+fn says_it_changes(text: &str) -> bool {
+    let text = text.to_lowercase();
+    ["rule change", "instead", "no longer", "replaces the"].iter().any(|word| text.contains(word))
+}
+
+fn same_text(a: &str, b: &str) -> bool {
+    normalized(a).trim_end_matches(['.', '!', '?', ' ']) == normalized(b).trim_end_matches(['.', '!', '?', ' '])
+}
+
+/// Check each instruction against the turns being folded and apply them in
+/// the conversation's order: a new one is kept word for word, one that
+/// replaces another retires it, and one that says it changes a rule must
+/// name the rule it changes.
+fn apply_instructions(
+    ledger: &mut Ledger,
+    prior: &Ledger,
+    reply: &Reply,
+    pending: &[ChatMessage],
+    first_turn: usize,
+    errors: &mut Vec<String>,
+) {
+    ledger.instructions = prior.instructions.clone();
+    ledger.retired = prior.retired.clone();
+    let mut placed = Vec::new();
+    for update in &reply.instructions {
+        let short: String = update.text.chars().take(60).collect();
+        let Some((index, offset, text)) = verbatim(pending, &update.text) else {
+            errors.push(format!("instruction_evidence: '{short}' is not a sentence from the new turns"));
+            continue;
+        };
+        if more_than_one_sentence(&normalized(&text)) {
+            errors.push(format!("instruction_evidence: '{short}' is more than one sentence; quote only the instruction"));
+            continue;
+        }
+        placed.push((first_turn + index, offset, text, update.replaces.clone()));
+    }
+    placed.sort_by_key(|(turn, offset, _, _)| (*turn, *offset));
+    for (turn, _, text, replaces) in placed {
+        if ledger.instructions.iter().any(|kept| same_text(&kept.text, &text)) {
+            continue;
+        }
+        match replaces.filter(|old| !old.trim().is_empty()) {
+            Some(old) => {
+                let Some(at) = ledger.instructions.iter().position(|kept| same_text(&kept.text, &old)) else {
+                    let short: String = old.chars().take(60).collect();
+                    errors.push(format!("instruction_replaces: '{short}' is not a standing instruction"));
+                    continue;
+                };
+                let gone = ledger.instructions.remove(at);
+                ledger.retired.push(gone);
+                if ledger.retired.len() > MAX_RETIRED {
+                    ledger.retired.remove(0);
+                }
+            }
+            None if says_it_changes(&text) && !ledger.instructions.is_empty() => {
+                let short: String = text.chars().take(60).collect();
+                errors.push(format!("instruction_replaces: '{short}' changes a rule; name the instruction it replaces"));
+                continue;
+            }
+            None => {}
+        }
+        ledger.instructions.push(Instruction { text, turn });
+    }
+}
+
+/// Sentences of `text` that read as a standing instruction: "standing rule",
+/// "from now on", "every answer", "always", "never" and the like. Each one in
+/// the turns being folded must end up kept or replaced.
+pub fn instruction_sentences(text: &str) -> Vec<String> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)\b(standing rule|rule change|from now on|every answer|all (?:your )?answers|any answer|always|never)\b",
+        )
+        .expect("instruction pattern compiles")
+    });
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut sentences = Vec::new();
+    let mut start = 0;
+    let chars: Vec<(usize, char)> = flat.char_indices().collect();
+    for (k, (at, c)) in chars.iter().enumerate() {
+        let ends = matches!(c, '.' | '!' | '?') && chars.get(k + 1).is_none_or(|(_, next)| *next == ' ');
+        if ends || k + 1 == chars.len() {
+            let end = at + c.len_utf8();
+            let sentence = flat[start..end].trim().to_string();
+            if re.is_match(&sentence) {
+                sentences.push(sentence);
+            }
+            start = end;
+        }
+    }
+    sentences
+}
+
+/// Whether a sentence the turns gave as an instruction is kept or was replaced.
+pub fn keeps_instruction(ledger: &Ledger, sentence: &str) -> bool {
+    let wanted = normalized(sentence);
+    let wanted = wanted.trim_end_matches(['.', '!', '?', ' ']);
+    ledger.instructions.iter().chain(&ledger.retired).any(|kept| {
+        let kept = normalized(&kept.text);
+        let kept = kept.trim_end_matches(['.', '!', '?', ' ']);
+        kept.contains(wanted) || wanted.contains(kept)
+    })
 }
 
 /// Whether some current fact states `pin`: its value contains the pinned
@@ -397,6 +577,134 @@ mod tests {
 
     fn pair(field: &str, value: &str) -> (String, String) {
         (field.to_string(), value.to_string())
+    }
+
+    #[test]
+    fn an_instruction_is_kept_in_the_conversations_own_words() {
+        let turns = [user("Hi.  Standing rule for every answer from now on: at most THREE bullets. Thanks.")];
+        let r = reply(r#"{"instructions":[{"text":"standing rule for every answer from now on: at most three bullets"}]}"#);
+        let ledger = apply(&Ledger::default(), &r, &turns, 4).unwrap();
+        assert_eq!(
+            ledger.instructions,
+            [Instruction { text: "Standing rule for every answer from now on: at most THREE bullets.".into(), turn: 4 }]
+        );
+        // The same instruction again changes nothing.
+        let again = apply(&ledger, &r, &turns, 9).unwrap();
+        assert_eq!(again.instructions.len(), 1);
+        // One not in the turns, or two sentences at once, is refused.
+        let made_up = reply(r#"{"instructions":[{"text":"Always answer in French, please."}]}"#);
+        assert_eq!(
+            apply(&Ledger::default(), &made_up, &turns, 4).unwrap_err(),
+            ["instruction_evidence: 'Always answer in French, please.' is not a sentence from the new turns"]
+        );
+        let two = reply(r#"{"instructions":[{"text":"Hi. Standing rule for every answer from now on: at most THREE bullets."}]}"#);
+        assert!(apply(&Ledger::default(), &two, &turns, 4).unwrap_err()[0].contains("more than one sentence"));
+    }
+
+    #[test]
+    fn a_rule_change_retires_the_rule_it_names() {
+        let first = [user("Standing rule: end every answer with this exact line: Ref: A.")];
+        let kept = apply(&Ledger::default(), &reply(r#"{"instructions":[{"text":"Standing rule: end every answer with this exact line: Ref: A."}]}"#), &first, 0).unwrap();
+        let change = [user("Rule change: from now on end every answer with this exact line instead: Ref: B.")];
+        let named = reply(r#"{"instructions":[{"text":"Rule change: from now on end every answer with this exact line instead: Ref: B.","replaces":"Standing rule: end every answer with this exact line: Ref: A."}]}"#);
+        let changed = apply(&kept, &named, &change, 10).unwrap();
+        assert_eq!(changed.instructions.len(), 1);
+        assert!(changed.instructions[0].text.ends_with("Ref: B."));
+        assert_eq!(changed.retired, kept.instructions);
+        // A change that names no rule, or a rule not kept, is refused.
+        let unnamed = reply(r#"{"instructions":[{"text":"Rule change: from now on end every answer with this exact line instead: Ref: B."}]}"#);
+        assert!(apply(&kept, &unnamed, &change, 10).unwrap_err()[0].starts_with("instruction_replaces: "), "changes a rule");
+        let unknown = reply(r#"{"instructions":[{"text":"Rule change: from now on end every answer with this exact line instead: Ref: B.","replaces":"Never use emoji."}]}"#);
+        assert_eq!(
+            apply(&kept, &unknown, &change, 10).unwrap_err(),
+            ["instruction_replaces: 'Never use emoji.' is not a standing instruction"]
+        );
+    }
+
+    #[test]
+    fn instructions_count_towards_the_ledgers_size() {
+        let ledger = Ledger {
+            instructions: vec![Instruction { text: "x".repeat(30), turn: 1 }],
+            retired: vec![Instruction { text: "y".repeat(20), turn: 0 }],
+            context: "z".repeat(5),
+            ..Default::default()
+        };
+        assert_eq!(ledger.chars(), 55);
+    }
+
+    #[test]
+    fn instructions_render_first_and_are_never_cut() {
+        let ledger = Ledger {
+            facts: vec![Fact { field: "owner".into(), value: "Ines".into(), evidence: String::new(), turn: 3, history: vec![] }],
+            instructions: vec![Instruction { text: "Never mention BIRCH-204.".into(), turn: 1 }],
+            context: "Note. ".repeat(40),
+            ..Default::default()
+        };
+        let rendered = ledger.render(160).unwrap();
+        assert!(
+            rendered.starts_with("Standing instructions from the user, still in force:\n- Never mention BIRCH-204.\n\nCurrent facts:\n- owner: Ines\n\nContext:\nNote."),
+            "{rendered}"
+        );
+        assert_eq!(rendered.chars().count(), 160);
+        assert!(ledger.render(60).unwrap_err().starts_with("within_length_bound: the instructions and facts alone are"));
+    }
+
+    #[test]
+    fn instruction_sentences_are_found_and_others_are_not() {
+        let text = "Workshop note 03: the team filed notes. Standing rule: never mention BIRCH-204 or Ana in any answer; \
+                    that project is confidential. BIRCH-204 note: do not merge its budget. From now on, dates as DD.MM.YYYY, \
+                    for example 18.02.2027.";
+        assert_eq!(
+            instruction_sentences(text),
+            [
+                "Standing rule: never mention BIRCH-204 or Ana in any answer; that project is confidential.",
+                "From now on, dates as DD.MM.YYYY, for example 18.02.2027.",
+            ]
+        );
+        let ledger = Ledger {
+            instructions: vec![Instruction { text: "From now on, dates as DD.MM.YYYY, for example 18.02.2027.".into(), turn: 1 }],
+            retired: vec![Instruction { text: "Standing rule: never mention BIRCH-204 or Ana in any answer; that project is confidential.".into(), turn: 0 }],
+            ..Default::default()
+        };
+        assert!(instruction_sentences(text).iter().all(|sentence| keeps_instruction(&ledger, sentence)));
+        assert!(!keeps_instruction(&Ledger::default(), "Always answer in French."));
+        // Each instruction word on its own.
+        assert_eq!(instruction_sentences("Never use emoji."), ["Never use emoji."]);
+        assert_eq!(instruction_sentences("Always cite the ticket."), ["Always cite the ticket."]);
+        assert_eq!(instruction_sentences("Keep all your answers short."), ["Keep all your answers short."]);
+    }
+
+    /// Every kind of turn in the folding benchmark's conversations: only the
+    /// five rules read as instructions.
+    #[test]
+    fn only_the_benchmarks_rules_read_as_instructions() {
+        let rules = [
+            "Standing rule for every answer from now on: at most three bullet points, each line starting with '- '.",
+            "Standing rule: never mention project BIRCH-204 or Ana in any answer; that project is confidential.",
+            "Standing rule: end every answer with this exact line: Ref: CEDAR-731",
+            "Standing rule from now on: write every date as DD.MM.YYYY, for example 18.02.2027.",
+            "Rule change: from now on end every answer with this exact line instead: Ref: CEDAR-731/B",
+        ];
+        let others = [
+            "The project identifier is CEDAR-731.",
+            "Mira owns this project. The delivery city is Oslo.",
+            "External uploads are forbidden, including diagnostic logs.",
+            "Workshop note 07: the team reviewed the packaging checklist, discussed the order of verification steps, and filed the meeting notes. This discussion introduced no changes to the project requirements.",
+            "Budget correction: the ceiling is now 1800 USD; 2400 USD is void.",
+            "Ownership and destination correction: Noor replaces Mira, and delivery moves to Bergen.",
+            "Correction: staging now listens on 8444, not 8443.",
+            "Unrelated: project BIRCH-204 is budgeted at 7200 USD and owned by Ana.",
+            "BIRCH-204 note: do not merge its 7200 USD budget with the delivery project figures.",
+            "Progress note 61: packaging review continues; no requirements changed.",
+            "Correction: owner is now Ines, superseding the earlier value.",
+            "New recovery phrase: opal-harbor. Record it for the release.",
+        ];
+        for rule in rules {
+            assert_eq!(instruction_sentences(rule), [rule], "{rule}");
+        }
+        for other in others {
+            assert!(instruction_sentences(other).is_empty(), "{other}");
+        }
     }
 
     #[test]
@@ -522,7 +830,7 @@ mod tests {
 
     #[test]
     fn a_value_goes_to_the_fact_its_evidence_names() {
-        let prior = Ledger { facts: vec![fact("staging_port", "8443", 1), fact("production_port", "9443", 1)], context: String::new() };
+        let prior = Ledger { facts: vec![fact("staging_port", "8443", 1), fact("production_port", "9443", 1)], context: String::new(), ..Default::default() };
         let turns = [user("Correction: staging now listens on 8444.")];
         let misfiled = reply(r#"{"updates":[{"field":"production_port","value":"8444","evidence":"staging now listens on 8444"}]}"#);
         assert_eq!(
@@ -605,7 +913,7 @@ mod tests {
 
     #[test]
     fn a_correction_cannot_start_a_new_fact_beside_the_one_it_corrects() {
-        let prior = Ledger { facts: vec![fact("spending_ceiling_usd", "2400", 1)], context: String::new() };
+        let prior = Ledger { facts: vec![fact("spending_ceiling_usd", "2400", 1)], context: String::new(), ..Default::default() };
         let turns = [user("Budget correction: the ceiling is now 1800 USD; 2400 USD is obsolete.")];
         let beside = reply(r#"{"updates":[{"field":"ceiling","value":"1800 USD","evidence":"Budget correction: the ceiling is now 1800 USD; 2400 USD is obsolete."}]}"#);
         assert_eq!(
@@ -618,7 +926,7 @@ mod tests {
 
     #[test]
     fn a_facts_history_keeps_its_latest_replaced_values() {
-        let mut ledger = Ledger { facts: vec![fact("port", "1000", 0)], context: String::new() };
+        let mut ledger = Ledger { facts: vec![fact("port", "1000", 0)], context: String::new(), ..Default::default() };
         for turn in 1..=10 {
             let port = 1000 + turn;
             let text = format!("Correction: port is now {port}.");
@@ -641,6 +949,7 @@ mod tests {
                 history: vec![Replaced { value: "Mira".into(), turn: 2 }],
             }],
             context: String::new(),
+            ..Default::default()
         };
         let turns = [user("Noor owns the project and leads the team. Mira used to own it.")];
         let duplicate = reply(r#"{"updates":[{"field":"project_owner","value":"Noor","evidence":"Noor owns the project and leads the team"}]}"#);
@@ -677,6 +986,7 @@ mod tests {
                 history: vec![Replaced { value: "8443".into(), turn: 1 }],
             }],
             context: String::new(),
+            ..Default::default()
         };
         let turns = [user("The staging host listens on 8443 for health checks.")];
         let replaced = reply(r#"{"updates":[{"field":"staging_host_port","value":"8443","evidence":"The staging host listens on 8443 for health checks"}]}"#);
@@ -704,12 +1014,13 @@ mod tests {
                 Fact { field: "production_port".into(), value: "9445".into(), evidence: String::new(), turn: 3, history: vec![] },
             ],
             context: "A long note. ".repeat(20),
+            ..Default::default()
         };
         let rendered = ledger.render(120).unwrap();
         assert!(rendered.starts_with("Current facts:\n- owner: Ines (was Noor)\n- production port: 9445\n\nContext:\nA long note."), "{rendered}");
         assert_eq!(rendered.chars().count(), 120);
-        assert_eq!(ledger.render(20).unwrap_err(), "within_length_bound: the current facts alone are 63 chars, over the 20 allowed");
-        let bare = Ledger { facts: vec![], context: "Only context.".into() };
+        assert_eq!(ledger.render(20).unwrap_err(), "within_length_bound: the instructions and facts alone are 63 chars, over the 20 allowed");
+        let bare = Ledger { facts: vec![], context: "Only context.".into(), ..Default::default() };
         assert_eq!(bare.render(100).unwrap(), "Context:\nOnly context.");
     }
 
@@ -724,6 +1035,7 @@ mod tests {
                 history: vec![],
             }],
             context: String::new(),
+            ..Default::default()
         };
         let pin = |field: &str, value: &str| checks::FieldPin { field: field.into(), value: value.into() };
         assert!(states_pin(&ledger, &pin("ceiling", "1250")));
