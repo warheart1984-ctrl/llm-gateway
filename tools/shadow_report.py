@@ -3,7 +3,11 @@
 
 Each finished request logs its fold decision on the ``stream complete`` line,
 keyed by ``request_id`` (the caller's ``x-request-id`` when one was sent).
-A shadow decision has ``shadow: true`` inside that object. This report never
+A shadow decision has ``shadow: true`` inside that object. With
+``[folding] background = true`` the summarizer runs after that line is
+written, so a background shadow fold logs its own ``shadow fold finished``
+line (``background: true``) with what the summarizer cost; it counts towards
+the cost and the net saving, not towards the requests. This report never
 reads summary text: the log does not carry any.
 
 Usage: python tools/shadow_report.py <gateway.log>
@@ -38,26 +42,17 @@ def _tenant(entry: dict) -> str:
     return str(tenant or "unknown")
 
 
-def _cost(entry: dict) -> int:
-    raw = entry.get("cost_nano_usd")
-    if raw is None and isinstance(entry.get("fields"), dict):
-        raw = entry["fields"].get("cost_nano_usd")
-    try:
-        return int(raw or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
 def load(path: Path) -> dict[str, dict]:
     """Per-tenant totals. A line that is not a shadow decision is ignored."""
     totals: dict[str, dict] = defaultdict(
         lambda: {
             "requests": 0,
             "would_fold": 0,
-            "reasons": defaultdict(int),
+            # (outcome, reason) of every request's decision, applied included.
+            "outcomes": defaultdict(int),
+            "background_folds": 0,
             "net_saving_nano_usd": 0,
             "summarizer_cost_nano_usd": 0,
-            "backoff_cost_nano_usd": 0,
         }
     )
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -74,17 +69,17 @@ def load(path: Path) -> dict[str, dict]:
         if fold is None:
             continue
         row = totals[_tenant(entry)]
+        row["net_saving_nano_usd"] += int(fold.get("net_saving_nano_usd") or 0)
+        row["summarizer_cost_nano_usd"] += int(fold.get("summarizer_cost_nano_usd") or 0)
+        if fold.get("background") is True:
+            row["background_folds"] += 1
+            continue
         row["requests"] += 1
         if fold.get("would_fold") is True:
             row["would_fold"] += 1
+        outcome = str(fold.get("outcome") or "unknown")
         reason = str(fold.get("reason") or "unknown")
-        outcome = str(fold.get("outcome") or "")
-        if outcome != "applied":
-            row["reasons"][reason] += 1
-        row["net_saving_nano_usd"] += int(fold.get("net_saving_nano_usd") or 0)
-        row["summarizer_cost_nano_usd"] += int(fold.get("summarizer_cost_nano_usd") or 0)
-        if reason == "backoff":
-            row["backoff_cost_nano_usd"] += _cost(entry)
+        row["outcomes"][(outcome, reason)] += 1
     return totals
 
 
@@ -97,12 +92,14 @@ def render(totals: dict[str, dict]) -> str:
         lines.append(f"tenant {tenant}")
         lines.append(f"  requests {requests}")
         lines.append(f"  would_fold_rate {would:.4f}")
-        for reason in sorted(row["reasons"]):
-            rate = row["reasons"][reason] / requests if requests else 0.0
-            lines.append(f"  refused {reason} {rate:.4f}")
+        # The fold's own outcome. `not_due` can still mean the request would
+        # have gone out with an earlier summary: see would_fold_rate.
+        for outcome, reason in sorted(row["outcomes"]):
+            rate = row["outcomes"][(outcome, reason)] / requests if requests else 0.0
+            lines.append(f"  outcome {outcome} {reason} {rate:.4f}")
+        lines.append(f"  background_folds {row['background_folds']}")
         lines.append(f"  net_saving_nano_usd {row['net_saving_nano_usd']}")
         lines.append(f"  summarizer_cost_nano_usd {row['summarizer_cost_nano_usd']}")
-        lines.append(f"  backoff_cost_nano_usd {row['backoff_cost_nano_usd']}")
     return "\n".join(lines) + ("\n" if lines else "")
 
 

@@ -1053,6 +1053,8 @@ struct FoldWork {
     state: Arc<AppState>,
     /// The on-mode store, or the shadow store. A shadow fold never writes the other.
     store: Arc<crate::folding::store::FoldingStore>,
+    /// A shadow fold: its counters go to the `gw_shadow_*` metrics.
+    shadow: bool,
     tenant_id: String,
     limits: crate::config::LimitProfile,
     summarizer_model_id: String,
@@ -1298,13 +1300,13 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
             Ok(made) => made,
             Err(errors) => {
                 let failed_checks = crate::folding::checks::failed_check_counts(&errors);
-                work.state.metrics.record_fold_checks(&work.tenant_id, &failed_checks);
+                work.state.metrics.record_fold_checks(&work.tenant_id, &failed_checks, work.shadow);
                 if correction.is_none() {
                     corrected_checks = failed_checks;
                     correction = Some((content, errors));
                     continue;
                 }
-                work.state.metrics.record_corrective_retry(&work.tenant_id, false);
+                work.state.metrics.record_corrective_retry(&work.tenant_id, false, work.shadow);
                 return AppliedFold::Stopped {
                     outcome: "refused",
                     reason: "checks_failed",
@@ -1346,7 +1348,7 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
             };
         }
         if correction.is_some() {
-            work.state.metrics.record_corrective_retry(&work.tenant_id, true);
+            work.state.metrics.record_corrective_retry(&work.tenant_id, true, work.shadow);
         }
         return AppliedFold::Committed {
             summary,
@@ -1555,6 +1557,7 @@ async fn foreground_fold(
     let work = FoldWork {
         state: Arc::clone(state),
         store: Arc::clone(&store),
+        shadow,
         tenant_id: decision.tenant.tenant_id.clone(),
         limits: decision.limits.clone(),
         summarizer_model_id: folding.summarizer_model.clone(),
@@ -1583,6 +1586,7 @@ async fn foreground_fold(
             let tenant_id = work.tenant_id.clone();
             let metrics = Arc::clone(&state.metrics);
             let store = Arc::clone(&store);
+            let summarizer_cost = summarizer_model.config.cost.clone();
             tokio::spawn(async move {
                 let _end = EndFold { store, key };
                 let result = run_applied_fold(work).await;
@@ -1594,7 +1598,24 @@ async fn foreground_fold(
                         (accounting, prompt_tokens, completion_tokens)
                     }
                 };
-                metrics.record_fold(&tenant_id, accounting, prompt_tokens, completion_tokens);
+                metrics.record_fold(&tenant_id, accounting, prompt_tokens, completion_tokens, shadow);
+                // The request that started this fold has already logged its
+                // decision, so a shadow fold's summarizer spend gets a line of
+                // its own; without it the shadow report shows the saving and
+                // not what it cost.
+                if shadow {
+                    let cost = prompt_tokens
+                        .saturating_mul(summarizer_cost.input_nano_usd_per_token())
+                        .saturating_add(completion_tokens.saturating_mul(summarizer_cost.output_nano_usd_per_token()));
+                    let fold = json!({
+                        "shadow": true,
+                        "background": true,
+                        "committed": matches!(accounting, FoldAccounting::Committed),
+                        "summarizer_cost_nano_usd": cost,
+                        "net_saving_nano_usd": -(cost as i64),
+                    });
+                    tracing::info!(tenant = %tenant_id, fold = %fold, "shadow fold finished");
+                }
             });
         }
         let sent_cut = u64::from(
@@ -2053,6 +2074,7 @@ async fn admit(
             attempt.outcome,
             attempt.prompt_tokens,
             attempt.completion_tokens,
+            fold.shadow.is_some(),
         );
     }
     if fold.folded_turns > 0 {

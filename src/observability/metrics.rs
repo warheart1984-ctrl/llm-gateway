@@ -110,6 +110,9 @@ pub struct Metrics {
     by_model: DashMap<String, Arc<ModelRollup>>,
     by_tenant: DashMap<String, Arc<TenantRollup>>,
     folds: DashMap<String, Arc<FoldCounters>>,
+    /// The same counters for shadow-mode folds, exported as `gw_shadow_*`: a
+    /// shadow fold never changes a request, so it must not count as a fold.
+    shadow_folds: DashMap<String, Arc<FoldCounters>>,
     /// Read at scrape time so the gauge is the conversations actually held.
     fold_store: Mutex<Option<Arc<FoldingStore>>>,
     uptime_secs: AtomicU64,
@@ -126,6 +129,7 @@ impl Default for Metrics {
             by_model: DashMap::new(),
             by_tenant: DashMap::new(),
             folds: DashMap::new(),
+            shadow_folds: DashMap::new(),
             fold_store: Mutex::new(None),
             uptime_secs: AtomicU64::new(0),
             receipts: Mutex::new(None),
@@ -173,9 +177,10 @@ impl Metrics {
         *self.fold_store.lock().unwrap_or_else(|p| p.into_inner()) = Some(store);
     }
 
-    fn fold_counters(&self, tenant: &str) -> Arc<FoldCounters> {
+    fn fold_counters(&self, tenant: &str, shadow: bool) -> Arc<FoldCounters> {
+        let folds = if shadow { &self.shadow_folds } else { &self.folds };
         Arc::clone(
-            self.folds
+            folds
                 .entry(tenant.to_string())
                 .or_insert_with(|| Arc::new(FoldCounters::default()))
                 .value(),
@@ -190,8 +195,9 @@ impl Metrics {
         outcome: FoldAccounting,
         prompt_tokens: u64,
         completion_tokens: u64,
+        shadow: bool,
     ) {
-        let counters = self.fold_counters(tenant);
+        let counters = self.fold_counters(tenant, shadow);
         let slot = match outcome {
             FoldAccounting::Committed => &counters.committed,
             FoldAccounting::Rejected => &counters.rejected,
@@ -209,15 +215,15 @@ impl Metrics {
     }
 
     /// A corrective retry that ended: its summary committed, or rejected again.
-    pub fn record_corrective_retry(&self, tenant: &str, committed: bool) {
-        let counters = self.fold_counters(tenant);
+    pub fn record_corrective_retry(&self, tenant: &str, committed: bool, shadow: bool) {
+        let counters = self.fold_counters(tenant, shadow);
         let slot = if committed { &counters.corrective_committed } else { &counters.corrective_rejected };
         slot.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A summary's failed checks: each named check counts the summary once.
-    pub fn record_fold_checks(&self, tenant: &str, failed: &BTreeMap<&'static str, u32>) {
-        let counters = self.fold_counters(tenant);
+    pub fn record_fold_checks(&self, tenant: &str, failed: &BTreeMap<&'static str, u32>, shadow: bool) {
+        let counters = self.fold_counters(tenant, shadow);
         for (slot, name) in crate::folding::checks::CHECK_NAMES.iter().enumerate() {
             if failed.contains_key(name) {
                 counters.checks_failed[slot].fetch_add(1, Ordering::Relaxed);
@@ -227,7 +233,7 @@ impl Metrics {
 
     /// A main request that was sent with a summary in place of old turns.
     pub fn record_folded_request(&self, tenant: &str, prompt_tokens_cut: u64) {
-        let counters = self.fold_counters(tenant);
+        let counters = self.fold_counters(tenant, false);
         counters.requests.fetch_add(1, Ordering::Relaxed);
         counters.prompt_tokens_cut.fetch_add(prompt_tokens_cut, Ordering::Relaxed);
     }
@@ -724,107 +730,119 @@ impl Metrics {
             store_entries,
         );
 
-        let mut folds: BTreeMap<String, Arc<FoldCounters>> = BTreeMap::new();
-        for entry in self.folds.iter() {
-            folds.insert(entry.key().clone(), Arc::clone(entry.value()));
-        }
-        if !folds.is_empty() {
-            let mut outcome_series = Vec::new();
-            let mut request_series = Vec::new();
-            let mut cut_series = Vec::new();
-            let mut prompt_series = Vec::new();
-            let mut completion_series = Vec::new();
-            let mut check_series = Vec::new();
-            let mut retry_series = Vec::new();
-            for (tenant, counters) in &folds {
-                let tenant_label = safe_label(tenant);
-                for (outcome, value) in [
-                    ("committed", counters.committed.load(Ordering::Relaxed)),
-                    ("rejected", counters.rejected.load(Ordering::Relaxed)),
-                    ("failed", counters.failed.load(Ordering::Relaxed)),
-                    ("unprofitable", counters.unprofitable.load(Ordering::Relaxed)),
-                    ("refused_admission", counters.refused_admission.load(Ordering::Relaxed)),
-                    ("pinned_overflow", counters.pinned_overflow.load(Ordering::Relaxed)),
-                    ("backoff", counters.backed_off.load(Ordering::Relaxed)),
-                ] {
-                    outcome_series.push((
-                        render_labels(&[("tenant", tenant_label), ("outcome", outcome)], &[]),
-                        value,
-                    ));
-                }
-                let labels = render_labels(&[("tenant", tenant_label)], &[]);
-                request_series.push((labels.clone(), counters.requests.load(Ordering::Relaxed)));
-                cut_series.push((labels.clone(), counters.prompt_tokens_cut.load(Ordering::Relaxed)));
-                prompt_series.push((
-                    render_labels(&[("tenant", tenant_label), ("kind", "prompt")], &[]),
-                    counters.summarizer_prompt.load(Ordering::Relaxed),
-                ));
-                completion_series.push((
-                    render_labels(&[("tenant", tenant_label), ("kind", "completion")], &[]),
-                    counters.summarizer_completion.load(Ordering::Relaxed),
-                ));
-                for (result, value) in [
-                    ("committed", counters.corrective_committed.load(Ordering::Relaxed)),
-                    ("rejected", counters.corrective_rejected.load(Ordering::Relaxed)),
-                ] {
-                    retry_series.push((render_labels(&[("tenant", tenant_label), ("result", result)], &[]), value));
-                }
-                for (slot, check) in crate::folding::checks::CHECK_NAMES.iter().enumerate() {
-                    check_series.push((
-                        render_labels(&[("tenant", tenant_label), ("check", check)], &[]),
-                        counters.checks_failed[slot].load(Ordering::Relaxed),
-                    ));
-                }
-            }
-            family(
-                &mut out,
-                "gw_folds_total",
-                "counter",
-                "Fold attempts by outcome.",
-                outcome_series.iter().map(|(l, v)| (l.as_str(), *v)),
-            );
-            family(
-                &mut out,
-                "gw_fold_requests_total",
-                "counter",
-                "Main requests sent with a summary in place of older turns.",
-                request_series.iter().map(|(l, v)| (l.as_str(), *v)),
-            );
-            family(
-                &mut out,
-                "gw_fold_prompt_tokens_cut_total",
-                "counter",
-                "Estimated prompt tokens removed from main calls.",
-                cut_series.iter().map(|(l, v)| (l.as_str(), *v)),
-            );
-            family(
-                &mut out,
-                "gw_fold_summarizer_tokens_total",
-                "counter",
-                "Real summarizer token usage.",
-                prompt_series
-                    .iter()
-                    .chain(completion_series.iter())
-                    .map(|(l, v)| (l.as_str(), *v)),
-            );
-            family(
-                &mut out,
-                "gw_fold_checks_failed_total",
-                "counter",
-                "Summaries by check failed, a corrective retry's included; one failing several counts once for each.",
-                check_series.iter().map(|(l, v)| (l.as_str(), *v)),
-            );
-            family(
-                &mut out,
-                "gw_fold_corrective_retries_total",
-                "counter",
-                "Corrective retries of a summary that failed its checks, by whether the retry committed.",
-                retry_series.iter().map(|(l, v)| (l.as_str(), *v)),
-            );
+        for shadow in [false, true] {
+            let map = if shadow { &self.shadow_folds } else { &self.folds };
+            let folds: BTreeMap<String, Arc<FoldCounters>> =
+                map.iter().map(|entry| (entry.key().clone(), Arc::clone(entry.value()))).collect();
+            render_fold_counters(&mut out, &folds, shadow);
         }
 
         out
     }
+}
+
+/// The folding families: `gw_fold*` for folds that changed a request, and
+/// `gw_shadow_fold*` for shadow-mode folds, which never do.
+fn render_fold_counters(out: &mut String, folds: &BTreeMap<String, Arc<FoldCounters>>, shadow: bool) {
+    if folds.is_empty() {
+        return;
+    }
+    let prefix = if shadow { "gw_shadow_fold" } else { "gw_fold" };
+    let folds_total = if shadow { "gw_shadow_folds_total" } else { "gw_folds_total" };
+    let mut outcome_series = Vec::new();
+    let mut request_series = Vec::new();
+    let mut cut_series = Vec::new();
+    let mut prompt_series = Vec::new();
+    let mut completion_series = Vec::new();
+    let mut check_series = Vec::new();
+    let mut retry_series = Vec::new();
+    for (tenant, counters) in folds {
+        let tenant_label = safe_label(tenant);
+        for (outcome, value) in [
+            ("committed", counters.committed.load(Ordering::Relaxed)),
+            ("rejected", counters.rejected.load(Ordering::Relaxed)),
+            ("failed", counters.failed.load(Ordering::Relaxed)),
+            ("unprofitable", counters.unprofitable.load(Ordering::Relaxed)),
+            ("refused_admission", counters.refused_admission.load(Ordering::Relaxed)),
+            ("pinned_overflow", counters.pinned_overflow.load(Ordering::Relaxed)),
+            ("backoff", counters.backed_off.load(Ordering::Relaxed)),
+        ] {
+            outcome_series.push((
+                render_labels(&[("tenant", tenant_label), ("outcome", outcome)], &[]),
+                value,
+            ));
+        }
+        let labels = render_labels(&[("tenant", tenant_label)], &[]);
+        request_series.push((labels.clone(), counters.requests.load(Ordering::Relaxed)));
+        cut_series.push((labels.clone(), counters.prompt_tokens_cut.load(Ordering::Relaxed)));
+        prompt_series.push((
+            render_labels(&[("tenant", tenant_label), ("kind", "prompt")], &[]),
+            counters.summarizer_prompt.load(Ordering::Relaxed),
+        ));
+        completion_series.push((
+            render_labels(&[("tenant", tenant_label), ("kind", "completion")], &[]),
+            counters.summarizer_completion.load(Ordering::Relaxed),
+        ));
+        for (result, value) in [
+            ("committed", counters.corrective_committed.load(Ordering::Relaxed)),
+            ("rejected", counters.corrective_rejected.load(Ordering::Relaxed)),
+        ] {
+            retry_series.push((render_labels(&[("tenant", tenant_label), ("result", result)], &[]), value));
+        }
+        for (slot, check) in crate::folding::checks::CHECK_NAMES.iter().enumerate() {
+            check_series.push((
+                render_labels(&[("tenant", tenant_label), ("check", check)], &[]),
+                counters.checks_failed[slot].load(Ordering::Relaxed),
+            ));
+        }
+    }
+    family(
+        out,
+        folds_total,
+        "counter",
+        "Fold attempts by outcome.",
+        outcome_series.iter().map(|(l, v)| (l.as_str(), *v)),
+    );
+    if !shadow {
+        family(
+            out,
+            "gw_fold_requests_total",
+            "counter",
+            "Main requests sent with a summary in place of older turns.",
+            request_series.iter().map(|(l, v)| (l.as_str(), *v)),
+        );
+        family(
+            out,
+            "gw_fold_prompt_tokens_cut_total",
+            "counter",
+            "Estimated prompt tokens removed from main calls.",
+            cut_series.iter().map(|(l, v)| (l.as_str(), *v)),
+        );
+    }
+    family(
+        out,
+        &format!("{prefix}_summarizer_tokens_total"),
+        "counter",
+        "Real summarizer token usage.",
+        prompt_series
+            .iter()
+            .chain(completion_series.iter())
+            .map(|(l, v)| (l.as_str(), *v)),
+    );
+    family(
+        out,
+        &format!("{prefix}_checks_failed_total"),
+        "counter",
+        "Summaries by check failed, a corrective retry's included; one failing several counts once for each.",
+        check_series.iter().map(|(l, v)| (l.as_str(), *v)),
+    );
+    family(
+        out,
+        &format!("{prefix}_corrective_retries_total"),
+        "counter",
+        "Corrective retries of a summary that failed its checks, by whether the retry committed.",
+        retry_series.iter().map(|(l, v)| (l.as_str(), *v)),
+    );
 }
 
 /// Read process resource gauges without adding a background sampler or a

@@ -1101,7 +1101,9 @@ async fn shadow_answers_like_folding_off_and_sends_the_unfolded_request() {
     assert!(shadow.contains("net_saving_nano_usd="), "{shadow}");
     assert!(!shadow.contains("Summary"), "{shadow}");
     for (name, value) in off_headers.iter() {
-        if name == "x-request-id" {
+        // Two live calls differ in their id, and in `date` whenever a second
+        // boundary falls between them.
+        if name == "x-request-id" || name == "date" {
             continue;
         }
         assert_eq!(headers.get(name).map(|v| v.as_bytes()), Some(value.as_bytes()), "{name}");
@@ -1122,6 +1124,58 @@ async fn shadow_answers_like_folding_off_and_sends_the_unfolded_request() {
     assert!(fold.get("net_saving_nano_usd").is_some(), "{fold}");
     assert!(store_has_conversation(&gw.state.shadow_folding, 6));
     assert!(!store_has_conversation(&gw.state.folding, 6), "on-mode state stays empty");
+
+    // A shadow fold is counted apart: nothing was folded for this tenant.
+    let (_, metrics) = gw.get("/metrics", TEST_KEY).await;
+    assert!(metrics.contains("gw_shadow_folds_total{tenant=\"acme\",outcome=\"committed\"} 1"), "{metrics}");
+    assert!(metrics.contains("gw_shadow_fold_summarizer_tokens_total{tenant=\"acme\",kind=\"prompt\"}"), "{metrics}");
+    assert!(!metrics.contains("gw_folds_total{tenant=\"acme\""), "{metrics}");
+    assert!(!metrics.contains("gw_fold_summarizer_tokens_total{tenant=\"acme\""), "{metrics}");
+    // Shadow folds change no request, so they have no request or cut series.
+    assert!(!metrics.contains("gw_fold_requests_total{tenant=\"acme\""), "{metrics}");
+    assert!(!metrics.contains("gw_fold_prompt_tokens_cut_total{tenant=\"acme\""), "{metrics}");
+    assert!(!metrics.contains("gw_shadow_fold_requests_total"), "{metrics}");
+}
+
+#[tokio::test]
+async fn a_background_shadow_fold_logs_what_its_summarizer_cost() {
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let gw = Gateway::start_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(SHADOW_TENANT), None, "", true).await;
+    let (status, headers, _) = gw.post_chat(TEST_KEY, folding_body(6)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.get("x-gateway-folded").is_none());
+    let mut finished = None;
+    for _ in 0..100 {
+        finished = captured_logs::contents()
+            .lines()
+            .rev()
+            .find(|line| line.contains("shadow fold finished") && line.contains("\"acme\""))
+            .map(str::to_string);
+        if finished.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let line = finished.expect("a background shadow fold logs its own line");
+    let event: Value = serde_json::from_str(&line).unwrap();
+    let fold: Value = serde_json::from_str(event.pointer("/fields/fold").unwrap().as_str().unwrap()).unwrap();
+    assert_eq!(fold["shadow"], true, "{fold}");
+    assert_eq!(fold["background"], true, "{fold}");
+    assert_eq!(fold["committed"], true, "{fold}");
+    let cost = fold["summarizer_cost_nano_usd"].as_i64().unwrap();
+    // Priced from the summarizer's own usage: 10 and 20 nano-USD a token.
+    let (_, metrics) = gw.get("/metrics", TEST_KEY).await;
+    let tokens = |kind: &str| -> i64 {
+        let series = format!("gw_shadow_fold_summarizer_tokens_total{{tenant=\"acme\",kind=\"{kind}\"}} ");
+        let line = metrics.lines().find(|line| line.starts_with(&series)).unwrap_or_else(|| panic!("{metrics}"));
+        line[series.len()..].trim().parse().unwrap()
+    };
+    assert!(tokens("completion") > 0, "{metrics}");
+    assert_eq!(cost, tokens("prompt") * 10 + tokens("completion") * 20, "{fold}");
+    assert!(metrics.contains("gw_shadow_folds_total{tenant=\"acme\",outcome=\"committed\"} 1"), "{metrics}");
+    assert!(!metrics.contains("gw_folds_total{tenant=\"acme\""), "a background shadow fold is not a fold: {metrics}");
+    assert_eq!(fold["net_saving_nano_usd"].as_i64().unwrap(), -cost, "{fold}");
+    assert!(!line.contains("Hello, world"), "no summary text in the log: {line}");
 }
 
 #[tokio::test]
