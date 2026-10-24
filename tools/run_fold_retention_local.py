@@ -18,6 +18,10 @@ Keys:
   -MaskInput 'key'), 'User')`). It is passed to the gateway only, and never
   printed.
 
+`--scenario constraints` runs `tools/fold_tasks.py`, the task-success
+benchmark (standing rules given in the conversation, checked on every
+answer), instead of the fact-recall one; `--max-success-drop` is passed to it.
+
 `--provider` picks the models: `groq` uses `bench/folding/models.yaml`, and
 `openrouter` uses `bench/folding/models.openrouter.yaml`, with the same tenant
 files and the model ids swapped. `--summarizer` replaces the provider's
@@ -152,7 +156,8 @@ def result_name(provider: str, scenario: str, profile: str, stamp: str, summariz
     an amortization other than the profile's, are named in it."""
     suffix = f"_sum-{summarizer.rsplit('/', 1)[-1]}" if summarizer else ""
     suffix += f"_amort-{amortization}" if amortization else ""
-    return f"fold_retention_{provider}_{scenario}_{profile}_{stamp}{suffix}.json"
+    prefix = "fold_tasks" if scenario == "constraints" else "fold_retention"
+    return f"{prefix}_{provider}_{scenario}_{profile}_{stamp}{suffix}.json"
 
 
 def with_amortization(tenants: str, requests: int) -> str:
@@ -188,7 +193,9 @@ def wait_live(base_url: str, gateway: subprocess.Popen, seconds: float = 120) ->
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--scenario", choices=["fixed", "mutating"], default="fixed")
+    parser.add_argument("--scenario", choices=["fixed", "mutating", "constraints"], default="fixed")
+    parser.add_argument("--max-success-drop", type=float,
+                        help="constraints only: how far the folded tenant's task success may fall")
     parser.add_argument("--profile", choices=["lifecycle", "economics"], default="economics")
     parser.add_argument("--provider", choices=sorted(PROVIDERS), default="groq")
     parser.add_argument("--summarizer", help="a model id from the provider's models file, in place of its summarizer")
@@ -249,7 +256,8 @@ def main(argv: list[str] | None = None) -> int:
         output = args.output or (ROOT / "benchmark_results" /
                                  result_name(args.provider, args.scenario, args.profile, stamp, args.summarizer,
                                              args.amortization_requests))
-        command = [sys.executable, "-u", str(ROOT / "tools" / "fold_retention.py"),
+        harness = "fold_tasks.py" if args.scenario == "constraints" else "fold_retention.py"
+        command = [sys.executable, "-u", str(ROOT / "tools" / harness),
                    "--base-url", base_url, "--model", provider["main"],
                    "--scenario", args.scenario, "--profile", args.profile,
                    "--main-input-per-mtok-usd", str(main_in), "--main-output-per-mtok-usd", str(main_out),
@@ -260,6 +268,8 @@ def main(argv: list[str] | None = None) -> int:
             command += ["--main-cached-input-per-mtok-usd", str(cached)]
         if args.max_calls:
             command += ["--max-calls", str(args.max_calls)]
+        if args.max_success_drop is not None and args.scenario == "constraints":
+            command += ["--max-success-drop", str(args.max_success_drop)]
         # The harness gets the gateway keys, never the vendor key.
         harness_env = {k: v for k, v in os.environ.items() if k != provider["key"]}
         harness_env.update(LLM_GATEWAY_PLAIN_KEY=gateway_keys["GATEWAY_KEY_PLAIN"],
