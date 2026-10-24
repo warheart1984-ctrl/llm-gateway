@@ -16,7 +16,11 @@ asks, at every Nth user turn, only the fact questions whose `source_turn`
 has been folded away. A fact counts only when the unfolded tenant got it
 right, scored with the harness's strict typed equality.
 
-The corpus directory is gitignored (`/corpus/`). Raw exports stay there.
+The corpus directory is gitignored (`/corpus/`). Raw exports stay there,
+and so do reports: by default a corpus run writes to `corpus/results/`. A
+report holds text from the conversations (summaries, fact values, answers),
+so one written anywhere git would commit it, such as `benchmark_results/`,
+is written without that text and marked `text_stripped`.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
+import subprocess
 import sys
 import uuid
 from typing import Any, Callable
@@ -134,8 +139,57 @@ def _text_to_scan(report: dict[str, Any]) -> str:
     return json.dumps(cloned)
 
 
+#: Where a corpus report goes by default. `/corpus/` is gitignored.
+RESULTS_DIR = Path(__file__).resolve().parent.parent / "corpus" / "results"
+
+#: Report keys that hold conversation text: an expected fact value, what a
+#: tenant answered, a whole reply, a summary. Field names and scores stay.
+TEXT_KEYS = frozenset({"expected", "plain_answer", "folded_answer", "plain_text", "folded_text", "text"})
+
+
+def may_hold_text(path: Path) -> bool:
+    """Whether a report at `path` may keep conversation text: git ignores it,
+    or it is in no git work tree at all, so it cannot be committed by mistake.
+    When git cannot answer, the answer is no."""
+    probe = path.resolve().parent
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    try:
+        inside = subprocess.run(["git", "-C", str(probe), "rev-parse", "--is-inside-work-tree"],
+                                capture_output=True, text=True)
+        if inside.returncode != 0 or inside.stdout.strip() != "true":
+            return inside.returncode != 0 and "not a git repository" in inside.stderr
+        ignored = subprocess.run(["git", "-C", str(probe), "check-ignore", "-q", str(path.resolve())],
+                                 capture_output=True, text=True)
+    except OSError:
+        return False
+    return ignored.returncode == 0
+
+
+def strip_text(report: dict[str, Any]) -> dict[str, Any]:
+    """A copy of `report` without conversation text, for a path git would commit."""
+    def walk(node: Any) -> Any:
+        if isinstance(node, dict):
+            return {key: walk(value) for key, value in node.items() if key not in TEXT_KEYS}
+        if isinstance(node, list):
+            return [walk(item) for item in node]
+        return node
+
+    stripped = walk(report)
+    if isinstance(stripped.get("settings"), dict):
+        stripped["settings"]["text_stripped"] = True
+    return stripped
+
+
 def write_json(path: Path, report: dict[str, Any]) -> None:
-    """Write a report, or refuse when the serialized text looks like it holds a key."""
+    """Write a report, or refuse when the serialized text looks like it holds a key.
+
+    A corpus report holds text from real conversations: summaries, fact values,
+    answers. It keeps that text only where git cannot commit it (see
+    `may_hold_text`); anywhere else it is written without it.
+    """
+    if not may_hold_text(path):
+        report = strip_text(report)
     text = json.dumps(report, indent=2, ensure_ascii=False)
     kind = key_like_kind(_text_to_scan(report))
     if kind:

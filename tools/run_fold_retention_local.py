@@ -160,6 +160,12 @@ def stop(gateway: subprocess.Popen | None) -> None:
             gateway.kill()
 
 
+def results_dir(corpus: bool) -> Path:
+    """Where a run's report goes. A corpus report can hold real conversation
+    text, so it goes under the gitignored `corpus/`, never `benchmark_results/`."""
+    return ROOT / "corpus" / "results" if corpus else ROOT / "benchmark_results"
+
+
 def result_name(provider: str, scenario: str, profile: str, stamp: str, summarizer: str | None = None,
                 amortization: int | None = None) -> str:
     """The result file's name; a summarizer other than the provider's own, and
@@ -271,7 +277,7 @@ def main(argv: list[str] | None = None) -> int:
         sum_in, sum_out = model_prices(provider["models"], summarizer)
         stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
         scenario_name = "corpus" if args.corpus else args.scenario
-        output = args.output or (ROOT / "benchmark_results" /
+        output = args.output or (results_dir(corpus=bool(args.corpus)) /
                                  result_name(args.provider, scenario_name, args.profile, stamp, args.summarizer,
                                              args.amortization_requests))
         harness = "fold_tasks.py" if args.scenario == "constraints" and not args.corpus else "fold_retention.py"
