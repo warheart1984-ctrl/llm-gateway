@@ -816,6 +816,16 @@ const FOLDING_TENANT: &str = r#"      enabled: true
       amortization_requests: 1
 "#;
 
+const SHADOW_TENANT: &str = r#"      fold_mode: shadow
+      summarizer_model: mock/summarizer
+      keep_last: 2
+      summary_chars: 200
+      summarizer_max_tokens: 64
+      min_new_turns: 2
+      min_new_tokens: 0
+      amortization_requests: 1
+"#;
+
 fn folding_body(turns: usize) -> Value {
     let messages: Vec<Value> = (0..turns)
         .map(|index| {
@@ -1031,6 +1041,150 @@ async fn a_tenant_without_folding_keeps_the_upstream_body_byte_for_byte() {
     assert!(headers.get("x-gateway-folded").is_none());
     assert_eq!(upstream.last_body().unwrap(), expected);
     assert_eq!(upstream.calls(), 1);
+}
+
+/// Request id and elapsed time differ between two live calls. Everything a
+/// fold can change — tokens, cost, and the answer — stays in the comparison.
+fn comparable_stream(body: &str) -> String {
+    body.lines()
+        .map(|line| {
+            let Some(json) = line.strip_prefix("data: ") else {
+                return line.to_string();
+            };
+            let Ok(mut value) = serde_json::from_str::<Value>(json) else {
+                return line.to_string();
+            };
+            if let Some(object) = value.as_object_mut() {
+                object.remove("request_id");
+                object.remove("duration_ms");
+                object.remove("ttft_ms");
+            }
+            format!("data: {value}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn conversation_messages(turns: usize) -> Vec<llm_gateway::providers::ChatMessage> {
+    serde_json::from_value(folding_body(turns)["messages"].clone()).unwrap()
+}
+
+fn store_has_conversation(store: &llm_gateway::folding::store::FoldingStore, turns: usize) -> bool {
+    let messages = conversation_messages(turns);
+    let (protected, turn_list) = llm_gateway::folding::split_messages(&messages);
+    let key = store.conversation_key("acme", "ak_test", &protected, turn_list.first());
+    store.lookup(&key, "acme", &turn_list).is_some()
+}
+
+#[tokio::test]
+async fn shadow_answers_like_folding_off_and_sends_the_unfolded_request() {
+    let body = folding_body(6);
+    let off_upstream = MockUpstream::start(Scenario::Happy).await;
+    let off = Gateway::start(&off_upstream).await;
+    let (off_status, off_headers, off_body) = off.post_chat(TEST_KEY, body.clone()).await;
+    assert_eq!(off_status, StatusCode::OK);
+    let off_upstream_body = off_upstream.last_body().unwrap();
+
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(SHADOW_TENANT)).await;
+    let (status, headers, response) = gw.post_chat(TEST_KEY, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        comparable_stream(&response),
+        comparable_stream(&off_body),
+        "the shadow body matches folding off apart from the request id and the time the summarizer added"
+    );
+    assert!(headers.get("x-gateway-folded").is_none());
+    assert!(headers.get("x-gateway-fold-summary").is_none());
+    let shadow = headers.get("x-gateway-fold-shadow").unwrap().to_str().unwrap();
+    assert!(shadow.starts_with("outcome=applied;"), "{shadow}");
+    assert!(shadow.contains("net_saving_nano_usd="), "{shadow}");
+    assert!(!shadow.contains("Summary"), "{shadow}");
+    for (name, value) in off_headers.iter() {
+        if name == "x-request-id" {
+            continue;
+        }
+        assert_eq!(headers.get(name).map(|v| v.as_bytes()), Some(value.as_bytes()), "{name}");
+    }
+    assert_eq!(upstream.calls(), 2, "the summarizer still runs");
+    assert_eq!(upstream.last_body().unwrap(), off_upstream_body);
+    let sent = serde_json::from_value::<Vec<llm_gateway::providers::ChatMessage>>(
+        upstream.last_body().unwrap()["messages"].clone(),
+    )
+    .unwrap();
+    assert_eq!(sent, conversation_messages(6));
+
+    let (_, fold) = decision_record(prompt_tokens_of(&upstream.last_body().unwrap()));
+    assert_eq!(fold["shadow"], true, "{fold}");
+    assert_eq!(fold["would_fold"], true, "{fold}");
+    assert_eq!(fold["outcome"], "applied", "{fold}");
+    assert!(fold["tokens_unfolded"].as_u64().unwrap() > fold["tokens_folded"].as_u64().unwrap());
+    assert!(fold.get("net_saving_nano_usd").is_some(), "{fold}");
+    assert!(store_has_conversation(&gw.state.shadow_folding, 6));
+    assert!(!store_has_conversation(&gw.state.folding, 6), "on-mode state stays empty");
+}
+
+#[tokio::test]
+async fn a_shadow_summarizer_failure_still_returns_the_unfolded_answer() {
+    let upstream = MockUpstream::start(Scenario::SummarizerDown).await;
+    let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(SHADOW_TENANT)).await;
+    let (status, headers, body) = gw.post_chat(TEST_KEY, folding_body(6)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(tokens_in(&body), vec!["Hello", ", ", "world"]);
+    let shadow = headers.get("x-gateway-fold-shadow").unwrap().to_str().unwrap();
+    assert!(shadow.contains("outcome=failed"), "{shadow}");
+    assert!(headers.get("x-gateway-folded").is_none());
+    let sent = serde_json::from_value::<Vec<llm_gateway::providers::ChatMessage>>(
+        upstream.last_body().unwrap()["messages"].clone(),
+    )
+    .unwrap();
+    assert_eq!(sent, conversation_messages(6));
+}
+
+#[tokio::test]
+async fn shadow_backoff_and_budget_skip_the_summarizer_without_refusing() {
+    let upstream = MockUpstream::start(Scenario::SummarizerEmpty).await;
+    let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(SHADOW_TENANT)).await;
+    let (status, _, _) = gw.post_chat(TEST_KEY, folding_body(6)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(upstream.calls(), 2);
+    let (status, headers, _) = gw.post_chat(TEST_KEY, folding_body(8)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(upstream.calls(), 3, "backoff does not call the summarizer again");
+    let shadow = headers.get("x-gateway-fold-shadow").unwrap().to_str().unwrap();
+    assert!(shadow.contains("reason=backoff"), "{shadow}");
+
+    let messages = conversation_messages(6);
+    let prompt = llm_gateway::router::estimate_prompt_tokens(&messages) as u64;
+    let budget = prompt * 2_000 + 64 * 8_000;
+    let tight_upstream = MockUpstream::start(Scenario::Happy).await;
+    let tight = Gateway::start_folding(
+        &tight_upstream,
+        FOLDING_SUMMARIZER_MODEL,
+        Some(SHADOW_TENANT),
+        Some(budget),
+        "",
+        false,
+    )
+    .await;
+    let (status, headers, body) = tight.post_chat(TEST_KEY, folding_body(6)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(tight_upstream.calls(), 1, "no budget for the summarizer, so it is not called");
+    let shadow = headers.get("x-gateway-fold-shadow").unwrap().to_str().unwrap();
+    assert!(shadow.contains("reason=no_budget_headroom"), "{shadow}");
+}
+
+#[tokio::test]
+async fn shadow_cost_check_refuses_without_folding_the_request() {
+    let tenant = SHADOW_TENANT.replace("amortization_requests: 1", "amortization_requests: 1\n      min_saving_nano_usd: 999999999999");
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(&tenant)).await;
+    let (status, headers, _) = gw.post_chat(TEST_KEY, folding_body(6)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(upstream.calls(), 1);
+    let shadow = headers.get("x-gateway-fold-shadow").unwrap().to_str().unwrap();
+    assert!(shadow.contains("reason=cost_check"), "{shadow}");
+    assert!(!store_has_conversation(&gw.state.folding, 6));
 }
 
 #[tokio::test]

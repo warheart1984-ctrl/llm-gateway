@@ -169,6 +169,7 @@ async fn shutdown_signal(grace: std::time::Duration, state: Arc<AppState>) {
     terminate_signal().await;
     tracing::info!("received shutdown signal; draining in-flight streams");
     state.folding.cancel();
+    state.shadow_folding.cancel();
 
     let drain = wait_for_drain(state.inflight.clone());
     tokio::pin!(drain);

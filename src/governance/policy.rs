@@ -135,11 +135,30 @@ fn default_max_pending_holds() -> u32 {
 }
 
 /// Per-tenant folding configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FoldMode {
+    #[default]
+    Off,
+    Shadow,
+    On,
+}
+
+impl FoldMode {
+    pub fn enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct FoldingConfig {
     /// Whether folding is enabled for this tenant.
     pub enabled: bool,
+    /// Explicit mode. `None` preserves the pre-shadow schema: enabled tenants
+    /// map to `on`, and disabled tenants map to `off`.
+    #[serde(default)]
+    pub fold_mode: Option<FoldMode>,
     /// Registry model id for the summarizer. Must be in the tenant's allowlist.
     pub summarizer_model: String,
     /// Most recent turns always sent verbatim.
@@ -170,6 +189,7 @@ impl Default for FoldingConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            fold_mode: None,
             summarizer_model: String::new(),
             keep_last: 4,
             summary_chars: 1200,
@@ -186,8 +206,12 @@ impl Default for FoldingConfig {
 }
 
 impl FoldingConfig {
+    pub fn mode(&self) -> FoldMode {
+        self.fold_mode.unwrap_or(if self.enabled { FoldMode::On } else { FoldMode::Off })
+    }
+
     fn validate_basic(&self, tenant_id: &str, receipts: bool) -> Result<(), String> {
-        if !self.enabled {
+        if !self.mode().enabled() {
             return Ok(());
         }
         if receipts && self.summary_chars > 4_000 {
@@ -732,7 +756,7 @@ pub fn validate_with_models(
         }
 
         if let Some(folding) = &tenant.folding {
-            if !folding.enabled {
+            if !folding.mode().enabled() {
                 continue;
             }
             let requested = qualify(&tenant.model_suffix, &folding.summarizer_model);
@@ -769,7 +793,7 @@ pub fn validate_receipt_folding(tenants: &TenantRegistry, background: bool) -> V
         .into_iter()
         .filter_map(|id| {
             let tenant = tenants.get(id)?;
-            (tenant.receipts && tenant.folding.as_ref().is_some_and(|folding| folding.enabled))
+            (tenant.receipts && tenant.folding.as_ref().is_some_and(|folding| folding.mode().enabled()))
                 .then(|| format!("tenant `{id}` cannot enable folding with receipts while [folding] background = true"))
         })
         .collect()
@@ -875,6 +899,7 @@ mod tests {
         assert_eq!(folding.min_new_tokens, 400);
         assert_eq!(folding.amortization_requests, 4);
         assert_eq!(folding.min_saving_nano_usd, 0);
+        assert_eq!(folding.mode(), FoldMode::On, "enabled: true without fold_mode is on");
 
         let unknown = serde_yaml::from_str::<TenantFile>(
             "tenants:\n  - tenant_id: acme\n    credentials: [{ key_id: k, key: secret }]\n    folding:\n      enabled: true\n      summarizer_model: groq/summarizer\n      typo: true\n",
@@ -882,6 +907,29 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(unknown.contains("typo"), "{unknown}");
+    }
+
+    #[test]
+    fn fold_mode_defaults_to_off_and_rejects_unknown_values() {
+        assert_eq!(FoldingConfig::default().mode(), FoldMode::Off);
+        let shadow: TenantFile = serde_yaml::from_str(
+            "tenants:\n  - tenant_id: acme\n    credentials: [{ key_id: k, key: secret }]\n    folding:\n      fold_mode: shadow\n      summarizer_model: groq/summarizer\n",
+        )
+        .unwrap();
+        let folding = shadow.tenants[0].folding.as_ref().unwrap();
+        assert_eq!(folding.mode(), FoldMode::Shadow);
+        assert!(!folding.enabled, "shadow does not require the old enabled flag");
+        let off: TenantFile = serde_yaml::from_str(
+            "tenants:\n  - tenant_id: acme\n    credentials: [{ key_id: k, key: secret }]\n    folding:\n      enabled: true\n      fold_mode: off\n      summarizer_model: groq/summarizer\n",
+        )
+        .unwrap();
+        assert_eq!(off.tenants[0].folding.as_ref().unwrap().mode(), FoldMode::Off);
+        let unknown = serde_yaml::from_str::<TenantFile>(
+            "tenants:\n  - tenant_id: acme\n    credentials: [{ key_id: k, key: secret }]\n    folding:\n      fold_mode: sideways\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(unknown.contains("sideways") || unknown.contains("fold_mode"), "{unknown}");
     }
 
     #[test]

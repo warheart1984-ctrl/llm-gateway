@@ -62,7 +62,8 @@ class FoldingConfigBoot(unittest.TestCase):
                 timeout=900,
             )
             self.assertEqual(build.returncode, 0, "gateway build failed")
-            binary = root / "target" / "debug" / "llm-gateway"
+            target_dir = os.environ.get("CARGO_TARGET_DIR")
+            binary = (Path(target_dir) if target_dir else root / "target") / "debug" / "llm-gateway"
             if os.name == "nt":
                 binary = binary.with_suffix(".exe")
             process = subprocess.Popen(

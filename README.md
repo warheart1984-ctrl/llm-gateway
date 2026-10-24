@@ -537,13 +537,17 @@ A chat client resends the whole conversation on every request, so the prompt gro
 
 The summary is a `user` message, never `system` or `developer`: it is model-written from the tenant's own turns, and a user turn that says "ignore your rules" must not come back with system authority. Some providers reject two `user` messages in a row. The OpenAI-compatible providers this gateway calls accept it.
 
+`fold_mode` is `off`, `shadow`, or `on`. It defaults to `off`. A tenant that still sets `enabled: true` and no `fold_mode` is `on`, so existing configs do not change. `shadow` runs the same fold — summarizer, fact ledger, pin and stale-fact checks, back-off, amortization, and the single-flight lock — and records what it would have done, then forwards the original messages. The shadow ledger is a separate store: switching that tenant to `on` starts fresh. The response matches `off` except for `x-gateway-fold-shadow`, which carries the outcome and the estimated net saving and never the summary. A shadow fold is receipted as `fold_shadow`, not `fold`. Summarizer spend counts against the tenant budget. If the summarizer fails, times out, or the budget cannot cover both calls, the client request still succeeds unfolded.
+
+Shadow mode spends real summarizer money to produce its estimates. A tenant in shadow pays for those fold attempts and does not get the token savings, because the upstream request stays unfolded.
+
 A folded response carries `x-gateway-folded: <turns replaced>`. The decision log records counts and hashes only, never the summary or the message text. The summarizer call is a separate governed request: a model the tenant is allowed to call, with its own reservation and settlement. If the fold fails, is refused, does not pay, or cannot be admitted, the client request still succeeds and goes out with the last good summary, or unfolded.
 
 Folding works with `receipts: true`: the receipts bind the summary the model was actually sent, and the summarizer call gets its own receipt (see "Folded calls" under Receipts). For such a tenant `summary_chars` is at most 4,000, because the summary comes back in a header, and `[folding] background = true` is refused at load, because a background fold has no caller to hand the salt and summary to.
 
 ```yaml
 folding:
-  enabled: true
+  fold_mode: on                        # off (default) | shadow | on; enabled: true still means on
   summarizer_model: groq/summarizer   # must be in this tenant's allowlist
   keep_last: 4                         # newest turns sent verbatim
   summary_chars: 1200

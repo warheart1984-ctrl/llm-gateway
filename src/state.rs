@@ -35,6 +35,9 @@ pub struct AppState {
     pub limits: Arc<LimitEngine>,
     /// Per-process bounded rolling-summary store.
     pub folding: Arc<FoldingStore>,
+    /// Independent state for shadow-mode simulations; it can never be reused
+    /// by an on-mode tenant without an explicit migration (not supported).
+    pub shadow_folding: Arc<FoldingStore>,
     /// Every receipt-enabled tenant's chain on this replica, when
     /// `[receipts] enabled` is set. `None` means no tenant may write receipts.
     pub receipts: Option<Arc<crate::receipts::ReceiptBook>>,
@@ -230,6 +233,7 @@ mod tests {
             policy: PolicyEngine::new(true, crate::config::DEFAULT_LIMITS),
             limits: LimitEngine::new(8, false),
             folding: Arc::new(FoldingStore::new(folding_bounds.0, folding_bounds.1)),
+            shadow_folding: Arc::new(FoldingStore::new(folding_bounds.0, folding_bounds.1)),
             receipts: None,
             metrics: crate::observability::Metrics::new(Instant::now()),
             started_at: Instant::now(),
