@@ -1,6 +1,7 @@
 # Tools scenario (tools/fold_tools.py): the lifecycle profile with tool turns
-# folding, and room for replies that carry tool_facts. The other scenarios
-# keep their own files, and their 512-token summarizer budget.
+# folding, room for replies that carry tool_facts, and summary room for the
+# values the gateway keeps from each result. The other scenarios keep their
+# own files, with a 512-token summarizer budget and 1200 summary chars.
 tenants:
   - tenant_id: plain
     enabled: true
@@ -25,7 +26,7 @@ tenants:
       enabled: true
       summarizer_model: groq/gpt-oss-20b
       keep_last: 4
-      summary_chars: 1200
+      summary_chars: 2400
       summarizer_max_tokens: 1024
       max_folds: 5
       refold_threshold: 8

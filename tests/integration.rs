@@ -826,11 +826,13 @@ const SHADOW_TENANT: &str = r#"      fold_mode: shadow
       amortization_requests: 1
 "#;
 
+// Room for the tool heading plus the short values the gateway keeps itself.
+// At 200 those fixed lines alone are over the budget and the fold is refused.
 const TOOL_FOLDING_TENANT: &str = r#"      enabled: true
       fold_tool_turns: true
       summarizer_model: mock/summarizer
       keep_last: 2
-      summary_chars: 200
+      summary_chars: 400
       summarizer_max_tokens: 64
       min_new_turns: 2
       min_new_tokens: 0
@@ -1087,6 +1089,8 @@ async fn a_fold_with_tool_turns_keeps_whole_exchanges_and_their_ledger() {
         "{summary}"
     );
     assert!(summary.contains("- read_file(path=\"src/folding/plan.rs\") -> ok"), "{summary}");
+    assert!(summary.contains("/lines: 1043"), "{summary}");
+    assert!(summary.contains("/status: green"), "{summary}");
     assert!(!summary.contains("run_tests"), "the tail's exchange stays verbatim, not in the ledger: {summary}");
     // The verbatim tail keeps the second exchange whole: call then result.
     let roles: Vec<&str> = messages.iter().map(|m| m["role"].as_str().unwrap()).collect();

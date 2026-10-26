@@ -108,6 +108,18 @@ class Aggregates(unittest.TestCase):
         self.assertEqual(agg["accuracy"]["plain"], 2 / 3)
         self.assertEqual(agg["total_spend_nano_usd"], {"plain": 300, "folded": 150})
 
+    def test_a_recall_of_the_needed_tool_is_counted_apart_from_a_guess(self) -> None:
+        guessed = self.row(True, False, True)
+        recalled = self.row(True, False, True)
+        recalled["needs_tool"] = "run_tests"
+        recalled["folded"]["tool_calls"] = [{"name": "run_tests", "arguments": "{}"}]
+        wrong_tool = self.row(True, False, True)
+        wrong_tool["needs_tool"] = "run_tests"
+        wrong_tool["folded"]["tool_calls"] = [{"name": "read_file", "arguments": "{}"}]
+        agg = fto.aggregates([guessed, recalled, wrong_tool], {"max_folds": 4}, {}, {})
+        self.assertEqual(agg["eligible_wrong"], 3)
+        self.assertEqual(agg["eligible_recalled"], 1)
+
     def test_refetch_counts(self) -> None:
         rows = [self.row(True, True, True, refetch_p=0, refetch_f=1),
                 self.row(True, True, True, refetch_p=0, refetch_f=2)]

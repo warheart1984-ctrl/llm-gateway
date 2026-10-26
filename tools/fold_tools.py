@@ -287,6 +287,7 @@ def run_agent(
                 "question": text,
                 "gold": gold,
                 "result_message_at": result_message_at,
+                "needs_tool": CALLS[result_index][1],
                 "eligible": eligible,
                 "plain": {"correct": plain_score["correct"], "answer": plain_score["answer"],
                           "finish_reason": plain["finish_reason"],
@@ -357,6 +358,15 @@ def aggregates(rows: list[dict[str, Any]], profile_data: dict[str, Any],
         "eligible_questions": len(eligible),
         "eligible_correct": sum(row["folded"]["correct"] for row in eligible),
         "eligible_wrong": sum(not row["folded"]["correct"] for row in eligible),
+        # Of those, the answers that called again the tool whose result the
+        # question needs, rather than guessing: what the summary asks for when
+        # a value is gone. Still counted wrong above; the harness serves no
+        # second result.
+        "eligible_recalled": sum(
+            not row["folded"]["correct"]
+            and any(call["name"] == row.get("needs_tool") for call in row["folded"]["tool_calls"])
+            for row in eligible
+        ),
         "tool_calls_made": {"plain": calls("plain"), "folded": calls("folded")},
         "refetches": {"plain": refetches("plain"), "folded": refetches("folded")},
         "total_spend_nano_usd": {"plain": plain_spend, "folded": folded_spend},
