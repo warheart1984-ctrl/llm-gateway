@@ -298,7 +298,7 @@ class Diagnostics(unittest.TestCase):
                          "fold_tasks_openrouter_constraints_lifecycle_T1.json")
 
     def test_the_amortization_is_set_in_the_tenants_file(self) -> None:
-        for name in ("tenants.yaml", "tenants.lifecycle.yaml"):
+        for name in ("tenants.yaml", "tenants.lifecycle.yaml", "tenants.tools.yaml"):
             text = (runner.BENCH / name).read_text(encoding="utf-8")
             changed = runner.with_amortization(text, 16)
             self.assertIn("      amortization_requests: 16\n", changed)
@@ -306,6 +306,20 @@ class Diagnostics(unittest.TestCase):
             self.assertEqual(len(changed.splitlines()), len(text.splitlines()))
         with self.assertRaises(ValueError):
             runner.with_amortization("tenants: []\n", 16)
+
+    def test_only_the_tools_scenario_gets_the_larger_summarizer_budget(self) -> None:
+        self.assertEqual(runner.tenants_file("tools", "lifecycle"), "tenants.tools.yaml")
+        self.assertEqual(runner.tenants_file("tools", "economics"), "tenants.tools.yaml")
+        self.assertEqual(runner.tenants_file("fixed", "lifecycle"), "tenants.lifecycle.yaml")
+        self.assertEqual(runner.tenants_file("constraints", "economics"), "tenants.yaml")
+        self.assertEqual(runner.tenants_file("tools", "lifecycle", corpus=True), "tenants.lifecycle.yaml")
+        for name in ("tenants.yaml", "tenants.lifecycle.yaml"):
+            text = (runner.BENCH / name).read_text(encoding="utf-8")
+            self.assertIn("summarizer_max_tokens: 512\n", text)
+            self.assertNotIn("fold_tool_turns", text)
+        tools = (runner.BENCH / "tenants.tools.yaml").read_text(encoding="utf-8")
+        self.assertIn("summarizer_max_tokens: 1024\n", tools)
+        self.assertIn("fold_tool_turns: true\n", tools)
 
     def test_the_runner_attaches_each_logged_fold_decision_by_request_id(self) -> None:
         decision = {"outcome": "refused", "reason": "cost_check", "fold_count": 8}

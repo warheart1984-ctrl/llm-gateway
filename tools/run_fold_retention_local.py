@@ -172,8 +172,16 @@ def result_name(provider: str, scenario: str, profile: str, stamp: str, summariz
     an amortization other than the profile's, are named in it."""
     suffix = f"_sum-{summarizer.rsplit('/', 1)[-1]}" if summarizer else ""
     suffix += f"_amort-{amortization}" if amortization else ""
-    prefix = "fold_tasks" if scenario == "constraints" else "fold_retention"
+    prefix = {"constraints": "fold_tasks", "tools": "fold_tools"}.get(scenario, "fold_retention")
     return f"{prefix}_{provider}_{scenario}_{profile}_{stamp}{suffix}.json"
+
+
+def tenants_file(scenario: str, profile: str, corpus: bool = False) -> str:
+    """The bench tenants file a run starts from. The tools scenario has its own,
+    so the summarizer budget it needs does not change the other scenarios."""
+    if scenario == "tools" and not corpus:
+        return "tenants.tools.yaml"
+    return "tenants.lifecycle.yaml" if profile == "lifecycle" else "tenants.yaml"
 
 
 def with_amortization(tenants: str, requests: int) -> str:
@@ -209,7 +217,7 @@ def wait_live(base_url: str, gateway: subprocess.Popen, seconds: float = 120) ->
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--scenario", choices=["fixed", "mutating", "constraints"], default="fixed")
+    parser.add_argument("--scenario", choices=["fixed", "mutating", "constraints", "tools"], default="fixed")
     parser.add_argument("--max-success-drop", type=float,
                         help="constraints only: how far the folded tenant's task success may fall")
     parser.add_argument("--profile", choices=["lifecycle", "economics"], default="economics")
@@ -254,7 +262,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         shutil.copy(BENCH / "default.toml", config / "default.toml")
         shutil.copy(BENCH / provider["models"], config / "models.yaml")
-        tenants = "tenants.lifecycle.yaml" if args.profile == "lifecycle" else "tenants.yaml"
+        tenants = tenants_file(args.scenario, args.profile, corpus=bool(args.corpus))
         text = (BENCH / tenants).read_text(encoding="utf-8")
         text = text.replace(GROQ_SUMMARIZER, summarizer).replace(GROQ_MAIN, provider["main"])
         if args.amortization_requests:
@@ -280,7 +288,7 @@ def main(argv: list[str] | None = None) -> int:
         output = args.output or (results_dir(corpus=bool(args.corpus)) /
                                  result_name(args.provider, scenario_name, args.profile, stamp, args.summarizer,
                                              args.amortization_requests))
-        harness = "fold_tasks.py" if args.scenario == "constraints" and not args.corpus else "fold_retention.py"
+        harness = {"constraints": "fold_tasks.py", "tools": "fold_tools.py"}.get(args.scenario, "fold_retention.py") if not args.corpus else "fold_retention.py"
         command = [sys.executable, "-u", str(ROOT / "tools" / harness),
                    "--base-url", base_url, "--model", provider["main"],
                    "--profile", args.profile,

@@ -1066,6 +1066,9 @@ struct FoldWork {
     key: [u8; 32],
     head: Vec<ChatMessage>,
     pending: Vec<ChatMessage>,
+    /// The verbatim remainder a committed fold forwards; checked for split
+    /// tool exchanges before the summary commits.
+    tail: Vec<ChatMessage>,
     covered: usize,
     prior_text: Option<String>,
     /// The facts the prior summary was written from.
@@ -1086,6 +1089,8 @@ enum AppliedFold {
         completion_tokens: u64,
         /// Which checks the first summary failed, when a corrective retry fixed them.
         corrected_checks: std::collections::BTreeMap<&'static str, u32>,
+        /// Tool facts this summary dropped without failing, by check name.
+        dropped_checks: std::collections::BTreeMap<&'static str, u32>,
     },
     Stopped {
         outcome: &'static str,
@@ -1289,11 +1294,12 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
                 corrected_checks: corrected_checks.clone(),
             };
         }
-        let (summary, ledger) = match summarizer::run_fold_checks(
+        let (summary, mut ledger) = match summarizer::run_fold_checks(
             &content,
             work.prior_text.as_deref(),
             &work.prior_ledger,
             &work.pending,
+            &work.tail,
             work.covered,
             &work.plan_config,
         ) {
@@ -1318,6 +1324,10 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
                 };
             }
         };
+        // Refused tool facts stay out of the summary. Their check name and
+        // count are logged with the committed fold; the refusal text is not
+        // stored on the ledger.
+        let dropped_checks = crate::folding::checks::failed_check_counts(&std::mem::take(&mut ledger.dropped_tool_facts));
 
         let new_covered = work.covered + work.pending.len();
         let prefix_hash = work.store.prefix_hash(&work.tenant_id, &work.head[..new_covered]);
@@ -1350,12 +1360,16 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
         if correction.is_some() {
             work.state.metrics.record_corrective_retry(&work.tenant_id, true, work.shadow);
         }
+        if !dropped_checks.is_empty() {
+            work.state.metrics.record_fold_checks(&work.tenant_id, &dropped_checks, work.shadow);
+        }
         return AppliedFold::Committed {
             summary,
             prefix_hash,
             prompt_tokens: used_prompt,
             completion_tokens: used_completion,
             corrected_checks,
+            dropped_checks,
         };
     }
 }
@@ -1471,7 +1485,9 @@ async fn foreground_fold(
         ));
     }
 
-    let split = turns.len().saturating_sub(folding.keep_last);
+    // The same boundary the plan used: with tool turns foldable it sits
+    // before, never inside, a tool exchange.
+    let split = crate::folding::plan::head_tail_boundary(&turns, folding.keep_last, folding.fold_tool_turns);
     let head = turns[..split].to_vec();
     let tail = turns[split..].to_vec();
     let covered = prior.as_ref().map(|summary| summary.turns_covered.min(head.len())).unwrap_or(0);
@@ -1569,6 +1585,7 @@ async fn foreground_fold(
         key,
         head,
         pending: pending.clone(),
+        tail: tail.clone(),
         covered,
         prior_text: prior.as_ref().map(|summary| summary.summary.clone()),
         prior_ledger: existing.as_ref().map(|entry| entry.lock().ledger.clone()).unwrap_or_default(),
@@ -1731,7 +1748,7 @@ async fn foreground_fold(
     let fold_receipt_id = fold_receipt.map(|open| open.decision_receipt_id);
 
     let mut result = match applied {
-        AppliedFold::Committed { summary, prefix_hash, prompt_tokens, completion_tokens, corrected_checks } => {
+        AppliedFold::Committed { summary, prefix_hash, prompt_tokens, completion_tokens, corrected_checks, dropped_checks } => {
             let forwarded = crate::folding::plan::build_forwarded_messages(&protected, Some(&summary), &[], &tail);
             let mut applied = describe_fold(
                 messages,
@@ -1752,6 +1769,7 @@ async fn foreground_fold(
             );
             if let Some(facts) = applied.facts.as_mut() {
                 facts.corrected_checks = corrected_checks;
+                facts.failed_checks = dropped_checks;
             }
             applied
         }

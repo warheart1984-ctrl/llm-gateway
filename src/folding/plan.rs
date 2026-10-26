@@ -3,6 +3,7 @@
 //! No I/O, ported from 5-fold-engine's `plan_compression`, `CompressionPlan`,
 //! and `refusal`.
 
+use crate::folding::checks;
 use crate::providers::{ChatMessage, Content};
 use crate::router::estimate_prompt_tokens;
 
@@ -31,6 +32,10 @@ pub enum FoldReason {
     NotEnoughNewTurns { pending_turns: usize, pending_tokens: u32, min_turns: u32, min_tokens: u32 },
     BatchReady,
     UrgentValve { pending_tokens: u32 },
+    /// The tail alone is not a valid request: a `Tool` result whose call is
+    /// nowhere, or a call nothing answers. Folding could never leave a valid
+    /// request, so the conversation is sent as it came.
+    ToolExchangeSplit,
     CostCheckFailed { benefit: u64, overhead: u64, min_saving: u64 },
     MaxFoldsReached { fold_count: u32, max_folds: u32 },
     RefoldTriggered { pending_turns: usize, refold_threshold: u32 },
@@ -52,6 +57,7 @@ impl FoldReason {
             FoldReason::NotEnoughNewTurns { .. } => "not_enough_new_turns",
             FoldReason::BatchReady => "batch_ready",
             FoldReason::UrgentValve { .. } => "urgent_valve",
+            FoldReason::ToolExchangeSplit => "tool_exchange_split",
             FoldReason::CostCheckFailed { .. } => "cost_check",
             FoldReason::MaxFoldsReached { .. } => "max_folds",
             FoldReason::RefoldTriggered { .. } => "refold",
@@ -101,6 +107,8 @@ pub struct PlanConfig {
     pub min_new_tokens: u32,
     pub amortization_requests: u32,
     pub min_saving_nano_usd: u64,
+    /// Turns with tool calls may fold into the verified tool ledger.
+    pub fold_tool_turns: bool,
 }
 
 impl PlanConfig {
@@ -115,6 +123,7 @@ impl PlanConfig {
             min_new_tokens: config.min_new_tokens,
             amortization_requests: config.amortization_requests,
             min_saving_nano_usd: config.min_saving_nano_usd,
+            fold_tool_turns: config.fold_tool_turns,
         }
     }
 }
@@ -138,8 +147,9 @@ pub fn plan_fold(
     turns: &[ChatMessage],
     stored_summary: Option<&StoredSummary>,
 ) -> FoldPlan {
-    // 1. Split into head and tail.
-    let (head, tail) = split_head_tail(turns, config.keep_last);
+    // 1. Split into head and tail. With tool turns foldable, a boundary that
+    //    lands inside a tool exchange moves earlier so the exchange stays whole.
+    let (head, tail) = split_head_tail(turns, config.keep_last, config.fold_tool_turns);
 
     // If no head, nothing to fold.
     if head.is_empty() {
@@ -172,11 +182,12 @@ pub fn plan_fold(
         (vec![], head.clone())
     };
 
-    // 2. Skip if head contains tools, non-text, or tool messages.
-    if let Some(reason) = check_head_skippable(&head) {
+    // 2. Skip if head contains tools (when not allowed), non-text, or tool
+    //    messages.
+    if let Some(reason) = check_head_skippable(&head, config.fold_tool_turns) {
         // A tool inside the already-covered prefix means the stored summary
         // is not a safe stand-in. Send the client messages unchanged.
-        let summary_is_safe = check_head_skippable(&covered_turns).is_none();
+        let summary_is_safe = check_head_skippable(&covered_turns, config.fold_tool_turns).is_none();
         let summary = summary_is_safe.then_some(stored_summary).flatten();
         return FoldPlan {
             outcome: FoldOutcome::Skipped,
@@ -199,6 +210,34 @@ pub fn plan_fold(
         };
     }
 
+    // With tool turns foldable, a `Tool` result in the verbatim remainder may
+    // answer a call the stored summary already covers: sending the summary
+    // with the remainder would dangle it. The reuse paths below then send the
+    // conversation exactly as it came; a fresh fold still runs, because the
+    // new summary folds the pending half too. A tail that is not a
+    // self-contained request can never be forwarded folded.
+    let remainder_safe = !config.fold_tool_turns
+        || checks::check_tool_exchanges(pending_turns.iter().chain(tail.iter())).is_ok();
+    let reuse_summary = if remainder_safe { stored_summary } else { None };
+    let reuse_turns: &[ChatMessage] = if remainder_safe { &pending_turns } else { &head };
+    let reuse_covered = if reuse_summary.is_some() { covered_turns.len() } else { 0 };
+    if config.fold_tool_turns && checks::check_tool_exchanges(tail.iter()).is_err() {
+        return FoldPlan {
+            outcome: FoldOutcome::Skipped,
+            reason: FoldReason::ToolExchangeSplit,
+            turns_replaced: 0,
+            turns_covered: 0,
+            prompt_tokens_cut: 0,
+            benefit_nano_usd: 0,
+            overhead_nano_usd: 0,
+            min_saving_nano_usd: config.min_saving_nano_usd,
+            forwarded_messages: build_forwarded_messages(protected, None, turns, &[]),
+            summary: None,
+            new_prefix_hash: None,
+            new_fold_count: stored_summary.map(|s| s.fold_count).unwrap_or(0),
+        };
+    }
+
     // 4. Batching: fold only when pending reaches thresholds or urgent valve.
     let pending_turns_count = pending_turns.len();
     let pending_tokens = estimate_prompt_tokens(&pending_turns);
@@ -217,20 +256,20 @@ pub fn plan_fold(
                 fold_count: current_fold_count,
                 max_folds: config.max_folds,
             },
-            turns_replaced: covered_turns.len(),
-            turns_covered: covered_turns.len(),
+            turns_replaced: reuse_covered,
+            turns_covered: reuse_covered,
             prompt_tokens_cut: 0,
             benefit_nano_usd: 0,
             overhead_nano_usd: 0,
             min_saving_nano_usd: config.min_saving_nano_usd,
             forwarded_messages: build_forwarded_messages(
                 protected,
-                stored_summary.map(|s| s.summary.as_str()),
-                &pending_turns,
+                reuse_summary.map(|s| s.summary.as_str()),
+                reuse_turns,
                 &tail,
             ),
-            summary: stored_summary.map(|s| s.summary.clone()),
-            new_prefix_hash: stored_summary.map(|s| s.prefix_hash),
+            summary: reuse_summary.map(|s| s.summary.clone()),
+            new_prefix_hash: reuse_summary.map(|s| s.prefix_hash),
             new_fold_count: current_fold_count,
         };
     }
@@ -251,21 +290,21 @@ pub fn plan_fold(
         return FoldPlan {
             outcome: FoldOutcome::NotDue,
             reason,
-            turns_replaced: covered_turns.len(),
-            turns_covered: covered_turns.len(),
+            turns_replaced: reuse_covered,
+            turns_covered: reuse_covered,
             prompt_tokens_cut: 0,
             benefit_nano_usd: 0,
             overhead_nano_usd: 0,
             min_saving_nano_usd: config.min_saving_nano_usd,
             forwarded_messages: build_forwarded_messages(
                 protected,
-                stored_summary.map(|s| s.summary.as_str()),
-                &pending_turns,
+                reuse_summary.map(|s| s.summary.as_str()),
+                reuse_turns,
                 &tail,
             ),
-            summary: stored_summary.map(|s| s.summary.clone()),
-            new_prefix_hash: stored_summary.map(|s| s.prefix_hash),
-            new_fold_count: stored_summary.map(|s| s.fold_count).unwrap_or(0),
+            summary: reuse_summary.map(|s| s.summary.clone()),
+            new_prefix_hash: reuse_summary.map(|s| s.prefix_hash),
+            new_fold_count: reuse_summary.map(|s| s.fold_count).unwrap_or(0),
         };
     }
 
@@ -289,20 +328,20 @@ pub fn plan_fold(
                 overhead,
                 min_saving: config.min_saving_nano_usd,
             },
-            turns_replaced: covered_turns.len(),
-            turns_covered: covered_turns.len(),
+            turns_replaced: reuse_covered,
+            turns_covered: reuse_covered,
             prompt_tokens_cut,
             benefit_nano_usd: benefit,
             overhead_nano_usd: overhead,
             min_saving_nano_usd: config.min_saving_nano_usd,
             forwarded_messages: build_forwarded_messages(
                 protected,
-                stored_summary.map(|s| s.summary.as_str()),
-                &pending_turns,
+                reuse_summary.map(|s| s.summary.as_str()),
+                reuse_turns,
                 &tail,
             ),
-            summary: stored_summary.map(|s| s.summary.clone()),
-            new_prefix_hash: stored_summary.map(|s| s.prefix_hash),
+            summary: reuse_summary.map(|s| s.summary.clone()),
+            new_prefix_hash: reuse_summary.map(|s| s.prefix_hash),
             new_fold_count: current_fold_count,
         };
     }
@@ -350,29 +389,68 @@ pub fn plan_fold(
     }
 }
 
-/// Split turns into head (to potentially fold) and tail (always verbatim).
-fn split_head_tail(turns: &[ChatMessage], keep_last: usize) -> (Vec<ChatMessage>, Vec<ChatMessage>) {
-    if turns.len() <= keep_last {
-        return (Vec::new(), turns.to_vec());
+/// The head/tail boundary: the last `keep_last` turns stay verbatim. When
+/// `fold_tool_turns` is set and the boundary lands inside a tool exchange —
+/// an assistant `tool_calls` message and the `Tool` messages answering its
+/// call ids — it moves earlier, so the whole exchange stays in the tail.
+/// A `Tool` result answering nothing in the conversation is left where it
+/// is: it is not part of an exchange the boundary could split.
+pub fn head_tail_boundary(turns: &[ChatMessage], keep_last: usize, fold_tool_turns: bool) -> usize {
+    let mut split = turns.len().saturating_sub(keep_last);
+    if !fold_tool_turns {
+        return split;
     }
-    let split = turns.len() - keep_last;
+    // The boundary only ever moves earlier, to the message that made the
+    // call, so one pass over the tail reaches the fixed point.
+    let mut index = split;
+    while index < turns.len() {
+        if let ChatMessage::Tool { tool_call_id, .. } = &turns[index]
+            && let Some(at) = turns[..split].iter().rposition(|msg| calls_answer(msg, tool_call_id))
+        {
+            split = at;
+        }
+        index += 1;
+    }
+    split
+}
+
+/// Whether `msg` is an assistant message whose `tool_calls` include `id`.
+fn calls_answer(msg: &ChatMessage, id: &str) -> bool {
+    matches!(msg, ChatMessage::Assistant { tool_calls, .. } if tool_calls.iter().any(|call| call.id == id))
+}
+
+/// Split turns into head (to potentially fold) and tail (always verbatim).
+fn split_head_tail(turns: &[ChatMessage], keep_last: usize, fold_tool_turns: bool) -> (Vec<ChatMessage>, Vec<ChatMessage>) {
+    let split = head_tail_boundary(turns, keep_last, fold_tool_turns);
     (turns[..split].to_vec(), turns[split..].to_vec())
 }
 
-/// Check if the head contains any skippable messages.
-fn check_head_skippable(head: &[ChatMessage]) -> Option<FoldReason> {
+/// Check if the head contains any skippable messages. With `fold_tool_turns`
+/// the head may carry tool calls and their results; non-text content is
+/// still refused either way.
+fn check_head_skippable(head: &[ChatMessage], fold_tool_turns: bool) -> Option<FoldReason> {
     for msg in head {
         match msg {
             ChatMessage::Assistant { tool_calls, content, .. } => {
-                if !tool_calls.is_empty() {
+                if !tool_calls.is_empty() && !fold_tool_turns {
                     return Some(FoldReason::HeadHasTools);
                 }
-                if !matches!(content, Some(Content::Text(text)) if !text.is_empty()) {
+                // A calling assistant may carry no text; anything richer than
+                // text is refused.
+                if matches!(content, Some(Content::Parts(_)))
+                    || (tool_calls.is_empty()
+                        && !matches!(content, Some(Content::Text(text)) if !text.is_empty()))
+                {
                     return Some(FoldReason::HeadHasNonText);
                 }
             }
-            ChatMessage::Tool { .. } => {
-                return Some(FoldReason::HeadHasToolMessage);
+            ChatMessage::Tool { content, .. } => {
+                if !fold_tool_turns {
+                    return Some(FoldReason::HeadHasToolMessage);
+                }
+                if !matches!(content, Content::Text(_)) {
+                    return Some(FoldReason::HeadHasNonText);
+                }
             }
             ChatMessage::User { content }
                 if !matches!(content, Content::Text(text) if !text.is_empty()) =>
@@ -541,6 +619,7 @@ mod tests {
             min_new_tokens: 400,
             amortization_requests: 4,
             min_saving_nano_usd: 0,
+            fold_tool_turns: false,
         }
     }
 
@@ -610,7 +689,7 @@ mod tests {
             msg("user", "4"), msg("assistant", "4"),
             msg("user", "5"), msg("assistant", "5"),
         ];
-        let (head, tail) = split_head_tail(&turns, 4);
+        let (head, tail) = split_head_tail(&turns, 4, false);
         // keep_last=4 means last 4 turns (2 user + 2 assistant) in tail
         assert_eq!(tail.len(), 4);
         assert_eq!(head.len(), 6);
@@ -638,6 +717,126 @@ mod tests {
         let plan = plan_fold(&config, &main_cost, &summ_cost, &protected, &turns, None);
         assert_eq!(plan.outcome, FoldOutcome::Skipped);
         assert!(matches!(plan.reason, FoldReason::HeadHasToolMessage));
+    }
+
+    fn tool_turns_config() -> PlanConfig {
+        PlanConfig { fold_tool_turns: true, min_new_turns: 1, min_new_tokens: 0, ..config() }
+    }
+
+    fn exchange(id: &str, name: &str, arguments: &str, result: &str) -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::Assistant {
+                content: Some(Content::Text("calling tool".into())),
+                tool_calls: vec![crate::providers::ToolCall {
+                    id: id.into(),
+                    kind: "function".into(),
+                    function: crate::providers::FunctionCall { name: name.into(), arguments: arguments.into() },
+                }],
+            },
+            ChatMessage::Tool {
+                content: Content::Text(result.into()),
+                tool_call_id: id.into(),
+                name: Some(name.into()),
+            },
+        ]
+    }
+
+    #[test]
+    fn tool_turns_fold_when_allowed() {
+        let config = tool_turns_config();
+        let (main_cost, summ_cost) = cost_models();
+        let protected = vec![msg("system", "sys")];
+        let long = "x".repeat(2000);
+        let mut head = vec![msg("user", &long), msg("assistant", &long)];
+        head.extend(exchange("call_1", "read_file", r#"{"path":"src/main.rs"}"#, &long));
+        head.extend([msg("user", &long), msg("assistant", &long)]);
+        let turns = with_tail(head);
+        let plan = plan_fold(&config, &main_cost, &summ_cost, &protected, &turns, None);
+        assert_eq!(plan.outcome, FoldOutcome::Applied, "{:?}", plan.reason);
+    }
+
+    #[test]
+    fn a_boundary_inside_an_exchange_moves_earlier() {
+        let config = tool_turns_config();
+        let (main_cost, summ_cost) = cost_models();
+        let protected = vec![msg("system", "sys")];
+        // keep_last = 4 would split the exchange: its Tool result is the
+        // fifth-from-last turn. The boundary must move before the call.
+        let long = "x".repeat(2000);
+        let mut turns = vec![msg("user", &long), msg("assistant", &long)];
+        turns.extend(exchange("call_1", "read_file", "{}", "data"));
+        turns.extend([msg("user", "tail-1"), msg("assistant", "tail-2"), msg("user", "tail-3")]);
+        // The boundary lands inside the exchange: len 7 - keep 4 = index 3.
+        assert_eq!(head_tail_boundary(&turns, 4, true), 2);
+        let plan = plan_fold(&config, &main_cost, &summ_cost, &protected, &turns, None);
+        assert_eq!(plan.outcome, FoldOutcome::Applied, "{:?}", plan.reason);
+        let sent = &plan.forwarded_messages;
+        let ids: Vec<&str> = sent
+            .iter()
+            .filter_map(|m| match m {
+                ChatMessage::Tool { tool_call_id, .. } => Some(tool_call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, ["call_1"], "the whole exchange stayed in the tail: {sent:?}");
+        assert!(checks::check_tool_exchanges(sent.iter()).is_ok());
+        // Without the flag the same boundary stands and the head's call stops the fold.
+        let off_cfg = PlanConfig { fold_tool_turns: false, ..config };
+        let off = plan_fold(&off_cfg, &main_cost, &summ_cost, &protected, &turns, None);
+        assert_eq!(off.outcome, FoldOutcome::Skipped);
+    }
+
+    #[test]
+    fn an_orphan_tool_result_in_the_tail_never_folds() {
+        let config = tool_turns_config();
+        let (main_cost, summ_cost) = cost_models();
+        let protected = vec![msg("system", "sys")];
+        let head = vec![msg("user", "hello"), msg("assistant", "hi"), msg("user", "more"), msg("assistant", "more")];
+        let mut turns = with_tail(head);
+        turns.push(ChatMessage::Tool {
+            content: Content::Text("late result".into()),
+            tool_call_id: "call_missing".into(),
+            name: Some("lookup".into()),
+        });
+        let plan = plan_fold(&config, &main_cost, &summ_cost, &protected, &turns, None);
+        assert_eq!(plan.outcome, FoldOutcome::Skipped);
+        assert!(matches!(plan.reason, FoldReason::ToolExchangeSplit));
+        // The request goes out exactly as it came: protected plus every turn.
+        assert_eq!(plan.forwarded_messages.len(), 1 + turns.len());
+    }
+
+    #[test]
+    fn a_stored_summary_is_dropped_when_the_remainder_dangles() {
+        // The prior summary covered the call; the client then appended its
+        // result. Sending the summary with that result would dangle it, so
+        // the conversation goes out verbatim. A fresh fold still applies:
+        // its summary covers the pending half too.
+        let config = tool_turns_config();
+        let (main_cost, summ_cost) = cost_models();
+        let protected = vec![msg("system", "sys")];
+        let stored = StoredSummary {
+            turns_covered: 4,
+            prefix_hash: [0; 32],
+            summary: "prev summary".into(),
+            fold_count: 1,
+            summarizer_model: "m".into(),
+        };
+        let mut turns = vec![msg("user", "1"), tool_msg("assistant")];
+        turns.extend([msg("user", "2"), msg("assistant", "2")]);
+        // covered=4 covers turns 0..4; turn 4 is the result for call_1.
+        turns.push(ChatMessage::Tool {
+            content: Content::Text("late result".into()),
+            tool_call_id: "call_1".into(),
+            name: Some("test".into()),
+        });
+        turns.extend([msg("user", "3"), msg("assistant", "3"), msg("user", "4"), msg("assistant", "4")]);
+        // A request not due to fold must still not dangle the result.
+        let quiet = PlanConfig { min_new_turns: 100, ..config.clone() };
+        let plan = plan_fold(&quiet, &main_cost, &summ_cost, &protected, &turns, Some(&stored));
+        assert_eq!(plan.outcome, FoldOutcome::NotDue);
+        assert_eq!(plan.turns_replaced, 0, "the summary is not sent: {plan:?}");
+        assert_eq!(plan.forwarded_messages.len(), 1 + turns.len());
+        assert!(plan.forwarded_messages.iter().all(|m| m.content().map(|c| c.text()).unwrap_or_default() != "prev summary"));
     }
 
     #[test]

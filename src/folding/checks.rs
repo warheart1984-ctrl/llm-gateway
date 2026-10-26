@@ -383,8 +383,45 @@ fn bare_numbers(text: &str) -> Vec<&str> {
         .collect()
 }
 
+/// The invariant a folded request needs once tool turns may fold: every
+/// `Tool` message answers a call the request also makes, and every call is
+/// answered. Folding takes and leaves whole exchanges, so a violation is a
+/// bug in the split — the fold fails and is logged, never repaired silently.
+/// Call ids are the only detail reported; they are opaque to the client.
+pub fn check_tool_exchanges<'a>(
+    messages: impl IntoIterator<Item = &'a crate::providers::ChatMessage>,
+) -> Result<(), Vec<String>> {
+    use crate::providers::ChatMessage;
+    let mut calls: Vec<(&str, &str)> = Vec::new();
+    let mut answered = std::collections::HashSet::new();
+    let mut errors = Vec::new();
+    for msg in messages {
+        match msg {
+            ChatMessage::Assistant { tool_calls, .. } => {
+                calls.extend(tool_calls.iter().map(|call| (call.id.as_str(), call.function.name.as_str())));
+            }
+            ChatMessage::Tool { tool_call_id, .. } => {
+                answered.insert(tool_call_id.as_str());
+            }
+            _ => {}
+        }
+    }
+    let known: std::collections::HashSet<&str> = calls.iter().map(|(id, _)| *id).collect();
+    for id in &answered {
+        if !known.contains(id) {
+            errors.push(format!("tool_exchange_split: result for call '{id}' answers a call the request does not make"));
+        }
+    }
+    for (id, name) in &calls {
+        if !answered.contains(id) {
+            errors.push(format!("tool_exchange_split: call '{id}' ({name}) has no tool result"));
+        }
+    }
+    if errors.is_empty() { Ok(()) } else { Err(errors) }
+}
+
 /// Every check a summary can fail, by the name its errors start with.
-pub const CHECK_NAMES: [&str; 17] = [
+pub const CHECK_NAMES: [&str; 19] = [
     "format",
     "instruction_evidence",
     "instruction_replaces",
@@ -395,6 +432,8 @@ pub const CHECK_NAMES: [&str; 17] = [
     "ledger_misfiled",
     "ledger_duplicate",
     "ledger_stale",
+    "tool_fact_evidence",
+    "tool_exchange_split",
     "non_empty",
     "within_length_bound",
     "covers_something",
@@ -549,10 +588,15 @@ pub fn clip_to_chars(text: &str, max_chars: usize) -> String {
 /// Source text for pinned term extraction: the transcript of turns being summarized.
 /// Only the turns being folded: protected messages are sent verbatim on every
 /// request and never reach the summarizer, so pinning their values would
-/// demand terms the summarizer never saw and refuse every fold.
+/// demand terms the summarizer never saw and refuse every fold. `Tool`
+/// results contribute nothing: their bytes are data, not statements, and the
+/// verified tool ledger — not a pinned term — carries what they held.
 pub fn build_source_text(turns: &[crate::providers::ChatMessage]) -> String {
     let mut parts = Vec::new();
     for msg in turns {
+        if matches!(msg, crate::providers::ChatMessage::Tool { .. }) {
+            continue;
+        }
         parts.push(format!("{}: {}", msg.role(), msg.content().map(|c| c.text()).unwrap_or_default()));
     }
     parts.join("\n")
@@ -883,5 +927,30 @@ mod tests {
     #[test]
     fn pinned_terms_are_compared_without_case() {
         assert!(check_pinned_facts("deploy to STAGING-DB", "Deploy to the staging-db host").is_ok());
+    }
+
+    #[test]
+    fn tool_exchanges_hold_or_report_the_split() {
+        use crate::providers::{ChatMessage, Content, FunctionCall, ToolCall};
+        let call = |id: &str| ChatMessage::Assistant {
+            content: Some(Content::Text("calling".into())),
+            tool_calls: vec![ToolCall {
+                id: id.into(), kind: "function".into(),
+                function: FunctionCall { name: "read_file".into(), arguments: "{}".into() },
+            }],
+        };
+        let result = |id: &str| ChatMessage::Tool {
+            content: Content::Text("result".into()), tool_call_id: id.into(), name: None,
+        };
+        // Whole exchanges pass.
+        assert!(check_tool_exchanges([call("a"), result("a"), result("a"), call("b"), result("b")].iter()).is_ok());
+        // A result whose call is not in the request fails.
+        let err = check_tool_exchanges([result("a")].iter()).unwrap_err();
+        assert_eq!(err, ["tool_exchange_split: result for call 'a' answers a call the request does not make"]);
+        // A call missing its result fails.
+        let err = check_tool_exchanges([call("b")].iter()).unwrap_err();
+        assert_eq!(err, ["tool_exchange_split: call 'b' (read_file) has no tool result"]);
+        // An empty conversation has nothing to split.
+        assert!(check_tool_exchanges([].iter()).is_ok());
     }
 }
