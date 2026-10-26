@@ -568,7 +568,7 @@ pub fn check_summary_except(
     let clipped = clip_to_chars(summary, summary_chars);
     if let Err(missing) = check_pinned_facts_except(&clipped, source_text, replaced) {
         for term in missing {
-            errors.push(format!("pinned_facts_present: missing term '{}'", term));
+            errors.push(format!("pinned_facts_present: missing term '{term}'"));
         }
     }
 
@@ -680,7 +680,7 @@ mod tests {
         let source = "Meeting moved to 15:30";
         let err = check_summary(&long_summary, source, 1200).unwrap_err();
         // Should fail because "15:30" is clipped out
-        assert!(err.iter().any(|e| e.contains("15:30")), "err: {:?}", err);
+        assert!(err.iter().any(|e| e.contains("15:30")), "err: {err:?}");
     }
 
     #[test]

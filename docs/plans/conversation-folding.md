@@ -189,11 +189,22 @@ Pure functions in `plan.rs`, no I/O, ported from `plan_compression`,
    and the summarizer:
 
    ```
-   benefit  = prompt_tokens_cut * amortization_requests * main.prompt_rate
+   reuse    = max(amortization_requests, requests_served)
+   benefit  = prompt_tokens_cut * reuse * main.prompt_rate
    overhead = summary_input_tokens * summarizer.prompt_rate
             + (2 * summarizer_max_tokens) * summarizer.completion_rate
    fold only if benefit - overhead >= min_saving_nano_usd
    ```
+
+   `requests_served` is how many requests the summary already in place has
+   answered, including this one. It is `0` until a fold has committed.
+   `amortization_requests` stays the floor, so a first fold is priced exactly
+   as before. A later fold of a conversation that has already reused its
+   summary is priced over that observed reuse: the summary will be served
+   about that many more times. Without it, a summarizer that costs the same
+   as the main model is treated as paid back by only `amortization_requests`
+   calls, and a long conversation commits the folds that cut its largest
+   turns and refuses every later one.
 
    - `prompt_tokens_cut` = estimated prompt tokens of the unfolded request
      minus those of the folded one (with a placeholder summary of

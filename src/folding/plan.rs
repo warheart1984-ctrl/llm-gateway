@@ -136,6 +136,9 @@ pub struct StoredSummary {
     pub summary: String,
     pub fold_count: u32,
     pub summarizer_model: String,
+    /// Requests already answered with this summary, including the one being
+    /// planned. `0` when there is no summary yet.
+    pub requests_served: u32,
 }
 
 /// Plan a fold given the current conversation and optional stored summary.
@@ -488,11 +491,20 @@ fn cost_check(
     let unfolded_prompt_tokens = estimate_prompt_tokens(&unfolded_messages);
     let prompt_tokens_cut = unfolded_prompt_tokens.saturating_sub(folded_prompt_tokens);
 
-    // Benefit: prompt_tokens_cut * amortization_requests * main.prompt_rate
+    // Benefit: prompt_tokens_cut * reuse * main.prompt_rate.
+    // `amortization_requests` is the floor. A summary that has already been
+    // served longer than that will be served about that long again, so a
+    // later fold is priced over the observed reuse. The floor alone counts
+    // a same-priced summarizer as paid back by only a few requests, which
+    // lets the first folds of a large tool result through and refuses every
+    // later fold of ordinary turns, however long the conversation runs.
     let main_prompt_rate = main_model_cost.input_nano_usd_per_token();
-    let benefit = (prompt_tokens_cut as u64)
-        .saturating_mul(config.amortization_requests as u64)
-        .saturating_mul(main_prompt_rate);
+    let reuse = u64::from(
+        config
+            .amortization_requests
+            .max(stored_summary.map(|summary| summary.requests_served).unwrap_or(0)),
+    );
+    let benefit = (prompt_tokens_cut as u64).saturating_mul(reuse).saturating_mul(main_prompt_rate);
 
     // Overhead: summary_input_tokens * summarizer.prompt_rate + (2 * summarizer_max_tokens) * summarizer.completion_rate
     let summary_input_tokens = estimate_summarizer_input_tokens(stored_summary, pending_turns);
@@ -668,6 +680,7 @@ mod tests {
             summary: "s".repeat(config.summary_chars),
             fold_count: 1,
             summarizer_model: "m".into(),
+            requests_served: 0,
         };
         let plan = plan_fold(&config, &main, &summarizer, &protected, &turns, Some(&stored));
         let tail = &turns[24..];
@@ -820,6 +833,7 @@ mod tests {
             summary: "prev summary".into(),
             fold_count: 1,
             summarizer_model: "m".into(),
+            requests_served: 0,
         };
         let mut turns = vec![msg("user", "1"), tool_msg("assistant")];
         turns.extend([msg("user", "2"), msg("assistant", "2")]);
@@ -997,6 +1011,7 @@ mod tests {
             summary: "prev summary".into(),
             fold_count: 1,
             summarizer_model: "model".into(),
+            requests_served: 0,
         };
         let plan2 = plan_fold(&config, &main_cost, &summ_cost, &protected, &second, Some(&stored));
         assert_eq!(plan2.outcome, FoldOutcome::Applied);
@@ -1017,6 +1032,7 @@ mod tests {
             summary: "prev summary".into(),
             fold_count: 2,
             summarizer_model: "model".into(),
+            requests_served: 0,
         };
         let plan3 = plan_fold(&config, &main_cost, &summ_cost, &protected, &third, Some(&stored2));
         assert_eq!(plan3.outcome, FoldOutcome::NotDue);
@@ -1048,6 +1064,91 @@ mod tests {
         assert_eq!(plan4.outcome, FoldOutcome::Applied);
         assert!(matches!(plan4.reason, FoldReason::RefoldTriggered { .. }));
         assert_eq!(plan4.new_fold_count, 1); // Count resets on re-fold
+    }
+
+    #[test]
+    fn a_third_fold_commits_once_a_long_conversation_has_reused_its_summary() {
+        // Same prices for the main model and the summarizer, and the tools
+        // tenant's budgets: amortization 4, a 1024-token summarizer, summary
+        // capped at 2400 characters. The first folds cut the large early
+        // turns. Later turns are short notes. A third fold commits only
+        // because the summary already in place has been served often enough
+        // that cutting those notes pays for another summarizer call. One new
+        // note, priced at the amortization floor, is still refused.
+        let mut config = config();
+        config.summary_chars = 2400;
+        config.summarizer_max_tokens = 1024;
+        config.amortization_requests = 4;
+        config.min_new_turns = 1;
+        config.min_new_tokens = 0;
+        config.max_folds = 8;
+        config.keep_last = 4;
+        let cost = CostModel {
+            input_per_mtok_usd: 0.40,
+            output_per_mtok_usd: 1.60,
+            cached_input_per_mtok_usd: Some(0.10),
+        };
+        let protected = vec![msg("system", "You are an operations agent.")];
+        let blob = "y".repeat(4_000);
+        let mut turns: Vec<ChatMessage> = (0..8)
+            .flat_map(|i| [msg("user", &format!("{blob}-{i}")), msg("assistant", "noted")])
+            .collect();
+        let mut stored: Option<StoredSummary> = None;
+        let mut commits: Vec<(u32, u32, u32)> = Vec::new();
+        let mut refused_after_third = false;
+        for n in 0..80 {
+            if n > 0 {
+                turns.push(msg(
+                    "user",
+                    &format!("Workshop note {n:02}: the team reviewed the checklist and filed the notes."),
+                ));
+            }
+            if let Some(summary) = stored.as_mut() {
+                summary.requests_served = summary.requests_served.saturating_add(1);
+            }
+            let plan = plan_fold(&config, &cost, &cost, &protected, &turns, stored.as_ref());
+            if plan.outcome == FoldOutcome::Applied {
+                let served = stored.as_ref().map(|summary| summary.requests_served).unwrap_or(0);
+                commits.push((plan.new_fold_count, served, plan.prompt_tokens_cut));
+                let committed = StoredSummary {
+                    turns_covered: plan.turns_covered,
+                    prefix_hash: [0; 32],
+                    summary: "s".repeat(config.summary_chars),
+                    fold_count: plan.new_fold_count,
+                    summarizer_model: "m".into(),
+                    requests_served: 0,
+                };
+                if plan.new_fold_count == 3 {
+                    let mut probe_turns = turns.clone();
+                    probe_turns.push(msg("user", "one more workshop note, with no new requirement."));
+                    let mut probe = committed.clone();
+                    probe.requests_served = 1;
+                    let probe_plan = plan_fold(&config, &cost, &cost, &protected, &probe_turns, Some(&probe));
+                    assert_eq!(probe_plan.outcome, FoldOutcome::Refused);
+                    let reason = &probe_plan.reason;
+                    assert!(
+                        matches!(
+                            reason,
+                            FoldReason::CostCheckFailed { benefit, overhead, .. } if benefit < overhead
+                        ),
+                        "a single new note is still unprofitable: {reason:?}"
+                    );
+                    refused_after_third = true;
+                }
+                stored = Some(committed);
+            }
+        }
+        assert!(
+            commits.iter().any(|(fold, served, _)| *fold == 1 && *served == 0),
+            "the first fold uses the amortization floor: {commits:?}"
+        );
+        assert!(
+            commits.iter().any(|(fold, served, cut)| {
+                *fold == 3 && *served > config.amortization_requests && *cut > 0
+            }),
+            "the third fold is paid for by observed reuse, not by another tool payload: {commits:?}"
+        );
+        assert!(refused_after_third, "the turn after the third fold must be refused: {commits:?}");
     }
 
     #[test]

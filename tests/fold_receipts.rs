@@ -151,8 +151,7 @@ models:
         key: test-key-acme
         scopes: [chat:stream, chat:complete, receipts:read]
     allowed_models: ["mock/chat", "mock/summarizer"]
-{folding}"#,
-        folding = folding
+{folding}"#
     );
     std::fs::write(dir.join("models.yaml"), models).unwrap();
     std::fs::write(dir.join("tenants.yaml"), tenants).unwrap();

@@ -1019,14 +1019,19 @@ fn describe_fold(
     }
 }
 
-fn stored_summary(entry: &EntryRef) -> StoredSummary {
-    let entry = entry.lock();
+/// Count this request as another use of the committed summary and return the
+/// view the planner prices. A new summary replaces the entry, so the count
+/// starts again at zero when a fold commits.
+fn note_summary_served(entry: &EntryRef) -> StoredSummary {
+    let mut entry = entry.lock();
+    entry.requests_served = entry.requests_served.saturating_add(1);
     StoredSummary {
         turns_covered: entry.turns_covered,
         prefix_hash: entry.prefix_hash,
         summary: entry.summary.clone(),
         fold_count: entry.fold_count,
         summarizer_model: entry.summarizer_model.clone(),
+        requests_served: entry.requests_served,
     }
 }
 
@@ -1342,6 +1347,7 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
                 fold_count: work.new_fold_count,
                 tokens_spent: work.old_spent.saturating_add(used_prompt.saturating_add(used_completion)),
                 tokens_saved: work.old_saved.saturating_add(u64::from(work.prompt_tokens_cut)),
+                requests_served: 0,
                 summarizer_model: work.summarizer_model_id.clone(),
                 last_accessed: std::time::Instant::now(),
             },
@@ -1419,7 +1425,7 @@ async fn foreground_fold(
             None
         }
     });
-    let prior = existing.as_ref().map(stored_summary);
+    let prior = existing.as_ref().map(note_summary_served);
     let plan_config = PlanConfig::from_tenant(folding);
 
     // Resolved with the tenant's model suffix, as load-time validation checked

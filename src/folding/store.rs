@@ -36,6 +36,11 @@ pub struct SummaryEntry {
     pub tokens_spent: u64,
     /// Tokens saved on main calls by using this summary.
     pub tokens_saved: u64,
+    /// Requests answered with this summary since it was committed. The cost
+    /// check uses this as the reuse of the next fold when it exceeds the
+    /// configured amortization.
+    #[serde(default)]
+    pub requests_served: u32,
     /// The summarizer model this summary was made with.
     pub summarizer_model: String,
     /// The facts the summary's "Current facts" block is written from.
@@ -521,6 +526,7 @@ mod tests {
             fold_count: 1,
             tokens_spent: 100,
             tokens_saved: 500,
+            requests_served: 0,
             ledger: Default::default(),
             summarizer_model: "model".into(),
             last_accessed: Instant::now(),
@@ -558,6 +564,7 @@ mod tests {
                 fold_count: 1,
                 tokens_spent: 0,
                 tokens_saved: 0,
+                requests_served: 0,
                 ledger: Default::default(),
                 summarizer_model: "model".into(),
                 last_accessed: Instant::now(),
@@ -610,6 +617,7 @@ mod tests {
                 fold_count: 1,
                 tokens_spent: 100,
                 tokens_saved: 500,
+                requests_served: 0,
                 ledger: Default::default(),
                 summarizer_model: "model".into(),
                 last_accessed: Instant::now() - std::time::Duration::from_secs(30 - i as u64),
@@ -641,6 +649,7 @@ mod tests {
                 fold_count: 1,
                 tokens_spent: 100,
                 tokens_saved: 500,
+                requests_served: 0,
                 ledger: Default::default(),
                 summarizer_model: "model".into(),
                 last_accessed: Instant::now(),
@@ -661,6 +670,7 @@ mod tests {
             fold_count: 1,
             tokens_spent: 0,
             tokens_saved: 0,
+            requests_served: 0,
             ledger: Default::default(),
             summarizer_model: "model".into(),
             last_accessed: Instant::now(),
