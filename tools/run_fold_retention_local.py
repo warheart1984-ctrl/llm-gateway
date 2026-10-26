@@ -176,6 +176,14 @@ def result_name(provider: str, scenario: str, profile: str, stamp: str, summariz
     return f"{prefix}_{provider}_{scenario}_{profile}_{stamp}{suffix}.json"
 
 
+def tenants_file(scenario: str, profile: str, corpus: bool = False) -> str:
+    """The bench tenants file a run starts from. The tools scenario has its own,
+    so the summarizer budget it needs does not change the other scenarios."""
+    if scenario == "tools" and not corpus:
+        return "tenants.tools.yaml"
+    return "tenants.lifecycle.yaml" if profile == "lifecycle" else "tenants.yaml"
+
+
 def with_amortization(tenants: str, requests: int) -> str:
     """The tenants file with the folded tenant's `amortization_requests` set."""
     lines = tenants.splitlines(keepends=True)
@@ -254,7 +262,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         shutil.copy(BENCH / "default.toml", config / "default.toml")
         shutil.copy(BENCH / provider["models"], config / "models.yaml")
-        tenants = "tenants.lifecycle.yaml" if args.profile == "lifecycle" else "tenants.yaml"
+        tenants = tenants_file(args.scenario, args.profile, corpus=bool(args.corpus))
         text = (BENCH / tenants).read_text(encoding="utf-8")
         text = text.replace(GROQ_SUMMARIZER, summarizer).replace(GROQ_MAIN, provider["main"])
         if args.amortization_requests:
