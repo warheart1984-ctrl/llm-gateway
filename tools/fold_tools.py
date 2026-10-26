@@ -13,9 +13,13 @@ memory can call one again: every such call is counted, and a call for a path
 or filter already fetched is counted a refetch. A folded summary that keeps
 the verified tool ledger should answer from it instead of fetching again.
 
-Answers are scored by strict equality against the scripted gold values; a
-question counts against folding only where the result it depends on was folded
-away and the unfolded tenant answered correctly on the same call.
+Answers are scored two ways against the scripted gold values. Strict equality
+requires the same type and value. Lenient equality also accepts an integer
+given as its canonical decimal string, or embedded as the only number in a
+short sentence. Both accuracies are reported, with a count of answers that
+miss only on format. The exit status still uses the strict score. A question
+counts against folding only where the result it depends on was folded away
+and the unfolded tenant answered correctly, strictly, on the same call.
 
 Exit status: 0 no regression, 1 regression, 2 incomplete.
 """
@@ -29,6 +33,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import sys
 from typing import Any
 
@@ -202,6 +207,48 @@ def parse_answer(content: Any, finish_reason: str | None) -> tuple[Any, bool]:
         return None, False
 
 
+# A number token, including a decimal. Used to reject a sentence that names
+# more than one number, or a different one.
+_NUMBER = re.compile(r"-?\d+(?:\.\d+)?")
+# "fails at line 1043" and "39 tests in checkout/totals passed." are short.
+# A long reply that happens to contain the gold number is not an answer.
+_LENIENT_MAX_CHARS = 160
+_LENIENT_MAX_WORDS = 24
+
+
+def strict_match(value: Any, gold: Any) -> bool:
+    """Same Python type and value. `True` is not `1`."""
+    return type(value) is type(gold) and value == gold
+
+
+def lenient_match(value: Any, gold: Any) -> bool:
+    """Strict match, or an integer written as its canonical decimal string, or
+    as the only number in a short sentence.
+
+    "39" and "fails at line 1043" match. "12.81", "at line 39" for 1043,
+    "1043 and 887", and "10430" do not. Booleans and non-integer golds stay
+    strict: `bool` is a subclass of `int` and must not take this path.
+    """
+    if strict_match(value, gold):
+        return True
+    if isinstance(gold, bool) or not isinstance(gold, int) or isinstance(value, bool):
+        return False
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if text == str(gold):
+        return True
+    if len(text) > _LENIENT_MAX_CHARS or len(text.split()) > _LENIENT_MAX_WORDS:
+        return False
+    numbers = _NUMBER.findall(text)
+    if len(numbers) != 1 or "." in numbers[0]:
+        return False
+    token = numbers[0]
+    if token != str(int(token)):
+        return False
+    return int(token) == gold
+
+
 def emitted_calls(arm: dict[str, Any]) -> list[dict[str, str]]:
     """Tool calls the model emitted instead of answering, as (name, canonical args)."""
     message = (arm["payload"].get("choices") or [{}])[0].get("message") or {}
@@ -264,7 +311,8 @@ def run_agent(
                 calls = emitted_calls(arm)
                 return {
                     "answer": value,
-                    "correct": bool(ok and type(value) is type(gold) and value == gold),
+                    "correct": bool(ok and strict_match(value, gold)),
+                    "lenient_correct": bool(ok and lenient_match(value, gold)),
                     "tool_calls": calls,
                     "refetches": [c for c in calls if (c["name"], c["arguments"]) in FETCHED],
                 }
@@ -289,13 +337,15 @@ def run_agent(
                 "result_message_at": result_message_at,
                 "needs_tool": CALLS[result_index][1],
                 "eligible": eligible,
-                "plain": {"correct": plain_score["correct"], "answer": plain_score["answer"],
+                "plain": {"correct": plain_score["correct"], "lenient_correct": plain_score["lenient_correct"],
+                          "answer": plain_score["answer"],
                           "finish_reason": plain["finish_reason"],
                           "spend_delta_nano_usd": plain["spend_delta_nano_usd"],
                           "usage": plain["usage"], "retries": plain["retries"],
                           "tool_calls": plain_score["tool_calls"],
                           "refetches": plain_score["refetches"]},
-                "folded": {"correct": folded_score["correct"], "answer": folded_score["answer"],
+                "folded": {"correct": folded_score["correct"], "lenient_correct": folded_score["lenient_correct"],
+                           "answer": folded_score["answer"],
                            "finish_reason": folded["finish_reason"],
                            "spend_delta_nano_usd": folded["spend_delta_nano_usd"],
                            "usage": folded["usage"], "retries": folded["retries"],
@@ -343,8 +393,15 @@ def aggregates(rows: list[dict[str, Any]], profile_data: dict[str, Any],
                prices: dict[str, float | None], final_metrics: dict) -> dict[str, Any]:
     asked = [row for row in rows if row["result_message_at"] > 0]
     eligible = [row for row in asked if row["eligible"]]
-    def rate(arm: str) -> float | None:
-        return sum(row[arm]["correct"] for row in asked) / len(asked) if asked else None
+    def matched(row: dict[str, Any], arm: str, field: str) -> bool:
+        arm_row = row[arm]
+        if field == "lenient_correct" and field not in arm_row:
+            return bool(arm_row["correct"])
+        return bool(arm_row[field])
+    def rate(arm: str, field: str = "correct") -> float | None:
+        return sum(matched(row, arm, field) for row in asked) / len(asked) if asked else None
+    def format_only(arm: str) -> int:
+        return sum(not matched(row, arm, "correct") and matched(row, arm, "lenient_correct") for row in asked)
     def refetches(arm: str) -> int:
         return sum(len(row[arm]["refetches"]) for row in rows)
     def calls(arm: str) -> int:
@@ -355,9 +412,14 @@ def aggregates(rows: list[dict[str, Any]], profile_data: dict[str, Any],
     return {
         "questions_asked": len(asked),
         "accuracy": {"plain": rate("plain"), "folded": rate("folded")},
+        "accuracy_lenient": {"plain": rate("plain", "lenient_correct"), "folded": rate("folded", "lenient_correct")},
+        "format_only_misses": {"plain": format_only("plain"), "folded": format_only("folded")},
         "eligible_questions": len(eligible),
         "eligible_correct": sum(row["folded"]["correct"] for row in eligible),
         "eligible_wrong": sum(not row["folded"]["correct"] for row in eligible),
+        "eligible_format_only": sum(
+            not matched(row, "folded", "correct") and matched(row, "folded", "lenient_correct") for row in eligible
+        ),
         # Of those, the answers that called again the tool whose result the
         # question needs, rather than guessing: what the summary asks for when
         # a value is gone. Still counted wrong above; the harness serves no

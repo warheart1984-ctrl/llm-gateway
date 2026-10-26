@@ -30,6 +30,39 @@ class Scoring(unittest.TestCase):
         self.assertEqual(fto.parse_answer('{"answer": 1043', "stop"), (None, False))
         self.assertEqual(fto.parse_answer('{"answer": 1043}', "length"), (None, False))
 
+    def test_strict_match_keeps_types_apart(self) -> None:
+        self.assertTrue(fto.strict_match(39, 39))
+        self.assertTrue(fto.strict_match(1043, 1043))
+        self.assertFalse(fto.strict_match("39", 39))
+        self.assertFalse(fto.strict_match("1043", 1043))
+        self.assertFalse(fto.strict_match(True, 1))
+        self.assertFalse(fto.strict_match(1, True))
+
+    def test_lenient_match_accepts_a_numeric_string_and_a_short_sentence(self) -> None:
+        self.assertTrue(fto.lenient_match(39, 39))
+        self.assertTrue(fto.lenient_match("39", 39))
+        self.assertTrue(fto.lenient_match("1043", 1043))
+        self.assertTrue(fto.lenient_match("fails at line 1043", 1043))
+        self.assertTrue(fto.lenient_match("totals/rounds_partial_refund fails at line 1043", 1043))
+        self.assertTrue(fto.lenient_match("39 tests in checkout/totals passed.", 39))
+
+    def test_lenient_match_rejects_a_wrong_or_ambiguous_number(self) -> None:
+        self.assertFalse(fto.lenient_match("fails at line 12.81", 1043))
+        self.assertFalse(fto.lenient_match("at line 39", 1043))
+        self.assertFalse(fto.lenient_match("1043 and 887", 1043))
+        self.assertFalse(fto.lenient_match("1043 and 1043", 1043))
+        self.assertFalse(fto.lenient_match("10430", 1043))
+        self.assertFalse(fto.lenient_match("039", 39))
+        self.assertFalse(fto.lenient_match("the line is 01043", 1043))
+        long_sentence = " ".join(["note"] * 30) + " 1043"
+        self.assertGreater(len(long_sentence.split()), 24)
+        self.assertFalse(fto.lenient_match(long_sentence, 1043))
+        self.assertFalse(fto.lenient_match("true", True))
+        self.assertFalse(fto.lenient_match(1, True))
+        self.assertTrue(fto.strict_match("v2.14.7", "v2.14.7"))
+        self.assertTrue(fto.lenient_match("v2.14.7", "v2.14.7"))
+        self.assertFalse(fto.lenient_match("the tag is v2.14.7", "v2.14.7"))
+
     def test_emitted_calls(self) -> None:
         calls = [{"id": "x", "type": "function",
                   "function": {"name": "read_file", "arguments": '{"path":"deploy/notes.txt"}'}}]
@@ -106,7 +139,27 @@ class Aggregates(unittest.TestCase):
         self.assertEqual(agg["eligible_correct"], 1)
         self.assertEqual(agg["eligible_wrong"], 1)
         self.assertEqual(agg["accuracy"]["plain"], 2 / 3)
+        self.assertEqual(agg["accuracy_lenient"]["plain"], 2 / 3)
+        self.assertEqual(agg["format_only_misses"], {"plain": 0, "folded": 0})
+        self.assertEqual(agg["eligible_format_only"], 0)
         self.assertEqual(agg["total_spend_nano_usd"], {"plain": 300, "folded": 150})
+
+    def test_format_only_misses_are_counted_and_strict_still_fails(self) -> None:
+        strict_hit = self.row(True, True, True)
+        strict_hit["plain"]["lenient_correct"] = True
+        strict_hit["folded"]["lenient_correct"] = True
+        format_miss = self.row(True, False, True)
+        format_miss["plain"]["lenient_correct"] = True
+        format_miss["folded"]["lenient_correct"] = True
+        real_miss = self.row(True, False, True)
+        real_miss["plain"]["lenient_correct"] = True
+        real_miss["folded"]["lenient_correct"] = False
+        agg = fto.aggregates([strict_hit, format_miss, real_miss], {"max_folds": 4}, {}, {})
+        self.assertEqual(agg["accuracy"]["folded"], 1 / 3)
+        self.assertEqual(agg["accuracy_lenient"]["folded"], 2 / 3)
+        self.assertEqual(agg["format_only_misses"]["folded"], 1)
+        self.assertEqual(agg["eligible_wrong"], 2)
+        self.assertEqual(agg["eligible_format_only"], 1)
 
     def test_a_recall_of_the_needed_tool_is_counted_apart_from_a_guess(self) -> None:
         guessed = self.row(True, False, True)
