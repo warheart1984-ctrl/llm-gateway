@@ -1,0 +1,88 @@
+{
+  "schema": "folding.tools.v1",
+  "started_utc": "2026-10-26T14:21:26.837244+00:00",
+  "finished_utc": "2026-10-26T14:32:26.546565+00:00",
+  "settings": {
+    "model": "openrouter/gpt-4.1-mini",
+    "scenario": "tools",
+    "profile": "lifecycle",
+    "max_calls": 500,
+    "max_tokens": 512,
+    "temperature": 0,
+    "fold_cap": 5,
+    "secrets_written": false,
+    "git_commit": "f78896503d1aca2179f4600da087027c5b4f0596",
+    "prices": {
+      "main_input_per_mtok_usd": 0.4,
+      "main_output_per_mtok_usd": 1.6,
+      "main_cached_input_per_mtok_usd": 0.1,
+      "summarizer_input_per_mtok_usd": 0.4,
+      "summarizer_output_per_mtok_usd": 1.6
+    }
+  },
+  "calls": [
+    {
+      "call": 1,
+      "order": "plain-first",
+      "question": "What image tag is the checkout deploy running?",
+      "gold": "v2.14.7",
+      "result_message_at": 3,
+      "needs_tool": "read_file",
+      "eligible": false,
+      "plain": {
+        "correct": true,
+        "answer": "v2.14.7",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1894400,
+        "usage": {
+          "prompt_tokens": 2672,
+          "cached_tokens": 2176,
+          "completion_tokens": 12
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": "v2.14.7",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1894400,
+        "usage": {
+          "prompt_tokens": 2672,
+          "cached_tokens": 2176,
+          "completion_tokens": 12
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 0,
+        "request_id": "312b923e-72e7-42ce-9bd7-2b0ac601d1aa",
+        "fold_outcomes": {},
+        "failed_checks": {},
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 0,
+          "fold_count": 0,
+          "min_saving_nano_usd": 0,
+          "outcome": "not_due",
+          "overhead_nano_usd": 0,
+          "prefix_hash": "",
+          "prompt_tokens_cut": 0,
+          "reason": "no_head",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 0,
+          "turns_replaced": 0
+        }
+      }
+    }
+  ],
+  "fold_summaries": [],
+  "error": {
+    "type": "TransientError",
+    "message": "HTTP 502 from /v1/chat/completions"
+  }
+}
