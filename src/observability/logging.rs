@@ -147,19 +147,17 @@ const KEY_PREFIXES: &[&str] = &["sk-", "sk_", "nvapi-", "gsk_", "gwk_", "xai-", 
 /// UUID (36) stays readable, so vendor correlation ids survive.
 const OPAQUE_MIN: usize = 40;
 
-/// Vendor text made fit for a log line: anything shaped like a credential is
-/// replaced by `[redacted]` and the result is bounded to [`DETAIL_MAX`]
-/// characters. Upstream error bodies sometimes quote the key that was sent,
-/// and the logs must not become a second place keys live.
-///
-/// Heuristic by design: a token is a run of ASCII letters, digits, `-` and
-/// `_`; it is redacted when it starts with a known key prefix, follows the
-/// word `Bearer`, or is long and opaque.
-pub fn redact_secrets(text: &str) -> String {
+/// Byte spans of `text` that look like credentials, in order: a token with a
+/// known key prefix, the run of non-space characters after `Bearer`, or a
+/// long opaque token mixing letters and digits. Shared by
+/// [`redact_secrets`] and [`looks_key_like`] so a value checked one way is
+/// hidden the same way.
+fn secret_spans(text: &str) -> Vec<(usize, usize)> {
     let is_token_char = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
-    let mut out = String::with_capacity(text.len().min(DETAIL_MAX + 16));
+    let mut spans = Vec::new();
     let mut after_bearer = false;
     let mut rest = text;
+    let mut offset = 0usize;
     while let Some(c) = rest.chars().next() {
         // A bearer credential runs to the next delimiter, dots included, so a
         // JWT goes whole.
@@ -167,13 +165,14 @@ pub fn redact_secrets(text: &str) -> String {
             let end = rest
                 .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | '}' | ']'))
                 .unwrap_or(rest.len());
-            out.push_str("[redacted]");
+            spans.push((offset, offset + end));
             after_bearer = false;
+            offset += end;
             rest = &rest[end..];
             continue;
         }
         if !is_token_char(c) {
-            out.push(c);
+            offset += c.len_utf8();
             rest = &rest[c.len_utf8()..];
             continue;
         }
@@ -184,13 +183,39 @@ pub fn redact_secrets(text: &str) -> String {
             && token.chars().any(|c| c.is_ascii_alphabetic());
         let keyed = KEY_PREFIXES.iter().any(|p| token.len() > p.len() + 8 && token.starts_with(p));
         if keyed || opaque {
-            out.push_str("[redacted]");
-        } else {
-            out.push_str(token);
+            spans.push((offset, offset + end));
         }
         after_bearer = token.eq_ignore_ascii_case("bearer");
+        offset += end;
         rest = &rest[end..];
     }
+    spans
+}
+
+/// Whether `text` contains anything [`redact_secrets`] would hide: a key-like
+/// token by the same heuristic. The folding ledger refuses tool facts whose
+/// value looks like a credential.
+pub fn looks_key_like(text: &str) -> bool {
+    !secret_spans(text).is_empty()
+}
+
+/// Vendor text made fit for a log line: anything shaped like a credential is
+/// replaced by `[redacted]` and the result is bounded to [`DETAIL_MAX`]
+/// characters. Upstream error bodies sometimes quote the key that was sent,
+/// and the logs must not become a second place keys live.
+///
+/// Heuristic by design: a token is a run of ASCII letters, digits, `-` and
+/// `_`; it is redacted when it starts with a known key prefix, follows the
+/// word `Bearer`, or is long and opaque.
+pub fn redact_secrets(text: &str) -> String {
+    let mut out = String::with_capacity(text.len().min(DETAIL_MAX + 16));
+    let mut at = 0usize;
+    for (start, end) in secret_spans(text) {
+        out.push_str(&text[at..start]);
+        out.push_str("[redacted]");
+        at = end;
+    }
+    out.push_str(&text[at..]);
     crate::providers::truncate(&out, DETAIL_MAX)
 }
 

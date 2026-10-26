@@ -1,0 +1,3692 @@
+{
+  "schema": "folding.tools.v1",
+  "started_utc": "2026-10-26T08:17:41.978963+00:00",
+  "finished_utc": "2026-10-26T08:19:39.677595+00:00",
+  "settings": {
+    "model": "openrouter/gpt-4.1-mini",
+    "scenario": "tools",
+    "profile": "lifecycle",
+    "max_calls": 60,
+    "max_tokens": 512,
+    "temperature": 0,
+    "fold_cap": 5,
+    "secrets_written": false,
+    "git_commit": "76844832cfdbcbbeec488402d7fecc8a2abe9af7",
+    "prices": {
+      "main_input_per_mtok_usd": 0.4,
+      "main_output_per_mtok_usd": 1.6,
+      "main_cached_input_per_mtok_usd": 0.1,
+      "summarizer_input_per_mtok_usd": 0.4,
+      "summarizer_output_per_mtok_usd": 1.6
+    }
+  },
+  "calls": [
+    {
+      "call": 1,
+      "order": "plain-first",
+      "question": "What image tag is the checkout deploy running?",
+      "gold": "v2.14.7",
+      "result_message_at": 3,
+      "eligible": false,
+      "plain": {
+        "correct": true,
+        "answer": "v2.14.7",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1894400,
+        "usage": {
+          "prompt_tokens": 2672,
+          "cached_tokens": 2176,
+          "completion_tokens": 12
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": "v2.14.7",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1088000,
+        "usage": {
+          "prompt_tokens": 2672,
+          "cached_tokens": 2176,
+          "completion_tokens": 12
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 0,
+        "request_id": "6442f256-4219-4a58-8c50-a0df82d9d858",
+        "fold_outcomes": {},
+        "failed_checks": {},
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 0,
+          "fold_count": 0,
+          "min_saving_nano_usd": 0,
+          "outcome": "not_due",
+          "overhead_nano_usd": 0,
+          "prefix_hash": "",
+          "prompt_tokens_cut": 0,
+          "reason": "no_head",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 0,
+          "turns_replaced": 0
+        }
+      }
+    },
+    {
+      "call": 2,
+      "order": "folded-first",
+      "question": "At which line does totals/rounds_partial_refund fail?",
+      "gold": 1043,
+      "result_message_at": 5,
+      "eligible": false,
+      "plain": {
+        "correct": true,
+        "answer": 1043,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2094400,
+        "usage": {
+          "prompt_tokens": 3172,
+          "cached_tokens": 2816,
+          "completion_tokens": 8
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 1043,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2094400,
+        "usage": {
+          "prompt_tokens": 3172,
+          "cached_tokens": 2816,
+          "completion_tokens": 8
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 0,
+        "request_id": "af591e5f-0573-45b3-b32f-fc4b1e9aea36",
+        "fold_outcomes": {
+          "unprofitable": 1
+        },
+        "failed_checks": {},
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 0,
+          "fold_count": 0,
+          "min_saving_nano_usd": 0,
+          "outcome": "refused",
+          "overhead_nano_usd": 3284800,
+          "prefix_hash": "",
+          "prompt_tokens_cut": 0,
+          "reason": "cost_check",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 0,
+          "turns_replaced": 0
+        }
+      }
+    },
+    {
+      "call": 3,
+      "order": "plain-first",
+      "question": "Why could the error log not be read?",
+      "gold": "log stream unavailable",
+      "result_message_at": 0,
+      "eligible": false,
+      "plain": {
+        "correct": false,
+        "answer": null,
+        "finish_reason": "tool_calls",
+        "spend_delta_nano_usd": 1320800,
+        "usage": {
+          "prompt_tokens": 3226,
+          "cached_tokens": 2816,
+          "completion_tokens": 19
+        },
+        "retries": 0,
+        "tool_calls": [
+          {
+            "name": "query_logs",
+            "arguments": "{\"filter\": \"error\", \"service\": \"checkout\"}"
+          }
+        ],
+        "refetches": [
+          {
+            "name": "query_logs",
+            "arguments": "{\"filter\": \"error\", \"service\": \"checkout\"}"
+          }
+        ]
+      },
+      "folded": {
+        "correct": false,
+        "answer": null,
+        "finish_reason": "tool_calls",
+        "spend_delta_nano_usd": 2116000,
+        "usage": {
+          "prompt_tokens": 3226,
+          "cached_tokens": 2816,
+          "completion_tokens": 19
+        },
+        "retries": 0,
+        "tool_calls": [
+          {
+            "name": "query_logs",
+            "arguments": "{\"filter\": \"error\", \"service\": \"checkout\"}"
+          }
+        ],
+        "refetches": [
+          {
+            "name": "query_logs",
+            "arguments": "{\"filter\": \"error\", \"service\": \"checkout\"}"
+          }
+        ],
+        "folded_turns": 0,
+        "request_id": "6d5cf070-5fca-4699-a271-9b529d56879b",
+        "fold_outcomes": {
+          "unprofitable": 1
+        },
+        "failed_checks": {},
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 3472000,
+          "fold_count": 0,
+          "min_saving_nano_usd": 0,
+          "outcome": "refused",
+          "overhead_nano_usd": 4296400,
+          "prefix_hash": "",
+          "prompt_tokens_cut": 2170,
+          "reason": "cost_check",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 0,
+          "turns_replaced": 0
+        }
+      }
+    },
+    {
+      "call": 4,
+      "order": "folded-first",
+      "question": "What was the p99 latency for checkout over 24h?",
+      "gold": 1307,
+      "result_message_at": 0,
+      "eligible": false,
+      "plain": {
+        "correct": false,
+        "answer": null,
+        "finish_reason": "tool_calls",
+        "spend_delta_nano_usd": 1350400,
+        "usage": {
+          "prompt_tokens": 3288,
+          "cached_tokens": 2944,
+          "completion_tokens": 22
+        },
+        "retries": 0,
+        "tool_calls": [
+          {
+            "name": "query_logs",
+            "arguments": "{\"filter\": \"latency_p99\", \"service\": \"checkout\"}"
+          }
+        ],
+        "refetches": []
+      },
+      "folded": {
+        "correct": false,
+        "answer": null,
+        "finish_reason": "tool_calls",
+        "spend_delta_nano_usd": 2140800,
+        "usage": {
+          "prompt_tokens": 3288,
+          "cached_tokens": 2816,
+          "completion_tokens": 24
+        },
+        "retries": 0,
+        "tool_calls": [
+          {
+            "name": "query_logs",
+            "arguments": "{\"filter\": \"checkout | latency | p99\", \"service\": \"checkout\"}"
+          }
+        ],
+        "refetches": [],
+        "folded_turns": 0,
+        "request_id": "1364dc6d-bff2-412a-a0bb-508173fac95a",
+        "fold_outcomes": {
+          "unprofitable": 1
+        },
+        "failed_checks": {},
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 3472000,
+          "fold_count": 0,
+          "min_saving_nano_usd": 0,
+          "outcome": "refused",
+          "overhead_nano_usd": 4296400,
+          "prefix_hash": "",
+          "prompt_tokens_cut": 2170,
+          "reason": "cost_check",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 0,
+          "turns_replaced": 0
+        }
+      }
+    },
+    {
+      "call": 5,
+      "order": "plain-first",
+      "question": "How many cases in checkout/totals passed?",
+      "gold": 39,
+      "result_message_at": 5,
+      "eligible": false,
+      "plain": {
+        "correct": true,
+        "answer": 39,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2164000,
+        "usage": {
+          "prompt_tokens": 3346,
+          "cached_tokens": 2944,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 39,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2164000,
+        "usage": {
+          "prompt_tokens": 3346,
+          "cached_tokens": 2944,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 0,
+        "request_id": "b642c044-f9c9-440b-91fe-479bddacb2fb",
+        "fold_outcomes": {
+          "unprofitable": 1
+        },
+        "failed_checks": {},
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 4268800,
+          "fold_count": 0,
+          "min_saving_nano_usd": 0,
+          "outcome": "refused",
+          "overhead_nano_usd": 4495200,
+          "prefix_hash": "",
+          "prompt_tokens_cut": 2668,
+          "reason": "cost_check",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 0,
+          "turns_replaced": 0
+        }
+      }
+    },
+    {
+      "call": 6,
+      "order": "folded-first",
+      "question": "How many replicas does the deploy declare?",
+      "gold": 3,
+      "result_message_at": 3,
+      "eligible": false,
+      "plain": {
+        "correct": true,
+        "answer": 3,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1373200,
+        "usage": {
+          "prompt_tokens": 3405,
+          "cached_tokens": 2944,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 3,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2187600,
+        "usage": {
+          "prompt_tokens": 3405,
+          "cached_tokens": 2816,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 0,
+        "request_id": "8a4e7d60-d753-44ba-8656-1758a2a0449e",
+        "fold_outcomes": {
+          "unprofitable": 1
+        },
+        "failed_checks": {},
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 4363200,
+          "fold_count": 0,
+          "min_saving_nano_usd": 0,
+          "outcome": "refused",
+          "overhead_nano_usd": 4519200,
+          "prefix_hash": "",
+          "prompt_tokens_cut": 2727,
+          "reason": "cost_check",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 0,
+          "turns_replaced": 0
+        }
+      }
+    },
+    {
+      "call": 7,
+      "order": "plain-first",
+      "question": "What image tag is the checkout deploy running?",
+      "gold": "v2.14.7",
+      "result_message_at": 3,
+      "eligible": false,
+      "plain": {
+        "correct": true,
+        "answer": "v2.14.7",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2212000,
+        "usage": {
+          "prompt_tokens": 3466,
+          "cached_tokens": 3072,
+          "completion_tokens": 12
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": "v2.14.7",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2212000,
+        "usage": {
+          "prompt_tokens": 3466,
+          "cached_tokens": 2944,
+          "completion_tokens": 12
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 0,
+        "request_id": "e6c102a9-fc39-4be4-9031-8e66bd343426",
+        "fold_outcomes": {
+          "unprofitable": 1
+        },
+        "failed_checks": {},
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 4459200,
+          "fold_count": 0,
+          "min_saving_nano_usd": 0,
+          "outcome": "refused",
+          "overhead_nano_usd": 4542800,
+          "prefix_hash": "",
+          "prompt_tokens_cut": 2787,
+          "reason": "cost_check",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 0,
+          "turns_replaced": 0
+        }
+      }
+    },
+    {
+      "call": 8,
+      "order": "folded-first",
+      "question": "At which line does totals/rounds_partial_refund fail?",
+      "gold": 1043,
+      "result_message_at": 5,
+      "eligible": false,
+      "plain": {
+        "correct": true,
+        "answer": 1043,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2236400,
+        "usage": {
+          "prompt_tokens": 3527,
+          "cached_tokens": 3072,
+          "completion_tokens": 8
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 1043,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2236400,
+        "usage": {
+          "prompt_tokens": 3527,
+          "cached_tokens": 2944,
+          "completion_tokens": 8
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 0,
+        "request_id": "5b8876bc-2ba2-407f-980e-3da88b86ea85",
+        "fold_outcomes": {
+          "unprofitable": 1
+        },
+        "failed_checks": {},
+        "fold_count": 0,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 4553600,
+          "fold_count": 0,
+          "min_saving_nano_usd": 0,
+          "outcome": "refused",
+          "overhead_nano_usd": 4566400,
+          "prefix_hash": "",
+          "prompt_tokens_cut": 2846,
+          "reason": "cost_check",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 0,
+          "turns_replaced": 0
+        }
+      }
+    },
+    {
+      "call": 9,
+      "order": "plain-first",
+      "question": "Why could the error log not be read?",
+      "gold": "log stream unavailable",
+      "result_message_at": 13,
+      "eligible": false,
+      "plain": {
+        "correct": false,
+        "answer": "The error log could not be read because the log backend is down, resulting in a 'log stream unavailable' error with status 502 on attempts to access the logs.",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2266400,
+        "usage": {
+          "prompt_tokens": 3602,
+          "cached_tokens": 3200,
+          "completion_tokens": 40
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": false,
+        "answer": "The error log could not be read because the log backend is down, resulting in a 502 status error when attempting to access the log stream for the checkout service.",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 3910800,
+        "usage": {
+          "prompt_tokens": 699,
+          "cached_tokens": 0,
+          "completion_tokens": 39
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "0d6b9b99-6265-4e0d-b18e-9f9f0288afb0",
+        "fold_outcomes": {
+          "committed": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 5019,
+        "summarizer_completion_tokens": 514,
+        "fold_decision": {
+          "benefit_nano_usd": 4742400,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "applied",
+          "overhead_nano_usd": 4613600,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "batch_ready",
+          "summarizer_completion_tokens": 514,
+          "summarizer_prompt_tokens": 5019,
+          "turns_covered": 10,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 10,
+      "order": "folded-first",
+      "question": "What was the p99 latency for checkout over 24h?",
+      "gold": 1307,
+      "result_message_at": 0,
+      "eligible": false,
+      "plain": {
+        "correct": false,
+        "answer": null,
+        "finish_reason": "tool_calls",
+        "spend_delta_nano_usd": 2291200,
+        "usage": {
+          "prompt_tokens": 3664,
+          "cached_tokens": 3072,
+          "completion_tokens": 20
+        },
+        "retries": 0,
+        "tool_calls": [
+          {
+            "name": "query_logs",
+            "arguments": "{\"filter\": \"latency\", \"service\": \"checkout\"}"
+          }
+        ],
+        "refetches": []
+      },
+      "folded": {
+        "correct": false,
+        "answer": null,
+        "finish_reason": "tool_calls",
+        "spend_delta_nano_usd": 332000,
+        "usage": {
+          "prompt_tokens": 742,
+          "cached_tokens": 0,
+          "completion_tokens": 22
+        },
+        "retries": 0,
+        "tool_calls": [
+          {
+            "name": "query_logs",
+            "arguments": "{\"filter\": \"latency p99\", \"service\": \"checkout\"}"
+          }
+        ],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "59bf9892-be78-4d20-b759-8308df61b00c",
+        "fold_outcomes": {
+          "unprofitable": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 94400,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "refused",
+          "overhead_nano_usd": 3439200,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "cost_check",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 10,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 11,
+      "order": "plain-first",
+      "question": "How many cases in checkout/totals passed?",
+      "gold": 39,
+      "result_message_at": 5,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": 39,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1500000,
+        "usage": {
+          "prompt_tokens": 3722,
+          "cached_tokens": 3200,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 39,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 322400,
+        "usage": {
+          "prompt_tokens": 778,
+          "cached_tokens": 0,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "2ef7e35a-4fb6-4dac-adce-37e896dc3d77",
+        "fold_outcomes": {
+          "unprofitable": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 96000,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "refused",
+          "overhead_nano_usd": 3439200,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "cost_check",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 10,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 12,
+      "order": "folded-first",
+      "question": "How many replicas does the deploy declare?",
+      "gold": 3,
+      "result_message_at": 3,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": 3,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2338000,
+        "usage": {
+          "prompt_tokens": 3781,
+          "cached_tokens": 3200,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 3,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 338000,
+        "usage": {
+          "prompt_tokens": 817,
+          "cached_tokens": 0,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "d4d936c7-52c6-4b0c-babd-14aa6ebafe5c",
+        "fold_outcomes": {
+          "unprofitable": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 222400,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "refused",
+          "overhead_nano_usd": 3471200,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "cost_check",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 10,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 13,
+      "order": "plain-first",
+      "question": "What image tag is the checkout deploy running?",
+      "gold": "v2.14.7",
+      "result_message_at": 3,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": "v2.14.7",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2362000,
+        "usage": {
+          "prompt_tokens": 3841,
+          "cached_tokens": 3328,
+          "completion_tokens": 12
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": "v2.14.7",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 370000,
+        "usage": {
+          "prompt_tokens": 877,
+          "cached_tokens": 0,
+          "completion_tokens": 12
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "bcca8a0f-36ad-4bcd-b0bf-41089401725b",
+        "fold_outcomes": {
+          "unprofitable": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 316800,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "refused",
+          "overhead_nano_usd": 3494800,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "cost_check",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 10,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 14,
+      "order": "folded-first",
+      "question": "At which line does totals/rounds_partial_refund fail?",
+      "gold": 1043,
+      "result_message_at": 5,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": 1043,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2386400,
+        "usage": {
+          "prompt_tokens": 3902,
+          "cached_tokens": 3328,
+          "completion_tokens": 8
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": false,
+        "answer": null,
+        "finish_reason": "tool_calls",
+        "spend_delta_nano_usd": 1200800,
+        "usage": {
+          "prompt_tokens": 938,
+          "cached_tokens": 0,
+          "completion_tokens": 28
+        },
+        "retries": 0,
+        "tool_calls": [
+          {
+            "name": "read_file",
+            "arguments": "{\"path\": \"tests/checkout/totals/rounds_partial_refund.test.js\"}"
+          }
+        ],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "3bd13c56-941f-4d2e-8f74-c8e31c1e5cb4",
+        "fold_outcomes": {
+          "unprofitable": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 411200,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "refused",
+          "overhead_nano_usd": 3518400,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "cost_check",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 10,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 15,
+      "order": "plain-first",
+      "question": "Why could the error log not be read?",
+      "gold": "log stream unavailable",
+      "result_message_at": 13,
+      "eligible": false,
+      "plain": {
+        "correct": false,
+        "answer": "The error log for the checkout service could not be read because the log backend was down, resulting in a 502 status error when attempting to access the log stream.",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2408400,
+        "usage": {
+          "prompt_tokens": 3957,
+          "cached_tokens": 3328,
+          "completion_tokens": 39
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": false,
+        "answer": "The error log could not be read because the log backend was down, resulting in a 502 status error when attempting to access the log stream for the checkout service.",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1222800,
+        "usage": {
+          "prompt_tokens": 993,
+          "cached_tokens": 0,
+          "completion_tokens": 39
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "02856456-7834-4950-8254-7d9b14860f36",
+        "fold_outcomes": {
+          "unprofitable": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 507200,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "refused",
+          "overhead_nano_usd": 3542000,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "cost_check",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 10,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 16,
+      "order": "folded-first",
+      "question": "What was the p99 latency for checkout over 24h?",
+      "gold": 1307,
+      "result_message_at": 0,
+      "eligible": false,
+      "plain": {
+        "correct": false,
+        "answer": null,
+        "finish_reason": "tool_calls",
+        "spend_delta_nano_usd": 1642800,
+        "usage": {
+          "prompt_tokens": 4019,
+          "cached_tokens": 3456,
+          "completion_tokens": 22
+        },
+        "retries": 0,
+        "tool_calls": [
+          {
+            "name": "query_logs",
+            "arguments": "{\"filter\": \"latency p99\", \"service\": \"checkout\"}"
+          }
+        ],
+        "refetches": []
+      },
+      "folded": {
+        "correct": false,
+        "answer": null,
+        "finish_reason": "tool_calls",
+        "spend_delta_nano_usd": 1247600,
+        "usage": {
+          "prompt_tokens": 1055,
+          "cached_tokens": 0,
+          "completion_tokens": 22
+        },
+        "retries": 0,
+        "tool_calls": [
+          {
+            "name": "query_logs",
+            "arguments": "{\"filter\": \"latency p99\", \"service\": \"checkout\"}"
+          }
+        ],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "85d1f11e-40ba-4d8e-a219-bd2876d6e6ba",
+        "fold_outcomes": {
+          "unprofitable": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 601600,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "refused",
+          "overhead_nano_usd": 3565600,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "cost_check",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 10,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 17,
+      "order": "plain-first",
+      "question": "How many cases in checkout/totals passed?",
+      "gold": 39,
+      "result_message_at": 5,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": 39,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 3350800,
+        "usage": {
+          "prompt_tokens": 6313,
+          "cached_tokens": 5888,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 39,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2165200,
+        "usage": {
+          "prompt_tokens": 3570,
+          "cached_tokens": 0,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "de03529c-38b9-4cfe-a4eb-68e576583d04",
+        "fold_outcomes": {
+          "unprofitable": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 790400,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "refused",
+          "overhead_nano_usd": 3612800,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "cost_check",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 10,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 18,
+      "order": "folded-first",
+      "question": "How many replicas does the deploy declare?",
+      "gold": 3,
+      "result_message_at": 3,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": 3,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2560400,
+        "usage": {
+          "prompt_tokens": 6373,
+          "cached_tokens": 6016,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 3,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1454000,
+        "usage": {
+          "prompt_tokens": 3607,
+          "cached_tokens": 3456,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "edd7b9a1-627e-422e-95bb-2f7151feecea",
+        "fold_outcomes": {
+          "unprofitable": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 884800,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "refused",
+          "overhead_nano_usd": 3636800,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "cost_check",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 10,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 19,
+      "order": "plain-first",
+      "question": "What image tag is the checkout deploy running?",
+      "gold": "v2.14.7",
+      "result_message_at": 3,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": "v2.14.7",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 3398800,
+        "usage": {
+          "prompt_tokens": 6433,
+          "cached_tokens": 6144,
+          "completion_tokens": 12
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": "v2.14.7",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2213200,
+        "usage": {
+          "prompt_tokens": 3647,
+          "cached_tokens": 3456,
+          "completion_tokens": 12
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "9d01013d-d49b-419b-b44e-24acf1a63767",
+        "fold_outcomes": {
+          "unprofitable": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 884800,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "refused",
+          "overhead_nano_usd": 3636800,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "cost_check",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 10,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 20,
+      "order": "folded-first",
+      "question": "At which line does totals/rounds_partial_refund fail?",
+      "gold": 1043,
+      "result_message_at": 5,
+      "eligible": false,
+      "plain": {
+        "correct": true,
+        "answer": 1043,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2610400,
+        "usage": {
+          "prompt_tokens": 6494,
+          "cached_tokens": 6144,
+          "completion_tokens": 8
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 1043,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 9632800,
+        "usage": {
+          "prompt_tokens": 6494,
+          "cached_tokens": 6016,
+          "completion_tokens": 8
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 0,
+        "request_id": "83cbd83f-0231-4862-96b5-8fbab1722176",
+        "fold_outcomes": {
+          "rejected": 1
+        },
+        "failed_checks": {
+          "pinned_facts_present": 2
+        },
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 12884,
+        "summarizer_completion_tokens": 660,
+        "fold_decision": {
+          "benefit_nano_usd": 4558400,
+          "corrected_checks": {
+            "pinned_facts_present": 3
+          },
+          "failed_checks": {
+            "pinned_facts_present": 1
+          },
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "refused",
+          "overhead_nano_usd": 4555200,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2849,
+          "reason": "checks_failed",
+          "summarizer_completion_tokens": 660,
+          "summarizer_prompt_tokens": 12884,
+          "turns_covered": 22,
+          "turns_replaced": 0
+        }
+      }
+    },
+    {
+      "call": 21,
+      "order": "plain-first",
+      "question": "Why could the error log not be read?",
+      "gold": "log stream unavailable",
+      "result_message_at": 13,
+      "eligible": false,
+      "plain": {
+        "correct": false,
+        "answer": "The error log could not be read because the log backend was down, resulting in a 'log stream unavailable' error with status 502 returned during attempts to access the logs.",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 3444800,
+        "usage": {
+          "prompt_tokens": 6548,
+          "cached_tokens": 6144,
+          "completion_tokens": 41
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": false,
+        "answer": "The error log could not be read because the log backend was down, resulting in a 502 status error when attempting to access the log stream for the checkout service.",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2259200,
+        "usage": {
+          "prompt_tokens": 3725,
+          "cached_tokens": 3584,
+          "completion_tokens": 39
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "f325dea2-9f73-4510-bfca-4df4f3849319",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 4652800,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4578800,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 23,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 22,
+      "order": "folded-first",
+      "question": "What was the p99 latency for checkout over 24h?",
+      "gold": 1307,
+      "result_message_at": 22,
+      "eligible": false,
+      "plain": {
+        "correct": true,
+        "answer": 1307,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 3470000,
+        "usage": {
+          "prompt_tokens": 6611,
+          "cached_tokens": 6272,
+          "completion_tokens": 8
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 1307,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1520000,
+        "usage": {
+          "prompt_tokens": 3768,
+          "cached_tokens": 3584,
+          "completion_tokens": 8
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "4bc5bed5-a2a0-487e-94d4-621e845e1ebb",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 4748800,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4602400,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 24,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 23,
+      "order": "plain-first",
+      "question": "How many cases in checkout/totals passed?",
+      "gold": 39,
+      "result_message_at": 5,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": 39,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2678400,
+        "usage": {
+          "prompt_tokens": 6668,
+          "cached_tokens": 5888,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 39,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1532800,
+        "usage": {
+          "prompt_tokens": 3804,
+          "cached_tokens": 3712,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "c7e7a3bd-fddf-4a39-865e-eec270af75e2",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 4841600,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4626000,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 25,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 24,
+      "order": "folded-first",
+      "question": "How many replicas does the deploy declare?",
+      "gold": 3,
+      "result_message_at": 3,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": 3,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 3516800,
+        "usage": {
+          "prompt_tokens": 6728,
+          "cached_tokens": 6144,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 3,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2331200,
+        "usage": {
+          "prompt_tokens": 3841,
+          "cached_tokens": 3712,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "e0fcb195-534c-41fb-9049-5537ad8dc3c3",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 4937600,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4649600,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 26,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 25,
+      "order": "plain-first",
+      "question": "What image tag is the checkout deploy running?",
+      "gold": "v2.14.7",
+      "result_message_at": 3,
+      "eligible": false,
+      "plain": {
+        "correct": false,
+        "answer": "The checkout deploy is running image tag v2.14.7.",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 3542000,
+        "usage": {
+          "prompt_tokens": 6791,
+          "cached_tokens": 6272,
+          "completion_tokens": 20
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": false,
+        "answer": "The checkout deploy is running image tag v2.14.7.",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1596400,
+        "usage": {
+          "prompt_tokens": 3911,
+          "cached_tokens": 3712,
+          "completion_tokens": 20
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "d3b2cb6b-a90e-441f-afad-bf52a44d4271",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5126400,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4696800,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 28,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 26,
+      "order": "folded-first",
+      "question": "At which line does totals/rounds_partial_refund fail?",
+      "gold": 1043,
+      "result_message_at": 5,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": 1043,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 3566400,
+        "usage": {
+          "prompt_tokens": 6852,
+          "cached_tokens": 6400,
+          "completion_tokens": 8
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": false,
+        "answer": "The test totals/rounds_partial_refund fails with a got value of 12.81 instead of the expected 12.80.",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2380800,
+        "usage": {
+          "prompt_tokens": 3954,
+          "cached_tokens": 3840,
+          "completion_tokens": 34
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "9be4468a-09c4-4399-9605-8f4168d4cca5",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5220800,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4720800,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 29,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 27,
+      "order": "plain-first",
+      "question": "Why could the error log not be read?",
+      "gold": "log stream unavailable",
+      "result_message_at": 13,
+      "eligible": false,
+      "plain": {
+        "correct": false,
+        "answer": "The error log for the checkout service could not be read because the log backend was down, returning a 502 status code when attempting to access the log stream.",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 3588000,
+        "usage": {
+          "prompt_tokens": 6906,
+          "cached_tokens": 6400,
+          "completion_tokens": 38
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": false,
+        "answer": "The error log could not be read because the log backend was down, returning a 502 status error when attempting to access the checkout service logs in the last 15 minutes.",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2402400,
+        "usage": {
+          "prompt_tokens": 3989,
+          "cached_tokens": 0,
+          "completion_tokens": 41
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "5490283f-d6ea-42de-8138-5e9df5d2bea1",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5220800,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4720800,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 29,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 28,
+      "order": "folded-first",
+      "question": "What was the p99 latency for checkout over 24h?",
+      "gold": 1307,
+      "result_message_at": 22,
+      "eligible": false,
+      "plain": {
+        "correct": true,
+        "answer": 1307,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 3613200,
+        "usage": {
+          "prompt_tokens": 6969,
+          "cached_tokens": 6528,
+          "completion_tokens": 8
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 1307,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 10450000,
+        "usage": {
+          "prompt_tokens": 6969,
+          "cached_tokens": 5888,
+          "completion_tokens": 8
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 0,
+        "request_id": "a12ce2a9-ecf9-498b-81bc-e315d96cad24",
+        "fold_outcomes": {
+          "rejected": 1
+        },
+        "failed_checks": {
+          "ledger_evidence": 2
+        },
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 14136,
+        "summarizer_completion_tokens": 1247,
+        "fold_decision": {
+          "benefit_nano_usd": 5321600,
+          "corrected_checks": {
+            "ledger_evidence": 8
+          },
+          "failed_checks": {
+            "ledger_evidence": 1
+          },
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "refused",
+          "overhead_nano_usd": 4745600,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 3326,
+          "reason": "checks_failed",
+          "summarizer_completion_tokens": 1247,
+          "summarizer_prompt_tokens": 14136,
+          "turns_covered": 31,
+          "turns_replaced": 0
+        }
+      }
+    },
+    {
+      "call": 29,
+      "order": "plain-first",
+      "question": "How many cases in checkout/totals passed?",
+      "gold": 39,
+      "result_message_at": 5,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": 39,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 3612400,
+        "usage": {
+          "prompt_tokens": 6967,
+          "cached_tokens": 6528,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 39,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2426800,
+        "usage": {
+          "prompt_tokens": 4029,
+          "cached_tokens": 3840,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "1c286ab5-3cbc-4bbb-9331-c22809ae4f30",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5320000,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4745600,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 31,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 30,
+      "order": "folded-first",
+      "question": "How many replicas does the deploy declare?",
+      "gold": 3,
+      "result_message_at": 3,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": 3,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2798000,
+        "usage": {
+          "prompt_tokens": 6967,
+          "cached_tokens": 6528,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 3,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1622000,
+        "usage": {
+          "prompt_tokens": 4027,
+          "cached_tokens": 3968,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "19d4b7a4-c528-4ed2-8d38-bf0d0ab3f743",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5320000,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4745600,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 31,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 31,
+      "order": "plain-first",
+      "question": "What image tag is the checkout deploy running?",
+      "gold": "v2.14.7",
+      "result_message_at": 3,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": "v2.14.7",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 3612800,
+        "usage": {
+          "prompt_tokens": 6968,
+          "cached_tokens": 6528,
+          "completion_tokens": 12
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": "v2.14.7",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2427200,
+        "usage": {
+          "prompt_tokens": 4028,
+          "cached_tokens": 0,
+          "completion_tokens": 12
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "ee755094-4c76-4551-9241-1d222ba96ee5",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5320000,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4745600,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 31,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 32,
+      "order": "folded-first",
+      "question": "At which line does totals/rounds_partial_refund fail?",
+      "gold": 1043,
+      "result_message_at": 5,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": 1043,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2824800,
+        "usage": {
+          "prompt_tokens": 7030,
+          "cached_tokens": 6272,
+          "completion_tokens": 8
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": false,
+        "answer": "The test totals/rounds_partial_refund fails at line 12.81 (got value) instead of the expected 12.80.",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2452000,
+        "usage": {
+          "prompt_tokens": 4071,
+          "cached_tokens": 3968,
+          "completion_tokens": 35
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "87feac7b-be8d-4a44-9a81-bde670c6ea9c",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5416000,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4769200,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 32,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 33,
+      "order": "plain-first",
+      "question": "Why could the error log not be read?",
+      "gold": "log stream unavailable",
+      "result_message_at": 13,
+      "eligible": false,
+      "plain": {
+        "correct": false,
+        "answer": "The error log could not be read because the log backend was down, returning a 502 status code when attempting to access the log stream for the checkout service.",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2870800,
+        "usage": {
+          "prompt_tokens": 7025,
+          "cached_tokens": 6400,
+          "completion_tokens": 38
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": false,
+        "answer": "The error log could not be read because the log backend was down, returning a 502 status error when attempting to access the checkout service logs in the last 15 minutes.",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1692400,
+        "usage": {
+          "prompt_tokens": 4067,
+          "cached_tokens": 0,
+          "completion_tokens": 41
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "e21be74b-3020-424e-aa97-750ca60b88e6",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5416000,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4769200,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 32,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 34,
+      "order": "folded-first",
+      "question": "What was the p99 latency for checkout over 24h?",
+      "gold": 1307,
+      "result_message_at": 22,
+      "eligible": false,
+      "plain": {
+        "correct": true,
+        "answer": 1307,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 3636800,
+        "usage": {
+          "prompt_tokens": 7028,
+          "cached_tokens": 6528,
+          "completion_tokens": 8
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 1307,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1641200,
+        "usage": {
+          "prompt_tokens": 4071,
+          "cached_tokens": 3968,
+          "completion_tokens": 8
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "0637c688-b66f-41ee-877b-f772d16a68dd",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5416000,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4769200,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 32,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 35,
+      "order": "plain-first",
+      "question": "How many cases in checkout/totals passed?",
+      "gold": 39,
+      "result_message_at": 5,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": 39,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 3636000,
+        "usage": {
+          "prompt_tokens": 7026,
+          "cached_tokens": 6528,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 39,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2450400,
+        "usage": {
+          "prompt_tokens": 4068,
+          "cached_tokens": 3968,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "6f0b4301-6775-43eb-b8b4-2f2263186d17",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5414400,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4769200,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 32,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 36,
+      "order": "folded-first",
+      "question": "How many replicas does the deploy declare?",
+      "gold": 3,
+      "result_message_at": 3,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": 3,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2845600,
+        "usage": {
+          "prompt_tokens": 7086,
+          "cached_tokens": 6528,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 3,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1660000,
+        "usage": {
+          "prompt_tokens": 4122,
+          "cached_tokens": 3968,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "cdda1a0c-e940-45e6-b575-3c02c132ffc3",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5510400,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4792800,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 33,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 37,
+      "order": "plain-first",
+      "question": "What image tag is the checkout deploy running?",
+      "gold": "v2.14.7",
+      "result_message_at": 3,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": "v2.14.7",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2854000,
+        "usage": {
+          "prompt_tokens": 7087,
+          "cached_tokens": 6528,
+          "completion_tokens": 12
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": "v2.14.7",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2474800,
+        "usage": {
+          "prompt_tokens": 4123,
+          "cached_tokens": 3968,
+          "completion_tokens": 12
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "daccb8f3-12fd-459b-bebf-5cacfc35cff2",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5510400,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4792800,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 33,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 38,
+      "order": "folded-first",
+      "question": "At which line does totals/rounds_partial_refund fail?",
+      "gold": 1043,
+      "result_message_at": 5,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": 1043,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2848400,
+        "usage": {
+          "prompt_tokens": 7089,
+          "cached_tokens": 6528,
+          "completion_tokens": 8
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": false,
+        "answer": "The test totals/rounds_partial_refund fails at the line where the value got is 12.81 instead of the expected 12.80.",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2475600,
+        "usage": {
+          "prompt_tokens": 4125,
+          "cached_tokens": 3968,
+          "completion_tokens": 37
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "8720a150-2593-448c-a70f-59efe6e5569a",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5510400,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4792800,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 33,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 39,
+      "order": "plain-first",
+      "question": "Why could the error log not be read?",
+      "gold": "log stream unavailable",
+      "result_message_at": 13,
+      "eligible": false,
+      "plain": {
+        "correct": false,
+        "answer": "The error log for the checkout service could not be read because the log backend was down, returning a 502 status code when attempting to access the log stream.",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2894400,
+        "usage": {
+          "prompt_tokens": 7084,
+          "cached_tokens": 6528,
+          "completion_tokens": 38
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": false,
+        "answer": "The error log could not be read because the log backend was down, resulting in a 502 status error when attempting to access the log stream for the checkout service.",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1710400,
+        "usage": {
+          "prompt_tokens": 4120,
+          "cached_tokens": 3968,
+          "completion_tokens": 39
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "be416d16-2ef0-485c-ac65-59987f3527de",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5510400,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4792800,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 33,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 40,
+      "order": "folded-first",
+      "question": "What was the p99 latency for checkout over 24h?",
+      "gold": 1307,
+      "result_message_at": 22,
+      "eligible": false,
+      "plain": {
+        "correct": true,
+        "answer": 1307,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 3684000,
+        "usage": {
+          "prompt_tokens": 7146,
+          "cached_tokens": 6528,
+          "completion_tokens": 8
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 1307,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1685600,
+        "usage": {
+          "prompt_tokens": 4182,
+          "cached_tokens": 3968,
+          "completion_tokens": 8
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "a184d99e-c30f-430c-9df2-46c1c1a2c73b",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5604800,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4816400,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 34,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 41,
+      "order": "plain-first",
+      "question": "How many cases in checkout/totals passed?",
+      "gold": 39,
+      "result_message_at": 5,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": 39,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 3683200,
+        "usage": {
+          "prompt_tokens": 7144,
+          "cached_tokens": 6528,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 39,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1683200,
+        "usage": {
+          "prompt_tokens": 4180,
+          "cached_tokens": 3840,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "ccc6d7d1-f1e6-4ced-8472-1e7afc3d1dc6",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5603200,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4816400,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 34,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 42,
+      "order": "folded-first",
+      "question": "How many replicas does the deploy declare?",
+      "gold": 3,
+      "result_message_at": 3,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": 3,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 3683600,
+        "usage": {
+          "prompt_tokens": 7145,
+          "cached_tokens": 6528,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 3,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2498000,
+        "usage": {
+          "prompt_tokens": 4181,
+          "cached_tokens": 3840,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "ae36e50b-4237-40c3-af8b-fa2d5ee6ca47",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5604800,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4816400,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 34,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 43,
+      "order": "plain-first",
+      "question": "What image tag is the checkout deploy running?",
+      "gold": "v2.14.7",
+      "result_message_at": 3,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": "v2.14.7",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2877600,
+        "usage": {
+          "prompt_tokens": 7146,
+          "cached_tokens": 6528,
+          "completion_tokens": 12
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": "v2.14.7",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1692000,
+        "usage": {
+          "prompt_tokens": 4182,
+          "cached_tokens": 3840,
+          "completion_tokens": 12
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "9d4261b6-9895-45ed-b9ce-5a5c39208eb5",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5604800,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4816400,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 34,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 44,
+      "order": "folded-first",
+      "question": "At which line does totals/rounds_partial_refund fail?",
+      "gold": 1043,
+      "result_message_at": 5,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": 1043,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 3708400,
+        "usage": {
+          "prompt_tokens": 7207,
+          "cached_tokens": 6656,
+          "completion_tokens": 8
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": false,
+        "answer": "The test totals/rounds_partial_refund fails at line 39 in the test suite results.",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2522800,
+        "usage": {
+          "prompt_tokens": 4243,
+          "cached_tokens": 3968,
+          "completion_tokens": 26
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "b8d75bb8-795e-4140-ae95-057fede2104b",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5699200,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4840000,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 35,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 45,
+      "order": "plain-first",
+      "question": "Why could the error log not be read?",
+      "gold": "log stream unavailable",
+      "result_message_at": 13,
+      "eligible": false,
+      "plain": {
+        "correct": false,
+        "answer": "The error log for the checkout service could not be read because the log backend was down, returning a 502 status code when attempting to access the log stream.",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 3706400,
+        "usage": {
+          "prompt_tokens": 7202,
+          "cached_tokens": 6656,
+          "completion_tokens": 38
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": false,
+        "answer": "The error log could not be read because the log backend was down, resulting in a 502 status error when attempting to access the log stream for the checkout service.",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2520800,
+        "usage": {
+          "prompt_tokens": 4238,
+          "cached_tokens": 3840,
+          "completion_tokens": 39
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "74e095da-e094-4f32-82c6-2446fc7d1e05",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5699200,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4840000,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 35,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 46,
+      "order": "folded-first",
+      "question": "What was the p99 latency for checkout over 24h?",
+      "gold": 1307,
+      "result_message_at": 22,
+      "eligible": false,
+      "plain": {
+        "correct": true,
+        "answer": 1307,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 3707600,
+        "usage": {
+          "prompt_tokens": 7205,
+          "cached_tokens": 6656,
+          "completion_tokens": 8
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 1307,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1709200,
+        "usage": {
+          "prompt_tokens": 4241,
+          "cached_tokens": 4096,
+          "completion_tokens": 8
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "d0dc463d-2523-4568-bddd-b126709fbaed",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5699200,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4840000,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 35,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 47,
+      "order": "plain-first",
+      "question": "How many cases in checkout/totals passed?",
+      "gold": 39,
+      "result_message_at": 5,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": 39,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2892800,
+        "usage": {
+          "prompt_tokens": 7204,
+          "cached_tokens": 5888,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 39,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2521600,
+        "usage": {
+          "prompt_tokens": 4240,
+          "cached_tokens": 4096,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "d60fa64d-13dc-4608-818d-e53e8c654cad",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5699200,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4840000,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 35,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 48,
+      "order": "folded-first",
+      "question": "How many replicas does the deploy declare?",
+      "gold": 3,
+      "result_message_at": 3,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": 3,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 3730800,
+        "usage": {
+          "prompt_tokens": 7263,
+          "cached_tokens": 6656,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 3,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1730800,
+        "usage": {
+          "prompt_tokens": 4299,
+          "cached_tokens": 4096,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "d273b8e1-0fb3-4285-87bd-de2a4d9f78f0",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5793600,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4864000,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 36,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 49,
+      "order": "plain-first",
+      "question": "What image tag is the checkout deploy running?",
+      "gold": "v2.14.7",
+      "result_message_at": 3,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": "v2.14.7",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 3731200,
+        "usage": {
+          "prompt_tokens": 7264,
+          "cached_tokens": 6656,
+          "completion_tokens": 12
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": "v2.14.7",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1739200,
+        "usage": {
+          "prompt_tokens": 4300,
+          "cached_tokens": 4096,
+          "completion_tokens": 12
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "6ed0110b-3c9b-4bc6-96ae-8a8c6c457dbe",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5793600,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4864000,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 36,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 50,
+      "order": "folded-first",
+      "question": "At which line does totals/rounds_partial_refund fail?",
+      "gold": 1043,
+      "result_message_at": 5,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": 1043,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 3732000,
+        "usage": {
+          "prompt_tokens": 7266,
+          "cached_tokens": 6656,
+          "completion_tokens": 8
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": false,
+        "answer": "The test totals/rounds_partial_refund fails at line 12.81 with a got value of 12.81 instead of the expected 12.80.",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1784800,
+        "usage": {
+          "prompt_tokens": 4302,
+          "cached_tokens": 4096,
+          "completion_tokens": 40
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "5d4bb97b-cddc-4ab9-9a38-1f3255076503",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5793600,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4864000,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 36,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 51,
+      "order": "plain-first",
+      "question": "Why could the error log not be read?",
+      "gold": "log stream unavailable",
+      "result_message_at": 13,
+      "eligible": false,
+      "plain": {
+        "correct": false,
+        "answer": "The error log could not be read because the log backend was down, returning a 502 status code when attempting to access the log stream for the checkout service.",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2965200,
+        "usage": {
+          "prompt_tokens": 7261,
+          "cached_tokens": 6656,
+          "completion_tokens": 38
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": false,
+        "answer": "The error log could not be read because the log backend was down, resulting in a 502 status error when attempting to access the log stream for the checkout service.",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1781200,
+        "usage": {
+          "prompt_tokens": 4297,
+          "cached_tokens": 4096,
+          "completion_tokens": 39
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "3cac5d01-aa30-4621-bf80-77332bb04e25",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5793600,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4864000,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 36,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 52,
+      "order": "folded-first",
+      "question": "What was the p99 latency for checkout over 24h?",
+      "gold": 1307,
+      "result_message_at": 22,
+      "eligible": false,
+      "plain": {
+        "correct": true,
+        "answer": 1307,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 3755200,
+        "usage": {
+          "prompt_tokens": 7324,
+          "cached_tokens": 6656,
+          "completion_tokens": 8
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 1307,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2569600,
+        "usage": {
+          "prompt_tokens": 4360,
+          "cached_tokens": 4096,
+          "completion_tokens": 8
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "575f1429-b339-4ad2-8648-834d1e9ffc2c",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5889600,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4887600,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 37,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 53,
+      "order": "plain-first",
+      "question": "How many cases in checkout/totals passed?",
+      "gold": 39,
+      "result_message_at": 5,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": 39,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2940000,
+        "usage": {
+          "prompt_tokens": 7322,
+          "cached_tokens": 6656,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 39,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2568800,
+        "usage": {
+          "prompt_tokens": 4358,
+          "cached_tokens": 3968,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "4de7acf3-3c01-4f6b-97e0-035e6587330e",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5888000,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4887600,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 37,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 54,
+      "order": "folded-first",
+      "question": "How many replicas does the deploy declare?",
+      "gold": 3,
+      "result_message_at": 3,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": 3,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2940000,
+        "usage": {
+          "prompt_tokens": 7322,
+          "cached_tokens": 6656,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 3,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2568800,
+        "usage": {
+          "prompt_tokens": 4358,
+          "cached_tokens": 3840,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "7c046605-2705-4062-8cd1-37ee4cc0ddd3",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5888000,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4887600,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 37,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 55,
+      "order": "plain-first",
+      "question": "What image tag is the checkout deploy running?",
+      "gold": "v2.14.7",
+      "result_message_at": 3,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": "v2.14.7",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2948400,
+        "usage": {
+          "prompt_tokens": 7323,
+          "cached_tokens": 6656,
+          "completion_tokens": 12
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": "v2.14.7",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1762800,
+        "usage": {
+          "prompt_tokens": 4359,
+          "cached_tokens": 4096,
+          "completion_tokens": 12
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "66cf1fd6-01fb-4cea-bba4-db7ac267b2e9",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5888000,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4887600,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 37,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 56,
+      "order": "folded-first",
+      "question": "At which line does totals/rounds_partial_refund fail?",
+      "gold": 1043,
+      "result_message_at": 5,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": 1043,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2966400,
+        "usage": {
+          "prompt_tokens": 7384,
+          "cached_tokens": 6784,
+          "completion_tokens": 8
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": false,
+        "answer": "The test totals/rounds_partial_refund fails at line 12.81 (got value) instead of the expected 12.80 (want value).",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2593600,
+        "usage": {
+          "prompt_tokens": 4420,
+          "cached_tokens": 4096,
+          "completion_tokens": 38
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "c6a89998-cb90-43fc-b600-8512a1abd045",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5982400,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4911200,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 38,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 57,
+      "order": "plain-first",
+      "question": "Why could the error log not be read?",
+      "gold": "log stream unavailable",
+      "result_message_at": 13,
+      "eligible": false,
+      "plain": {
+        "correct": false,
+        "answer": "The error log for the checkout service could not be read because the log backend was down, returning a 502 status code when attempting to access the log stream.",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 3777600,
+        "usage": {
+          "prompt_tokens": 7380,
+          "cached_tokens": 6784,
+          "completion_tokens": 38
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": false,
+        "answer": "The error log could not be read because the log backend was down, returning a 502 status error when attempting to access the checkout service logs.",
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2592000,
+        "usage": {
+          "prompt_tokens": 4416,
+          "cached_tokens": 4224,
+          "completion_tokens": 35
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "4bb1f493-5387-48bb-9d5e-01c61fe2f1f3",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5984000,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4911200,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 38,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 58,
+      "order": "folded-first",
+      "question": "What was the p99 latency for checkout over 24h?",
+      "gold": 1307,
+      "result_message_at": 22,
+      "eligible": false,
+      "plain": {
+        "correct": true,
+        "answer": 1307,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 3778800,
+        "usage": {
+          "prompt_tokens": 7383,
+          "cached_tokens": 6784,
+          "completion_tokens": 8
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 1307,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1780400,
+        "usage": {
+          "prompt_tokens": 4419,
+          "cached_tokens": 3840,
+          "completion_tokens": 8
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "1c05f483-25ff-41d2-8c06-caf7cf33891b",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5984000,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4911200,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 38,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 59,
+      "order": "plain-first",
+      "question": "How many cases in checkout/totals passed?",
+      "gold": 39,
+      "result_message_at": 5,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": 39,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2963600,
+        "usage": {
+          "prompt_tokens": 7381,
+          "cached_tokens": 6784,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 39,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 2592400,
+        "usage": {
+          "prompt_tokens": 4417,
+          "cached_tokens": 4224,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "0eca3b21-a4ab-4922-a068-3124895e117e",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 5982400,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4911200,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 38,
+          "turns_replaced": 10
+        }
+      }
+    },
+    {
+      "call": 60,
+      "order": "folded-first",
+      "question": "How many replicas does the deploy declare?",
+      "gold": 3,
+      "result_message_at": 3,
+      "eligible": true,
+      "plain": {
+        "correct": true,
+        "answer": 3,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 3801600,
+        "usage": {
+          "prompt_tokens": 7440,
+          "cached_tokens": 6784,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": []
+      },
+      "folded": {
+        "correct": true,
+        "answer": 3,
+        "finish_reason": "stop",
+        "spend_delta_nano_usd": 1801600,
+        "usage": {
+          "prompt_tokens": 4476,
+          "cached_tokens": 4224,
+          "completion_tokens": 7
+        },
+        "retries": 0,
+        "tool_calls": [],
+        "refetches": [],
+        "folded_turns": 10,
+        "request_id": "661fd505-3007-4831-87f4-d4685633a513",
+        "fold_outcomes": {
+          "backoff": 1
+        },
+        "failed_checks": {},
+        "fold_count": 1,
+        "summarizer_prompt_tokens": 0,
+        "summarizer_completion_tokens": 0,
+        "fold_decision": {
+          "benefit_nano_usd": 6076800,
+          "fold_count": 1,
+          "min_saving_nano_usd": 0,
+          "outcome": "skipped",
+          "overhead_nano_usd": 4934800,
+          "prefix_hash": "bd350f9d3300667d3eb08d427dd67214d475a87c0d1ea414e3ab64a6c52b3b56",
+          "prompt_tokens_cut": 2964,
+          "reason": "backoff",
+          "summarizer_completion_tokens": 0,
+          "summarizer_prompt_tokens": 0,
+          "turns_covered": 39,
+          "turns_replaced": 10
+        }
+      }
+    }
+  ],
+  "fold_summaries": [
+    {
+      "call": 9,
+      "folded_turns": 10,
+      "chars": 1200,
+      "text": "Tool results folded away (call the tool again to see one in full):\n- read_file(path=\"deploy/checkout.yaml\") -> ok, 8,758 chars\n  - /image_tag: v2.14.7\n  - /replicas: 3\n  - /resources/cpu: 750m\n  - /resources/memory: 1Gi\n  - /rollout/strategy: canary\n- run_tests(filter=\"checkout/totals\") -> ok, 1,654 chars\n  - /passed: 39\n  - /failed/0/name: totals/rounds_partial_refund\n  - /failed/0/got: 12.81\n  - /failed/0/want: 12.80\n  - /failed/1/name: totals/crosses_currency\n  - /failed/1/got: USD 9.99\n  - /failed/1/want: EUR 9.99\n\nContext:\nThe checkout deployment configuration includes image tag v2.14.7, 3 replicas, CPU resource of 750m, memory resource of 1Gi, and a canary rollout strategy with steps weighted 10, 50, and 100. Environment variables include feature flags from CHECKOUT_FEATURE_FLAG_000 to CHECKOUT_FEATURE_FLAG_089 all enabled. The test suite 'checkout/totals' ran 41 cases, passing 39 and failing 2: 'totals/rounds_partial_refund' with a got value of 12.81 instead of 12.80, and 'totals/crosses_currency' with a got value of USD 9.99 instead of EUR 9.99. Workshop notes 03 to 07 record that the team reviewed the packaging checklist, discussed verification step order, and filed meetin"
+    }
+  ],
+  "aggregates": {
+    "questions_asked": 56,
+    "accuracy": {
+      "plain": 0.8214285714285714,
+      "folded": 0.6964285714285714
+    },
+    "eligible_questions": 32,
+    "eligible_correct": 25,
+    "eligible_wrong": 7,
+    "tool_calls_made": {
+      "plain": 4,
+      "folded": 5
+    },
+    "refetches": {
+      "plain": 1,
+      "folded": 1
+    },
+    "total_spend_nano_usd": {
+      "plain": 177589200,
+      "folded": 132853600
+    },
+    "folds": {
+      "committed": 1,
+      "rejected": 2,
+      "unprofitable": 17,
+      "failed_checks": {
+        "ledger_evidence": 2,
+        "pinned_facts_present": 2
+      }
+    },
+    "reached": "warm",
+    "caching": {
+      "cached_share": {
+        "plain": 0.9108790893829587,
+        "folded": 0.8346850395493605
+      },
+      "cached_tokens": {
+        "plain": 333696,
+        "folded": 183296
+      },
+      "provider_cost_usd": {
+        "plain": 0.0477652,
+        "folded": 0.051178400000000006,
+        "folded_main_calls": 0.034489200000000005,
+        "folded_summarizer_calls": 0.0166892,
+        "saving": -0.003413200000000005,
+        "saving_share": -0.07145788147019179
+      }
+    }
+  }
+}

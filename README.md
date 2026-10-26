@@ -561,6 +561,7 @@ folding:
   amortization_requests: 4            # requests a summary is expected to serve; set near real reuse
   min_saving_nano_usd: 0
   backoff_turns: 8                     # after a rejected fold, wait this many more turns
+  fold_tool_turns: false               # fold tool calls and results too; see "Tool turns"
 ```
 
 `[folding]` in `config/default.toml` bounds the in-memory store (`max_entries`, `max_total_chars`) and sets `background`. The default runs the fold before the request is forwarded. `background = true` answers with the summary already committed and folds afterwards, which spends the tenant's budget after the response.
@@ -586,7 +587,7 @@ What a fold costs and keeps:
 - **A replaced value must not be stated as current.** "Noor replaces Mira", "Bergen instead of Oslo", "8444, not 8443", "Tromso, superseding Bergen" and "2400 USD is void" mark the old value as replaced, as do a field update for that field's previous value ("staging now listens on 9443", later "… on 8443 again") and the prior summary's own `(was …)` notes; a later update that names the value again takes it back. A restore in words none of these patterns know ("we are back on 8443") leaves the value replaced, so the right summary is rejected: the fold is lost, not the fact. No line of the `Current facts:` block (the whole summary if it has none) may contain a replaced value before its `(was`. This catches the summarizer reading "Noor replaces Mira" backwards, which a value pin cannot: "owner: Mira (was Noor)" still contains "Noor". Only values that start with a digit or a capital count.
 - **A fold that cannot pass is not paid for.** If the pinned values alone would take more than half of `summary_chars`, the fold is skipped before the summarizer is admitted (`gw_folds_total{outcome="pinned_overflow"}`). Raise `summary_chars` for conversations heavy in ids and codes.
 - **A summary that fails its checks gets one corrective retry.** The summarizer is sent its rejected reply and what was wrong with it ("It leaves out '9443'", "Update rejected: 'Mira' for owner is the value its own evidence replaces", "It is not the JSON object asked for"), and answers again. Only the summarizer, which has seen the conversation, gets those values. If the retry fails too, the fold is rejected. `gw_fold_corrective_retries_total{result="committed"|"rejected"}` counts how retries end, and the decision log's `corrected_checks` names what the first summary failed.
-- **A rejected summary says which checks it failed.** Its decision log entry carries `failed_checks`, each check's name and how many errors it gave (never the values it found missing), and `gw_fold_checks_failed_total{check=…}` counts failing summaries per check, a corrective retry's included: `format`, `instruction_evidence`, `instruction_replaces`, `instruction_missing`, `ledger_field`, `ledger_evidence`, `ledger_backwards`, `ledger_misfiled`, `ledger_duplicate`, `ledger_stale`, `pinned_facts_present`, `field_value_present`, `superseded_not_current`, `within_length_bound`, `non_empty`, `covers_something`.
+- **A rejected summary says which checks it failed.** Its decision log entry carries `failed_checks`, each check's name and how many errors it gave (never the values it found missing), and `gw_fold_checks_failed_total{check=…}` counts failing summaries per check, a corrective retry's included: `format`, `instruction_evidence`, `instruction_replaces`, `instruction_missing`, `ledger_field`, `ledger_evidence`, `ledger_backwards`, `ledger_misfiled`, `ledger_duplicate`, `ledger_stale`, `tool_fact_evidence`, `tool_exchange_split`, `pinned_facts_present`, `field_value_present`, `superseded_not_current`, `within_length_bound`, `non_empty`, `covers_something`.
 - **A rejected fold backs off, longer each time.** After a summary fails its checks, comes back empty, or stops at the length limit, that conversation is not folded again until `backoff_turns` more turns have arrived (`outcome="backoff"`), and each further rejection in a row doubles the wait, up to 16 times `backoff_turns`. A fold that commits resets it. A conversation whose summaries keep failing then pays for a few attempts, not one every `backoff_turns` turns. A provider error does not back off; it is usually transient.
 - **One fold per conversation at a time.** A request that finds a fold running for its conversation goes out with the summary already committed.
 - **A conversation is keyed by tenant, API key, system messages and first turn.** Sessions behind different keys never share a summary.
@@ -717,6 +718,46 @@ With standing instructions kept word for word in the ledger (see "The gateway ke
 | same, repeat | 8, re-folded | 42% → **58%** | 90% / 98%; broken twice | 54% |
 
 The bullets rule went from broken 30 and 10 times to once and twice, and the folded tenant now follows the rules better than the unfolded one: they sit word for word at the top of its summary instead of at turn 8 of a long conversation. The footer, its change at call 60, and the date format were again kept on every call. Both mini runs still exit `1` under the strict gate, for those one and two slips; with `--max-success-drop 0` they pass, since the folded success rate is higher. `gpt-4.1-nano` still commits no fold.
+
+### Tool turns
+
+Everything above refuses a conversation whose older turns contain tool calls: agent conversations, usually the longest, never folded. `folding.fold_tool_turns: true` (default `false`) lets them fold, under the same rule as the fact ledger — the summarizer proposes, the gateway verifies, and the gateway writes the summary. With the setting off, the same turns are refused exactly as before; it works under `fold_mode: shadow` as well as `on`.
+
+A **tool exchange** — one assistant message with `tool_calls` and every `Tool` message answering those call ids — is folded or kept whole. If the `keep_last` boundary would land inside one, it moves earlier so the exchange stays in the tail. A folded request is checked for split exchanges (`tool_exchange_split`): a `Tool` result whose call is not in the request, or an assistant `tool_calls` message missing a result, is a bug, so it fails the fold and is logged rather than repaired.
+
+What the summary keeps for each folded exchange is written by the gateway from the messages, never by the summarizer, under `Tool results folded away (call the tool again to see one in full):`
+
+```
+- read_file(path="src/folding/plan.rs") -> ok, 21,480 chars
+- run_tests(filter="shadow") -> error, 3,112 chars
+```
+
+Each line gives the tool name, its arguments as compact readable text cut to a fixed length (a hash is kept for de-duplication), the result's size in characters, and whether it looks like an error — decided deterministically: a JSON result with a top-level `error` key is an error; anything else is not. The complete results are gone; the line says how to get one back. Like instructions and facts this section is never cut, and it counts towards both `summary_chars` (the fold is refused under `within_length_bound` if they pass it, not truncated) and the store's `max_total_chars`. Tool records carry forward across later folds and re-folds unchanged.
+
+The summarizer may also propose `tool_facts`: `{call_id, path, value}` where `path` is a JSON pointer such as `/items/0/status`. The gateway accepts one only if `call_id` names a folded call and, for a JSON result, the value at `path` equals `value` by typed comparison — or, for a text result, `path` is empty and `value` is an exact substring of bounded length. A rejected tool fact fails the summary like a rejected fact update (`tool_fact_evidence`) and gets the corrective retry. Tool arguments and accepted fact values pass through the same key-like detection the gateway applies to secrets: a fact whose value looks like a key is refused, and an argument containing one is redacted in the ledger line.
+
+What is dropped: the full result text, in every case. What is kept: the call, its compact arguments, the result's size and error status, and only the facts the gateway could verify against the result itself.
+
+`tools/fold_tools.py` is the paired-tenant agent benchmark: a scripted investigation — five harness-served calls returning several KB of JSON each, one an error — followed by questions answerable only from inside those results, with the same `tools` still offered. A question counts against folding only where the result it needs was folded away and the unfolded tenant answered correctly; a call the model repeats for something already fetched is counted a refetch; provider cost is priced with prompt caching as above. Run it with `python tools/run_fold_retention_local.py --provider openrouter --scenario tools --profile lifecycle --summarizer openrouter/gpt-4.1-mini`. The result files are in `benchmark_results/`.
+
+OpenRouter, 2026-10-26, `gpt-4.1-mini` answering and summarizing, lifecycle profile, 60 calls each:
+
+| Run | Folds committed | Eligible answers, folded correct | Accuracy, unfolded / folded | Tool calls (refetches), unfolded / folded | Provider cost with caching, unfolded → folded | Saving |
+|---|---|---|---|---|---|---|
+| 1 | 1 (2 rejected, 17 unprofitable) | 25 / 32 | 82% / 70% | 4 (1) / 5 (1) | $0.0478 → $0.0512 | −7% |
+| 2 | 1 (2 rejected, 17 unprofitable) | 24 / 32 | 82% / 70% | 4 (1) / 5 (1) | $0.0476 → $0.0507 | −7% |
+
+What this shows:
+
+- **Values the gateway verified were answered from the summary.** The image tag, the replica count and the pass count, all kept as `tool_facts`, were answered correctly on 50 of 51 eligible calls across both runs after their results were folded away, with no tool call. The one miss (run 2, call 29) was the right number written as a sentence ("39 tests in checkout/totals passed."), which strict typed scoring counts wrong.
+- **A value the summarizer did not pick was lost, and the model guessed instead of re-calling.** Both runs kept `/failed/0/got` and `/failed/0/want` but not `/failed/0/line` (1043). "At which line does totals/rounds_partial_refund fail?" was then wrong on 7 of 7 calls in each run. On 12 of those 14 the model answered without calling any tool ("fails at line 12.81", "at line 39"), although the summary says the full result is gone and how to get it back. On the other 2 it called `read_file` on a test file never fetched; it never called `run_tests` again. Both runs exit `1`.
+- **The error-message and p99 questions were never eligible.** Their results arrived after the only fold, so they were still verbatim; these runs say nothing about them.
+- **Folding did not pay here.** The folded tenant's main calls cost 28–31% less ($0.0345 and $0.0330), but the summarizer cost $0.0167–0.0177, so the total was 7% higher. The cost check refused 17 fold attempts per run as unprofitable and only one fold committed, so neither run reached the fold cap or a re-fold. Carry-forward across later folds was not exercised by a live run, only by unit tests.
+- **The scenario is synthetic and small:** five scripted calls, six questions, one model. It shows that verified tool facts survive a fold and that an unchosen one does not; it does not show how often real agents need a value the summarizer left out.
+
+Two earlier runs, with a summarizer prompt that showed each tool result on one line, committed no fold at all (result files from 2026-10-26T07:44 and T08:00): the summarizer quoted whole JSON results as fact-update evidence and ran out of tokens every time, at a 512- and then a 1024-token reply budget. Results are now shown to the summarizer one key per line, and its reply lists `tool_facts` before `updates`; the bench tenants' `summarizer_max_tokens` is 1024. Those two runs cost 10% and 20% more than unfolded, and both exit `2` (no eligible question).
+
+Not measured: `fold_mode: shadow` with tool turns (covered by tests only), a re-fold over tool turns, text (non-JSON) tool results in a live run, a provider other than OpenRouter, and a summarizer other than `gpt-4.1-mini`.
 
 ## Receipts
 

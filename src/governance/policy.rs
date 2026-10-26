@@ -183,6 +183,10 @@ pub struct FoldingConfig {
     /// empty, or stopped at the length limit), do not fold this conversation
     /// again until this many more turns have arrived. `0` turns it off.
     pub backoff_turns: usize,
+    /// Fold turns that carry tool calls and their results into the verified
+    /// tool ledger instead of refusing the fold. Off by default.
+    #[serde(default)]
+    pub fold_tool_turns: bool,
 }
 
 impl Default for FoldingConfig {
@@ -201,6 +205,7 @@ impl Default for FoldingConfig {
             amortization_requests: 4,
             min_saving_nano_usd: 0,
             backoff_turns: 8,
+            fold_tool_turns: false,
         }
     }
 }

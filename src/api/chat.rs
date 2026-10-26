@@ -1066,6 +1066,9 @@ struct FoldWork {
     key: [u8; 32],
     head: Vec<ChatMessage>,
     pending: Vec<ChatMessage>,
+    /// The verbatim remainder a committed fold forwards; checked for split
+    /// tool exchanges before the summary commits.
+    tail: Vec<ChatMessage>,
     covered: usize,
     prior_text: Option<String>,
     /// The facts the prior summary was written from.
@@ -1294,6 +1297,7 @@ async fn run_summarizer_attempts(work: FoldWork) -> AppliedFold {
             work.prior_text.as_deref(),
             &work.prior_ledger,
             &work.pending,
+            &work.tail,
             work.covered,
             &work.plan_config,
         ) {
@@ -1471,7 +1475,9 @@ async fn foreground_fold(
         ));
     }
 
-    let split = turns.len().saturating_sub(folding.keep_last);
+    // The same boundary the plan used: with tool turns foldable it sits
+    // before, never inside, a tool exchange.
+    let split = crate::folding::plan::head_tail_boundary(&turns, folding.keep_last, folding.fold_tool_turns);
     let head = turns[..split].to_vec();
     let tail = turns[split..].to_vec();
     let covered = prior.as_ref().map(|summary| summary.turns_covered.min(head.len())).unwrap_or(0);
@@ -1569,6 +1575,7 @@ async fn foreground_fold(
         key,
         head,
         pending: pending.clone(),
+        tail: tail.clone(),
         covered,
         prior_text: prior.as_ref().map(|summary| summary.summary.clone()),
         prior_ledger: existing.as_ref().map(|entry| entry.lock().ledger.clone()).unwrap_or_default(),

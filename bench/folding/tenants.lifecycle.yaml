@@ -25,13 +25,14 @@ tenants:
       summarizer_model: groq/gpt-oss-20b
       keep_last: 4
       summary_chars: 1200
-      summarizer_max_tokens: 512
+      summarizer_max_tokens: 1024  # tool_facts replies need the room
       max_folds: 5
       refold_threshold: 8
       min_new_turns: 1
       min_new_tokens: 0
       amortization_requests: 4
       min_saving_nano_usd: 0
+      fold_tool_turns: true
   - tenant_id: benchmark-admin
     enabled: true
     credentials:

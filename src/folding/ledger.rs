@@ -29,8 +29,46 @@ pub struct Ledger {
     /// Instructions a later one replaced, the most recent last.
     #[serde(default)]
     pub retired: Vec<Instruction>,
+    /// The tool calls the folded turns made: name, arguments, result size and
+    /// whether it errored, written by the gateway from the messages
+    /// themselves — never from the summarizer — plus the verified key facts.
+    #[serde(default)]
+    pub tool_calls: Vec<ToolRecord>,
     /// The summarizer's note of what else matters, rewritten each fold.
     pub context: String,
+}
+
+/// One call in a folded exchange: the gateway's record of what ran and the
+/// shape of what came back, so the model can call the tool again if it needs
+/// the result in full.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolRecord {
+    /// The id the assistant gave the call.
+    pub call_id: String,
+    pub name: String,
+    /// The call's arguments as readable compact text ("path=\"src/main.rs\""),
+    /// secrets redacted, cut to [`MAX_TOOL_ARGUMENT_CHARS`].
+    pub arguments: String,
+    /// SHA-256 of name, raw arguments and result text: an identical call
+    /// folded twice is kept once.
+    pub hash: String,
+    /// The result's size in characters.
+    pub result_chars: usize,
+    /// Whether the result looked like an error (see [`looks_like_error`]).
+    pub error: bool,
+    /// Facts from this result the summarizer proposed and the gateway
+    /// verified against it.
+    #[serde(default)]
+    pub facts: Vec<ToolFact>,
+}
+
+/// A value verified inside a folded tool result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolFact {
+    /// A JSON pointer into the result ("/items/0/status"); empty for a text
+    /// result, where the value is an exact substring of it.
+    pub path: String,
+    pub value: String,
 }
 
 /// One fact's current value, where it came from, and what it replaced.
@@ -79,6 +117,17 @@ pub struct InstructionUpdate {
     pub replaces: Option<String>,
 }
 
+/// A fact the summarizer reports from a folded tool result.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolFactUpdate {
+    /// The call id of the exchange it came from.
+    pub call_id: String,
+    /// A JSON pointer for a JSON result; empty for a text result.
+    #[serde(default)]
+    pub path: String,
+    pub value: serde_json::Value,
+}
+
 /// The summarizer's reply.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Reply {
@@ -87,11 +136,19 @@ pub struct Reply {
     #[serde(default)]
     pub updates: Vec<Update>,
     #[serde(default)]
+    pub tool_facts: Vec<ToolFactUpdate>,
+    #[serde(default)]
     pub context: String,
 }
 
 const MAX_FIELD_CHARS: usize = 48;
 const MAX_VALUE_CHARS: usize = 200;
+/// Longest rendered argument list on a tool-ledger line.
+pub const MAX_TOOL_ARGUMENT_CHARS: usize = 160;
+/// Longest value a tool fact may carry.
+const MAX_TOOL_FACT_VALUE_CHARS: usize = MAX_VALUE_CHARS;
+/// Longest JSON pointer a tool fact may name.
+const MAX_TOOL_FACT_PATH_CHARS: usize = 120;
 /// Replaced values kept per fact. Only the latest is shown; the rest are
 /// provenance, and the oldest go first.
 const MAX_HISTORY: usize = 8;
@@ -111,6 +168,17 @@ impl Ledger {
                         + fact.value.len()
                         + fact.evidence.len()
                         + fact.history.iter().map(|old| old.value.len()).sum::<usize>()
+                })
+                .sum::<usize>()
+            + self
+                .tool_calls
+                .iter()
+                .map(|call| {
+                    call.call_id.len()
+                        + call.name.len()
+                        + call.arguments.len()
+                        + call.hash.len()
+                        + call.facts.iter().map(|fact| fact.path.len() + fact.value.len()).sum::<usize>()
                 })
                 .sum::<usize>()
     }
@@ -150,12 +218,48 @@ impl Ledger {
         block
     }
 
+    /// The folded tool calls, one line each, with their verified facts
+    /// indented beneath. Empty when there are none. Like the facts and
+    /// instructions, never cut.
+    pub fn tools_block(&self) -> String {
+        if self.tool_calls.is_empty() {
+            return String::new();
+        }
+        let mut block =
+            String::from("Tool results folded away (call the tool again to see one in full):");
+        for call in &self.tool_calls {
+            block.push_str("\n- ");
+            block.push_str(&call.name);
+            block.push('(');
+            block.push_str(&call.arguments);
+            block.push_str(") -> ");
+            block.push_str(if call.error { "error" } else { "ok" });
+            block.push_str(", ");
+            block.push_str(&thousands(call.result_chars));
+            block.push_str(" chars");
+            for fact in &call.facts {
+                block.push_str("\n  - ");
+                if fact.path.is_empty() {
+                    block.push('"');
+                    block.push_str(&fact.value);
+                    block.push('"');
+                } else {
+                    block.push_str(&fact.path);
+                    block.push_str(": ");
+                    block.push_str(&fact.value);
+                }
+            }
+        }
+        block
+    }
+
     /// The summary the model is sent: the standing instructions, the facts
-    /// block, then the context note cut to what `summary_chars` leaves.
-    /// Instructions and facts are never cut: a ledger whose instructions and
-    /// facts alone run past `summary_chars` cannot be folded.
+    /// block, the folded tool calls, then the context note cut to what
+    /// `summary_chars` leaves. Instructions, facts and tool calls are never
+    /// cut: a ledger whose fixed sections alone run past `summary_chars`
+    /// cannot be folded.
     pub fn render(&self, summary_chars: usize) -> Result<String, String> {
-        let facts = [self.instructions_block(), self.facts_block()]
+        let facts = [self.instructions_block(), self.facts_block(), self.tools_block()]
             .into_iter()
             .filter(|block| !block.is_empty())
             .collect::<Vec<_>>()
@@ -163,7 +267,7 @@ impl Ledger {
         let facts_chars = facts.chars().count();
         if facts_chars > summary_chars {
             return Err(format!(
-                "within_length_bound: the instructions and facts alone are {facts_chars} chars, over the {summary_chars} allowed"
+                "within_length_bound: the instructions, facts and tool entries alone are {facts_chars} chars, over the {summary_chars} allowed"
             ));
         }
         let context = self.context.trim();
@@ -268,6 +372,92 @@ fn more_than_one_sentence(evidence: &str) -> bool {
     chars.windows(3).any(|w| matches!(w[0], '.' | '!' | '?') && w[1] == ' ' && w[2].is_alphanumeric())
 }
 
+/// "21480" rendered "21,480".
+fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The exchange records the folded turns contain, written from the messages
+/// themselves: one record per call, in the order the calls were made, paired
+/// with the `Tool` message answering its id. Results are matched by
+/// `tool_call_id`; a call nothing answered gets a record with no facts and a
+/// `result_chars` of 0 — the split check reports it separately.
+pub fn tool_records(turns: &[ChatMessage]) -> Vec<ToolRecord> {
+    folded_calls(turns)
+        .into_iter()
+        .map(|(call, result)| ToolRecord {
+            call_id: call.id.clone(),
+            name: call.function.name.clone(),
+            arguments: compact_arguments(&call.function.arguments),
+            hash: record_hash(call, &result),
+            result_chars: result.chars().count(),
+            error: looks_like_error(&result),
+            facts: Vec::new(),
+        })
+        .collect()
+}
+
+/// SHA-256 over name, raw arguments and result, hex: the de-duplication key
+/// for a call folded twice (a re-fold overlap, a resent batch).
+fn record_hash(call: &crate::providers::ToolCall, result: &str) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    for part in [&call.function.name, &call.function.arguments, result] {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
+}
+
+/// The arguments as compact readable text: a JSON object renders as
+/// `k=v, k=v` with strings quoted, anything else as its own text with runs
+/// of whitespace collapsed. Secrets are redacted, then the text is cut to
+/// [`MAX_TOOL_ARGUMENT_CHARS`].
+fn compact_arguments(arguments: &str) -> String {
+    let compact = match serde_json::from_str::<serde_json::Value>(arguments) {
+        Ok(serde_json::Value::Object(fields)) => fields
+            .iter()
+            .map(|(key, value)| match value {
+                serde_json::Value::String(text) => format!("{key}=\"{text}\""),
+                other => format!("{key}={}", serde_json::to_string(other).unwrap_or_default()),
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => arguments.split_whitespace().collect::<Vec<_>>().join(" "),
+    };
+    let safe = crate::observability::logging::redact_secrets(&compact);
+    let cut: String = safe.chars().take(MAX_TOOL_ARGUMENT_CHARS).collect();
+    if cut.len() < safe.len() { format!("{cut}…") } else { cut }
+}
+
+/// Whether a tool result reads as an error: it parses as a JSON object with
+/// a top-level `error` key whose value is neither null nor false. Anything
+/// else — text, JSON without the key, `{"error": null}` — is `ok`.
+fn looks_like_error(result: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(result)
+        .ok()
+        .and_then(|value| value.get("error").cloned())
+        .is_some_and(|error| !error.is_null() && error != serde_json::Value::Bool(false))
+}
+
+/// The value at `path` in a JSON result, compared as typed JSON.
+fn json_value_at(result: &serde_json::Value, path: &str) -> Option<serde_json::Value> {
+    result.pointer(path).cloned()
+}
+
 /// A checked update, placed in the conversation.
 struct Placed {
     turn: usize,
@@ -288,8 +478,15 @@ pub fn apply(
     pending: &[ChatMessage],
     first_turn: usize,
 ) -> Result<Ledger, Vec<String>> {
-    let turns: Vec<String> =
-        pending.iter().map(|msg| normalized(&msg.content().map(|c| c.text()).unwrap_or_default())).collect();
+    // Tool output is data, not a statement: it is never evidence for a fact
+    // update (tool_facts covers it) or a standing instruction.
+    let turns: Vec<String> = pending
+        .iter()
+        .map(|msg| match msg {
+            ChatMessage::Tool { .. } => String::new(),
+            _ => normalized(&msg.content().map(|c| c.text()).unwrap_or_default()),
+        })
+        .collect();
     let mut errors = Vec::new();
     let mut placed = Vec::new();
     for update in &reply.updates {
@@ -355,7 +552,12 @@ pub fn apply(
     // The conversation's order, not the reply's, decides which value is latest.
     placed.sort_by_key(|update| (update.turn, update.offset));
 
-    let mut ledger = Ledger { facts: prior.facts.clone(), context: reply.context.trim().to_string(), ..Default::default() };
+    let mut ledger = Ledger {
+        facts: prior.facts.clone(),
+        tool_calls: prior.tool_calls.clone(),
+        context: reply.context.trim().to_string(),
+        ..Default::default()
+    };
     for update in placed {
         if let Some(fact) = ledger.facts.iter_mut().find(|fact| fact.field == update.field) {
             if update.turn < fact.turn || fact.value.eq_ignore_ascii_case(&update.value) {
@@ -411,8 +613,91 @@ pub fn apply(
             history: Vec::new(),
         });
     }
+    // The calls the folded turns made, written from the messages themselves
+    // and carried forward across later folds. An identical call already kept
+    // is not repeated.
+    for record in tool_records(pending) {
+        if !ledger.tool_calls.iter().any(|kept| kept.hash == record.hash) {
+            ledger.tool_calls.push(record);
+        }
+    }
+    apply_tool_facts(&mut ledger, reply, pending, &mut errors);
     apply_instructions(&mut ledger, prior, reply, pending, first_turn, &mut errors);
     if errors.is_empty() { Ok(ledger) } else { Err(errors) }
+}
+
+/// The calls `turns` make and the result text each was answered with, in the
+/// order they were made.
+fn folded_calls(turns: &[ChatMessage]) -> Vec<(&crate::providers::ToolCall, String)> {
+    let mut out = Vec::new();
+    for msg in turns {
+        let ChatMessage::Assistant { tool_calls, .. } = msg else {
+            continue;
+        };
+        for call in tool_calls {
+            let result = turns
+                .iter()
+                .find_map(|m| match m {
+                    ChatMessage::Tool { tool_call_id, content, .. } if tool_call_id == &call.id => {
+                        Some(content.text())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            out.push((call, result));
+        }
+    }
+    out
+}
+
+/// Check each `tool_facts` entry against the calls this fold covers and keep
+/// the verified ones on their record. An entry the messages do not bear out
+/// is an error: like a rejected fact update it fails the whole summary and
+/// nothing is applied.
+fn apply_tool_facts(ledger: &mut Ledger, reply: &Reply, pending: &[ChatMessage], errors: &mut Vec<String>) {
+    let calls = folded_calls(pending);
+    for fact in &reply.tool_facts {
+        let Some((_, result)) = calls.iter().find(|(call, _)| call.id == fact.call_id) else {
+            errors.push(format!(
+                "tool_fact_evidence: call '{}' is not a call in the turns being folded",
+                fact.call_id
+            ));
+            continue;
+        };
+        if fact.path.chars().count() > MAX_TOOL_FACT_PATH_CHARS {
+            errors.push(format!("tool_fact_evidence: the path for call '{}' is over {MAX_TOOL_FACT_PATH_CHARS} chars", fact.call_id));
+            continue;
+        }
+        let value = value_text(&fact.value);
+        if value.is_empty() || value.chars().count() > MAX_TOOL_FACT_VALUE_CHARS || value.contains('\n') {
+            errors.push(format!("tool_fact_evidence: the fact for call '{}' has no usable value", fact.call_id));
+            continue;
+        }
+        if crate::observability::logging::looks_key_like(&value) {
+            errors.push(format!(
+                "tool_fact_evidence: the value for call '{}' looks like a credential",
+                fact.call_id
+            ));
+            continue;
+        }
+        let verified = match serde_json::from_str::<serde_json::Value>(result) {
+            // A JSON result: the typed value at the pointer must equal it.
+            Ok(json) => {
+                !fact.path.is_empty() && json_value_at(&json, &fact.path).is_some_and(|found| found == fact.value)
+            }
+            // A text result: an exact substring, no path.
+            Err(_) => fact.path.is_empty() && result.contains(&value),
+        };
+        if !verified {
+            let path = if fact.path.is_empty() { "the value".to_string() } else { format!("'{}'", fact.path) };
+            errors.push(format!("tool_fact_evidence: {path} is not in the result of call '{}'", fact.call_id));
+            continue;
+        }
+        if let Some(record) = ledger.tool_calls.iter_mut().rev().find(|record| record.call_id == fact.call_id)
+            && !record.facts.iter().any(|kept| kept.path == fact.path && kept.value == value) {
+            record.facts.push(ToolFact { path: fact.path.clone(), value });
+        }
+    }
 }
 
 /// An instruction's sentence as the conversation has it: found in a pending
@@ -425,6 +710,9 @@ fn verbatim(pending: &[ChatMessage], text: &str) -> Option<(usize, usize, String
         return None;
     }
     pending.iter().enumerate().find_map(|(index, msg)| {
+        if matches!(msg, ChatMessage::Tool { .. }) {
+            return None;
+        }
         let turn = msg.content().map(|c| c.text()).unwrap_or_default().split_whitespace().collect::<Vec<_>>().join(" ");
         if !turn.is_ascii() || !wanted.is_ascii() {
             return None;
@@ -646,7 +934,7 @@ mod tests {
             "{rendered}"
         );
         assert_eq!(rendered.chars().count(), 160);
-        assert!(ledger.render(60).unwrap_err().starts_with("within_length_bound: the instructions and facts alone are"));
+        assert!(ledger.render(60).unwrap_err().starts_with("within_length_bound: the instructions, facts and tool entries alone are"));
     }
 
     #[test]
@@ -1019,9 +1307,222 @@ mod tests {
         let rendered = ledger.render(120).unwrap();
         assert!(rendered.starts_with("Current facts:\n- owner: Ines (was Noor)\n- production port: 9445\n\nContext:\nA long note."), "{rendered}");
         assert_eq!(rendered.chars().count(), 120);
-        assert_eq!(ledger.render(20).unwrap_err(), "within_length_bound: the instructions and facts alone are 63 chars, over the 20 allowed");
+        assert_eq!(ledger.render(20).unwrap_err(), "within_length_bound: the instructions, facts and tool entries alone are 63 chars, over the 20 allowed");
         let bare = Ledger { facts: vec![], context: "Only context.".into(), ..Default::default() };
         assert_eq!(bare.render(100).unwrap(), "Context:\nOnly context.");
+    }
+
+    fn tool_turns() -> Vec<ChatMessage> {
+        vec![
+            user("check the files"),
+            ChatMessage::Assistant {
+                content: Some(Content::Text("reading".into())),
+                tool_calls: vec![
+                    crate::providers::ToolCall {
+                        id: "call_1".into(),
+                        kind: "function".into(),
+                        function: crate::providers::FunctionCall {
+                            name: "read_file".into(),
+                            arguments: r#"{"path":"src/folding/plan.rs"}"#.into(),
+                        },
+                    },
+                    crate::providers::ToolCall {
+                        id: "call_2".into(),
+                        kind: "function".into(),
+                        function: crate::providers::FunctionCall {
+                            name: "run_tests".into(),
+                            arguments: r#"{"filter":"shadow"}"#.into(),
+                        },
+                    },
+                ],
+            },
+            ChatMessage::Tool {
+                content: Content::Text(r#"{"lines":1043,"items":[{"status":"green"}]}"#.into()),
+                tool_call_id: "call_1".into(),
+                name: Some("read_file".into()),
+            },
+            ChatMessage::Tool {
+                content: Content::Text(r#"{"error":"2 failed"}"#.into()),
+                tool_call_id: "call_2".into(),
+                name: Some("run_tests".into()),
+            },
+            user("plain text result follows"),
+            ChatMessage::Assistant {
+                content: None,
+                tool_calls: vec![crate::providers::ToolCall {
+                    id: "call_3".into(),
+                    kind: "function".into(),
+                    function: crate::providers::FunctionCall {
+                        name: "lookup".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+            },
+            ChatMessage::Tool {
+                content: Content::Text("the deployment is on host alpha-9".into()),
+                tool_call_id: "call_3".into(),
+                name: Some("lookup".into()),
+            },
+        ]
+    }
+
+    #[test]
+    fn tool_records_come_from_the_messages_not_the_summarizer() {
+        let records = tool_records(&tool_turns());
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].name, "read_file");
+        assert_eq!(records[0].arguments, r#"path="src/folding/plan.rs""#);
+        assert_eq!(records[0].result_chars, 43);
+        assert!(!records[0].error);
+        assert_eq!(records[1].arguments, r#"filter="shadow""#);
+        assert!(records[1].error, "a JSON object with a top-level error key");
+        assert_eq!(records[2].name, "lookup");
+        assert!(!records[2].error, "plain text is not an error");
+    }
+
+    #[test]
+    fn a_json_result_with_a_null_error_is_not_an_error() {
+        let turns = [ChatMessage::Assistant {
+            content: None,
+            tool_calls: vec![crate::providers::ToolCall {
+                id: "c".into(),
+                kind: "function".into(),
+                function: crate::providers::FunctionCall { name: "f".into(), arguments: "{}".into() },
+            }],
+        },
+        ChatMessage::Tool {
+            content: Content::Text(r#"{"error":null,"ok":true}"#.into()),
+            tool_call_id: "c".into(),
+            name: Some("f".into()),
+        }];
+        assert!(!tool_records(&turns)[0].error);
+    }
+
+    #[test]
+    fn tool_facts_are_verified_against_the_folded_result() {
+        let turns = tool_turns();
+        let reply = reply(r#"{"tool_facts":[
+            {"call_id":"call_1","path":"/lines","value":1043},
+            {"call_id":"call_1","path":"/items/0/status","value":"green"},
+            {"call_id":"call_3","path":"","value":"host alpha-9"}
+        ],"context":"c"}"#);
+        let ledger = apply(&Ledger::default(), &reply, &turns, 0).unwrap();
+        assert_eq!(ledger.tool_calls.len(), 3);
+        assert_eq!(
+            ledger.tool_calls[0].facts,
+            [ToolFact { path: "/lines".into(), value: "1043".into() },
+             ToolFact { path: "/items/0/status".into(), value: "green".into() }]
+        );
+        assert_eq!(ledger.tool_calls[2].facts, [ToolFact { path: String::new(), value: "host alpha-9".into() }]);
+    }
+
+    #[test]
+    fn tool_facts_that_do_not_match_the_result_fail_the_summary() {
+        let turns = tool_turns();
+        // A typed comparison: the result has 1043 as a number, not a string.
+        let wrong_type = reply(r#"{"tool_facts":[{"call_id":"call_1","path":"/lines","value":"1043"}]}"#);
+        assert_eq!(
+            apply(&Ledger::default(), &wrong_type, &turns, 0).unwrap_err(),
+            ["tool_fact_evidence: '/lines' is not in the result of call 'call_1'"]
+        );
+        // A call the fold did not cover.
+        let unknown = reply(r#"{"tool_facts":[{"call_id":"call_9","path":"/x","value":1}]}"#);
+        assert_eq!(
+            apply(&Ledger::default(), &unknown, &turns, 0).unwrap_err(),
+            ["tool_fact_evidence: call 'call_9' is not a call in the turns being folded"]
+        );
+        // A path on a text result, and a substring the text does not hold.
+        let on_text = reply(r#"{"tool_facts":[{"call_id":"call_3","path":"/x","value":"host"}]}"#);
+        assert!(apply(&Ledger::default(), &on_text, &turns, 0).unwrap_err()[0].starts_with("tool_fact_evidence"));
+        let absent = reply(r#"{"tool_facts":[{"call_id":"call_3","path":"","value":"host omega"}]}"#);
+        assert!(apply(&Ledger::default(), &absent, &turns, 0).unwrap_err()[0].starts_with("tool_fact_evidence"));
+        // A JSON result wants a path, not a substring.
+        let bare = reply(r#"{"tool_facts":[{"call_id":"call_1","path":"","value":"green"}]}"#);
+        assert!(apply(&Ledger::default(), &bare, &turns, 0).unwrap_err()[0].starts_with("tool_fact_evidence"));
+    }
+
+    #[test]
+    fn a_tool_fact_that_looks_like_a_key_is_refused() {
+        let key = "sk-".to_string() + &"a1".repeat(30);
+        let turns = vec![
+            ChatMessage::Assistant {
+                content: None,
+                tool_calls: vec![crate::providers::ToolCall {
+                    id: "call_1".into(),
+                    kind: "function".into(),
+                    function: crate::providers::FunctionCall { name: "read_file".into(), arguments: "{}".into() },
+                }],
+            },
+            ChatMessage::Tool {
+                content: Content::Text(format!(r#"{{"token":"{key}"}}"#)),
+                tool_call_id: "call_1".into(),
+                name: Some("read_file".into()),
+            },
+        ];
+        // It verifies against the result — and is refused anyway.
+        let reply = reply(&format!(r#"{{"tool_facts":[{{"call_id":"call_1","path":"/token","value":"{key}"}}]}}"#));
+        assert_eq!(
+            apply(&Ledger::default(), &reply, &turns, 0).unwrap_err(),
+            ["tool_fact_evidence: the value for call 'call_1' looks like a credential"]
+        );
+        // And the key in arguments is redacted in the record.
+        let turns = vec![
+            ChatMessage::Assistant {
+                content: None,
+                tool_calls: vec![crate::providers::ToolCall {
+                    id: "call_1".into(),
+                    kind: "function".into(),
+                    function: crate::providers::FunctionCall {
+                        name: "read_file".into(),
+                        arguments: format!(r#"{{"path":"x","token":"{key}"}}"#),
+                    },
+                }],
+            },
+            ChatMessage::Tool {
+                content: Content::Text("ok".into()),
+                tool_call_id: "call_1".into(),
+                name: Some("read_file".into()),
+            },
+        ];
+        let record = &tool_records(&turns)[0];
+        assert!(record.arguments.contains("[redacted]"), "{}", record.arguments);
+        assert!(!record.arguments.contains(&key));
+    }
+
+    #[test]
+    fn tool_records_carry_forward_and_are_never_cut() {
+        let turns = tool_turns();
+        let first = apply(&Ledger::default(), &reply(r#"{"context":"c"}"#), &turns, 0).unwrap();
+        let quiet = apply(&first, &reply(r#"{"context":"quiet"}"#), &[user("nothing new")], 7).unwrap();
+        assert_eq!(quiet.tool_calls.len(), 3, "entries carry forward unchanged");
+        // The section renders after instructions and facts.
+        let rendered = quiet.render(2000).unwrap();
+        assert!(rendered.contains(
+            "Tool results folded away (call the tool again to see one in full):\n- read_file(path=\"src/folding/plan.rs\") -> ok, 43 chars\n- run_tests(filter=\"shadow\") -> error, 20 chars"
+        ), "{rendered}");
+        // Fixed sections over summary_chars refuse the fold, not truncate.
+        let err = quiet.render(60).unwrap_err();
+        assert!(err.starts_with("within_length_bound:"), "{err}");
+        // A call folded twice is kept once.
+        let twice = apply(&first, &reply(r#"{"context":"again"}"#), &turns, 9).unwrap();
+        assert_eq!(twice.tool_calls.len(), 3);
+    }
+
+    #[test]
+    fn tool_records_count_towards_the_ledgers_size() {
+        let ledger = Ledger {
+            tool_calls: vec![ToolRecord {
+                call_id: "c".into(),
+                name: "f".into(),
+                arguments: "x".repeat(10),
+                hash: "y".repeat(64),
+                result_chars: 9,
+                error: false,
+                facts: vec![ToolFact { path: "/a".into(), value: "1".into() }],
+            }],
+            ..Default::default()
+        };
+        assert_eq!(ledger.chars(), 1 + 1 + 10 + 64 + 2 + 1);
     }
 
     #[test]
