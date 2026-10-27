@@ -1194,7 +1194,7 @@ async fn shadow_answers_like_folding_off_and_sends_the_unfolded_request() {
     .unwrap();
     assert_eq!(sent, conversation_messages(6));
 
-    let (_, fold) = decision_record(prompt_tokens_of(&upstream.last_body().unwrap()));
+    let (_, fold) = decision_record(&headers);
     assert_eq!(fold["shadow"], true, "{fold}");
     assert_eq!(fold["would_fold"], true, "{fold}");
     assert_eq!(fold["outcome"], "applied", "{fold}");
@@ -1370,7 +1370,7 @@ async fn a_reply_that_is_not_json_is_fixed_by_its_corrective_retry() {
     assert_eq!(retry[2]["role"], "assistant");
     assert_eq!(retry[2]["content"], "x".repeat(400));
     assert!(retry[3]["content"].as_str().unwrap().contains("It is not the JSON object asked for."), "{}", retry[3]);
-    let (decision, fold) = decision_record(prompt_tokens_of(&upstream.last_body().unwrap()));
+    let (decision, fold) = decision_record(&headers);
     assert_eq!(fold["outcome"], "applied", "{decision}");
     assert_eq!(fold["corrected_checks"]["format"], 1, "{fold}");
     assert!(fold.get("failed_checks").is_none(), "{fold}");
@@ -1393,9 +1393,9 @@ async fn a_rejected_summary_names_the_checks_it_failed_and_nothing_else() {
     let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(FOLDING_TENANT)).await;
     let mut body = folding_body(6);
     body["messages"][0]["content"] = json!("The appointment moved to 15:30");
-    let (status, _, _) = gw.post_chat(TEST_KEY, body.clone()).await;
+    let (status, headers, _) = gw.post_chat(TEST_KEY, body.clone()).await;
     assert_eq!(status, StatusCode::OK);
-    let (decision, fold) = decision_record(prompt_tokens_of(&upstream.last_body().unwrap()));
+    let (decision, fold) = decision_record(&headers);
     assert_eq!(fold["reason"], "checks_failed");
     // Both the summary and its corrective retry dropped 15:30.
     assert_eq!(fold["failed_checks"]["pinned_facts_present"], 1, "{fold}");
@@ -2775,16 +2775,19 @@ async fn metric_labels_come_from_config_never_from_the_request() {
     );
 }
 
-/// The decision line of a request, found by its `prompt_tokens` (the estimate
-/// of the messages that were forwarded), for tests that do not have its id.
-fn decision_record(prompt_tokens: u32) -> (String, Value) {
-    let needle = format!("\"prompt_tokens\":{prompt_tokens},");
+/// The decision line for the request identified by its response header.
+fn decision_record(headers: &HeaderMap) -> (String, Value) {
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("gateway request id");
+    let needle = format!("\"request_id\":\"{request_id}\"");
     let logs = captured_logs::contents();
     let line = logs
         .lines()
         .rev()
         .find(|line| line.contains("stream complete") && line.contains(&needle))
-        .unwrap_or_else(|| panic!("no decision line for prompt_tokens {prompt_tokens}"))
+        .unwrap_or_else(|| panic!("no decision line for request_id {request_id}"))
         .to_string();
     let event: Value = serde_json::from_str(&line).expect(&line);
     let fold = event
@@ -2888,10 +2891,10 @@ async fn the_decision_log_records_each_fold_outcome_without_message_text() {
     let upstream = MockUpstream::start(Scenario::Happy).await;
     let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(FOLDING_TENANT)).await;
     let body = marked_folding_body(6, 17);
-    let (status, _, _) = gw.post_chat(TEST_KEY, body.clone()).await;
+    let (status, headers, _) = gw.post_chat(TEST_KEY, body.clone()).await;
     assert_eq!(status, StatusCode::OK);
     let sent_body = upstream.last_body().unwrap();
-    let (decision, fold) = decision_record(prompt_tokens_of(&sent_body));
+    let (decision, fold) = decision_record(&headers);
     assert!(!decision.contains(FOLD_MARKER), "message text reached the decision line: {decision}");
     assert!(!decision.contains("Hello, world"), "summary text reached the decision line: {decision}");
 
@@ -2944,9 +2947,9 @@ async fn the_decision_log_records_each_fold_outcome_without_message_text() {
         "content": "calling a tool",
         "tool_calls": [{ "id": "call_1", "type": "function", "function": { "name": "lookup", "arguments": "{}" } }]
     });
-    let (status, _, _) = gw.post_chat(TEST_KEY, skipped).await;
+    let (status, headers, _) = gw.post_chat(TEST_KEY, skipped).await;
     assert_eq!(status, StatusCode::OK);
-    let (_, fold) = decision_record(prompt_tokens_of(&upstream.last_body().unwrap()));
+    let (_, fold) = decision_record(&headers);
     assert_fold_shape(&fold);
     assert_eq!(fold["outcome"], "skipped");
     assert_eq!(fold["reason"], "head_has_tools");
@@ -2970,7 +2973,7 @@ async fn a_fold_the_cost_check_refuses_is_logged_and_counted_unprofitable() {
     assert_eq!(status, StatusCode::OK);
     assert!(headers.get("x-gateway-folded").is_none());
     assert_eq!(upstream.calls(), 1);
-    let (_, fold) = decision_record(prompt_tokens_of(&upstream.last_body().unwrap()));
+    let (_, fold) = decision_record(&headers);
     assert_fold_shape(&fold);
     assert_eq!(fold["outcome"], "refused");
     assert_eq!(fold["reason"], "cost_check");
@@ -2987,7 +2990,7 @@ async fn a_failed_summarizer_is_logged_and_counted_failed() {
     let (status, headers, _) = gw.post_chat(TEST_KEY, marked_folding_body(6, 47)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(headers.get("x-gateway-folded").is_none());
-    let (decision, fold) = decision_record(prompt_tokens_of(&upstream.last_body().unwrap()));
+    let (decision, fold) = decision_record(&headers);
     assert_fold_shape(&fold);
     assert_eq!(fold["outcome"], "failed");
     assert_eq!(fold["reason"], "provider_error");
@@ -3012,7 +3015,7 @@ async fn fold_metric_outcomes_add_up_to_the_attempts() {
     let (status, headers, _) = gw.post_chat(TEST_KEY, reused).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers.get("x-gateway-folded").unwrap(), "4");
-    let (_, fold) = decision_record(prompt_tokens_of(&upstream.last_body().unwrap()));
+    let (_, fold) = decision_record(&headers);
     assert_fold_shape(&fold);
     assert_eq!(fold["outcome"], "not_due");
     assert_eq!(fold["reason"], "not_enough_new_turns");
