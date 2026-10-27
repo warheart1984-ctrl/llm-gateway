@@ -14,7 +14,36 @@ pub mod plan;
 pub mod store;
 pub mod summarizer;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+/// How the folded tool calls' verified facts render in the summary the model
+/// is sent. Stored ledger data is identical either way; this changes only the
+/// rendered text. `Bare` is the historical form (`- /passed: 39`). `Json`
+/// renders each call's consecutive pointer facts as one compact JSON object
+/// (`{"passed":39,"suite":"checkout/totals"}`). Measured on captured folded
+/// requests, `Json` alone made the model's answers more prose-like; with
+/// `context_dedup` it made them more strictly typed, so the configuration
+/// allows `Json` only together with `context_dedup`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolFactsRender {
+    #[default]
+    Bare,
+    Json,
+}
+
+/// The two summary-rendering options a tenant can turn on. Both default to
+/// the historical behavior, so `RenderStyle::default()` must produce
+/// byte-identical summaries to a gateway that predates the options.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RenderStyle {
+    /// How the verified tool facts render.
+    pub tool_facts: ToolFactsRender,
+    /// Drop context-note sentences that repeat a numeric tool-fact value as a
+    /// standalone token; the fact line already carries the number, so the
+    /// prose copy is redundant. Off by default.
+    pub context_dedup: bool,
+}
 
 /// How many more turns a conversation waits after `rejections` folds of it
 /// in a row were rejected: `backoff_turns`, doubled for each rejection after

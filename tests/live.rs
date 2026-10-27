@@ -21,7 +21,7 @@
 //! retried twice after a pause; anything else fails at once.
 //!
 //! **Opt-in, because it spends money.** Nothing runs unless
-//! `LLM_GATEWAY_LIVE` names the providers (`groq,openrouter,nvidia` or
+//! `LLM_GATEWAY_LIVE` names the providers (`groq,openrouter` or
 //! `all`); a named provider whose key is not set fails rather than skips.
 //! Each test's tenant has a daily budget of 5 cents, so a runaway test is
 //! refused by the gateway itself. A full run costs well under a cent.
@@ -477,7 +477,7 @@ fn catalogue() -> PathBuf {
 /// model does not exist.
 fn catalogue_with_missing_models() -> String {
     let mut yaml = std::fs::read_to_string(catalogue()).expect("config/models.yaml");
-    for provider in ["groq", "openrouter", "nvidia"] {
+    for provider in ["groq", "openrouter"] {
         yaml.push_str(&format!(
             "\n  live/missing-{provider}:\n    provider: {provider}\n    upstream_model: {NO_SUCH_MODEL}\n    default_params:\n      max_tokens: 16\n    cost:\n      input_per_mtok_usd: 1.0\n      output_per_mtok_usd: 1.0\n"
         ));
@@ -542,10 +542,10 @@ async fn live_openrouter() {
     live("openrouter", "OPENROUTER_API_KEY", "openrouter/gpt-4.1-mini").await;
 }
 
-#[tokio::test]
-async fn live_nvidia() {
-    live("nvidia", "NVIDIA_API_KEY", "nvidia/nemotron-3-super").await;
-}
+// No live_nvidia: NVIDIA retired two catalogue models inside a day
+// (nemotron-3-super 404, then its llama-3.1-8b replacement 410, live suite on
+// 2026-10-27). The provider and the models.yaml entry stay for tenants that
+// use them; the suite no longer pays for a probe that cannot keep up.
 
 // ---------------------------------------------------------------------------
 // The checks, checked: a local server with the vendors' wire format

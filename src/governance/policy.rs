@@ -194,6 +194,15 @@ pub struct FoldingConfig {
     /// does not.
     #[serde(default = "default_pinned_terms_margin")]
     pub pinned_terms_margin: u32,
+    /// How folded tool facts render in the committed summary: `bare` (the
+    /// default, `- /passed: 39`) or `json` (`{"passed":39,"suite":"x"}`).
+    /// `json` measured worse alone, so it requires `context_dedup`.
+    #[serde(default)]
+    pub tool_facts_render: crate::folding::ToolFactsRender,
+    /// Drop context-note sentences that repeat a numeric tool-fact value as a
+    /// standalone token; the fact already carries the number. Off by default.
+    #[serde(default)]
+    pub context_dedup: bool,
 }
 
 fn default_pinned_terms_margin() -> u32 {
@@ -218,6 +227,8 @@ impl Default for FoldingConfig {
             backoff_turns: 8,
             fold_tool_turns: false,
             pinned_terms_margin: default_pinned_terms_margin(),
+            tool_facts_render: crate::folding::ToolFactsRender::Bare,
+            context_dedup: false,
         }
     }
 }
@@ -248,6 +259,11 @@ impl FoldingConfig {
         }
         if self.pinned_terms_margin == 0 {
             return Err("folding.pinned_terms_margin must be at least 1".into());
+        }
+        if self.tool_facts_render == crate::folding::ToolFactsRender::Json && !self.context_dedup {
+            return Err(
+                "folding.tool_facts_render \"json\" requires folding.context_dedup: true (json alone measured worse)".into(),
+            );
         }
         let _ = tenant_id;
         Ok(())
@@ -921,6 +937,8 @@ mod tests {
         assert_eq!(folding.min_saving_nano_usd, 0);
         assert_eq!(folding.pinned_terms_margin, 2);
         assert_eq!(folding.mode(), FoldMode::On, "enabled: true without fold_mode is on");
+        assert_eq!(folding.tool_facts_render, crate::folding::ToolFactsRender::Bare);
+        assert!(!folding.context_dedup);
 
         let unknown = serde_yaml::from_str::<TenantFile>(
             "tenants:\n  - tenant_id: acme\n    credentials: [{ key_id: k, key: secret }]\n    folding:\n      enabled: true\n      summarizer_model: groq/summarizer\n      typo: true\n",
@@ -997,6 +1015,46 @@ mod tests {
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(errors[0].contains("acme") && errors[0].contains("background"), "{errors:?}");
         assert!(validate_receipt_folding(&registry, false).is_empty());
+    }
+
+    /// The probe measured `json` rendering alone as worse, so the
+    /// configuration refuses that combination; `json` with `context_dedup`
+    /// (variant D) and `context_dedup` alone (variant B) both load.
+    #[test]
+    fn json_tool_facts_render_requires_context_dedup() {
+        use crate::folding::ToolFactsRender;
+
+        let mut bare = tenant(&["*"], &[]);
+        bare.folding = Some(FoldingConfig {
+            tool_facts_render: ToolFactsRender::Json,
+            ..folding_config("groq/summarizer")
+        });
+        let err = TenantRegistry::from_file(TenantFile { tenants: vec![bare] }, PathBuf::from("tenants.yaml"))
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("acme"), "{err}");
+        assert!(err.to_string().contains("context_dedup"), "{err}");
+
+        let mut combined = tenant(&["*"], &[]);
+        combined.folding = Some(FoldingConfig {
+            tool_facts_render: ToolFactsRender::Json,
+            context_dedup: true,
+            ..folding_config("groq/summarizer")
+        });
+        TenantRegistry::from_file(TenantFile { tenants: vec![combined] }, PathBuf::from("tenants.yaml"))
+            .unwrap();
+
+        let mut dedup_only = tenant(&["*"], &[]);
+        dedup_only.folding = Some(FoldingConfig { context_dedup: true, ..folding_config("groq/summarizer") });
+        TenantRegistry::from_file(TenantFile { tenants: vec![dedup_only] }, PathBuf::from("tenants.yaml"))
+            .unwrap();
+
+        let unknown = serde_yaml::from_str::<TenantFile>(
+            "tenants:\n  - tenant_id: acme\n    credentials: [{ key_id: k, key: secret }]\n    folding:\n      enabled: true\n      summarizer_model: groq/summarizer\n      tool_facts_render: sideways\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(unknown.contains("sideways") || unknown.contains("tool_facts_render"), "{unknown}");
     }
 
     #[test]

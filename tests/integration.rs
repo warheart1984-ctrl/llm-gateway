@@ -75,6 +75,9 @@ enum Scenario {
     /// The first summarizer call reports a fact ("appointment" = 15:30); the
     /// next reports none. Streams stay happy.
     SummarizerFacts,
+    /// The summarizer's context note repeats a folded tool result's number,
+    /// to exercise context dedup. Streams stay happy.
+    SummarizerRepeats,
 }
 
 /// Stands in for the operator's provider account id in [`Scenario::LeakyReject`]
@@ -249,6 +252,16 @@ async fn handle_upstream(State(state): State<MockState>, Json(body): Json<Value>
         }))
         .into_response();
     }
+    if !streaming && state.scenario == Scenario::SummarizerRepeats {
+        let reply = json!({"updates": [], "context": "The file has 1043 lines. Work continues."});
+        return Json(json!({
+            "id": "summarizer-repeats",
+            "model": "mock-summarizer",
+            "choices": [{ "index": 0, "message": { "role": "assistant", "content": reply.to_string() }, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 7, "completion_tokens": 4, "total_tokens": 11 }
+        }))
+        .into_response();
+    }
     if !streaming && state.scenario == Scenario::SummarizerDown && complete_call == 1 {
         return (
             StatusCode::BAD_GATEWAY,
@@ -344,7 +357,8 @@ async fn handle_upstream(State(state): State<MockState>, Json(body): Json<Value>
         | Scenario::SummarizerReasoningRetry
         | Scenario::SummarizerDown
         | Scenario::SummarizerThenEmpty
-        | Scenario::SummarizerFacts => sse_response(vec![
+        | Scenario::SummarizerFacts
+        | Scenario::SummarizerRepeats => sse_response(vec![
             chunk("c1", "Hello"),
             chunk("c1", ", "),
             chunk("c1", "world"),
@@ -497,7 +511,8 @@ async fn completion_answer(scenario: Scenario) -> Response {
         | Scenario::SummarizerThenEmpty
         | Scenario::SummarizerThenDown
         | Scenario::SummarizerHold
-        | Scenario::SummarizerFacts => unreachable!("handled by the caller"),
+        | Scenario::SummarizerFacts
+        | Scenario::SummarizerRepeats => unreachable!("handled by the caller"),
     };
     Json(body).into_response()
 }
@@ -839,6 +854,21 @@ const TOOL_FOLDING_TENANT: &str = r#"      enabled: true
       amortization_requests: 1
 "#;
 
+// The format-variant options measured well together: tool facts as compact
+// JSON objects plus context sentences that repeat a fact's number dropped.
+const TOOL_FOLDING_TENANT_JSON: &str = r#"      enabled: true
+      fold_tool_turns: true
+      tool_facts_render: json
+      context_dedup: true
+      summarizer_model: mock/summarizer
+      keep_last: 2
+      summary_chars: 400
+      summarizer_max_tokens: 64
+      min_new_turns: 2
+      min_new_tokens: 0
+      amortization_requests: 1
+"#;
+
 fn folding_body(turns: usize) -> Value {
     let messages: Vec<Value> = (0..turns)
         .map(|index| {
@@ -1101,6 +1131,81 @@ async fn a_fold_with_tool_turns_keeps_whole_exchanges_and_their_ledger() {
     let prompt = summarizer_bodies(&upstream)[0].to_string();
     assert!(prompt.contains("tool call call_1: read_file"), "{prompt}");
     assert!(prompt.contains("tool result call_1"), "{prompt}");
+}
+
+/// The opt-in rendering: pointer facts as one JSON object, and the context
+/// note's copy of a fact's number dropped. Stored data is unchanged, so a
+/// tenant flipping the option sees only the rendered summary differ.
+#[tokio::test]
+async fn a_tool_folding_tenant_can_opt_into_json_facts_and_context_dedup() {
+    let upstream = MockUpstream::start(Scenario::SummarizerRepeats).await;
+    let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(TOOL_FOLDING_TENANT_JSON)).await;
+
+    let fill = |word: &str| format!("{word} {}", "x".repeat(400));
+    let body = json!({
+        "model": "mock/chat",
+        "stream": true,
+        "params": { "max_tokens": 64 },
+        "messages": [
+            { "role": "user", "content": fill("first ask") },
+            { "role": "assistant", "content": fill("checking"),
+              "tool_calls": [{ "id": "call_1", "type": "function",
+                              "function": { "name": "read_file", "arguments": "{\"path\":\"src/folding/plan.rs\"}" } }] },
+            { "role": "tool", "tool_call_id": "call_1", "name": "read_file",
+              "content": json!({"lines": 1043, "status": "green"}).to_string() },
+            { "role": "user", "content": fill("second ask") },
+            { "role": "assistant", "content": fill("noted") },
+            { "role": "user", "content": "what now?" },
+        ]
+    });
+    let (status, headers, text) = gw.post_chat(TEST_KEY, body).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    // The first four turns fold: the exchange is whole inside the head.
+    assert_eq!(headers.get("x-gateway-folded").unwrap(), "4");
+
+    let sent = upstream.last_body().expect("main request body");
+    let summary = sent["messages"][0]["content"].as_str().unwrap();
+    // The call's facts render as one compact object, numbers bare.
+    assert!(summary.contains("  {\"lines\":1043,\"status\":\"green\"}"), "{summary}");
+    assert!(!summary.contains("- /lines"), "{summary}");
+    // The sentence repeating the fact's number is dropped; the rest stays.
+    assert!(!summary.contains("has 1043 lines"), "{summary}");
+    assert!(summary.contains("Work continues."), "{summary}");
+}
+
+/// The same request through a tenant that leaves the options off must
+/// produce the historical summary byte for byte.
+#[tokio::test]
+async fn a_tool_folding_tenant_without_the_options_renders_the_historical_summary() {
+    let upstream = MockUpstream::start(Scenario::SummarizerRepeats).await;
+    let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(TOOL_FOLDING_TENANT)).await;
+
+    let fill = |word: &str| format!("{word} {}", "x".repeat(400));
+    let body = json!({
+        "model": "mock/chat",
+        "stream": true,
+        "params": { "max_tokens": 64 },
+        "messages": [
+            { "role": "user", "content": fill("first ask") },
+            { "role": "assistant", "content": fill("checking"),
+              "tool_calls": [{ "id": "call_1", "type": "function",
+                              "function": { "name": "read_file", "arguments": "{\"path\":\"src/folding/plan.rs\"}" } }] },
+            { "role": "tool", "tool_call_id": "call_1", "name": "read_file",
+              "content": json!({"lines": 1043, "status": "green"}).to_string() },
+            { "role": "user", "content": fill("second ask") },
+            { "role": "assistant", "content": fill("noted") },
+            { "role": "user", "content": "what now?" },
+        ]
+    });
+    let (status, headers, text) = gw.post_chat(TEST_KEY, body).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(headers.get("x-gateway-folded").unwrap(), "4");
+
+    let sent = upstream.last_body().expect("main request body");
+    let summary = sent["messages"][0]["content"].as_str().unwrap();
+    assert!(summary.contains("  - /lines: 1043"), "{summary}");
+    assert!(summary.contains("  - /status: green"), "{summary}");
+    assert!(summary.contains("The file has 1043 lines."), "{summary}");
 }
 
 #[tokio::test]
@@ -2913,6 +3018,8 @@ async fn the_decision_log_records_each_fold_outcome_without_message_text() {
             min_saving_nano_usd: 0,
             fold_tool_turns: false,
             pinned_terms_margin: 2,
+            tool_facts_render: llm_gateway::folding::ToolFactsRender::Bare,
+            context_dedup: false,
         },
         &llm_gateway::router::CostModel { input_per_mtok_usd: 2.0, output_per_mtok_usd: 8.0, cached_input_per_mtok_usd: None },
         &llm_gateway::router::CostModel { input_per_mtok_usd: 0.01, output_per_mtok_usd: 0.02, cached_input_per_mtok_usd: None },

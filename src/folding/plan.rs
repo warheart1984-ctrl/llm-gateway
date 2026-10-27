@@ -3,7 +3,7 @@
 //! No I/O, ported from 5-fold-engine's `plan_compression`, `CompressionPlan`,
 //! and `refusal`.
 
-use crate::folding::checks;
+use crate::folding::{RenderStyle, ToolFactsRender, checks};
 use crate::providers::{ChatMessage, Content};
 use crate::router::estimate_prompt_tokens;
 
@@ -112,6 +112,12 @@ pub struct PlanConfig {
     /// `needed * margin <= summary_chars` before a fold is paid for.
     /// `0` selects the historical margin of 2.
     pub pinned_terms_margin: u32,
+    /// How the folded tool calls' facts render in the committed summary.
+    /// `Bare` (the default) is the historical `- /path: value` form.
+    pub tool_facts_render: ToolFactsRender,
+    /// Drop context-note sentences that only repeat a numeric tool-fact
+    /// value. Off by default.
+    pub context_dedup: bool,
 }
 
 impl PlanConfig {
@@ -128,7 +134,15 @@ impl PlanConfig {
             min_saving_nano_usd: config.min_saving_nano_usd,
             fold_tool_turns: config.fold_tool_turns,
             pinned_terms_margin: config.pinned_terms_margin,
+            tool_facts_render: config.tool_facts_render,
+            context_dedup: config.context_dedup,
         }
+    }
+
+    /// The summary rendering choices for this plan. The default is the
+    /// historical rendering, byte for byte.
+    pub fn render_style(&self) -> RenderStyle {
+        RenderStyle { tool_facts: self.tool_facts_render, context_dedup: self.context_dedup }
     }
 }
 
@@ -637,6 +651,8 @@ mod tests {
             min_saving_nano_usd: 0,
             fold_tool_turns: false,
             pinned_terms_margin: 2,
+            tool_facts_render: ToolFactsRender::Bare,
+            context_dedup: false,
         }
     }
 

@@ -742,6 +742,8 @@ The gateway also keeps short values from a JSON result itself, rather than leavi
 
 What is dropped: the full result text, in every case. What is kept: the call, its compact arguments, the result's size and error status, the short values the gateway kept, any further fact the gateway could verify, and the outline of what was left out.
 
+Two rendering options change how the committed summary presents that data, without changing what is stored or verified. `folding.context_dedup: true` (default `false`) drops context-note sentences that repeat a numeric tool-fact value as a standalone token — the fact already carries the number, so the prose copy was redundant. `folding.tool_facts_render: json` renders each call's consecutive pointer facts as one compact JSON object (`{"passed":39,"suite":"checkout/totals"}`) instead of one `- /path: value` line each; `/items/N/…` pointers rebuild arrays, and a run whose pointers cannot combine into one object keeps the line form. Measured on captured folded requests, `json` alone made the answers more prose-like, so the configuration refuses it unless `context_dedup` is also on; together they improved strict typed accuracy at unchanged value accuracy. Either way, a `ToolFact`'s stored `value` is unchanged, a `context` the ledger keeps is unchanged, old ledgers load and render as before, and rollback is flipping the options off.
+
 `tools/fold_tools.py` is the paired-tenant agent benchmark: a scripted investigation — five harness-served calls returning several KB of JSON each, one an error — followed by questions answerable only from inside those results, with the same `tools` still offered. A question counts against folding only where the result it needs was folded away and the unfolded tenant answered correctly on the strict score. The same answer written as a numeric string (`"39"` for `39`) or as the only number in a short sentence (`"fails at line 1043"`) is leniently correct and counted as a format-only miss, so both accuracies are in the result file. A call the model repeats for something already fetched is counted a refetch; provider cost is priced with prompt caching as above. Run it with `python tools/run_fold_retention_local.py --provider openrouter --scenario tools --profile lifecycle --summarizer openrouter/gpt-4.1-mini`. The result files are in `benchmark_results/`. `python tools/bench_report.py` prints them as one table, one row per run: the build each run recorded, provider cost with caching for both tenants, the saving, folds committed, and both tenants' strict accuracy beside the folded tenant's lenient one. A run that stopped early is listed as incomplete, without numbers.
 
 OpenRouter, 2026-10-26, `gpt-4.1-mini` answering and summarizing, lifecycle profile, 60 calls each:
@@ -1261,7 +1263,7 @@ The SQLite ledger, lease and quota-split tests need no server and always
 run. Tests that count within one rate window wait until at least 15 s of the
 current minute remain, so they cannot straddle a boundary.
 
-`tests/live.rs` calls the real Groq, OpenRouter and NVIDIA APIs with the
+`tests/live.rs` calls the real Groq and OpenRouter APIs with the
 model the shipped catalogue names for each. It checks shape and money, never
 content:
 - a streamed answer follows the v1 contract and is billed exactly what its
@@ -1287,8 +1289,10 @@ LLM_GATEWAY_LIVE=all cargo test --test live -- --nocapture
 
 Each run appends estimated vs billed prompt tokens and reserved vs billed
 cost to `target/live-report.jsonl`. The `live` workflow runs it nightly and
-on demand from repository secrets (`GROQ_API_KEY`, `OPENROUTER_API_KEY`,
-`NVIDIA_API_KEY`), outside the gate: it depends on three vendors being up.
+on demand from repository secrets (`GROQ_API_KEY`, `OPENROUTER_API_KEY`),
+outside the gate: it depends on the vendors being up. NVIDIA was dropped on
+2026-10-27 after it retired two catalogue models inside a day; the provider
+stays in `config/models.yaml` for tenants that use it.
 Its checks are themselves tested on every normal run, against a local server
 that speaks the vendors' wire format, with no key and no cost.
 

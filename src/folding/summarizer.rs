@@ -358,11 +358,14 @@ pub fn run_fold_checks(
 ) -> Result<(String, ledger::Ledger), Vec<String>> {
     let parsed = ledger::parse_reply(reply).map_err(|error| vec![error])?;
     let updated = ledger::apply(prior_ledger, &parsed, pending, first_turn)?;
-    let rendered = updated.render(config.summary_chars).map_err(|error| vec![error])?;
+    let rendered =
+        updated.render_with(config.summary_chars, config.render_style()).map_err(|error| vec![error])?;
     // The context note is what `render` cuts. The pin check has to see that
     // cut — the text that would be committed — and the note before the cut,
-    // or a value past the cut is reported as missing.
-    let unclipped = updated.render(usize::MAX).map_err(|error| vec![error])?;
+    // or a value past the cut is reported as missing. `unclipped` uses the
+    // same rendering options so the difference it isolates is the length
+    // cut alone, not dedup or fact rendering.
+    let unclipped = updated.render_with(usize::MAX, config.render_style()).map_err(|error| vec![error])?;
     let source = pin_source(prior_summary, pending);
     let replaced = superseded(prior_summary, pending);
     let mut errors =
