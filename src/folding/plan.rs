@@ -109,6 +109,9 @@ pub struct PlanConfig {
     pub min_saving_nano_usd: u64,
     /// Turns with tool calls may fold into the verified tool ledger.
     pub fold_tool_turns: bool,
+    /// `needed * margin <= summary_chars` before a fold is paid for.
+    /// `0` selects the historical margin of 2.
+    pub pinned_terms_margin: u32,
     /// How the folded tool calls' facts render in the committed summary.
     /// `Bare` (the default) is the historical `- /path: value` form.
     pub tool_facts_render: ToolFactsRender,
@@ -130,6 +133,7 @@ impl PlanConfig {
             amortization_requests: config.amortization_requests,
             min_saving_nano_usd: config.min_saving_nano_usd,
             fold_tool_turns: config.fold_tool_turns,
+            pinned_terms_margin: config.pinned_terms_margin,
             tool_facts_render: config.tool_facts_render,
             context_dedup: config.context_dedup,
         }
@@ -646,6 +650,7 @@ mod tests {
             amortization_requests: 4,
             min_saving_nano_usd: 0,
             fold_tool_turns: false,
+            pinned_terms_margin: 2,
             tool_facts_render: ToolFactsRender::Bare,
             context_dedup: false,
         }

@@ -60,6 +60,7 @@ use crate::{
         ledger::{
             self,
             holds::{HoldClaim, HoldProblem, HoldRecord, NewHold},
+            Ledger, LedgerRefusal,
         },
         limits::AdmitRequest,
         limits::CostEstimate,
@@ -1528,7 +1529,7 @@ async fn foreground_fold(
     }
     let mut pinned = summarizer::pinned_terms(prior.as_ref().map(|summary| summary.summary.as_str()), &pending);
     pinned.extend(summarizer::field_pins(&pending).iter().map(ToString::to_string));
-    if !summarizer::pinned_terms_fit(&pinned, plan_config.summary_chars) {
+    if !summarizer::pinned_terms_fit(&pinned, plan_config.summary_chars, plan_config.pinned_terms_margin) {
         return seal(skip("skipped", "pinned_overflow", Some(FoldAccounting::PinnedOverflow)));
     }
 
@@ -1830,6 +1831,47 @@ impl Admitted {
 /// Everything before the upstream connection: authenticate, parse, authorize,
 /// resolve, merge parameters, and reserve cost. Shared by both endpoints, so
 /// a governance rule cannot apply to one and not the other.
+/// A key claimed before any fold. Dropped still armed, it releases the claim
+/// so a cancelled request does not leave the key stuck. Disarmed once the
+/// reservation has adopted the claim: releasing after that must not free the
+/// charged key.
+struct IdempotencyGuard {
+    ledger: Arc<dyn Ledger>,
+    id: Uuid,
+    tenant_id: Arc<str>,
+    armed: bool,
+}
+
+impl IdempotencyGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    async fn release(&mut self) {
+        if self.armed {
+            self.armed = false;
+            self.ledger.release_idempotency(self.id, &self.tenant_id).await;
+        }
+    }
+}
+
+impl Drop for IdempotencyGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        let ledger = Arc::clone(&self.ledger);
+        let id = self.id;
+        let tenant_id = Arc::clone(&self.tenant_id);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                ledger.release_idempotency(id, &tenant_id).await;
+            });
+        }
+    }
+}
+
 async fn admit(
     state: &Arc<AppState>,
     headers: &HeaderMap,
@@ -1972,8 +2014,8 @@ async fn admit(
         completion_nano_usd: estimate_cost_nano_usd(&resolved.config.cost, 0, max_output_tokens),
     };
     let unfolded_cost = cost;
-    //    A repeated Idempotency-Key is decided here too, by the ledger, in the
-    //    same step as the budget: a duplicate never reaches the provider.
+    //    A repeated Idempotency-Key is claimed before any fold, then adopted
+    //    with the budget below. A duplicate never reaches the summarizer.
     if decision.tenant.require_idempotency_key && idempotency_key.is_none() {
         return Err(RequestError::IdempotencyKeyRequired);
     }
@@ -2055,7 +2097,34 @@ async fn admit(
 
     // Holds are deliberately resolved before folding: a held request must not
     // spend a summarizer reservation, and idempotency still fingerprints the
-    // original client body below.
+    // original client body. The key is claimed before any fold work, so a
+    // duplicate of the same request is refused before the summarizer runs or
+    // the fold store changes. A different request under the same key is not
+    // claimed here: it still folds, and the reservation below refuses the
+    // reused key, carrying the fold the caller was charged for. That
+    // reservation adopts a claim at the folded estimate.
+    let request_uuid = Uuid::parse_str(request_id).unwrap_or_else(|_| Uuid::new_v4());
+    let idempotency = idempotency_key.map(|key| state.limits.fingerprinter().claim(key, scope, &value));
+    let mut claimed = None;
+    if let Some(claim) = &idempotency {
+        match state
+            .limits
+            .ledger()
+            .claim_idempotency(request_uuid, &principal.tenant_id, claim)
+            .await
+        {
+            Ok(()) => {
+                claimed = Some(IdempotencyGuard {
+                    ledger: Arc::clone(state.limits.ledger()),
+                    id: request_uuid,
+                    tenant_id: Arc::clone(&principal.tenant_id),
+                    armed: true,
+                });
+            }
+            Err(LedgerRefusal::IdempotencyKeyReused) => {}
+            Err(refusal) => return Err(LimitError::from(refusal).into()),
+        }
+    }
     let original_messages = req.messages.clone();
     let fold = foreground_fold(
         state,
@@ -2144,11 +2213,10 @@ async fn admit(
         exposure_nano_usd: unfolded_cost.total(),
         key_id: principal.key_id.to_string(),
     });
-    let idempotency = idempotency_key.map(|key| state.limits.fingerprinter().claim(key, scope, &value));
-    let mut reservation = state
+    let admitted = state
         .limits
         .admit_request(AdmitRequest {
-            id: Uuid::parse_str(request_id).unwrap_or_else(|_| Uuid::new_v4()),
+            id: request_uuid,
             tenant_id: &principal.tenant_id,
             limits: &decision.limits,
             prompt_tokens,
@@ -2157,7 +2225,21 @@ async fn admit(
             idempotency,
             hold,
         })
-        .await?;
+        .await;
+    let mut reservation = match admitted {
+        Ok(reservation) => {
+            if let Some(guard) = claimed.as_mut() {
+                guard.disarm();
+            }
+            reservation
+        }
+        Err(error) => {
+            if let Some(guard) = claimed.as_mut() {
+                guard.release().await;
+            }
+            return Err(error.into());
+        }
+    };
     let receipt = if let Some(chain) = &chain {
         let written: Result<OpenReceipt, ReceiptError> = async {
             let salt = receipt_salt.clone().ok_or(ReceiptError::Unavailable)?;
@@ -2216,7 +2298,7 @@ async fn admit(
     });
 
     let request = ProviderRequest {
-        request_id: Uuid::parse_str(request_id).unwrap_or_else(|_| Uuid::new_v4()),
+        request_id: request_uuid,
         tenant_id: Arc::clone(&principal.tenant_id),
         key_id: Arc::clone(&principal.key_id),
         upstream_model: resolved.upstream_model.clone(),

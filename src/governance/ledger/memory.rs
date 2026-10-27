@@ -11,7 +11,7 @@ use dashmap::{DashMap, mapref::entry::Entry};
 use uuid::Uuid;
 
 use super::{
-    Closing, Ledger, LedgerRefusal, NewReservation, Outcome,
+    Closing, IdempotencyClaim, Ledger, LedgerRefusal, NewReservation, Outcome,
     decisions::{Decision, DecisionKind, DecisionQuery, DecisionRecord, DecisionRing, unix_now},
     holds::{self, HoldDecision, HoldProblem, HoldQuery, HoldRecord, HoldState, NewHold, Transition},
 };
@@ -127,6 +127,10 @@ struct KeyRecord {
     billed: u64,
     response: Option<String>,
     closed_at: Option<SystemTime>,
+    /// Set while the key is claimed and the budget is not yet reserved. The
+    /// reservation clears it. A release only frees a key that still has it,
+    /// so releasing after adoption cannot drop a charged attempt.
+    preclaim: bool,
 }
 
 /// A hold as the memory ledger keeps it: the record, with its stored (not
@@ -210,6 +214,8 @@ impl MemoryLedger {
             return Some(LedgerRefusal::IdempotencyKeyReused);
         }
         match record.state {
+            // This attempt's own pre-fold claim is not a repeat of someone else.
+            KeyState::Open if record.id == r.id && record.preclaim => None,
             KeyState::Open => Some(LedgerRefusal::InProgress { original: Some(record.id) }),
             KeyState::Billed => Some(LedgerRefusal::Duplicate {
                 original: record.id,
@@ -265,6 +271,7 @@ impl MemoryLedger {
             billed: 0,
             response: None,
             closed_at: None,
+            preclaim: false,
         };
         // The entry guard locks this key's shard for the whole decision, so
         // two attempts with one key are decided one after the other.
@@ -276,35 +283,129 @@ impl MemoryLedger {
                 Ok(bucket)
             }
             Entry::Occupied(mut held) => {
-                let record = held.get();
-                // An expired key is forgotten entirely. Otherwise the key is
-                // bound to its first request for good: a different request
-                // under it is refused whatever state the first one is in.
-                if !self.expired(record, r.now) {
-                    if !claim.matches(&record.fingerprint) {
-                        return Err(LedgerRefusal::IdempotencyKeyReused);
-                    }
-                    match record.state {
-                        KeyState::Open => {
-                            return Err(LedgerRefusal::InProgress { original: Some(record.id) });
+                // Copy the decision out, then drop the shared borrow so an
+                // adoption can write the same entry.
+                let adopt = {
+                    let record = held.get();
+                    // An expired key is forgotten entirely. Otherwise the key is
+                    // bound to its first request for good: a different request
+                    // under it is refused whatever state the first one is in.
+                    if !self.expired(record, r.now) {
+                        if !claim.matches(&record.fingerprint) {
+                            return Err(LedgerRefusal::IdempotencyKeyReused);
                         }
-                        KeyState::Billed => {
-                            return Err(LedgerRefusal::Duplicate {
-                                original: record.id,
-                                billed_nano_usd: record.billed,
-                                response: record.response.clone(),
-                            });
+                        match record.state {
+                            KeyState::Open if record.id == r.id && record.preclaim => true,
+                            KeyState::Open => {
+                                return Err(LedgerRefusal::InProgress { original: Some(record.id) });
+                            }
+                            KeyState::Billed => {
+                                return Err(LedgerRefusal::Duplicate {
+                                    original: record.id,
+                                    billed_nano_usd: record.billed,
+                                    response: record.response.clone(),
+                                });
+                            }
+                            // Nothing was executed or billed: run it again.
+                            KeyState::Released => false,
                         }
-                        // Nothing was executed or billed: run it again.
-                        KeyState::Released => {}
+                    } else {
+                        false
                     }
-                }
+                };
                 let bucket = spend.try_reserve(r.now, r.amount_nano_usd, r.budget_nano_usd)?;
-                let previous = std::mem::replace(held.get_mut(), fresh(r.id));
-                self.by_id.remove(&previous.id);
-                self.by_id.insert(r.id, key);
+                if adopt {
+                    let adopted = held.get_mut();
+                    adopted.reserved = r.amount_nano_usd;
+                    adopted.preclaim = false;
+                } else {
+                    let previous = std::mem::replace(held.get_mut(), fresh(r.id));
+                    self.by_id.remove(&previous.id);
+                    self.by_id.insert(r.id, key);
+                }
                 Ok(bucket)
             }
+        }
+    }
+}
+
+impl MemoryLedger {
+    /// Claim `claim` for `id` without charging. A later [`reserve`] of the
+    /// same id adopts it.
+    fn claim_key(&self, id: Uuid, tenant_id: &str, claim: &IdempotencyClaim<'_>) -> Result<(), LedgerRefusal> {
+        let key = (tenant_id.to_string(), claim.key.to_string());
+        let fresh = KeyRecord {
+            id,
+            fingerprint: claim.fingerprint.clone(),
+            state: KeyState::Open,
+            reserved: 0,
+            billed: 0,
+            response: None,
+            closed_at: None,
+            preclaim: true,
+        };
+        let now = SystemTime::now();
+        match self.keys.entry(key.clone()) {
+            Entry::Vacant(slot) => {
+                slot.insert(fresh);
+                self.by_id.insert(id, key);
+                Ok(())
+            }
+            Entry::Occupied(mut held) => {
+                let replace = {
+                    let record = held.get();
+                    if !self.expired(record, now) {
+                        if !claim.matches(&record.fingerprint) {
+                            return Err(LedgerRefusal::IdempotencyKeyReused);
+                        }
+                        match record.state {
+                            KeyState::Open if record.id == id && record.preclaim => return Ok(()),
+                            KeyState::Open => {
+                                return Err(LedgerRefusal::InProgress { original: Some(record.id) });
+                            }
+                            KeyState::Billed => {
+                                return Err(LedgerRefusal::Duplicate {
+                                    original: record.id,
+                                    billed_nano_usd: record.billed,
+                                    response: record.response.clone(),
+                                });
+                            }
+                            KeyState::Released => true,
+                        }
+                    } else {
+                        true
+                    }
+                };
+                if replace {
+                    let previous = std::mem::replace(held.get_mut(), fresh);
+                    self.by_id.remove(&previous.id);
+                    self.by_id.insert(id, key);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Release an unadopted claim. An adopted key, or one held by another
+    /// attempt, is left as it is.
+    fn release_claim(&self, id: Uuid) {
+        let Some(key) = self.by_id.get(&id).map(|entry| entry.clone()) else {
+            return;
+        };
+        let released = {
+            let Some(mut record) = self.keys.get_mut(&key) else {
+                return;
+            };
+            if record.id == id && record.preclaim && record.state == KeyState::Open {
+                record.state = KeyState::Released;
+                record.closed_at = Some(SystemTime::now());
+                true
+            } else {
+                false
+            }
+        };
+        if released {
+            self.by_id.remove(&id);
         }
     }
 }
@@ -348,6 +449,19 @@ impl Ledger for MemoryLedger {
             .with_reason(&format!("executed as request {}", r.id)),
         );
         Ok(bucket)
+    }
+
+    async fn claim_idempotency(
+        &self,
+        id: Uuid,
+        tenant_id: &str,
+        claim: &IdempotencyClaim<'_>,
+    ) -> Result<(), LedgerRefusal> {
+        self.claim_key(id, tenant_id, claim)
+    }
+
+    async fn release_idempotency(&self, id: Uuid, _tenant_id: &str) {
+        self.release_claim(id);
     }
 
     fn close(&self, c: Closing) {
@@ -581,5 +695,47 @@ mod tests {
             ledger.close(settled(id, bucket, at));
         }
         assert_eq!(ledger.keys.len(), 1, "only the key still inside retention is left");
+    }
+
+    #[tokio::test]
+    async fn a_preclaim_blocks_a_duplicate_until_it_is_released() {
+        let ledger = MemoryLedger::default();
+        let claim = IdempotencyClaim { key: "k", fingerprint: vec![1], also_matches: vec![] };
+        let id = Uuid::new_v4();
+        ledger.claim_idempotency(id, "t", &claim).await.unwrap();
+        let other = Uuid::new_v4();
+        match ledger.claim_idempotency(other, "t", &claim).await.unwrap_err() {
+            LedgerRefusal::InProgress { original: Some(original) } => assert_eq!(original, id),
+            other => panic!("expected in progress, got {other:?}"),
+        }
+        // The budget refuses the adoption. The claim is still held, and a
+        // release then lets another attempt take the key.
+        let mut refused = keyed(id, "k");
+        refused.amount_nano_usd = 100;
+        refused.budget_nano_usd = 10;
+        assert!(matches!(
+            ledger.try_reserve(refused).await.unwrap_err(),
+            LedgerRefusal::BudgetWouldBeExceeded { .. }
+        ));
+        match ledger.claim_idempotency(other, "t", &claim).await.unwrap_err() {
+            LedgerRefusal::InProgress { original: Some(original) } => assert_eq!(original, id),
+            other => panic!("a refused adoption must keep the claim, got {other:?}"),
+        }
+        ledger.release_idempotency(id, "t").await;
+        ledger.claim_idempotency(other, "t", &claim).await.expect("a released claim is free");
+    }
+
+    #[tokio::test]
+    async fn releasing_an_adopted_preclaim_does_not_free_the_key() {
+        let ledger = MemoryLedger::default();
+        let claim = IdempotencyClaim { key: "k", fingerprint: vec![1], also_matches: vec![] };
+        let id = Uuid::new_v4();
+        ledger.claim_idempotency(id, "t", &claim).await.unwrap();
+        ledger.try_reserve(keyed(id, "k")).await.unwrap();
+        ledger.release_idempotency(id, "t").await;
+        match ledger.try_reserve(keyed(Uuid::new_v4(), "k")).await.unwrap_err() {
+            LedgerRefusal::InProgress { original: Some(original) } => assert_eq!(original, id),
+            other => panic!("adoption must survive a later release, got {other:?}"),
+        }
     }
 }

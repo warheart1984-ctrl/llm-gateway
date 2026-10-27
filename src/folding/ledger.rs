@@ -665,6 +665,26 @@ const KINDS: &[&str] = &[
     "total", "limit", "id",
 ];
 
+/// Whether a field update named `update` is about the kept fact `kept`.
+///
+/// Equal names and same-fact names are. So is an update that is one word
+/// of the kept name, unless that word only says the kind of value: "ceiling"
+/// names `spending_ceiling_usd`, while "port" does not name `staging_port`
+/// (it would also name `production_port`). Used when a later fold's field pin
+/// supersedes a value carried forward. Ambiguous names are not this function's
+/// problem; the caller keeps every matching fact's old value.
+pub(crate) fn fact_named_by(kept: &str, update: &str) -> bool {
+    let kept = kept.trim().to_lowercase();
+    let update = update.trim().to_lowercase();
+    if kept == update || same_fact(&kept, &update) {
+        return true;
+    }
+    if update.len() <= 2 || KINDS.contains(&update.as_str()) {
+        return false;
+    }
+    kept.split('_').any(|part| part == update)
+}
+
 /// Whether two names are one fact: one's words all belong to the other's,
 /// and what the longer adds is only the kind of value ("staging" and
 /// "staging_port", "release" and "release_date"). A name that adds which
@@ -1376,6 +1396,33 @@ mod tests {
 
     fn pair(field: &str, value: &str) -> (String, String) {
         (field.to_string(), value.to_string())
+    }
+
+    #[test]
+    fn a_field_update_names_the_fact_it_is_about_and_not_every_port() {
+        assert!(fact_named_by("city", "city"));
+        assert!(fact_named_by("production_port", "production"));
+        assert!(fact_named_by("spending_ceiling_usd", "ceiling"));
+        assert!(fact_named_by("delivery_city", "delivery"));
+        assert!(fact_named_by("budget_usd", "budget"));
+        assert!(fact_named_by("project_owner", "owner"));
+        assert!(!fact_named_by("delivery_city", "city"));
+        assert!(!fact_named_by("staging_port", "port"));
+        assert!(!fact_named_by("production_port", "port"));
+        assert!(!fact_named_by("staging_port", "production"));
+        assert!(!fact_named_by("birch_budget", "budget"));
+    }
+
+    #[test]
+    fn a_ledger_stored_before_instructions_and_tool_calls_still_loads() {
+        let json = r#"{"facts":[{"field":"city","value":"Bergen","evidence":"the city is now Bergen.","turn":0,"history":[]}],"context":"The city was set."}"#;
+        let ledger: Ledger = serde_json::from_str(json).unwrap();
+        assert_eq!(ledger.facts.len(), 1);
+        assert_eq!(ledger.facts[0].value, "Bergen");
+        assert!(ledger.instructions.is_empty());
+        assert!(ledger.retired.is_empty());
+        assert!(ledger.tool_calls.is_empty());
+        assert_eq!(ledger.context, "The city was set.");
     }
 
     #[test]

@@ -14,8 +14,10 @@
 //!   amount <= budget`) that either commits the reservation or refuses;
 //! * closing is `open -> settled | abandoned | released | committed`, applied
 //!   only if the reservation is still `open`, so a duplicate close is inert;
-//! * an idempotency key is claimed in the same step as the budget, so there
-//!   is never a charge without a key record or a key record without a charge.
+//! * an idempotency key is claimed before any provider call, including a
+//!   conversation fold, so a duplicate is refused before it can fold. The
+//!   budget reservation adopts that claim in the same step as the charge. A
+//!   claim whose request never reserves is released, and is not a charge.
 //!
 //! The provider is contacted only after [`Ledger::try_reserve`] returns, i.e.
 //! after the reservation is durable. "Called but unrecorded" cannot happen.
@@ -360,9 +362,27 @@ pub enum LedgerRefusal {
 
 #[async_trait::async_trait]
 pub trait Ledger: Send + Sync + std::fmt::Debug {
-    /// Check the budget, claim the idempotency key if any, and reserve, as
-    /// one atomic step. Returns the day bucket charged.
+    /// Check the budget and reserve, as one atomic step. Returns the day
+    /// bucket charged. Adopts an idempotency claim this attempt already
+    /// holds; a key with no prior claim is claimed here, with the charge.
     async fn try_reserve(&self, r: NewReservation<'_>) -> Result<u64, LedgerRefusal>;
+
+    /// Claim an idempotency key before any provider work, without charging
+    /// the budget and without counting a reservation. [`try_reserve`] adopts
+    /// the claim. [`release_idempotency`] drops it when the request is
+    /// refused before it reserves. A duplicate, a key still in progress, or a
+    /// key used for a different request is refused, and nothing is claimed.
+    async fn claim_idempotency(
+        &self,
+        id: Uuid,
+        tenant_id: &str,
+        claim: &IdempotencyClaim<'_>,
+    ) -> Result<(), LedgerRefusal>;
+
+    /// Drop a claim this attempt holds and has not adopted. An adopted claim,
+    /// or one this attempt does not hold, is left alone: the reservation owns
+    /// the key from adoption on.
+    async fn release_idempotency(&self, id: Uuid, tenant_id: &str);
 
     /// Close a reservation. Synchronous because it is called from `Drop`:
     /// the memory backend applies it at once, the Postgres backend queues it

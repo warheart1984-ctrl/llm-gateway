@@ -63,6 +63,7 @@ tenants:
     #   min_new_tokens: 400
     #   amortization_requests: 4
     #   min_saving_nano_usd: 0
+    #   pinned_terms_margin: 2   # 2: pins may use half of summary_chars; 1 admits a list that fits
     #   backoff_turns: 8         # after a rejected fold, wait this many turns
     #   tool_facts_render: bare  # or json: facts as one JSON object per call;
     #                            # json requires context_dedup: true
