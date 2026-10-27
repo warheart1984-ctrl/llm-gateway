@@ -64,6 +64,10 @@ tenants:
     #   amortization_requests: 4
     #   min_saving_nano_usd: 0
     #   backoff_turns: 8         # after a rejected fold, wait this many turns
+    #   tool_facts_render: bare  # or json: facts as one JSON object per call;
+    #                            # json requires context_dedup: true
+    #   context_dedup: false     # drop context sentences that only repeat a
+    #                            # numeric tool-fact value
 
   # Isolated benchmark tenant. Limits are intentionally high enough to expose
   # provider and gateway capacity at the selected test point, but remain finite

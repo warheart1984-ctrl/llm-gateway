@@ -35,6 +35,12 @@ tenants:
       amortization_requests: 4
       min_saving_nano_usd: 0
       fold_tool_turns: true
+      # Format variant D: tool facts as one JSON object per call plus context
+      # sentences that repeat a fact's number dropped. `json` requires
+      # `context_dedup` (json alone measured worse). Roll back by removing
+      # these two lines; stored ledgers are unaffected.
+      tool_facts_render: json
+      context_dedup: true
   - tenant_id: benchmark-admin
     enabled: true
     credentials:

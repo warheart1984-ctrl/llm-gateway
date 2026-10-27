@@ -301,7 +301,8 @@ pub fn run_fold_checks(
 ) -> Result<(String, ledger::Ledger), Vec<String>> {
     let parsed = ledger::parse_reply(reply).map_err(|error| vec![error])?;
     let updated = ledger::apply(prior_ledger, &parsed, pending, first_turn)?;
-    let rendered = updated.render(config.summary_chars).map_err(|error| vec![error])?;
+    let rendered =
+        updated.render_with(config.summary_chars, config.render_style()).map_err(|error| vec![error])?;
     let source = pin_source(prior_summary, pending);
     let replaced = superseded(prior_summary, pending);
     let mut errors =

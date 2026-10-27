@@ -3,7 +3,7 @@
 //! No I/O, ported from 5-fold-engine's `plan_compression`, `CompressionPlan`,
 //! and `refusal`.
 
-use crate::folding::checks;
+use crate::folding::{RenderStyle, ToolFactsRender, checks};
 use crate::providers::{ChatMessage, Content};
 use crate::router::estimate_prompt_tokens;
 
@@ -109,6 +109,12 @@ pub struct PlanConfig {
     pub min_saving_nano_usd: u64,
     /// Turns with tool calls may fold into the verified tool ledger.
     pub fold_tool_turns: bool,
+    /// How the folded tool calls' facts render in the committed summary.
+    /// `Bare` (the default) is the historical `- /path: value` form.
+    pub tool_facts_render: ToolFactsRender,
+    /// Drop context-note sentences that only repeat a numeric tool-fact
+    /// value. Off by default.
+    pub context_dedup: bool,
 }
 
 impl PlanConfig {
@@ -124,7 +130,15 @@ impl PlanConfig {
             amortization_requests: config.amortization_requests,
             min_saving_nano_usd: config.min_saving_nano_usd,
             fold_tool_turns: config.fold_tool_turns,
+            tool_facts_render: config.tool_facts_render,
+            context_dedup: config.context_dedup,
         }
+    }
+
+    /// The summary rendering choices for this plan. The default is the
+    /// historical rendering, byte for byte.
+    pub fn render_style(&self) -> RenderStyle {
+        RenderStyle { tool_facts: self.tool_facts_render, context_dedup: self.context_dedup }
     }
 }
 
@@ -632,6 +646,8 @@ mod tests {
             amortization_requests: 4,
             min_saving_nano_usd: 0,
             fold_tool_turns: false,
+            tool_facts_render: ToolFactsRender::Bare,
+            context_dedup: false,
         }
     }
 
