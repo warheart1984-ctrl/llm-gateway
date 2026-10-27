@@ -1528,7 +1528,7 @@ async fn foreground_fold(
     }
     let mut pinned = summarizer::pinned_terms(prior.as_ref().map(|summary| summary.summary.as_str()), &pending);
     pinned.extend(summarizer::field_pins(&pending).iter().map(ToString::to_string));
-    if !summarizer::pinned_terms_fit(&pinned, plan_config.summary_chars) {
+    if !summarizer::pinned_terms_fit(&pinned, plan_config.summary_chars, plan_config.pinned_terms_margin) {
         return seal(skip("skipped", "pinned_overflow", Some(FoldAccounting::PinnedOverflow)));
     }
 

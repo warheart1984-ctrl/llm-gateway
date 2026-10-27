@@ -187,6 +187,17 @@ pub struct FoldingConfig {
     /// tool ledger instead of refusing the fold. Off by default.
     #[serde(default)]
     pub fold_tool_turns: bool,
+    /// Skip a fold before paying when the comma-separated pinned values take
+    /// more than `summary_chars / pinned_terms_margin`. `2` is half the
+    /// budget, which is the historical rule. `1` admits any list that fits
+    /// in `summary_chars`; the commit checks still refuse a summary that
+    /// does not.
+    #[serde(default = "default_pinned_terms_margin")]
+    pub pinned_terms_margin: u32,
+}
+
+fn default_pinned_terms_margin() -> u32 {
+    2
 }
 
 impl Default for FoldingConfig {
@@ -206,6 +217,7 @@ impl Default for FoldingConfig {
             min_saving_nano_usd: 0,
             backoff_turns: 8,
             fold_tool_turns: false,
+            pinned_terms_margin: default_pinned_terms_margin(),
         }
     }
 }
@@ -233,6 +245,9 @@ impl FoldingConfig {
                 "folding.summary_chars must be in 200..=8000, got {}",
                 self.summary_chars
             ));
+        }
+        if self.pinned_terms_margin == 0 {
+            return Err("folding.pinned_terms_margin must be at least 1".into());
         }
         let _ = tenant_id;
         Ok(())
@@ -904,6 +919,7 @@ mod tests {
         assert_eq!(folding.min_new_tokens, 400);
         assert_eq!(folding.amortization_requests, 4);
         assert_eq!(folding.min_saving_nano_usd, 0);
+        assert_eq!(folding.pinned_terms_margin, 2);
         assert_eq!(folding.mode(), FoldMode::On, "enabled: true without fold_mode is on");
 
         let unknown = serde_yaml::from_str::<TenantFile>(
@@ -997,6 +1013,21 @@ mod tests {
         .unwrap();
         assert!(err.to_string().contains("acme"), "{err}");
         assert!(err.to_string().contains("keep_last"), "{err}");
+    }
+
+    #[test]
+    fn pinned_terms_margin_defaults_to_two_and_zero_is_rejected() {
+        let mut relaxed = tenant(&["*"], &[]);
+        relaxed.folding = Some(FoldingConfig { pinned_terms_margin: 1, ..folding_config("groq/summarizer") });
+        let registry =
+            TenantRegistry::from_file(TenantFile { tenants: vec![relaxed] }, PathBuf::from("tenants.yaml")).unwrap();
+        assert_eq!(registry.get("acme").unwrap().folding.as_ref().unwrap().pinned_terms_margin, 1);
+
+        let mut zero = tenant(&["*"], &[]);
+        zero.folding = Some(FoldingConfig { pinned_terms_margin: 0, ..folding_config("groq/summarizer") });
+        let err =
+            TenantRegistry::from_file(TenantFile { tenants: vec![zero] }, PathBuf::from("tenants.yaml")).err().unwrap();
+        assert!(err.to_string().contains("pinned_terms_margin"), "{err}");
     }
 
     #[test]

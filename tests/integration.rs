@@ -2762,6 +2762,7 @@ async fn the_decision_log_records_each_fold_outcome_without_message_text() {
             amortization_requests: 1,
             min_saving_nano_usd: 0,
             fold_tool_turns: false,
+            pinned_terms_margin: 2,
         },
         &llm_gateway::router::CostModel { input_per_mtok_usd: 2.0, output_per_mtok_usd: 8.0, cached_input_per_mtok_usd: None },
         &llm_gateway::router::CostModel { input_per_mtok_usd: 0.01, output_per_mtok_usd: 0.02, cached_input_per_mtok_usd: None },
