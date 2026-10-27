@@ -120,6 +120,8 @@ fn build_summarizer_prompt(
     // The same values the commit check will demand, so the summarizer is told
     // what it must keep instead of guessing (5-fold-engine's `fold_prompt`).
     let pinned = pinned_terms(prior_summary, pending_turns);
+    // Only pins the new turns set. Carried facts stay in the ledger without
+    // being asked for again as updates.
     let fields = field_pins(pending_turns);
     let replaced = superseded(prior_summary, pending_turns);
 
@@ -168,13 +170,58 @@ fn pin_source(prior_summary: Option<&str>, pending_turns: &[ChatMessage]) -> Str
     source
 }
 
-/// The field/value pairs a fold of `pending_turns` must state as current.
-/// Taken from the turns being folded only: a prior summary's facts are
-/// carried by the summarizer, and its own field names need not match the
-/// words of a later update ("city: Bergen", then "delivery moves to Tromso"),
-/// so pinning both would demand a stale value.
+/// The field/value pairs the turns being folded set, the latest value for
+/// each field. What a fold must still state as current is
+/// [`required_field_pins`]: these, laid over the facts already committed.
 pub fn field_pins(pending_turns: &[ChatMessage]) -> Vec<checks::FieldPin> {
     checks::extract_field_pins(&checks::build_source_text(pending_turns))
+}
+
+/// Field pins a fold must state as current.
+///
+/// Starts from the prior ledger's current facts. A fact that is only in the
+/// prior summary (a ledger stored before it carried facts) is included too.
+/// A field update in the turns being folded replaces the carried value of the
+/// one fact it names, so the latest value wins and the stale one is not
+/// required. An update that names more than one kept fact replaces none of
+/// them: both old values stay required, and so does the new one.
+pub fn required_field_pins(
+    prior_summary: Option<&str>,
+    prior_ledger: &ledger::Ledger,
+    pending_turns: &[ChatMessage],
+) -> Vec<checks::FieldPin> {
+    let mut pins: Vec<checks::FieldPin> = prior_ledger
+        .facts
+        .iter()
+        .map(|fact| checks::FieldPin { field: fact.field.clone(), value: fact.value.clone() })
+        .collect();
+    if let Some(summary) = prior_summary {
+        for pin in checks::summary_field_pins(summary) {
+            if !pins.iter().any(|kept| ledger::fact_named_by(&kept.field, &pin.field)) {
+                pins.push(pin);
+            }
+        }
+    }
+    for pin in field_pins(pending_turns) {
+        overlay_field_pin(&mut pins, pin);
+    }
+    pins
+}
+
+/// One new field pin laid over pins already required. A single kept fact it
+/// names takes the new value. None, or more than one, leaves every old value
+/// required and requires the new pin as well.
+fn overlay_field_pin(pins: &mut Vec<checks::FieldPin>, update: checks::FieldPin) {
+    let hits: Vec<usize> = pins
+        .iter()
+        .enumerate()
+        .filter(|(_, kept)| ledger::fact_named_by(&kept.field, &update.field))
+        .map(|(index, _)| index)
+        .collect();
+    match hits.as_slice() {
+        [index] => pins[*index].value = update.value,
+        _ => pins.push(update),
+    }
 }
 
 /// The values a fold must not state as current: those the prior summary
@@ -306,7 +353,7 @@ pub fn run_fold_checks(
     let replaced = superseded(prior_summary, pending);
     let mut errors =
         checks::check_summary_except(&rendered, &source, config.summary_chars, &replaced).err().unwrap_or_default();
-    for pin in field_pins(pending) {
+    for pin in required_field_pins(prior_summary, prior_ledger, pending) {
         if !ledger::states_pin(&updated, &pin) {
             errors.push(format!("field_value_present: missing '{pin}'"));
         }
@@ -366,7 +413,8 @@ pub fn run_checks_with_prior(
     let mut errors =
         checks::check_summary_except(summary, &source, config.summary_chars, &replaced).err().unwrap_or_default();
     let clipped = checks::clip_to_chars(summary, config.summary_chars);
-    if let Err(missing) = checks::check_field_pins(&clipped, &field_pins(turns_being_summarized)) {
+    let carried = required_field_pins(prior_summary, &ledger::Ledger::default(), turns_being_summarized);
+    if let Err(missing) = checks::check_field_pins(&clipped, &carried) {
         errors.extend(missing.into_iter().map(|pin| format!("field_value_present: missing '{pin}'")));
     }
     if let Err(stated) = checks::check_superseded(&clipped, &replaced) {
@@ -596,6 +644,71 @@ mod tests {
         );
     }
 
+    /// Fold 1 pins `city: Bergen`. Fold 2 never sets that field. Rewriting the
+    /// current value must not commit. Omitting the update must not drop it
+    /// either. A name like "city" has no distinctive word, so the ledger's
+    /// misfile check does not stop the rewrite, and "(was Bergen)" still
+    /// contains the old text, so the pinned-term check does not either.
+    #[test]
+    fn a_carried_field_pin_is_required_when_later_turns_do_not_set_it() {
+        let config = PlanConfig { summary_chars: 1200, ..Default::default() };
+        let first_turns = vec![msg("user", "Correction: the city is now Bergen.")];
+        let first = r#"{"updates":[{"field":"city","value":"Bergen","evidence":"the city is now Bergen."}],"context":"The city was set."}"#;
+        let (summary, ledger) = run_fold_checks(first, None, &ledger::Ledger::default(), &first_turns, &[], 0, &config).unwrap();
+        assert!(summary.contains("city: Bergen"), "{summary}");
+
+        let later = vec![msg("user", "We will meet in Oslo tomorrow.")];
+        let rewritten = r#"{"updates":[{"field":"city","value":"Oslo","evidence":"We will meet in Oslo tomorrow."}],"context":"Meeting plans."}"#;
+        let err = run_fold_checks(rewritten, Some(&summary), &ledger, &later, &[], 1, &config).unwrap_err();
+        assert!(err.iter().any(|e| e.contains("city: Bergen")), "{err:?}");
+
+        let omitted = r#"{"updates":[],"context":"Meeting plans."}"#;
+        let (kept, _) = run_fold_checks(omitted, Some(&summary), &ledger, &later, &[], 1, &config).unwrap();
+        assert!(kept.contains("city: Bergen"), "{kept}");
+
+        // The prose check has no ledger to copy the fact. It still requires it.
+        let prior = "Current facts:\n- city: Bergen";
+        let dropped = "Current facts:\n- note: meeting plans";
+        let err = run_checks_with_prior(dropped, Some(prior), &later, &config).unwrap_err();
+        assert!(err.iter().any(|e| e.contains("city: Bergen")), "{err:?}");
+        let changed = "Current facts:\n- city: Oslo";
+        let err = run_checks_with_prior(changed, Some(prior), &later, &config).unwrap_err();
+        assert!(err.iter().any(|e| e.contains("city: Bergen")), "{err:?}");
+    }
+
+    /// A later turn that sets the field replaces the carried pin. The old
+    /// value may remain as history; it is not required as current.
+    #[test]
+    fn a_later_turn_that_sets_the_field_supersedes_the_carried_pin() {
+        let config = PlanConfig { summary_chars: 1200, ..Default::default() };
+        let first_turns = vec![msg("user", "Correction: the city is now Bergen.")];
+        let first = r#"{"updates":[{"field":"city","value":"Bergen","evidence":"the city is now Bergen."}],"context":"The city was set."}"#;
+        let (prior, ledger) = run_fold_checks(first, None, &ledger::Ledger::default(), &first_turns, &[], 0, &config).unwrap();
+        let later = vec![msg("user", "Correction: the city is now Oslo.")];
+        let reply = r#"{"updates":[{"field":"city","value":"Oslo","evidence":"the city is now Oslo."}],"context":"The city changed."}"#;
+        let (summary, updated) = run_fold_checks(reply, Some(&prior), &ledger, &later, &[], 1, &config).unwrap();
+        assert!(summary.contains("city: Oslo (was Bergen)"), "{summary}");
+        assert_eq!(updated.facts[0].value, "Oslo");
+        // The stale pin is not what the check demanded.
+        let pins = required_field_pins(Some(&prior), &ledger, &later);
+        assert_eq!(pins, [checks::FieldPin { field: "city".into(), value: "Oslo".into() }]);
+    }
+
+    /// No prior fold: the only pins are the ones these turns set.
+    #[test]
+    fn a_single_fold_requires_only_the_pins_its_own_turns_set() {
+        let config = PlanConfig { summary_chars: 1200, ..Default::default() };
+        let turns = vec![msg("user", "Correction: the city is now Bergen.")];
+        let dropped = r#"{"updates":[],"context":"The city was discussed."}"#;
+        let err = run_fold_checks(dropped, None, &ledger::Ledger::default(), &turns, &[], 0, &config).unwrap_err();
+        assert!(err.iter().any(|e| e.contains("city: Bergen")), "{err:?}");
+        let kept = r#"{"updates":[{"field":"city","value":"Bergen","evidence":"the city is now Bergen."}],"context":"The city was set."}"#;
+        let (summary, ledger) = run_fold_checks(kept, None, &ledger::Ledger::default(), &turns, &[], 0, &config).unwrap();
+        assert!(summary.contains("city: Bergen"), "{summary}");
+        assert_eq!(ledger.facts.len(), 1);
+        assert!(required_field_pins(None, &ledger::Ledger::default(), &turns).iter().all(|pin| pin.field == "city"));
+    }
+
     #[test]
     fn run_checks_rejects_a_value_kept_without_its_field() {
         let config = PlanConfig { summary_chars: 1200, ..Default::default() };
@@ -665,10 +778,13 @@ mod tests {
         let turns = vec![msg("user", "Progress note 50: nothing changed.")];
         let latest = "Current facts:\n- ceiling: 1250 USD\n- staging port: 8444\n- production port: 9443";
         assert_eq!(run_checks_with_prior(latest, Some(prior), &turns, &config).unwrap(), latest);
-        // A current value is still required.
+        // A current value is still required, as a term and as that field's pin.
         let dropped = "Current facts:\n- ceiling: 1250 USD\n- staging port: 8444";
         let err = run_checks_with_prior(dropped, Some(prior), &turns, &config).unwrap_err();
-        assert_eq!(err, ["pinned_facts_present: missing term '9443'"]);
+        assert_eq!(
+            err,
+            ["pinned_facts_present: missing term '9443'", "field_value_present: missing 'production_port: 9443'"]
+        );
         // The prompt does not ask for them either.
         assert_eq!(pinned_terms(Some(prior), &turns), ["1250", "8444", "9443"]);
     }
@@ -721,10 +837,14 @@ mod tests {
         let second = "Current facts:\n- staging port: 8444";
         assert!(run_checks_with_prior(second, Some(first), &quiet, &config).is_ok());
         assert!(run_checks_with_prior("Current facts:\n- staging port: 8443", Some(first), &quiet, &config).is_err());
-        // Fold 3, after the history is gone, still needs the current value.
+        // Fold 3, after the history is gone, still needs the current value,
+        // both as a term and as the field's current pin.
         assert!(run_checks_with_prior(second, Some(second), &quiet, &config).is_ok());
         let err = run_checks_with_prior("Current facts:\n- staging port: 8443", Some(second), &quiet, &config).unwrap_err();
-        assert_eq!(err, ["pinned_facts_present: missing term '8444'"]);
+        assert_eq!(
+            err,
+            ["pinned_facts_present: missing term '8444'", "field_value_present: missing 'staging_port: 8444'"]
+        );
     }
 
     #[test]
