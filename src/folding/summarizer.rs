@@ -283,14 +283,24 @@ pub fn retry_messages(
     messages
 }
 
-/// Whether `terms`, comma-separated, take at most half of `summary_chars`.
-/// Past that, a summary that keeps them all has almost no room left to say
-/// what they are, and in practice fails the check: such a fold is skipped
-/// before the summarizer is paid.
-pub fn pinned_terms_fit(terms: &[String], summary_chars: usize) -> bool {
+/// Today's `pinned_terms_margin`: the comma-separated pins may use at most
+/// half of `summary_chars`. A margin of `0` means this default, so a
+/// [`PlanConfig`] built with `..Default::default()` keeps it.
+pub const DEFAULT_PINNED_TERMS_MARGIN: u32 = 2;
+
+/// Whether `terms`, comma-separated, fit in `summary_chars / margin`.
+///
+/// `margin` 2 is the historical rule: leave as much room as the pins
+/// themselves take, because a summary has to say what each value is. Long
+/// identifiers make that stricter than the rendered facts need, so a tenant
+/// can set a smaller margin. `1` admits any list that fits in `summary_chars`
+/// as text. The commit checks still refuse a summary that does not fit or
+/// drops a pin. A fold that fails here is skipped before the summarizer is paid.
+pub fn pinned_terms_fit(terms: &[String], summary_chars: usize, margin: u32) -> bool {
+    let margin = if margin == 0 { DEFAULT_PINNED_TERMS_MARGIN } else { margin };
     let needed: usize =
         terms.iter().map(|term| term.chars().count()).sum::<usize>() + 2 * terms.len().saturating_sub(1);
-    needed.saturating_mul(2) <= summary_chars
+    needed.saturating_mul(margin as usize) <= summary_chars
 }
 
 /// Format turns for the summarizer prompt. Tool calls render with their ids
@@ -349,10 +359,16 @@ pub fn run_fold_checks(
     let parsed = ledger::parse_reply(reply).map_err(|error| vec![error])?;
     let updated = ledger::apply(prior_ledger, &parsed, pending, first_turn)?;
     let rendered = updated.render(config.summary_chars).map_err(|error| vec![error])?;
+    // The context note is what `render` cuts. The pin check has to see that
+    // cut — the text that would be committed — and the note before the cut,
+    // or a value past the cut is reported as missing.
+    let unclipped = updated.render(usize::MAX).map_err(|error| vec![error])?;
     let source = pin_source(prior_summary, pending);
     let replaced = superseded(prior_summary, pending);
     let mut errors =
-        checks::check_summary_except(&rendered, &source, config.summary_chars, &replaced).err().unwrap_or_default();
+        checks::check_committed_summary(&unclipped, &rendered, &source, config.summary_chars, &replaced, false)
+            .err()
+            .unwrap_or_default();
     for pin in required_field_pins(prior_summary, prior_ledger, pending) {
         if !ledger::states_pin(&updated, &pin) {
             errors.push(format!("field_value_present: missing '{pin}'"));
@@ -921,5 +937,111 @@ mod tests {
         let summary = "The user scheduled a meeting for the afternoon.";
         let err = run_checks_with_prior(summary, None, &turns, &config).unwrap_err();
         assert!(err.iter().any(|e| e.contains("15:30")));
+    }
+
+    #[test]
+    fn an_overshoot_that_keeps_its_pins_commits_the_clip() {
+        let summary_chars = 40;
+        let config = PlanConfig { summary_chars, ..Default::default() };
+        let turns = vec![msg("user", "The deadline is 2024-01-15.")];
+        let summary = format!("Deadline 2024-01-15. {}", "y".repeat(20));
+        let len = summary.chars().count();
+        let max_len = (summary_chars as f64 * 1.5).ceil() as usize;
+        assert!(len > summary_chars && len <= max_len, "{len} vs {summary_chars}/{max_len}");
+        let committed = run_checks_with_prior(&summary, None, &turns, &config).unwrap();
+        assert!(committed.chars().count() <= summary_chars, "{}", committed.chars().count());
+        assert!(committed.contains("2024-01-15"), "{committed}");
+        assert_eq!(committed, checks::clip_to_chars(&summary, summary_chars));
+    }
+
+    #[test]
+    fn a_clip_that_drops_a_pin_is_not_committed() {
+        let summary_chars = 40;
+        let config = PlanConfig { summary_chars, ..Default::default() };
+        let turns = vec![msg("user", "The deadline is 2024-01-15.")];
+        let summary = format!("{} 2024-01-15", "x".repeat(summary_chars));
+        let err = run_checks_with_prior(&summary, None, &turns, &config).unwrap_err();
+        assert!(err.iter().any(|e| e.starts_with("within_length_bound")), "{err:?}");
+        assert!(err.iter().all(|e| !e.starts_with("pinned_facts_present")), "{err:?}");
+    }
+
+    #[test]
+    fn a_pinned_value_cut_from_the_context_note_is_refused_as_length() {
+        let summary_chars = 200;
+        let config = PlanConfig { summary_chars, ..Default::default() };
+        let pin = "2024-01-15";
+        let turns = vec![msg("user", "The deadline is 2024-01-15.")];
+        let note = format!("{} {pin}", "x".repeat(summary_chars));
+        let reply = format!(r#"{{"context":"{note}"}}"#);
+        let err = run_fold_checks(&reply, None, &ledger::Ledger::default(), &turns, &[], 0, &config).unwrap_err();
+        assert!(err.iter().any(|e| e.starts_with("within_length_bound")), "{err:?}");
+        assert!(err.iter().all(|e| !e.contains(pin)), "the date is in the note; the cut is not a missing fact: {err:?}");
+        let rendered = ledger::Ledger { context: note, ..Default::default() }.render(summary_chars).unwrap();
+        assert!(!rendered.contains(pin), "{rendered}");
+        assert!(rendered.chars().count() <= summary_chars);
+    }
+
+    #[test]
+    fn a_pinned_value_inside_the_context_budget_is_committed() {
+        let config = PlanConfig { summary_chars: 200, ..Default::default() };
+        let turns = vec![msg("user", "The deadline is 2024-01-15.")];
+        let (summary, _) = run_fold_checks(
+            r#"{"context":"The deadline is 2024-01-15."}"#,
+            None,
+            &ledger::Ledger::default(),
+            &turns,
+            &[],
+            0,
+            &config,
+        )
+        .unwrap();
+        assert!(summary.contains("2024-01-15"), "{summary}");
+        assert!(summary.chars().count() <= 200, "{}", summary.chars().count());
+    }
+
+    /// 34 ids of 18 characters. The comma-separated list takes more than half
+    /// of 1200 characters, so margin 2 skips the fold, but the fact lines the
+    /// ledger would commit fit, and every id is in that text.
+    #[test]
+    fn the_double_margin_refuses_ids_a_committed_summary_can_hold() {
+        let summary_chars = 1200;
+        let terms: Vec<String> = (0..34).map(|i| format!("build-{i:02}-candidate")).collect();
+        let needed = terms.iter().map(|term| term.chars().count()).sum::<usize>() + 2 * terms.len().saturating_sub(1);
+        assert!(needed * 2 > summary_chars, "needed {needed} is not past half of {summary_chars}");
+        assert!(needed <= summary_chars, "needed {needed} does not itself fit in {summary_chars}");
+        assert!(!pinned_terms_fit(&terms, summary_chars, 2));
+        assert!(!pinned_terms_fit(&terms, summary_chars, 0), "margin 0 is the default of 2");
+        assert!(pinned_terms_fit(&terms, summary_chars, 1));
+
+        let kept = ledger::Ledger {
+            facts: terms
+                .iter()
+                .enumerate()
+                .map(|(i, value)| ledger::Fact {
+                    field: format!("build_id_{i:02}"),
+                    value: value.clone(),
+                    evidence: format!("Keep {value}."),
+                    turn: 0,
+                    history: Vec::new(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let rendered = kept.render(summary_chars).expect("the fact lines fit");
+        assert!(rendered.chars().count() <= summary_chars, "{}", rendered.chars().count());
+        for term in &terms {
+            assert!(rendered.contains(term.as_str()), "{term} missing from the summary that fits");
+        }
+        assert!(checks::check_summary(&rendered, &terms.join(" "), summary_chars).is_ok(), "{rendered}");
+    }
+
+    #[test]
+    fn margin_one_still_refuses_a_pin_list_that_does_not_fit() {
+        let summary_chars = 200;
+        let terms: Vec<String> = (0..20).map(|i| format!("build-{i:02}-candidate")).collect();
+        let needed = terms.iter().map(|term| term.chars().count()).sum::<usize>() + 2 * terms.len().saturating_sub(1);
+        assert!(needed > summary_chars, "needed {needed}");
+        assert!(!pinned_terms_fit(&terms, summary_chars, 1));
+        assert!(!pinned_terms_fit(&terms, summary_chars, 2));
     }
 }

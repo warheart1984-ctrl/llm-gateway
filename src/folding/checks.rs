@@ -352,7 +352,7 @@ fn durable_patterns() -> &'static [Regex] {
     })
 }
 
-/// Values that must survive in the clipped summary or the fold is refused,
+/// Values that must survive in the committed summary or the fold is refused,
 /// in the order found, without case-insensitive duplicates. Port of
 /// 5-fold-engine's `required_fold_terms`.
 pub fn extract_pinned_terms(text: &str) -> Vec<String> {
@@ -530,9 +530,9 @@ fn is_plain_hyphenated_word(value: &str) -> bool {
         && ENGLISH_HEADS.contains(&first)
 }
 
-/// Check if all pinned terms from the source text are present in the summary,
-/// ignoring case as 5-fold-engine does. The check is done against the summary
-/// AFTER clipping to summary_chars.
+/// Check if all pinned terms from the source text are present in `summary`,
+/// ignoring case as 5-fold-engine does. `summary` is taken as given: this
+/// does not clip. Callers pass the exact text that would be committed.
 pub fn check_pinned_facts(summary: &str, source_text: &str) -> Result<(), Vec<String>> {
     check_pinned_facts_except(summary, source_text, &[])
 }
@@ -581,49 +581,102 @@ pub fn check_summary(
 
 /// All summary checks, with `replaced` values exempt from the pinned-value
 /// check.
+///
+/// When `summary` is longer than `summary_chars`, a commit stores
+/// [`clip_to_chars`] of it. The pinned-fact check reads that string and does
+/// not clip on its own. A fact the clip removes is a length failure: the
+/// summary did contain it.
 pub fn check_summary_except(
     summary: &str,
     source_text: &str,
     summary_chars: usize,
     replaced: &[Superseded],
 ) -> Result<(), Vec<String>> {
-    let mut errors = Vec::new();
+    let committed = clip_to_chars(summary, summary_chars);
+    check_committed_summary(summary, &committed, source_text, summary_chars, replaced, true)
+}
 
-    // non_empty
+/// Checks for a summary the ledger has already cut to `summary_chars`.
+///
+/// `committed` is the exact text that would be stored. `offered` is that
+/// summary before the context note was cut; pass `committed` again when
+/// nothing was cut. The 1.5× overshoot bound is not applied to `offered`,
+/// because the ledger's cut is the commit, not a tolerated overshoot.
+pub(crate) fn check_committed_summary(
+    offered: &str,
+    committed: &str,
+    source_text: &str,
+    summary_chars: usize,
+    replaced: &[Superseded],
+    bound_the_overshoot: bool,
+) -> Result<(), Vec<String>> {
+    let mut errors = summary_structure_errors(
+        if bound_the_overshoot { offered } else { committed },
+        summary_chars,
+        bound_the_overshoot,
+    );
+    let overshoot_reported = errors.iter().any(|error| error.starts_with("within_length_bound"));
+    errors.extend(pinned_fact_commitment_errors(
+        offered,
+        committed,
+        source_text,
+        replaced,
+        summary_chars,
+        overshoot_reported,
+    ));
+    if errors.is_empty() { Ok(()) } else { Err(errors) }
+}
+
+/// `non_empty`, `covers_something`, and, when `bound_the_overshoot` is set,
+/// the 1.5× `within_length_bound`. These do not look at pinned facts.
+fn summary_structure_errors(summary: &str, summary_chars: usize, bound_the_overshoot: bool) -> Vec<String> {
+    let mut errors = Vec::new();
     if summary.trim().is_empty() {
         errors.push("non_empty: summary is empty".to_string());
     }
-
-    // within_length_bound (at most 1.5 × summary_chars)
-    let max_len = (summary_chars as f64 * 1.5).ceil() as usize;
-    if summary.chars().count() > max_len {
-        errors.push(format!(
-            "within_length_bound: summary is {} chars, max allowed {}",
-            summary.chars().count(),
-            max_len
-        ));
+    if bound_the_overshoot {
+        let max_len = (summary_chars as f64 * 1.5).ceil() as usize;
+        let len = summary.chars().count();
+        if len > max_len {
+            errors.push(format!("within_length_bound: summary is {len} chars, max allowed {max_len}"));
+        }
     }
-
-    // covers_something (at least some content beyond the preamble)
     let preamble = crate::folding::plan::SUMMARY_PREAMBLE;
     let content = summary.trim_start_matches(preamble).trim();
     if content.is_empty() {
         errors.push("covers_something: summary has no content beyond preamble".to_string());
     }
+    errors
+}
 
-    // pinned_facts_present (checked on clipped text)
-    let clipped = clip_to_chars(summary, summary_chars);
-    if let Err(missing) = check_pinned_facts_except(&clipped, source_text, replaced) {
-        for term in missing {
-            errors.push(format!("pinned_facts_present: missing term '{term}'"));
-        }
+/// Pinned-fact failures for the text that would be committed.
+///
+/// `committed` is not clipped here. A fact absent from `offered` is missing.
+/// A fact present in `offered` and absent from `committed` was cut, so the
+/// failure is length — unless `overshoot_reported` already said the summary
+/// is past the 1.5× bound.
+pub(crate) fn pinned_fact_commitment_errors(
+    offered: &str,
+    committed: &str,
+    source_text: &str,
+    replaced: &[Superseded],
+    summary_chars: usize,
+    overshoot_reported: bool,
+) -> Vec<String> {
+    let missing_offered = check_pinned_facts_except(offered, source_text, replaced).err().unwrap_or_default();
+    let missing_committed = check_pinned_facts_except(committed, source_text, replaced).err().unwrap_or_default();
+    let mut errors = Vec::new();
+    for term in &missing_offered {
+        errors.push(format!("pinned_facts_present: missing term '{term}'"));
     }
-
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
+    let cut_dropped_a_pin = missing_committed.iter().any(|term| !missing_offered.iter().any(|have| have == term));
+    if cut_dropped_a_pin && !overshoot_reported {
+        let offered_len = offered.chars().count();
+        errors.push(format!(
+            "within_length_bound: summary is {offered_len} chars, over the {summary_chars} that can be committed without dropping a pinned value"
+        ));
     }
+    errors
 }
 
 /// Clip text to at most `max_chars` characters.
@@ -721,13 +774,65 @@ mod tests {
     }
 
     #[test]
-    fn check_summary_pinned_facts_on_clipped_text() {
-        // Term is at position 1500 in a 2000-char summary (clipped to 1200)
+    fn a_pin_past_the_overshoot_bound_is_length_not_a_missing_fact() {
+        // The fact sits past summary_chars, and the summary is also past the
+        // 1.5× bound. It is in the summary. The refusal is the length.
         let long_summary = "x".repeat(1190) + "moved to 15:30" + &"y".repeat(1000);
-        let source = "Meeting moved to 15:30";
-        let err = check_summary(&long_summary, source, 1200).unwrap_err();
-        // Should fail because "15:30" is clipped out
-        assert!(err.iter().any(|e| e.contains("15:30")), "err: {err:?}");
+        let err = check_summary(&long_summary, "Meeting moved to 15:30", 1200).unwrap_err();
+        assert!(err.iter().any(|e| e.starts_with("within_length_bound")), "err: {err:?}");
+        assert!(
+            err.iter().all(|e| !e.starts_with("pinned_facts_present")),
+            "15:30 is in the summary; the cut is not a missing fact: {err:?}"
+        );
+    }
+
+    /// A summary inside the 1.5× length bound, longer than `summary_chars`,
+    /// with every pinned fact present. Clipping to `summary_chars` cuts the
+    /// fact off the end. That refusal is the clip: the fact is not missing.
+    #[test]
+    fn a_summary_inside_the_length_bound_is_not_refused_for_a_pin_the_clip_cut() {
+        let summary_chars = 80usize;
+        let pin = "15:30";
+        let summary = format!("{} moved to {pin}", "x".repeat(summary_chars));
+        let len = summary.chars().count();
+        let max_len = (summary_chars as f64 * 1.5).ceil() as usize;
+        assert!(len > summary_chars && len <= max_len, "len {len}, max {max_len}");
+        assert!(summary.contains(pin));
+
+        let err = check_summary(&summary, "The meeting moved to 15:30", summary_chars)
+            .expect_err("a clip that drops a pinned fact must not be committed");
+        let pins: Vec<_> = err.iter().filter(|e| e.starts_with("pinned_facts_present")).collect();
+        let lengths: Vec<_> = err.iter().filter(|e| e.starts_with("within_length_bound")).collect();
+        assert!(
+            pins.is_empty(),
+            "the pin is in the summary; refusing it as missing is the clip, not a missing fact: {err:?}"
+        );
+        assert!(
+            !lengths.is_empty(),
+            "the summary cannot be committed without dropping the pin, so the refusal is length: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_pin_at_the_end_of_a_summary_within_the_cap_is_kept() {
+        let summary_chars = 40;
+        let pin = "15:30";
+        let summary = format!("{}{pin}", "x".repeat(summary_chars - pin.chars().count()));
+        assert_eq!(summary.chars().count(), summary_chars);
+        assert!(check_summary(&summary, "Meeting moved to 15:30", summary_chars).is_ok());
+    }
+
+    #[test]
+    fn a_missing_pin_is_not_reported_as_length() {
+        let err = check_summary(&"x".repeat(40), "Meeting moved to 15:30", 80).unwrap_err();
+        assert_eq!(err, ["pinned_facts_present: missing term '15:30'"]);
+    }
+
+    #[test]
+    fn a_summary_past_the_overshoot_bound_that_lacks_a_pin_names_both() {
+        let err = check_summary(&"x".repeat(2000), "Meeting moved to 15:30", 1200).unwrap_err();
+        assert!(err.iter().any(|e| e.starts_with("within_length_bound")), "{err:?}");
+        assert!(err.iter().any(|e| e == "pinned_facts_present: missing term '15:30'"), "{err:?}");
     }
 
     #[test]
