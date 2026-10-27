@@ -17,6 +17,25 @@ the gateway reported for that call before more are spent.
 OpenRouter only — the gateway is not involved. The key is read from
 `OPENROUTER_API_KEY` and never printed, logged or written. Scoring reuses
 `fold_tools.parse_answer`, `strict_match` and `lenient_match` unchanged.
+
+Measured result (gpt-4.1-mini): the typed form is a hypothesis the probe
+tested, not a shipped rendering — the gateway keeps bare facts. In
+`probe_tool_fact_types_20261027T123519Z.json` (9 repeats, 360 rows) the
+numeric-gold questions went from 116/126 strict bare to 93/126 typed —
+at after-fold-2, 71/72 to 53/72 — while lenient was unchanged: quoting
+turned strict numeric answers into prose or quoted strings, the miss it
+was meant to fix. It did fix number-looking strings: the "12.81" control
+went 0/18 strict to 13/18. The earlier 3-repeat run,
+`probe_tool_fact_types_20261027T120012Z.json`, showed the same direction
+with less resolution.
+
+Two limits. The after-fold-2 prompt_tokens check is weak: the recorded
+1948 is the gateway's own chars/3.5 estimate, not the provider's count
+(the provider observed 1722), so it passes on the estimate arm of the
+comparison rather than proving the tail byte for byte. And the probe does
+not reproduce the in-run miss it set out to explain: at call 101 the
+recorded run's folded answer was the string "39", while the bare
+reconstruction answers the int 39 on all 9 tries.
 """
 
 from __future__ import annotations
@@ -133,8 +152,8 @@ def scripted_results() -> dict[str, Any]:
 def typed_rendering(summary: str) -> str:
     """The summary with every JSON-string tool fact quoted: `/path: "value"`.
     Bare numbers, booleans and null, text facts, "not kept" lines, the heading
-    and the Context section are untouched — what the typed Rust renderer
-    emits."""
+    and the Context section are untouched — the probe's hypothetical typed
+    variant; the gateway renders every value bare."""
     results = scripted_results()
     out = []
     current: Any = MISSING

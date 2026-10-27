@@ -24,7 +24,7 @@ def summary_at(call: int) -> str:
 class TypedRendering(unittest.TestCase):
     def test_strings_are_quoted_and_numbers_stay_bare(self) -> None:
         typed = p.typed_rendering(summary_at(16))
-        # The three lines the Rust typed renderer is pinned to emit.
+        # The three lines the probe's typed variant emits.
         self.assertIn("  - /passed: 39", typed)
         self.assertIn('  - /suite: "checkout/totals"', typed)
         self.assertIn('  - /failed/0/got: "12.81"', typed)
