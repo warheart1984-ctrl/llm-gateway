@@ -1,15 +1,20 @@
-# The gateway against the real Groq, OpenRouter and NVIDIA APIs.
+# The gateway against the real Groq and OpenRouter APIs.
 #
-# Not part of the gate on purpose: it spends real money, depends on three
+# Not part of the gate on purpose: it spends real money, depends on the
 # vendors being up, and needs secrets that pull requests from forks never
 # get. It runs nightly, on demand, and whenever the adapters, the catalogue
 # or the suite change, so a vendor changing its wire format or retiring a
 # catalogue model shows up within a day.
 #
-# Set the three repository secrets once: GROQ_API_KEY, OPENROUTER_API_KEY and
-# NVIDIA_API_KEY. A missing one fails that provider's test rather than
-# skipping it. Each test's tenant has a daily budget of 5 cents; a full run
-# costs well under a cent.
+# NVIDIA was dropped on 2026-10-27: it retired two catalogue models inside a
+# day (nemotron-3-super 404, then its llama-3.1-8b replacement 410), so the
+# probe could not stay green long enough to be signal. The provider stays in
+# config/models.yaml for tenants that use it.
+#
+# Set the two repository secrets once: GROQ_API_KEY and OPENROUTER_API_KEY.
+# A missing one fails that provider's test rather than skipping it. Each
+# test's tenant has a daily budget of 5 cents; a full run costs well under a
+# cent.
 
 name: live
 
@@ -28,7 +33,7 @@ on:
   workflow_dispatch:
     inputs:
       providers:
-        description: "Providers to call: all, or a comma list of groq, openrouter, nvidia"
+        description: "Providers to call: all, or a comma list of groq, openrouter"
         default: all
 
 permissions:
@@ -51,7 +56,6 @@ jobs:
           LLM_GATEWAY_LIVE: ${{ github.event.inputs.providers || 'all' }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: cargo test --locked --test live -- --nocapture
       - name: Keep what was measured
         if: always()

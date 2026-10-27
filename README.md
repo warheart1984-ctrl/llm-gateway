@@ -1263,7 +1263,7 @@ The SQLite ledger, lease and quota-split tests need no server and always
 run. Tests that count within one rate window wait until at least 15 s of the
 current minute remain, so they cannot straddle a boundary.
 
-`tests/live.rs` calls the real Groq, OpenRouter and NVIDIA APIs with the
+`tests/live.rs` calls the real Groq and OpenRouter APIs with the
 model the shipped catalogue names for each. It checks shape and money, never
 content:
 - a streamed answer follows the v1 contract and is billed exactly what its
@@ -1289,8 +1289,10 @@ LLM_GATEWAY_LIVE=all cargo test --test live -- --nocapture
 
 Each run appends estimated vs billed prompt tokens and reserved vs billed
 cost to `target/live-report.jsonl`. The `live` workflow runs it nightly and
-on demand from repository secrets (`GROQ_API_KEY`, `OPENROUTER_API_KEY`,
-`NVIDIA_API_KEY`), outside the gate: it depends on three vendors being up.
+on demand from repository secrets (`GROQ_API_KEY`, `OPENROUTER_API_KEY`),
+outside the gate: it depends on the vendors being up. NVIDIA was dropped on
+2026-10-27 after it retired two catalogue models inside a day; the provider
+stays in `config/models.yaml` for tenants that use it.
 Its checks are themselves tested on every normal run, against a local server
 that speaks the vendors' wire format, with no key and no cost.
 
