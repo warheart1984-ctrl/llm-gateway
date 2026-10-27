@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import fold_retention as fr  # noqa: E402
 import fold_tools as fto  # noqa: E402
 
 
@@ -178,6 +180,107 @@ class Aggregates(unittest.TestCase):
                 self.row(True, True, True, refetch_p=0, refetch_f=2)]
         agg = fto.aggregates(rows, {"max_folds": 4}, {}, {})
         self.assertEqual(agg["refetches"], {"plain": 0, "folded": 3})
+
+
+PRICES = {
+    "main_input_per_mtok_usd": 0.40,
+    "main_cached_input_per_mtok_usd": 0.10,
+    "main_output_per_mtok_usd": 1.60,
+    "summarizer_input_per_mtok_usd": 0.10,
+    "summarizer_output_per_mtok_usd": 0.40,
+}
+
+
+class CostGuard(unittest.TestCase):
+    def test_call_cost_prices_both_arms_and_the_summarizer(self) -> None:
+        row = {
+            "plain": {"usage": {"prompt_tokens": 1_000_000, "cached_tokens": 250_000, "completion_tokens": 0},
+                      "spend_delta_nano_usd": 0},
+            "folded": {"usage": {"prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 1_000_000},
+                       "spend_delta_nano_usd": 0,
+                       "summarizer_prompt_tokens": 1_000_000, "summarizer_completion_tokens": 0},
+        }
+        # 750k fresh input at 0.40, 250k cached at 0.10, 1M output at 1.60, 1M summarizer input at 0.10.
+        self.assertAlmostEqual(fto.call_cost_usd(row, PRICES), 0.325 + 1.60 + 0.10)
+
+    def test_a_missing_rate_uses_the_gateway_ledger(self) -> None:
+        row = {
+            "plain": {"usage": {"prompt_tokens": 1, "cached_tokens": 0, "completion_tokens": 0},
+                      "spend_delta_nano_usd": 1_500_000_000},
+            "folded": {"usage": {"prompt_tokens": 1, "cached_tokens": 0, "completion_tokens": 0},
+                       "spend_delta_nano_usd": 500_000_000},
+        }
+        self.assertAlmostEqual(fto.call_cost_usd(row, {}), 2.0)
+
+    def test_a_run_stops_once_spend_passes_the_cap_and_keeps_the_partial_file(self) -> None:
+        calls = {"n": 0}
+
+        def arm(*_args, **_kwargs):
+            calls["n"] += 1
+            return {
+                "finish_reason": "stop",
+                "spend_delta_nano_usd": 0,
+                "folded_turns": 0,
+                "request_id": f"req-{calls['n']}",
+                "fold_summary": None,
+                "retries": 0,
+                "usage": {"prompt_tokens": 1_000_000, "cached_tokens": 0, "completion_tokens": 0},
+                "content": '{"answer": 39}',
+                "payload": {"choices": [{"message": {"content": '{"answer": 39}'}, "finish_reason": "stop"}]},
+            }
+
+        original_arm, original_metrics = fr._arm, fr._metrics
+        fr._arm, fr._metrics = arm, lambda *_args, **_kwargs: {}
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                output = Path(tmp) / "out.json"
+                report, code = fto.run_agent(
+                    base_url="http://stub", plain_key="p", folded_key="f", admin_key="a",
+                    model="m", profile="lifecycle", output=output, max_calls=5,
+                    prices=PRICES, max_cost_usd=0.50,
+                )
+                self.assertTrue(output.exists())
+        finally:
+            fr._arm, fr._metrics = original_arm, original_metrics
+        # Both arms of the first call run (0.40 + 0.40), then the cap stops the rest.
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(code, 2)
+        self.assertEqual(len(report["calls"]), 1)
+        self.assertIn("passed the 0.50 USD limit", report["error"]["message"])
+        self.assertEqual(report["settings"]["max_cost_usd"], 0.50)
+
+    def test_without_a_cap_the_run_is_not_stopped_for_cost(self) -> None:
+        calls = {"n": 0}
+
+        def arm(*_args, **_kwargs):
+            calls["n"] += 1
+            return {
+                "finish_reason": "stop",
+                "spend_delta_nano_usd": 0,
+                "folded_turns": 0,
+                "request_id": "req",
+                "fold_summary": None,
+                "retries": 0,
+                "usage": {"prompt_tokens": 10, "cached_tokens": 0, "completion_tokens": 1},
+                "content": '{"answer": 39}',
+                "payload": {"choices": [{"message": {"content": '{"answer": 39}'}, "finish_reason": "stop"}]},
+            }
+
+        original_arm, original_metrics = fr._arm, fr._metrics
+        fr._arm, fr._metrics = arm, lambda *_args, **_kwargs: {}
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                report, _code = fto.run_agent(
+                    base_url="http://stub", plain_key="p", folded_key="f", admin_key="a",
+                    model="m", profile="lifecycle", output=Path(tmp) / "out.json", max_calls=2,
+                    prices=PRICES,
+                )
+        finally:
+            fr._arm, fr._metrics = original_arm, original_metrics
+        self.assertEqual(calls["n"], 4)
+        self.assertEqual(len(report["calls"]), 2)
+        self.assertNotIn("max_cost_usd", report["settings"])
+        self.assertNotIn("error", report)
 
 
 if __name__ == "__main__":

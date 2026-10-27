@@ -43,6 +43,15 @@ call's fold decision (outcome, reason code, turns, cost estimates; counts and
 hashes, no text) is read from the gateway log and added to the result file as
 `fold_decision`.
 
+`--capture-forwarded` is off unless named. It asks the gateway to append, for
+each folded-tenant completion, the exact JSON body it forwarded and the
+provider's reported usage (prompt tokens, completion tokens, cost) to
+`<result>.forwarded.jsonl` beside the result. The provider usage is also
+joined onto that call as `provider_usage`. The body stays in the sidecar.
+With the flag unset the gateway environment and the result file are unchanged.
+A tools run with the flag on stops once priced spend passes `--max-cost-usd`
+(default 1).
+
 Exit status is `tools/fold_retention.py`'s: 0 no regression, 1 regression, 2
 incomplete (including a missing key or a gateway that did not start).
 """
@@ -65,6 +74,9 @@ from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parent.parent
 BENCH = ROOT / "bench" / "folding"
+#: What `--capture-forwarded` spends at most, unless `--max-cost-usd` says otherwise.
+CAPTURE_COST_LIMIT_USD = 1.0
+FOLDED_TENANT = "folded"
 #: The tenant files name the Groq models; another provider's ids replace them.
 GROQ_MAIN, GROQ_SUMMARIZER = "groq/gpt-oss-120b", "groq/gpt-oss-20b"
 PROVIDERS = {
@@ -134,6 +146,72 @@ def fold_decisions(log_text: str) -> dict[str, dict]:
                 # client_request_id and echoes it, which is what the harness stores.
                 decisions.setdefault(client, decision)
     return decisions
+
+
+def tools_cost_limit(capture: bool, explicit: float | None) -> float | None:
+    """USD cap for a tools run. Unset when capture is off and no cap was given,
+    so an ordinary run is not stopped early. A capture run defaults to $1."""
+    if explicit is not None:
+        return explicit
+    if capture:
+        return CAPTURE_COST_LIMIT_USD
+    return None
+
+
+def capture_env(enabled: bool, path: Path | None, tenant: str = FOLDED_TENANT) -> dict[str, str]:
+    """Gateway env for forwarded-body capture. Empty when `enabled` is false,
+    so a run without the flag adds no variables and the gateway stays on its
+    ordinary send path."""
+    if not enabled:
+        return {}
+    if path is None:
+        raise ValueError("a capture path is required when forwarded capture is on")
+    return {
+        "LLM_GATEWAY_CAPTURE_FORWARDED": "1",
+        "LLM_GATEWAY_CAPTURE_FORWARDED_PATH": str(path),
+        "LLM_GATEWAY_CAPTURE_FORWARDED_TENANT": tenant,
+    }
+
+
+def capture_path_for(output: Path) -> Path:
+    """Sidecar of exact forwarded bodies, next to the result file."""
+    return output.with_name(f"{output.stem}.forwarded.jsonl")
+
+
+def load_forwarded_captures(path: Path) -> dict[str, dict]:
+    """request id -> capture record. Blank lines are ignored."""
+    records: dict[str, dict] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        request_id = record.get("request_id")
+        if isinstance(request_id, str):
+            records[request_id] = record
+    return records
+
+
+def attach_forwarded_captures(result: Path, capture: Path | None) -> int:
+    """Join provider-reported usage onto each folded call. The forwarded body
+    stays in the sidecar. With no capture file the result is left byte for
+    byte as the harness wrote it, and this returns 0."""
+    if capture is None or not capture.exists():
+        return 0
+    report = json.loads(result.read_text(encoding="utf-8"))
+    records = load_forwarded_captures(capture)
+    attached = 0
+    for row in report.get("calls", report.get("rows", [])):
+        folded = row.get("folded") if isinstance(row, dict) else None
+        if not isinstance(folded, dict):
+            continue
+        record = records.get(folded.get("request_id") or "")
+        if record is None:
+            continue
+        folded["provider_usage"] = record.get("usage")
+        attached += 1
+    report["forwarded_capture"] = capture.name
+    result.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return attached
 
 
 def attach_fold_decisions(result: Path, log: Path) -> int:
@@ -226,6 +304,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--amortization-requests", type=int,
                         help="the folded tenant's amortization_requests, in place of the profile's")
     parser.add_argument("--max-calls", type=int)
+    parser.add_argument("--capture-forwarded", action="store_true",
+                        help="save each folded-tenant forwarded body and the provider's reported usage")
+    parser.add_argument("--max-cost-usd", type=float,
+                        help="abort a tools run once priced spend passes this many USD "
+                             "(a capture run defaults to 1)")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--corpus", type=Path,
                         help="replay this directory of JSONL conversations instead of a synthetic scenario")
@@ -269,11 +352,18 @@ def main(argv: list[str] | None = None) -> int:
             text = with_amortization(text, args.amortization_requests)
         (config / "tenants.yaml").write_text(text, encoding="utf-8")
 
+        stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
+        scenario_name = "corpus" if args.corpus else args.scenario
+        output = args.output or (results_dir(corpus=bool(args.corpus)) /
+                                 result_name(args.provider, scenario_name, args.profile, stamp, args.summarizer,
+                                             args.amortization_requests))
+        capture = capture_path_for(output) if args.capture_forwarded else None
         gateway_env = dict(os.environ, **gateway_keys, **{provider["key"]: key},
                            LLM_GATEWAY_CONFIG_DIR=str(config),
                            LLM_GATEWAY__SERVER__PORT=str(port),
                            LLM_GATEWAY__RECEIPTS__ENABLED="true",
                            LLM_GATEWAY__RECEIPTS__DIRECTORY=str(config / "receipts"))
+        gateway_env.update(capture_env(args.capture_forwarded, capture))
         with log_path.open("wb") as log:
             gateway = subprocess.Popen([str(args.binary)], cwd=ROOT, env=gateway_env,
                                        stdout=log, stderr=subprocess.STDOUT)
@@ -283,11 +373,6 @@ def main(argv: list[str] | None = None) -> int:
 
         main_in, main_out = model_prices(provider["models"], provider["main"])
         sum_in, sum_out = model_prices(provider["models"], summarizer)
-        stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
-        scenario_name = "corpus" if args.corpus else args.scenario
-        output = args.output or (results_dir(corpus=bool(args.corpus)) /
-                                 result_name(args.provider, scenario_name, args.profile, stamp, args.summarizer,
-                                             args.amortization_requests))
         harness = {"constraints": "fold_tasks.py", "tools": "fold_tools.py"}.get(args.scenario, "fold_retention.py") if not args.corpus else "fold_retention.py"
         command = [sys.executable, "-u", str(ROOT / "tools" / harness),
                    "--base-url", base_url, "--model", provider["main"],
@@ -316,6 +401,9 @@ def main(argv: list[str] | None = None) -> int:
             command += ["--max-calls", str(args.max_calls)]
         if args.max_success_drop is not None and args.scenario == "constraints" and not args.corpus:
             command += ["--max-success-drop", str(args.max_success_drop)]
+        cost_limit = tools_cost_limit(args.capture_forwarded, args.max_cost_usd)
+        if cost_limit is not None and args.scenario == "tools" and not args.corpus:
+            command += ["--max-cost-usd", str(cost_limit)]
         # The harness gets the gateway keys, never the vendor key.
         harness_env = {k: v for k, v in os.environ.items() if k != provider["key"]}
         harness_env.update(LLM_GATEWAY_PLAIN_KEY=gateway_keys["GATEWAY_KEY_PLAIN"],
@@ -326,6 +414,9 @@ def main(argv: list[str] | None = None) -> int:
         if output.exists():
             attached = attach_fold_decisions(output, log_path)
             print(f"run-fold-retention: fold decisions attached to {attached} calls", file=sys.stderr)
+            if capture is not None:
+                captured = attach_forwarded_captures(output, capture)
+                print(f"run-fold-retention: forwarded captures attached to {captured} calls", file=sys.stderr)
             report = json.loads(output.read_text(encoding="utf-8"))
             if report.get("conversations"):
                 from corpus_replay import refresh_conversation_totals
