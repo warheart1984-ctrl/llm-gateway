@@ -60,7 +60,7 @@ use crate::{
         ledger::{
             self,
             holds::{HoldClaim, HoldProblem, HoldRecord, NewHold},
-            Ledger,
+            Ledger, LedgerRefusal,
         },
         limits::AdmitRequest,
         limits::CostEstimate,
@@ -2098,24 +2098,32 @@ async fn admit(
     // Holds are deliberately resolved before folding: a held request must not
     // spend a summarizer reservation, and idempotency still fingerprints the
     // original client body. The key is claimed before any fold work, so a
-    // duplicate is refused before the summarizer runs or the fold store
-    // changes. The reservation below adopts the claim at the folded estimate.
+    // duplicate of the same request is refused before the summarizer runs or
+    // the fold store changes. A different request under the same key is not
+    // claimed here: it still folds, and the reservation below refuses the
+    // reused key, carrying the fold the caller was charged for. That
+    // reservation adopts a claim at the folded estimate.
     let request_uuid = Uuid::parse_str(request_id).unwrap_or_else(|_| Uuid::new_v4());
     let idempotency = idempotency_key.map(|key| state.limits.fingerprinter().claim(key, scope, &value));
     let mut claimed = None;
     if let Some(claim) = &idempotency {
-        state
+        match state
             .limits
             .ledger()
             .claim_idempotency(request_uuid, &principal.tenant_id, claim)
             .await
-            .map_err(LimitError::from)?;
-        claimed = Some(IdempotencyGuard {
-            ledger: Arc::clone(state.limits.ledger()),
-            id: request_uuid,
-            tenant_id: Arc::clone(&principal.tenant_id),
-            armed: true,
-        });
+        {
+            Ok(()) => {
+                claimed = Some(IdempotencyGuard {
+                    ledger: Arc::clone(state.limits.ledger()),
+                    id: request_uuid,
+                    tenant_id: Arc::clone(&principal.tenant_id),
+                    armed: true,
+                });
+            }
+            Err(LedgerRefusal::IdempotencyKeyReused) => {}
+            Err(refusal) => return Err(LimitError::from(refusal).into()),
+        }
     }
     let original_messages = req.messages.clone();
     let fold = foreground_fold(
