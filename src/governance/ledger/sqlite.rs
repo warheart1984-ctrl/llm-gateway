@@ -49,7 +49,8 @@ use tokio::{
 use uuid::Uuid;
 
 use super::{
-    Closing, CommitOutcome, Ledger, LedgerRefusal, NewReservation, Outcome, PRUNE_BATCH, PRUNE_BATCHES_PER_PASS,
+    Closing, CommitOutcome, IdempotencyClaim, Ledger, LedgerRefusal, NewReservation, Outcome, PRUNE_BATCH,
+    PRUNE_BATCHES_PER_PASS,
     Retention, Upkeep, UpkeepCounts, commit_within,
     refuse_if_backlogged,
     release_clean,
@@ -324,44 +325,14 @@ impl SqliteLedger {
         let today: i64 = sqlx::query_scalar(&format!("SELECT {TODAY}")).fetch_one(&mut *tx).await?;
 
         if let Some(claim) = &r.idempotency {
-            let held = sqlx::query(&format!(
-                "SELECT id, state, fingerprint, reserved_nano_usd, delta_nano_usd, response,
-                        (closed_at IS NOT NULL AND closed_at < {NOW} - ?3) AS expired
-                   FROM reservations
-                  WHERE tenant_id = ?1 AND idempotency_key = ?2"
-            ))
-            .bind(r.tenant_id)
-            .bind(claim.key)
-            .bind(self.retention.as_secs() as i64)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if let Some(row) = held {
-                let id_text: String = row.get("id");
-                let id = Uuid::parse_str(&id_text).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
-                let expired: i64 = row.get("expired");
-                if expired == 0 {
-                    let fingerprint: Option<Vec<u8>> = row.get("fingerprint");
-                    if !fingerprint.as_deref().is_some_and(|stored| claim.matches(stored)) {
-                        return Ok(Err(LedgerRefusal::IdempotencyKeyReused));
-                    }
-                    match row.get::<String, _>("state").as_str() {
-                        "open" => return Ok(Err(LedgerRefusal::InProgress { original: Some(id) })),
-                        "released" => {}
-                        _ => {
-                            let reserved: i64 = row.get("reserved_nano_usd");
-                            let delta: Option<i64> = row.get("delta_nano_usd");
-                            return Ok(Err(LedgerRefusal::Duplicate {
-                                original: id,
-                                billed_nano_usd: (reserved + delta.unwrap_or(0)).max(0) as u64,
-                                response: self.open_response(r.tenant_id, id, row.get("response")),
-                            }));
-                        }
-                    }
-                }
-                sqlx::query("UPDATE reservations SET idempotency_key = NULL WHERE id = ?1")
-                    .bind(&id_text)
-                    .execute(&mut *tx)
-                    .await?;
+            if let Err(refusal) = self.reservation_key(&mut tx, r.tenant_id, claim).await? {
+                return Ok(Err(refusal));
+            }
+            // A claim made before the fold is adopted here, in the same
+            // transaction as the charge. No claim row means this reservation
+            // takes the key itself, as admissions that never pre-claimed do.
+            if let Err(refusal) = adopt_preclaim(&mut tx, r.tenant_id, r.id, claim).await? {
+                return Ok(Err(refusal));
             }
         }
         // After the key, so a repeat of an executed request is answered as a
@@ -452,6 +423,231 @@ impl SqliteLedger {
             Err(e) => return Err(e),
         }
         Ok(Ok((tx, today)))
+    }
+
+    /// What a reservation already holding this key says. `Ok(())` means the
+    /// key is free: it was never held, or a released or expired row was
+    /// cleared in this transaction. A live row refuses.
+    async fn reservation_key(
+        &self,
+        tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+        tenant_id: &str,
+        claim: &IdempotencyClaim<'_>,
+    ) -> Result<Result<(), LedgerRefusal>, sqlx::Error> {
+        let held = sqlx::query(&format!(
+            "SELECT id, state, fingerprint, reserved_nano_usd, delta_nano_usd, response,
+                    (closed_at IS NOT NULL AND closed_at < {NOW} - ?3) AS expired
+               FROM reservations
+              WHERE tenant_id = ?1 AND idempotency_key = ?2"
+        ))
+        .bind(tenant_id)
+        .bind(claim.key)
+        .bind(self.retention.as_secs() as i64)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some(row) = held else {
+            return Ok(Ok(()));
+        };
+        let id_text: String = row.get("id");
+        let id = Uuid::parse_str(&id_text).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+        let expired: i64 = row.get("expired");
+        if expired == 0 {
+            let fingerprint: Option<Vec<u8>> = row.get("fingerprint");
+            if !fingerprint.as_deref().is_some_and(|stored| claim.matches(stored)) {
+                return Ok(Err(LedgerRefusal::IdempotencyKeyReused));
+            }
+            match row.get::<String, _>("state").as_str() {
+                "open" => return Ok(Err(LedgerRefusal::InProgress { original: Some(id) })),
+                "released" => {}
+                _ => {
+                    let reserved: i64 = row.get("reserved_nano_usd");
+                    let delta: Option<i64> = row.get("delta_nano_usd");
+                    return Ok(Err(LedgerRefusal::Duplicate {
+                        original: id,
+                        billed_nano_usd: (reserved + delta.unwrap_or(0)).max(0) as u64,
+                        response: self.open_response(tenant_id, id, row.get("response")),
+                    }));
+                }
+            }
+        }
+        sqlx::query("UPDATE reservations SET idempotency_key = NULL WHERE id = ?1")
+            .bind(&id_text)
+            .execute(&mut **tx)
+            .await?;
+        Ok(Ok(()))
+    }
+
+    /// Claim the key, up to but not including the commit. Dropping the
+    /// transaction rolls the claim back.
+    async fn decide_claim(
+        &self,
+        id: Uuid,
+        tenant_id: &str,
+        claim: &IdempotencyClaim<'_>,
+    ) -> Result<Result<sqlx::Transaction<'static, sqlx::Sqlite>, LedgerRefusal>, sqlx::Error> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Err(refusal) = self.reservation_key(&mut tx, tenant_id, claim).await? {
+            return Ok(Err(refusal));
+        }
+        if let Err(refusal) = write_claim(&mut tx, id, tenant_id, claim, lease_secs(self.lease)).await? {
+            return Ok(Err(refusal));
+        }
+        Ok(Ok(tx))
+    }
+
+    /// What to do if a claim's commit lands after the caller was refused:
+    /// delete the claim. Not a reservation, so it is not queued as a closing
+    /// and does not count as a late release of money. The sweeper is the
+    /// backstop if every attempt fails.
+    fn delete_claim_if_late(&self, id: Uuid, tenant_id: String) -> impl Future<Output = ()> + Send + 'static {
+        let pool = self.pool.clone();
+        let id_text = id.to_string();
+        async move {
+            tracing::warn!(
+                reservation = %id,
+                tenant = %tenant_id,
+                "an idempotency claim committed after it was refused; releasing it"
+            );
+            for attempt in 0..LATE_RELEASE_ATTEMPTS {
+                match sqlx::query("DELETE FROM idempotency_claims WHERE id = ?1 AND tenant_id = ?2")
+                    .bind(&id_text)
+                    .bind(&tenant_id)
+                    .execute(&pool)
+                    .await
+                {
+                    Ok(_) => return,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            attempt,
+                            reservation = %id,
+                            "releasing a late idempotency claim failed; retrying"
+                        );
+                        tokio::time::sleep(Duration::from_millis(100 << attempt)).await;
+                    }
+                }
+            }
+            tracing::error!(
+                reservation = %id,
+                "an idempotency claim committed late and could not be released; the sweeper drops it when its lease lapses"
+            );
+        }
+    }
+}
+
+/// Take a pre-fold claim into this reservation, or say why this attempt
+/// cannot. No row means there was no pre-claim. An expired row is cleared.
+/// The matching row is deleted in this transaction, so a rolled-back charge
+/// leaves the claim in place.
+async fn adopt_preclaim(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    tenant_id: &str,
+    reservation_id: Uuid,
+    claim: &IdempotencyClaim<'_>,
+) -> Result<Result<(), LedgerRefusal>, sqlx::Error> {
+    let row = sqlx::query(&format!(
+        "SELECT id, fingerprint, (lease_expires_at < {NOW}) AS expired
+           FROM idempotency_claims
+          WHERE tenant_id = ?1 AND idempotency_key = ?2"
+    ))
+    .bind(tenant_id)
+    .bind(claim.key)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(Ok(()));
+    };
+    let id_text: String = row.get("id");
+    let expired: i64 = row.get("expired");
+    if expired != 0 {
+        sqlx::query("DELETE FROM idempotency_claims WHERE tenant_id = ?1 AND idempotency_key = ?2")
+            .bind(tenant_id)
+            .bind(claim.key)
+            .execute(&mut **tx)
+            .await?;
+        return Ok(Ok(()));
+    }
+    let fingerprint: Vec<u8> = row.get("fingerprint");
+    if !claim.matches(&fingerprint) {
+        return Ok(Err(LedgerRefusal::IdempotencyKeyReused));
+    }
+    if id_text != reservation_id.to_string() {
+        let original = Uuid::parse_str(&id_text).ok();
+        return Ok(Err(LedgerRefusal::InProgress { original }));
+    }
+    sqlx::query("DELETE FROM idempotency_claims WHERE tenant_id = ?1 AND idempotency_key = ?2")
+        .bind(tenant_id)
+        .bind(claim.key)
+        .execute(&mut **tx)
+        .await?;
+    Ok(Ok(()))
+}
+
+/// Insert this attempt's claim, or refresh the lease when it already holds
+/// an unexpired matching one. A different attempt's live claim refuses.
+async fn write_claim(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    id: Uuid,
+    tenant_id: &str,
+    claim: &IdempotencyClaim<'_>,
+    lease: i64,
+) -> Result<Result<(), LedgerRefusal>, sqlx::Error> {
+    let row = sqlx::query(&format!(
+        "SELECT id, fingerprint, (lease_expires_at < {NOW}) AS expired
+           FROM idempotency_claims
+          WHERE tenant_id = ?1 AND idempotency_key = ?2"
+    ))
+    .bind(tenant_id)
+    .bind(claim.key)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let id_text = id.to_string();
+    if let Some(row) = row {
+        let held: String = row.get("id");
+        let expired: i64 = row.get("expired");
+        if expired != 0 {
+            sqlx::query("DELETE FROM idempotency_claims WHERE tenant_id = ?1 AND idempotency_key = ?2")
+                .bind(tenant_id)
+                .bind(claim.key)
+                .execute(&mut **tx)
+                .await?;
+        } else {
+            let fingerprint: Vec<u8> = row.get("fingerprint");
+            if !claim.matches(&fingerprint) {
+                return Ok(Err(LedgerRefusal::IdempotencyKeyReused));
+            }
+            if held != id_text {
+                let original = Uuid::parse_str(&held).ok();
+                return Ok(Err(LedgerRefusal::InProgress { original }));
+            }
+            sqlx::query(&format!(
+                "UPDATE idempotency_claims SET lease_expires_at = {NOW} + ?3
+                  WHERE tenant_id = ?1 AND idempotency_key = ?2"
+            ))
+            .bind(tenant_id)
+            .bind(claim.key)
+            .bind(lease)
+            .execute(&mut **tx)
+            .await?;
+            return Ok(Ok(()));
+        }
+    }
+    let inserted = sqlx::query(&format!(
+        "INSERT INTO idempotency_claims
+             (tenant_id, idempotency_key, id, fingerprint, lease_expires_at)
+         VALUES (?1, ?2, ?3, ?4, {NOW} + ?5)"
+    ))
+    .bind(tenant_id)
+    .bind(claim.key)
+    .bind(&id_text)
+    .bind(claim.fingerprint.clone())
+    .bind(lease)
+    .execute(&mut **tx)
+    .await;
+    match inserted {
+        Ok(_) => Ok(Ok(())),
+        Err(error) if is_unique_violation(&error) => Ok(Err(LedgerRefusal::InProgress { original: None })),
+        Err(error) => Err(error),
     }
 }
 
@@ -749,12 +945,23 @@ async fn run_renewer(pool: SqlitePool, live: Arc<DashMap<Uuid, ()>>, lease: Dura
             "UPDATE reservations SET lease_expires_at = {NOW} + ?2
               WHERE state = 'open' AND id IN (SELECT value FROM json_each(?1))"
         ))
-        .bind(list)
+        .bind(&list)
         .bind(lease_secs(lease))
         .execute(&pool)
         .await
         {
             tracing::warn!(%error, reservations = ids.len(), "lease renewal failed; will retry");
+        }
+        if let Err(error) = sqlx::query(&format!(
+            "UPDATE idempotency_claims SET lease_expires_at = {NOW} + ?2
+              WHERE id IN (SELECT value FROM json_each(?1))"
+        ))
+        .bind(&list)
+        .bind(lease_secs(lease))
+        .execute(&pool)
+        .await
+        {
+            tracing::warn!(%error, reservations = ids.len(), "idempotency claim renewal failed; will retry");
         }
     }
 }
@@ -817,6 +1024,9 @@ async fn sweep(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
     ))
     .execute(pool)
     .await?;
+    sqlx::query(&format!("DELETE FROM idempotency_claims WHERE lease_expires_at < {NOW}"))
+        .execute(pool)
+        .await?;
     sqlx::query(&format!("DELETE FROM rate_minutes WHERE minute < {MINUTE} - 60"))
         .execute(pool)
         .await?;
@@ -944,6 +1154,54 @@ impl Ledger for SqliteLedger {
             }
             CommitOutcome::Failed(error) => Err(unavailable("reserve", error)),
             CommitOutcome::Late => Err(unavailable("reserve", "timed out committing")),
+        }
+    }
+
+    async fn claim_idempotency(
+        &self,
+        id: Uuid,
+        tenant_id: &str,
+        claim: &IdempotencyClaim<'_>,
+    ) -> Result<(), LedgerRefusal> {
+        refuse_if_backlogged(self.pending.load(Ordering::Relaxed), self.max_pending_closings, &self.upkeep)?;
+        let started = Instant::now();
+        let tx = match tokio::time::timeout(self.timeout, self.decide_claim(id, tenant_id, claim)).await {
+            Ok(Ok(Ok(tx))) => tx,
+            Ok(Ok(Err(refusal))) => return Err(refusal),
+            Ok(Err(error)) => return Err(unavailable("claim", error)),
+            Err(_) => return Err(unavailable("claim", "timed out")),
+        };
+        let committing = self.timeout.saturating_sub(started.elapsed()).max(self.timeout / 4);
+        match commit_within(tx.commit(), committing, self.delete_claim_if_late(id, tenant_id.to_string())).await {
+            CommitOutcome::Committed => {
+                self.live.insert(id, ());
+                Ok(())
+            }
+            CommitOutcome::Failed(error) => Err(unavailable("claim", error)),
+            CommitOutcome::Late => Err(unavailable("claim", "timed out committing")),
+        }
+    }
+
+    async fn release_idempotency(&self, id: Uuid, tenant_id: &str) {
+        let query = sqlx::query("DELETE FROM idempotency_claims WHERE id = ?1 AND tenant_id = ?2")
+            .bind(id.to_string())
+            .bind(tenant_id)
+            .execute(&self.pool);
+        match tokio::time::timeout(self.timeout, query).await {
+            Ok(Ok(done)) => {
+                // Only a row this attempt still held. An adopted key lives on
+                // the reservation, and removing it from `live` would stop
+                // that reservation's lease renewal.
+                if done.rows_affected() > 0 {
+                    self.live.remove(&id);
+                }
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%error, reservation = %id, "releasing an idempotency claim failed; the sweeper drops it when its lease lapses");
+            }
+            Err(_) => {
+                tracing::warn!(reservation = %id, "releasing an idempotency claim timed out; the sweeper drops it when its lease lapses");
+            }
         }
     }
 
@@ -1554,6 +1812,51 @@ mod tests {
         let mut retry = reservation("t", 1_000, 0);
         retry.idempotency = Some(claim);
         ledger.try_reserve(retry).await.expect("nothing ran, so the key may run again");
+    }
+
+    #[tokio::test]
+    async fn a_preclaim_is_not_a_charge_and_a_failed_reservation_releases_it() {
+        let file = TempFile::new();
+        let ledger = open(&file).await;
+        let claim = IdempotencyClaim { key: "k", fingerprint: vec![4; 32], also_matches: vec![] };
+        let id = Uuid::new_v4();
+        ledger.claim_idempotency(id, "t", &claim).await.unwrap();
+        let other = Uuid::new_v4();
+        match ledger.claim_idempotency(other, "t", &claim).await.unwrap_err() {
+            LedgerRefusal::InProgress { original } => assert_eq!(original, Some(id)),
+            refusal => panic!("expected in progress, got {refusal:?}"),
+        }
+        assert_eq!(spent(&ledger, "t").await, 0, "a claim reserves no money");
+
+        let mut too_much = reservation("t", 1_000, 100);
+        too_much.id = id;
+        too_much.idempotency = Some(claim.clone());
+        assert!(matches!(
+            ledger.try_reserve(too_much).await,
+            Err(LedgerRefusal::BudgetWouldBeExceeded { .. })
+        ));
+        match ledger.claim_idempotency(other, "t", &claim).await.unwrap_err() {
+            LedgerRefusal::InProgress { original } => assert_eq!(original, Some(id)),
+            refusal => panic!("a rolled-back reservation must keep the claim, got {refusal:?}"),
+        }
+        ledger.release_idempotency(id, "t").await;
+        ledger
+            .claim_idempotency(other, "t", &claim)
+            .await
+            .expect("a released claim is free");
+
+        let mut reserved = reservation("t", 1_000, 0);
+        reserved.id = other;
+        reserved.idempotency = Some(claim.clone());
+        ledger.try_reserve(reserved).await.expect("the reservation adopts the claim");
+        assert_eq!(spent(&ledger, "t").await, 1_000);
+        ledger.release_idempotency(other, "t").await;
+        let mut second = reservation("t", 1_000, 0);
+        second.idempotency = Some(claim);
+        assert!(
+            matches!(ledger.try_reserve(second).await, Err(LedgerRefusal::InProgress { .. })),
+            "releasing an adopted claim must not free the key"
+        );
     }
 
     #[tokio::test]

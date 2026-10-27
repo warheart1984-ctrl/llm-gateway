@@ -1630,6 +1630,153 @@ async fn an_idempotent_replay_returns_the_folded_header_without_a_new_summarizer
     assert_eq!(upstream.calls(), 2, "a replay must not call the summarizer again");
 }
 
+/// The fold store as a rejected duplicate must leave it: everything a fold
+/// commits or counts, and not the access time a lookup itself touches.
+#[derive(Debug, PartialEq, Eq)]
+struct FoldSnap {
+    turns_covered: usize,
+    summary: String,
+    fold_count: u32,
+    tokens_spent: u64,
+    tokens_saved: u64,
+    requests_served: u32,
+    ledger: llm_gateway::folding::ledger::Ledger,
+    prefix_hash: [u8; 32],
+    backoff: Option<(usize, u32)>,
+}
+
+fn fold_snapshot(store: &llm_gateway::folding::store::FoldingStore, turns: usize) -> Option<FoldSnap> {
+    let messages = conversation_messages(turns);
+    let (protected, turn_list) = llm_gateway::folding::split_messages(&messages);
+    let key = store.conversation_key("acme", "ak_test", &protected, turn_list.first());
+    let entry = store.lookup(&key, "acme", &turn_list)?;
+    let entry = entry.lock();
+    Some(FoldSnap {
+        turns_covered: entry.turns_covered,
+        summary: entry.summary.clone(),
+        fold_count: entry.fold_count,
+        tokens_spent: entry.tokens_spent,
+        tokens_saved: entry.tokens_saved,
+        requests_served: entry.requests_served,
+        ledger: entry.ledger.clone(),
+        prefix_hash: entry.prefix_hash,
+        backoff: store.backed_off_at(&key),
+    })
+}
+
+fn error_code(body: &str) -> String {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| value["error"]["code"].as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn a_duplicate_idempotency_key_never_folds_before_it_is_rejected() {
+    // A completed stream is refused as a duplicate. Folding before that
+    // refusal counts the summary as served again, and can pay the summarizer.
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(FOLDING_TENANT)).await;
+    let body = folding_body(6);
+    let first = gw
+        .post_json("/v1/chat/stream", TEST_KEY, body.clone(), &[("idempotency-key", "fold-dup")])
+        .await;
+    assert_eq!(first.0, StatusCode::OK, "{}", first.2);
+    assert_eq!(first.1.get("x-gateway-folded").unwrap(), "4");
+    assert_eq!(summarizer_bodies(&upstream).len(), 1);
+    let before = fold_snapshot(&gw.state.folding, 6).expect("the first request committed a summary");
+
+    let duplicate = gw
+        .post_json("/v1/chat/stream", TEST_KEY, body, &[("idempotency-key", "fold-dup")])
+        .await;
+    assert_eq!(duplicate.0, StatusCode::CONFLICT, "{}", duplicate.2);
+    assert_eq!(error_code(&duplicate.2), "duplicate_request");
+    assert_eq!(summarizer_bodies(&upstream).len(), 1, "a duplicate must not call the summarizer");
+    assert_eq!(fold_snapshot(&gw.state.folding, 6), Some(before), "a duplicate must not change the fold store");
+}
+
+#[tokio::test]
+async fn a_duplicate_while_the_fold_is_in_flight_is_rejected_before_folding() {
+    // The first request is held inside the summarizer, so its key is claimed
+    // only if that claim happens before the fold. The duplicate must be told
+    // to wait, and the first request must be the one that folds and answers.
+    let upstream = MockUpstream::start(Scenario::SummarizerHold).await;
+    let gw = Gateway::start_with_folding(&upstream, FOLDING_SUMMARIZER_MODEL, Some(FOLDING_TENANT)).await;
+    let body = folding_body(6);
+    let first = tokio::spawn({
+        let url = gw.url("/v1/chat/stream");
+        let body = body.clone();
+        async move {
+            let response = reqwest::Client::new()
+                .post(url)
+                .header("x-api-key", TEST_KEY)
+                .header("idempotency-key", "fold-inflight")
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let headers = response.headers().clone();
+            let text = response.text().await.unwrap_or_default();
+            (status, headers, text)
+        }
+    });
+    for _ in 0..100 {
+        if summarizer_bodies(&upstream).len() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(summarizer_bodies(&upstream).len(), 1, "the first request is inside the summarizer");
+    assert!(fold_snapshot(&gw.state.folding, 6).is_none(), "the fold has not committed yet");
+
+    let duplicate = gw
+        .post_json("/v1/chat/stream", TEST_KEY, body, &[("idempotency-key", "fold-inflight")])
+        .await;
+    assert_eq!(duplicate.0, StatusCode::CONFLICT, "{}", duplicate.2);
+    assert_eq!(error_code(&duplicate.2), "request_in_progress");
+    assert_eq!(summarizer_bodies(&upstream).len(), 1, "the duplicate must not call the summarizer");
+    assert!(fold_snapshot(&gw.state.folding, 6).is_none(), "the duplicate must not commit a summary");
+
+    upstream.open_gate(1);
+    let (status, headers, text) = first.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(headers.get("x-gateway-folded").map(|v| v.to_str().unwrap()), Some("4"));
+    assert_eq!(summarizer_bodies(&upstream).len(), 1);
+    assert!(fold_snapshot(&gw.state.folding, 6).is_some(), "the request that holds the key commits the fold");
+}
+
+#[tokio::test]
+async fn a_fold_that_fails_after_the_idempotency_claim_releases_the_key() {
+    // The summarizer fits and the main request does not. The claim is taken
+    // before the fold; when admission then refuses, the key has to be free
+    // again. A leaked claim would answer the retry with request_in_progress.
+    let upstream = MockUpstream::start(Scenario::Happy).await;
+    let gw = Gateway::start_folding(
+        &upstream,
+        FOLDING_SUMMARIZER_MODEL,
+        Some(FOLDING_TENANT),
+        Some(50_000),
+        "",
+        false,
+    )
+    .await;
+    let body = folding_body(6);
+    let first = gw
+        .post_json("/v1/chat/stream", TEST_KEY, body.clone(), &[("idempotency-key", "fold-fail")])
+        .await;
+    assert_eq!(first.0, StatusCode::PAYMENT_REQUIRED, "{}", first.2);
+    assert_eq!(error_code(&first.2), "budget_exhausted");
+    assert_eq!(summarizer_bodies(&upstream).len(), 1, "the fold ran, and the main request was then refused");
+
+    let retry = gw
+        .post_json("/v1/chat/stream", TEST_KEY, body, &[("idempotency-key", "fold-fail")])
+        .await;
+    assert_eq!(retry.0, StatusCode::PAYMENT_REQUIRED, "{}", retry.2);
+    assert_eq!(error_code(&retry.2), "budget_exhausted");
+    assert_ne!(error_code(&retry.2), "request_in_progress");
+}
+
 #[tokio::test]
 async fn folding_applies_on_the_openai_completions_endpoint() {
     let upstream = MockUpstream::start(Scenario::Happy).await;
