@@ -1090,7 +1090,7 @@ async fn a_fold_with_tool_turns_keeps_whole_exchanges_and_their_ledger() {
     );
     assert!(summary.contains("- read_file(path=\"src/folding/plan.rs\") -> ok"), "{summary}");
     assert!(summary.contains("/lines: 1043"), "{summary}");
-    assert!(summary.contains("/status: green"), "{summary}");
+    assert!(summary.contains("/status: \"green\""), "{summary}");
     assert!(!summary.contains("run_tests"), "the tail's exchange stays verbatim, not in the ledger: {summary}");
     // The verbatim tail keeps the second exchange whole: call then result.
     let roles: Vec<&str> = messages.iter().map(|m| m["role"].as_str().unwrap()).collect();
