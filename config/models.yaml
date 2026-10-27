@@ -92,11 +92,13 @@ models:
   # NVIDIA — cloud NIM and self-hosted. `endpoint` is what makes local work.
   # ---------------------------------------------------------------------------
   # Nemotron 4 340B is still listed by NVIDIA's API but no longer served to
-  # new accounts (404, found by the live suite on 2026-09-30).
+  # new accounts (404, found by the live suite on 2026-09-30). The Nemotron 3
+  # Super 120B endpoint went the same way (404, live suite on 2026-10-27), so
+  # this entry now routes to a model NVIDIA's cloud NIM keeps serving.
   nvidia/nemotron-3-super:
     provider: nvidia
-    display_name: Nemotron 3 Super 120B (NVIDIA)
-    upstream_model: nvidia/nemotron-3-super-120b-a12b
+    display_name: Llama 3.1 8B Instruct (NVIDIA)
+    upstream_model: meta/llama-3.1-8b-instruct
     default_params:
       temperature: 0.7
       max_tokens: 2048
