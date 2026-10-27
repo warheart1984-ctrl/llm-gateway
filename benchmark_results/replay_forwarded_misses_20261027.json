@@ -1,0 +1,678 @@
+{
+ "model_body": "captured forwarded body, unchanged",
+ "spend_usd": 0.02708599999999999,
+ "misses": [
+  {
+   "result": "fold_tools_openrouter_tools_lifecycle_20261027T144858Z_sum-gpt-4.1-mini.json",
+   "call": 26,
+   "gold": 1043,
+   "run_answer": "totals/rounds_partial_refund fails at line 1043",
+   "temperature": 0.0,
+   "replays": [
+    {
+     "answer": "totals/rounds_partial_refund fails at line 1043",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "totals/rounds_partial_refund fails at line 1043",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "totals/rounds_partial_refund fails at line 1043",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "totals/rounds_partial_refund fails at line 1043.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "totals/rounds_partial_refund fails at line 1043",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "totals/rounds_partial_refund fails at line 1043",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "totals/rounds_partial_refund fails at line 1043",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "totals/rounds_partial_refund fails at line 1043",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "totals/rounds_partial_refund fails at line 1043",
+     "strict": false,
+     "lenient": true
+    }
+   ],
+   "strict": 0,
+   "lenient": 9
+  },
+  {
+   "result": "fold_tools_openrouter_tools_lifecycle_20261027T144858Z_sum-gpt-4.1-mini.json",
+   "call": 38,
+   "gold": 1043,
+   "run_answer": "totals/rounds_partial_refund fails at line 1043.",
+   "temperature": 0.0,
+   "replays": [
+    {
+     "answer": 1043,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 1043,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 1043,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 1043,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 1043,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 1043,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 1043,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 1043,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 1043,
+     "strict": true,
+     "lenient": true
+    }
+   ],
+   "strict": 9,
+   "lenient": 9
+  },
+  {
+   "result": "fold_tools_openrouter_tools_lifecycle_20261027T145527Z_sum-gpt-4.1-mini.json",
+   "call": 26,
+   "gold": 1043,
+   "run_answer": "totals/rounds_partial_refund fails at line 1043.",
+   "temperature": 0.0,
+   "replays": [
+    {
+     "answer": "totals/rounds_partial_refund fails at line 1043.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "totals/rounds_partial_refund fails at line 1043.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "totals/rounds_partial_refund fails at line 1043.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "totals/rounds_partial_refund fails at line 1043",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "totals/rounds_partial_refund fails at line 1043.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "totals/rounds_partial_refund fails at line 1043",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "totals/rounds_partial_refund fails at line 1043.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "totals/rounds_partial_refund fails at line 1043.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "totals/rounds_partial_refund fails at line 1043.",
+     "strict": false,
+     "lenient": true
+    }
+   ],
+   "strict": 0,
+   "lenient": 9
+  },
+  {
+   "result": "fold_tools_openrouter_tools_lifecycle_20261027T145527Z_sum-gpt-4.1-mini.json",
+   "call": 29,
+   "gold": 39,
+   "run_answer": "39 cases in checkout/totals passed.",
+   "temperature": 0.0,
+   "replays": [
+    {
+     "answer": 39,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": "39",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": 39,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": "39",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39",
+     "strict": false,
+     "lenient": true
+    }
+   ],
+   "strict": 2,
+   "lenient": 9
+  },
+  {
+   "result": "fold_tools_openrouter_tools_lifecycle_20261027T145527Z_sum-gpt-4.1-mini.json",
+   "call": 98,
+   "gold": 1043,
+   "run_answer": "totals/rounds_partial_refund fails at line 1043.",
+   "temperature": 0.0,
+   "replays": [
+    {
+     "answer": "totals/rounds_partial_refund fails at line 1043.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": 1043,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 1043,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 1043,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 1043,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 1043,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 1043,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 1043,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 1043,
+     "strict": true,
+     "lenient": true
+    }
+   ],
+   "strict": 8,
+   "lenient": 9
+  },
+  {
+   "result": "fold_tools_openrouter_tools_lifecycle_20261027T145527Z_sum-gpt-4.1-mini.json",
+   "call": 101,
+   "gold": 39,
+   "run_answer": "39 cases in checkout/totals passed.",
+   "temperature": 0.0,
+   "replays": [
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": 39,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 39,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 39,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    }
+   ],
+   "strict": 3,
+   "lenient": 9
+  },
+  {
+   "result": "fold_tools_openrouter_tools_lifecycle_20261027T145527Z_sum-gpt-4.1-mini.json",
+   "call": 107,
+   "gold": 39,
+   "run_answer": "39 cases in checkout/totals passed.",
+   "temperature": 0.0,
+   "replays": [
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    }
+   ],
+   "strict": 0,
+   "lenient": 9
+  },
+  {
+   "result": "fold_tools_openrouter_tools_lifecycle_20261027T145527Z_sum-gpt-4.1-mini.json",
+   "call": 119,
+   "gold": 39,
+   "run_answer": "39",
+   "temperature": 0.0,
+   "replays": [
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": 39,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    }
+   ],
+   "strict": 1,
+   "lenient": 9
+  },
+  {
+   "result": "fold_tools_openrouter_tools_lifecycle_20261027T145527Z_sum-gpt-4.1-mini.json",
+   "call": 122,
+   "gold": 1043,
+   "run_answer": "totals/rounds_partial_refund fails at line 1043.",
+   "temperature": 0.0,
+   "replays": [
+    {
+     "answer": 1043,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 1043,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 1043,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 1043,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 1043,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 1043,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 1043,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 1043,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 1043,
+     "strict": true,
+     "lenient": true
+    }
+   ],
+   "strict": 9,
+   "lenient": 9
+  },
+  {
+   "result": "fold_tools_openrouter_tools_lifecycle_20261027T145527Z_sum-gpt-4.1-mini.json",
+   "call": 125,
+   "gold": 39,
+   "run_answer": "39 cases in checkout/totals passed.",
+   "temperature": 0.0,
+   "replays": [
+    {
+     "answer": 39,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 39,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 39,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 39,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 39,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": 39,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    }
+   ],
+   "strict": 6,
+   "lenient": 9
+  },
+  {
+   "result": "fold_tools_openrouter_tools_lifecycle_20261027T145527Z_sum-gpt-4.1-mini.json",
+   "call": 131,
+   "gold": 39,
+   "run_answer": "39 cases in checkout/totals passed.",
+   "temperature": 0.0,
+   "replays": [
+    {
+     "answer": 39,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": 39,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": 39,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 39,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": 39,
+     "strict": true,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    }
+   ],
+   "strict": 5,
+   "lenient": 9
+  },
+  {
+   "result": "fold_tools_openrouter_tools_lifecycle_20261027T145527Z_sum-gpt-4.1-mini.json",
+   "call": 149,
+   "gold": 39,
+   "run_answer": "39 cases in checkout/totals passed.",
+   "temperature": 0.0,
+   "replays": [
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    },
+    {
+     "answer": "39 cases in checkout/totals passed.",
+     "strict": false,
+     "lenient": true
+    }
+   ],
+   "strict": 0,
+   "lenient": 9
+  }
+ ]
+}

@@ -268,6 +268,32 @@ def emitted_calls(arm: dict[str, Any]) -> list[dict[str, str]]:
 FETCHED = {(name, json.dumps(arguments, sort_keys=True)) for _id, name, arguments, _key in CALLS}
 
 
+def call_cost_usd(row: dict[str, Any], prices: dict[str, float | None]) -> float:
+    """USD for one paired call: both arms at the provider's token rates, plus
+    the summarizer. When a rate is missing, the gateway's ledger spend, which
+    does not apply the provider's cache discount and so runs high."""
+    needed = (
+        "main_input_per_mtok_usd", "main_cached_input_per_mtok_usd", "main_output_per_mtok_usd",
+        "summarizer_input_per_mtok_usd", "summarizer_output_per_mtok_usd",
+    )
+    if any(prices.get(name) is None for name in needed):
+        return (row["plain"]["spend_delta_nano_usd"] + row["folded"]["spend_delta_nano_usd"]) / 1_000_000_000
+    main = (
+        prices["main_input_per_mtok_usd"],
+        prices["main_cached_input_per_mtok_usd"],
+        prices["main_output_per_mtok_usd"],
+    )
+    summarizer = (
+        row["folded"].get("summarizer_prompt_tokens", 0) * prices["summarizer_input_per_mtok_usd"]
+        + row["folded"].get("summarizer_completion_tokens", 0) * prices["summarizer_output_per_mtok_usd"]
+    ) / 1_000_000
+    return (
+        fr.provider_cost_usd(row["plain"]["usage"], *main)
+        + fr.provider_cost_usd(row["folded"]["usage"], *main)
+        + summarizer
+    )
+
+
 def run_agent(
     *,
     base_url: str,
@@ -281,6 +307,7 @@ def run_agent(
     max_tokens: int = 512,
     timeout: float = 240.0,
     prices: dict[str, float | None] | None = None,
+    max_cost_usd: float | None = None,
 ) -> tuple[dict[str, Any], int]:
     if profile not in fr.PROFILES:
         raise fr.BenchmarkError(f"unknown profile {profile!r}")
@@ -359,6 +386,11 @@ def run_agent(
                            "summarizer_prompt_tokens": prompt_tokens(metrics_after) - prompt_tokens(metrics_before),
                            "summarizer_completion_tokens": completion_tokens(metrics_after) - completion_tokens(metrics_before)},
             })
+            spent = sum(call_cost_usd(done, prices or {}) for done in rows)
+            if max_cost_usd is not None and spent > max_cost_usd:
+                raise fr.BenchmarkError(
+                    f"provider cost {spent:.6f} USD passed the {max_cost_usd:.2f} USD limit"
+                )
     except fr.BenchmarkError as exc:
         error = {"type": type(exc).__name__, "message": str(exc)}
 
@@ -371,6 +403,7 @@ def run_agent(
             "max_calls": max_calls, "max_tokens": max_tokens, "temperature": 0,
             "fold_cap": profile_data["max_folds"], "secrets_written": False,
             "git_commit": fr._git_commit(), "prices": prices or {},
+            **({} if max_cost_usd is None else {"max_cost_usd": max_cost_usd}),
         },
         "calls": rows,
         "fold_summaries": summaries,
@@ -466,6 +499,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--main-cached-input-per-mtok-usd", type=float)
     parser.add_argument("--summarizer-input-per-mtok-usd", type=float)
     parser.add_argument("--summarizer-output-per-mtok-usd", type=float)
+    parser.add_argument("--max-cost-usd", type=float,
+                        help="abort once priced spend for the run passes this many USD")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
     missing = [name for name, value in (("--plain-key", args.plain_key), ("--folded-key", args.folded_key),
@@ -479,6 +514,7 @@ def main(argv: list[str] | None = None) -> int:
             base_url=args.base_url, plain_key=args.plain_key, folded_key=args.folded_key,
             admin_key=args.admin_key, model=args.model, profile=args.profile, output=output,
             max_calls=args.max_calls, max_tokens=args.max_tokens, timeout=args.timeout,
+            max_cost_usd=args.max_cost_usd,
             prices={
                 "main_input_per_mtok_usd": args.main_input_per_mtok_usd,
                 "main_output_per_mtok_usd": args.main_output_per_mtok_usd,
