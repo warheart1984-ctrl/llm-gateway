@@ -95,16 +95,34 @@ impl ChatProvider for OpenAiCompatAdapter {
     }
 
     async fn complete(&self, req: ProviderRequest) -> Result<Completion, ProviderError> {
-        let resp = self.post(&req, false).await?;
+        let resp = match self.post(&req, false).await {
+            Ok(resp) => resp,
+            Err(err) => {
+                super::capture::discard(&req.request_id);
+                return Err(err);
+            }
+        };
         // A non-streaming answer is one JSON document. A body that cannot be
         // read (reset, read timeout) is a transport failure after acceptance.
-        let bytes = read_capped(resp, self.max_response_bytes).await?;
-        let value: Value = serde_json::from_slice(&bytes).map_err(|e| {
-            ProviderError::Protocol(format!(
-                "upstream answer was not JSON ({e}): {}",
-                super::truncate(&String::from_utf8_lossy(&bytes), 160)
-            ))
-        })?;
+        let bytes = match read_capped(resp, self.max_response_bytes).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                // The provider accepted the body. Keep it, with no usage.
+                super::capture::finish(&req, None);
+                return Err(err);
+            }
+        };
+        let value: Value = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(e) => {
+                super::capture::finish(&req, None);
+                return Err(ProviderError::Protocol(format!(
+                    "upstream answer was not JSON ({e}): {}",
+                    super::truncate(&String::from_utf8_lossy(&bytes), 160)
+                )));
+            }
+        };
+        super::capture::finish(&req, Some(&value));
         parse_completion(&value, self.spec.quirks)
     }
 
@@ -150,17 +168,26 @@ impl OpenAiCompatAdapter {
         // reqwest surfaces a client-construction failure as a `Builder` error
         // from `send()`, so the whole error chain is included in the message:
         // "builder error" alone is not diagnosable.
-        let resp = builder
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Connect {
+        //
+        // Capture, when it is on for this call, sends the same `serde_json`
+        // bytes `.json` would and keeps a copy. Every other call, including
+        // every call while the flag is unset, still goes through `.json`.
+        let owned = super::capture::owned_body(req, &body, streaming);
+        let builder = match owned {
+            Some(bytes) => builder.body(bytes),
+            None => builder.json(&body),
+        };
+        let resp = builder.send().await.map_err(|e| {
+            super::capture::discard(&req.request_id);
+            ProviderError::Connect {
                 provider: self.spec.provider.to_string(),
                 message: describe(&e),
-            })?;
+            }
+        })?;
 
         let status = resp.status();
         if !status.is_success() {
+            super::capture::finish(req, None);
             // The body is read here, before streaming starts, so an upstream
             // error is a normal HTTP status the client can act on rather than
             // an error buried inside a 200 SSE stream.

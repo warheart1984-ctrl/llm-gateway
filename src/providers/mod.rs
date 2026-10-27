@@ -6,6 +6,7 @@
 //! never in the API layer, so adding a vendor is an adapter + a registry entry
 //! and no changes to the public contract.
 
+mod capture;
 mod groq;
 mod nvidia;
 mod openai_compat;

@@ -347,6 +347,52 @@ class Diagnostics(unittest.TestCase):
         self.assertNotIn("fold_decision", calls[2]["folded"])
         self.assertNotIn("fold_decision", calls[3]["folded"])
 
+    def test_capture_off_adds_nothing_and_leaves_the_result_untouched(self) -> None:
+        base = {"LLM_GATEWAY__SERVER__PORT": "9", "OPENROUTER_API_KEY": "not-a-key"}
+        merged = dict(base)
+        merged.update(runner.capture_env(False, Path("benchmark_results/out.forwarded.jsonl")))
+        self.assertEqual(merged, base)
+        self.assertEqual(runner.tools_cost_limit(False, None), None)
+        with tempfile.TemporaryDirectory() as tmp:
+            result = Path(tmp) / "result.json"
+            original = json.dumps({"calls": [{"folded": {"request_id": "req-1", "answer": 39}}]}, indent=2)
+            result.write_text(original, encoding="utf-8")
+            self.assertEqual(runner.attach_forwarded_captures(result, None), 0)
+            self.assertEqual(result.read_text(encoding="utf-8"), original)
+            missing = Path(tmp) / "absent.forwarded.jsonl"
+            self.assertEqual(runner.attach_forwarded_captures(result, missing), 0)
+            self.assertEqual(result.read_text(encoding="utf-8"), original)
+
+    def test_capture_on_joins_provider_usage_and_leaves_the_body_in_the_sidecar(self) -> None:
+        body = {"model": "openai/gpt-4.1-mini", "messages": [{"role": "user", "content": "39"}], "stream": False}
+        usage = {"prompt_tokens": 1722, "completion_tokens": 12, "cost": 0.000812, "reported": {"cost": 0.000812}}
+        with tempfile.TemporaryDirectory() as tmp:
+            result = Path(tmp) / "fold_tools_run.json"
+            capture = runner.capture_path_for(result)
+            self.assertEqual(capture.name, "fold_tools_run.forwarded.jsonl")
+            capture.write_text(json.dumps({
+                "request_id": "req-1", "tenant_id": "folded", "key_id": "ak_bench_folded",
+                "body": body, "usage": usage,
+            }) + "\n", encoding="utf-8")
+            result.write_text(json.dumps({"calls": [
+                {"folded": {"request_id": "req-1", "answer": "39"}},
+                {"folded": {"request_id": "req-2", "answer": 39}},
+            ]}), encoding="utf-8")
+            env = runner.capture_env(True, capture)
+            self.assertEqual(env["LLM_GATEWAY_CAPTURE_FORWARDED"], "1")
+            self.assertEqual(env["LLM_GATEWAY_CAPTURE_FORWARDED_TENANT"], "folded")
+            self.assertEqual(env["LLM_GATEWAY_CAPTURE_FORWARDED_PATH"], str(capture))
+            self.assertEqual(runner.attach_forwarded_captures(result, capture), 1)
+            report = json.loads(result.read_text(encoding="utf-8"))
+        self.assertEqual(report["forwarded_capture"], capture.name)
+        self.assertEqual(report["calls"][0]["folded"]["provider_usage"], usage)
+        self.assertNotIn("body", report["calls"][0]["folded"])
+        self.assertNotIn("provider_usage", report["calls"][1]["folded"])
+        self.assertEqual(runner.tools_cost_limit(True, None), 1.0)
+        self.assertEqual(runner.tools_cost_limit(True, 0.25), 0.25)
+        with self.assertRaises(ValueError):
+            runner.capture_env(True, None)
+
 
 class Usage(unittest.TestCase):
     def test_usage_without_cache_details_counts_none_cached(self) -> None:
