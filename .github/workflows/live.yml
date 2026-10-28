@@ -11,6 +11,8 @@
 # probe could not stay green long enough to be signal. The provider stays in
 # config/models.yaml for tenants that use it.
 #
+# Scheduled runs call only OpenRouter while the GROQ_API_KEY secret is rejected (HTTP 401);
+# dispatch with providers=all (or groq) once it is replaced.
 # Set the two repository secrets once: GROQ_API_KEY and OPENROUTER_API_KEY.
 # A missing one fails that provider's test rather than skipping it. Each
 # test's tenant has a daily budget of 5 cents; a full run costs well under a
@@ -53,7 +55,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Live provider tests
         env:
-          LLM_GATEWAY_LIVE: ${{ github.event.inputs.providers || 'all' }}
+          LLM_GATEWAY_LIVE: ${{ github.event.inputs.providers || 'openrouter' }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: cargo test --locked --test live -- --nocapture
