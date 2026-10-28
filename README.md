@@ -1,8 +1,7 @@
 # llm-gateway
 
 A streaming, multi-tenant, governed LLM chat gateway in Rust. One SSE front door
-(`POST /v1/chat/stream`) routing to **Groq**, **OpenRouter**, and **NVIDIA NIM**
-(cloud or self-hosted).
+(`POST /v1/chat/stream`) routing to **Groq** and **OpenRouter**.
 
 ```
 client ──▶ API (SSE framing) ──▶ governance (auth → policy → limits) ──▶ router ──▶ provider adapter ──▶ vendor
@@ -106,8 +105,8 @@ data: [DONE]
 | `GET` | `/health/ready` | Readiness; 503 if no model has a usable provider route |
 | `GET` | `/metrics` | Prometheus text exposition (admin scope) |
 
-Readiness evaluates each model route, including provider credentials and the
-explicit local endpoint used by self-hosted NVIDIA NIM. A deployment remains
+Readiness evaluates each model route, including provider credentials and any
+explicit local endpoint. A deployment remains
 ready when at least one route is usable; the response lists unavailable model
 routes in `unavailable_models` so a fallback does not hide a degraded catalog.
 
@@ -783,7 +782,11 @@ Savings are USD, from `aggregates.caching.provider_cost_usd`. A summary's saving
 
 Two earlier runs, with a summarizer prompt that showed each tool result on one line, committed no fold at all (result files from 2026-10-26T07:44 and T08:00): the summarizer quoted whole JSON results as fact-update evidence and ran out of tokens every time, at a 512- and then a 1024-token reply budget. Results are now shown to the summarizer one key per line, and its reply lists `tool_facts` before `updates`. The tools scenario runs from its own tenants file, `bench/folding/tenants.tools.yaml` (the lifecycle profile with `fold_tool_turns: true`, `summarizer_max_tokens: 1024`, and `summary_chars: 2400`); the other scenarios keep 512 tokens and 1200 summary characters. Those two runs cost 10% and 20% more than unfolded, and both exit `2` (no eligible question).
 
-Not measured: `fold_mode: shadow` with tool turns (covered by tests only), a re-fold over tool turns, text (non-JSON) tool results in a live run, a provider other than OpenRouter, and a summarizer other than `gpt-4.1-mini`.
+Longer runs hold the saving once a fold commits more than once (build `f788965`, then `74b8ceb` which also scored format-only misses): **+54.7% at 90 calls** (2 folds), **+43–50% at 300** (1–2 folds), **+40.6–40.9% at 500** (2 folds), and +40.1% / +50.6% on two 150-call runs at `74b8ceb` (1 and 5 folds). Short sessions still lose money: the 60-call rows above cost 7–20% more, so the break-even sits near 70 calls. On accuracy, every eligible folded miss at 300–500 calls had the right value in the wrong format — `"39"` or a sentence where strict typed scoring wants `39` — strict 73–81% against 82–83% unfolded, lenient up to 84%. The gap was format, not retention: a folded tenant never gave a wrong number.
+
+A probe replaying the captured forwarded bodies (`tools/probe_format_variants.py`) picked the rendering now shipped as two opt-in settings: `folding.tool_facts_render: "json"` renders each call's facts as one compact JSON object, and `folding.context_dedup: true` drops context sentences that only repeat a fact's number; `json` alone measured worse, so it requires `context_dedup`. The 150-call run with both on (`bf37fa9`, 2 folds) scored **82%/81% strict and 83% lenient folded, +43.7%**, with 4 eligible misses (3 format-only) against 6 and 10 on the two `74b8ceb` baselines. The bench tenant file `bench/folding/tenants.tools.yaml` enables them; for strict-JSON consumers the client-side fix is `response_format: json_schema`.
+
+Not measured: `fold_mode: shadow` with tool turns (covered by tests only), text (non-JSON) tool results in a live run, a provider other than OpenRouter, a summarizer other than `gpt-4.1-mini`, and the new rendering beyond a single 150-call run.
 
 ## Receipts
 
@@ -1155,8 +1158,8 @@ daily_budget_nano_usd = 5000000000   # 1 USD = 1_000_000_000 nano-USD
 ```
 
 `config/models.yaml` is the only place a model, provider, or upstream URL is
-defined. A per-model `endpoint:` override is what makes a self-hosted NIM
-container work. `prompt_overhead_tokens:` is what a vendor adds around every
+defined. A per-model `endpoint:` override is what makes a self-hosted
+OpenAI-compatible server work. `prompt_overhead_tokens:` is what a vendor adds around every
 prompt (its chat template, a default system prompt), which the gateway's
 estimate cannot see: Groq's gpt-oss bills a short prompt at ~79 tokens
 against ~13 estimated. It is added to the reservation only, so the budget
@@ -1192,9 +1195,9 @@ No API change, no client change.
 - **Latency claims.** The gateway adds no measurable per-token latency in either
   mode. It cannot remove DNS/TLS/connect time, provider queueing, provider TTFT,
   model scheduling, or client-side network distance. Those dominate.
-- **Per-token throughput is model- and load-dependent.** Local NIM latency
-  depends on model size, quantization, batch size, KV-cache length, and GPU —
-  measure it rather than assuming.
+- **Per-token throughput is model- and load-dependent.** Local model-server
+  latency depends on model size, quantization, batch size, KV-cache length,
+  and GPU — measure it rather than assuming.
 
 ## Security posture
 
@@ -1290,9 +1293,9 @@ LLM_GATEWAY_LIVE=all cargo test --test live -- --nocapture
 Each run appends estimated vs billed prompt tokens and reserved vs billed
 cost to `target/live-report.jsonl`. The `live` workflow runs it nightly and
 on demand from repository secrets (`GROQ_API_KEY`, `OPENROUTER_API_KEY`),
-outside the gate: it depends on the vendors being up. NVIDIA was dropped on
-2026-10-27 after it retired two catalogue models inside a day; the provider
-stays in `config/models.yaml` for tenants that use it.
+outside the gate: it depends on the vendors being up, so a vendor whose
+catalogue churns faster than the suite can follow gets dropped rather than
+chased.
 Its checks are themselves tested on every normal run, against a local server
 that speaks the vendors' wire format, with no key and no cost.
 
